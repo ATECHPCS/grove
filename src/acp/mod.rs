@@ -201,6 +201,11 @@ pub enum AcpUpdate {
         locations: Vec<(String, Option<u32>)>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timestamp: Option<DateTime<Utc>>,
+        /// ACP `tool_call.raw_input` 透传 — agent 实际发起调用时的入参 JSON
+        /// (Bash 命令、Grep pattern、MCP 入参等)。老 history.jsonl 无此字段
+        /// 反序列化兜底为 None。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_input: Option<serde_json::Value>,
     },
     /// 工具调用更新
     ToolCallUpdate {
@@ -208,6 +213,11 @@ pub enum AcpUpdate {
         status: String,
         content: Option<String>,
         locations: Vec<(String, Option<u32>)>,
+        /// 同 [`AcpUpdate::ToolCall::raw_input`]:一些 agent(Claude Code 等)
+        /// 的 `raw_input` 在首个 ToolCall 事件还没出现,要到 ToolCallUpdate
+        /// 才透出 — 这里也带上,前端按更新覆盖。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_input: Option<serde_json::Value>,
     },
     /// 权限请求（带选项，等待用户交互）。`id` 是 ACP tool_call.id，
     /// 用于把后续的 PermissionResponse 精确对应到这条 Request；老历史里的
@@ -1016,6 +1026,7 @@ async fn handle_session_notification(
                 title: tool_call.title.clone(),
                 locations,
                 timestamp: Some(Utc::now()),
+                raw_input: tool_call.raw_input.clone(),
             });
 
             // 记录 Write 工具的 tool_call_id → file_path(用于 PlanFileUpdate 检测)。
@@ -1144,6 +1155,7 @@ async fn handle_session_notification(
                 status: status.clone(),
                 content,
                 locations: locations.clone(),
+                raw_input: update.fields.raw_input.clone(),
             });
 
             // 检测 Plan File:Write 工具 completed 且在 plan mode 下写入 .md 文件
@@ -1210,6 +1222,7 @@ async fn handle_session_notification(
                     status: "completed".to_string(),
                     content: None,
                     locations: Default::default(),
+                    raw_input: None,
                 });
             }
         }

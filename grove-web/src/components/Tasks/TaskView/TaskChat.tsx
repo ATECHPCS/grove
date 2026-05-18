@@ -263,6 +263,9 @@ type ToolMessage = {
   content?: string;
   collapsed: boolean;
   locations?: { path: string; line?: number }[];
+  /// ACP `tool_call.raw_input` — agent 实际调用工具时的入参 JSON。
+  /// Bash 的 `command`、Grep 的 `pattern`、MCP 的入参等。
+  rawInput?: unknown;
 };
 
 interface PermOption {
@@ -1241,6 +1244,8 @@ function reduceHistoryMessages(
                 title: msg.title,
                 // locations 按增量合并，按 (path,line) 去重保序
                 locations: mergeLocations(m.locations, msg.locations),
+                // raw_input 后到优先（agent 在 update 阶段才补全 input 时不抹掉）
+                rawInput: msg.raw_input !== undefined ? msg.raw_input : m.rawInput,
               }
             : m,
         );
@@ -1257,6 +1262,7 @@ function reduceHistoryMessages(
           status: "running",
           collapsed: false,
           locations: msg.locations,
+          rawInput: msg.raw_input,
         },
       ];
     }
@@ -1287,6 +1293,8 @@ function reduceHistoryMessages(
                 status: msg.status,
                 content: mergeContent(m.content, msg.content),
                 locations: mergeLocations(m.locations, msg.locations),
+                rawInput:
+                  msg.raw_input !== undefined ? msg.raw_input : m.rawInput,
               }
             : m,
         );
@@ -1301,6 +1309,7 @@ function reduceHistoryMessages(
           content: msg.content,
           collapsed: true,
           locations: msg.locations ?? [],
+          rawInput: msg.raw_input,
         },
       ];
     }
@@ -7852,6 +7861,7 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
       content: tool.message.content ?? "",
       locations: tool.message.locations ?? [],
       status: tool.message.status,
+      rawInput: tool.message.rawInput,
     };
   };
   const actionItems = foregroundActions.map(buildChipItem);
@@ -7952,7 +7962,62 @@ type ActionChipItem = {
   content: string;
   locations: { path: string; line?: number }[];
   status: string;
+  rawInput?: unknown;
 };
+
+/** Render a diff string with +/-/@@ line coloring. Inline `<pre>` block. */
+function DiffPreview({ diff }: { diff: string }) {
+  const lines = diff.split("\n");
+  return (
+    <pre className="text-[11px] leading-[1.45] font-mono whitespace-pre-wrap break-all m-0">
+      {lines.map((line, i) => {
+        // file headers — render muted, no +/- coloring
+        const isHeader =
+          line.startsWith("+++") ||
+          line.startsWith("---") ||
+          line.startsWith("diff --git") ||
+          line.startsWith("index ");
+        const isHunk = line.startsWith("@@");
+        const isAdd = !isHeader && line.startsWith("+");
+        const isDel = !isHeader && line.startsWith("-");
+        const cls = isHunk
+          ? "text-[var(--color-text-muted)]"
+          : isHeader
+            ? "text-[var(--color-text-muted)] opacity-70"
+            : isAdd
+              ? "text-[var(--color-success)] bg-[color-mix(in_srgb,var(--color-success)_8%,transparent)]"
+              : isDel
+                ? "text-[var(--color-error)] bg-[color-mix(in_srgb,var(--color-error)_8%,transparent)]"
+                : "text-[var(--color-text)]";
+        return (
+          <span key={i} className={`block ${cls}`}>
+            {line || " "}
+          </span>
+        );
+      })}
+    </pre>
+  );
+}
+
+/**
+ * Pretty-format `tool_call.raw_input` for the expanded panel REQUEST block.
+ * Bash 类工具直接渲 `command`(更短更直观);其他工具 JSON.stringify。
+ * 返回 null 表示没有可显示的 raw_input,调用方应隐藏整个 REQUEST 块。
+ */
+function formatRawInput(raw: unknown, kind: ActionKind): string | null {
+  if (raw == null) return null;
+  if (typeof raw === "string") return raw.trim() || null;
+  if (typeof raw !== "object") return String(raw);
+  const obj = raw as Record<string, unknown>;
+  if ((kind === "bash" || kind === "bash_output") && typeof obj.command === "string") {
+    return obj.command;
+  }
+  try {
+    return JSON.stringify(obj, null, 2);
+  } catch {
+    return null;
+  }
+}
 
 /** Single clickable / expandable action chip. */
 function ActionChip({
@@ -8099,15 +8164,40 @@ function ActionChipList({
                     collapse
                   </button>
                 </div>
-                {renderMarkdown ? (
-                  <div className="text-[12px] leading-[1.45]">
-                    <MarkdownRenderer content={item.content} />
-                  </div>
-                ) : (
-                  <pre className="text-[11px] leading-[1.45] font-mono whitespace-pre-wrap break-all text-[var(--color-text)] m-0">
-                    {item.content || "(no output)"}
-                  </pre>
-                )}
+                {(() => {
+                  const reqText = formatRawInput(item.rawInput, item.kind);
+                  const resBody = renderMarkdown ? (
+                    <div className="text-[12px] leading-[1.45]">
+                      <MarkdownRenderer content={item.content} />
+                    </div>
+                  ) : (
+                    <pre className="text-[11px] leading-[1.45] font-mono whitespace-pre-wrap break-all text-[var(--color-text)] m-0">
+                      {item.content || "(no output)"}
+                    </pre>
+                  );
+                  return (
+                    <div className="space-y-2">
+                      {reqText && (
+                        <div>
+                          <div className="mb-1 text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
+                            Request
+                          </div>
+                          <pre className="text-[11px] leading-[1.45] font-mono whitespace-pre-wrap break-all text-[var(--color-text)] m-0">
+                            {reqText}
+                          </pre>
+                        </div>
+                      )}
+                      <div>
+                        {reqText && (
+                          <div className="mb-1 text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
+                            Response
+                          </div>
+                        )}
+                        {resBody}
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
             );
           })}
@@ -8230,6 +8320,9 @@ const ToolSectionView = memo(function ToolSectionView({
   const [expandedInspectionKeys, setExpandedInspectionKeys] = useState<
     Set<string>
   >(() => new Set());
+  const [expandedEditKeys, setExpandedEditKeys] = useState<Set<string>>(
+    () => new Set(),
+  );
   const hasDetails =
     summary.inspectionEntries.length > 0 ||
     summary.inspectionActionItems.length > 0 ||
@@ -8385,42 +8478,115 @@ const ToolSectionView = memo(function ToolSectionView({
                     Edit
                   </div>
                   <div className="flex flex-wrap gap-1.5">
-                    {summary.editItems.map((item) => (
-                      <button
-                        key={item.key}
-                        type="button"
-                        onClick={() => {
-                          const tool = tools.find(
-                            (t) => t.message.id === item.toolId,
-                          )?.message;
-                          const path = item.fullPath || tool?.locations?.[0]?.path;
-                          if (path && tool)
-                            onFileClick?.(
-                              path,
-                              undefined,
-                              getToolNavMode(tool),
-                            );
-                        }}
-                        className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] ${getStatusChipClasses(item.status)}`}
-                      >
-                        <VSCodeIcon filename={item.label} size={13} />
-                        <span>{item.label}</span>
-                        {(item.additions > 0 || item.deletions > 0) && (
-                          <span className="text-[10px]">
-                            <span className="text-[var(--color-success)]">
-                              +{item.additions}
-                            </span>
-                            <span className="mx-0.5 text-[var(--color-text-muted)]">
-                              /
-                            </span>
-                            <span className="text-[var(--color-error)]">
-                              -{item.deletions}
-                            </span>
-                          </span>
-                        )}
-                      </button>
-                    ))}
+                    {summary.editItems.map((item) => {
+                      const isExpanded = expandedEditKeys.has(item.key);
+                      const tool = tools.find(
+                        (t) => t.message.id === item.toolId,
+                      )?.message;
+                      const path = item.fullPath || tool?.locations?.[0]?.path;
+                      const hasDiff = (tool?.content?.trim()?.length ?? 0) > 0;
+                      return (
+                        <div
+                          key={item.key}
+                          className={`inline-flex items-center gap-1 rounded-full pl-2.5 pr-1 py-1 text-[11px] transition-colors ${getStatusChipClasses(item.status)} ${
+                            isExpanded
+                              ? "ring-1 ring-[color-mix(in_srgb,var(--color-highlight)_55%,transparent)] bg-[color-mix(in_srgb,var(--color-highlight)_14%,var(--color-bg-secondary))]"
+                              : ""
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (!hasDiff) return;
+                              setExpandedEditKeys((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(item.key)) next.delete(item.key);
+                                else next.add(item.key);
+                                return next;
+                              });
+                            }}
+                            disabled={!hasDiff}
+                            className={`inline-flex items-center gap-1.5 ${hasDiff ? "cursor-pointer" : "cursor-default"}`}
+                          >
+                            <VSCodeIcon filename={item.label} size={13} />
+                            <span>{item.label}</span>
+                            {(item.additions > 0 || item.deletions > 0) && (
+                              <span className="text-[10px]">
+                                <span className="text-[var(--color-success)]">
+                                  +{item.additions}
+                                </span>
+                                <span className="mx-0.5 text-[var(--color-text-muted)]">
+                                  /
+                                </span>
+                                <span className="text-[var(--color-error)]">
+                                  -{item.deletions}
+                                </span>
+                              </span>
+                            )}
+                            {hasDiff ? (
+                              isExpanded ? (
+                                <ChevronUp className="h-3 w-3 shrink-0 text-[var(--color-text-muted)]" />
+                              ) : (
+                                <ChevronDown className="h-3 w-3 shrink-0 text-[var(--color-text-muted)] opacity-70" />
+                              )
+                            ) : null}
+                          </button>
+                          {path && tool && (
+                            <button
+                              type="button"
+                              title="Open file"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onFileClick?.(
+                                  path,
+                                  undefined,
+                                  getToolNavMode(tool),
+                                );
+                              }}
+                              className="ml-0.5 inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-full text-[var(--color-text-muted)] hover:bg-[color-mix(in_srgb,var(--color-text)_8%,transparent)] hover:text-[var(--color-text)]"
+                            >
+                              <ExternalLink className="h-3 w-3" />
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
+                  {summary.editItems
+                    .filter((item) => expandedEditKeys.has(item.key))
+                    .map((item) => {
+                      const tool = tools.find(
+                        (t) => t.message.id === item.toolId,
+                      )?.message;
+                      const diff = tool?.content ?? "";
+                      return (
+                        <div
+                          key={`${item.key}:diff`}
+                          className="rounded-lg border border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_58%,transparent)] px-3 py-2"
+                        >
+                          <div className="mb-1.5 flex items-center gap-2">
+                            <VSCodeIcon filename={item.label} size={13} />
+                            <span className="text-[11px] text-[var(--color-text)]">
+                              {item.label}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setExpandedEditKeys((prev) => {
+                                  const next = new Set(prev);
+                                  next.delete(item.key);
+                                  return next;
+                                })
+                              }
+                              className="ml-auto text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] cursor-pointer transition-colors"
+                            >
+                              collapse
+                            </button>
+                          </div>
+                          <DiffPreview diff={diff || "(empty diff)"} />
+                        </div>
+                      );
+                    })}
                 </div>
               )}
 

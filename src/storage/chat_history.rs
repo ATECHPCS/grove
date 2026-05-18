@@ -240,6 +240,7 @@ pub fn cancel_unresolved_events(project: &str, task_id: &str, chat_id: &str) -> 
                         status: "cancelled".to_string(),
                         content: None,
                         locations,
+                        raw_input: None,
                     },
                 );
             }
@@ -373,6 +374,8 @@ struct ToolCompactState {
     content: Option<String>,
     locations: Vec<(String, Option<u32>)>,
     timestamp: Option<DateTime<Utc>>,
+    /// 最后一次见到的 raw_input(优先以非 None 覆盖,避免被 None 抹掉)。
+    raw_input: Option<serde_json::Value>,
 }
 
 /// 把 new_locs 合并进 existing（按 (path,line) 去重、保序）。
@@ -435,12 +438,14 @@ pub fn compact_events(events: Vec<AcpUpdate>) -> Vec<AcpUpdate> {
                     title: state.title,
                     locations: state.locations.clone(),
                     timestamp: state.timestamp,
+                    raw_input: state.raw_input.clone(),
                 });
                 result.push(AcpUpdate::ToolCallUpdate {
                     id,
                     status: state.status,
                     content: state.content,
                     locations: state.locations,
+                    raw_input: state.raw_input,
                 });
             }
         }
@@ -471,6 +476,7 @@ pub fn compact_events(events: Vec<AcpUpdate>) -> Vec<AcpUpdate> {
                 title,
                 locations,
                 timestamp,
+                raw_input,
             } => {
                 flush_messages(&mut msg_buf, &mut result);
                 flush_thoughts(&mut thought_buf, &mut result);
@@ -482,6 +488,9 @@ pub fn compact_events(events: Vec<AcpUpdate>) -> Vec<AcpUpdate> {
                     }
                     // locations 也按增量合并而不是覆盖
                     merge_locations(&mut state.locations, locations);
+                    if raw_input.is_some() {
+                        state.raw_input = raw_input.clone();
+                    }
                 } else {
                     tool_order.push(id.clone());
                     tool_map.insert(
@@ -492,6 +501,7 @@ pub fn compact_events(events: Vec<AcpUpdate>) -> Vec<AcpUpdate> {
                             content: None,
                             locations: locations.clone(),
                             timestamp: *timestamp,
+                            raw_input: raw_input.clone(),
                         },
                     );
                 }
@@ -501,6 +511,7 @@ pub fn compact_events(events: Vec<AcpUpdate>) -> Vec<AcpUpdate> {
                 status,
                 content,
                 locations,
+                raw_input,
             } => {
                 if let Some(state) = tool_map.get_mut(id) {
                     if !status.is_empty() {
@@ -537,6 +548,9 @@ pub fn compact_events(events: Vec<AcpUpdate>) -> Vec<AcpUpdate> {
                         }
                     }
                     merge_locations(&mut state.locations, locations);
+                    if raw_input.is_some() {
+                        state.raw_input = raw_input.clone();
+                    }
                 } else {
                     // Orphan ToolCallUpdate（没有对应的 ToolCall），直接保留
                     flush_messages(&mut msg_buf, &mut result);
@@ -731,18 +745,21 @@ mod tests {
                 title: "Read foo.rs".into(),
                 locations: vec![],
                 timestamp: None,
+                raw_input: None,
             },
             AcpUpdate::ToolCall {
                 id: "t1".into(),
                 title: "Read foo.rs".into(),
                 locations: vec![("foo.rs".into(), Some(1))],
                 timestamp: None,
+                raw_input: None,
             },
             AcpUpdate::ToolCallUpdate {
                 id: "t1".into(),
                 status: "completed".into(),
                 content: Some("file content".into()),
                 locations: vec![("foo.rs".into(), Some(1))],
+                raw_input: None,
             },
             AcpUpdate::Complete {
                 usage: None,
@@ -788,12 +805,14 @@ mod tests {
                 title: "Write x".into(),
                 locations: vec![],
                 timestamp: None,
+                raw_input: None,
             },
             AcpUpdate::ToolCallUpdate {
                 id: "tool1".into(),
                 status: "completed".into(),
                 content: None,
                 locations: vec![],
+                raw_input: None,
             },
             AcpUpdate::MessageChunk { text: "m3".into() },
             AcpUpdate::Complete {
@@ -857,18 +876,21 @@ mod tests {
                 title: "bash".into(),
                 locations: vec![],
                 timestamp: None,
+                raw_input: None,
             },
             AcpUpdate::ToolCallUpdate {
                 id: "t1".into(),
                 status: "running".into(),
                 content: Some("$ echo hi".into()),
                 locations: vec![],
+                raw_input: None,
             },
             AcpUpdate::ToolCallUpdate {
                 id: "t1".into(),
                 status: "completed".into(),
                 content: Some("hi".into()),
                 locations: vec![],
+                raw_input: None,
             },
             AcpUpdate::Complete {
                 usage: None,
@@ -901,18 +923,21 @@ mod tests {
                 title: "bash".into(),
                 locations: vec![],
                 timestamp: None,
+                raw_input: None,
             },
             AcpUpdate::ToolCallUpdate {
                 id: "t1".into(),
                 status: "".into(),
                 content: Some("payload-A".into()),
                 locations: vec![],
+                raw_input: None,
             },
             AcpUpdate::ToolCallUpdate {
                 id: "t1".into(),
                 status: "completed".into(),
                 content: Some("payload-A".into()),
                 locations: vec![],
+                raw_input: None,
             },
             AcpUpdate::Complete {
                 usage: None,
@@ -947,24 +972,28 @@ mod tests {
                 title: "bash".into(),
                 locations: vec![],
                 timestamp: None,
+                raw_input: None,
             },
             AcpUpdate::ToolCallUpdate {
                 id: "t1".into(),
                 status: "running".into(),
                 content: Some("line1".into()),
                 locations: vec![],
+                raw_input: None,
             },
             AcpUpdate::ToolCallUpdate {
                 id: "t1".into(),
                 status: "running".into(),
                 content: Some("line1\nline2".into()),
                 locations: vec![],
+                raw_input: None,
             },
             AcpUpdate::ToolCallUpdate {
                 id: "t1".into(),
                 status: "completed".into(),
                 content: Some("line1\nline2\nline3".into()),
                 locations: vec![],
+                raw_input: None,
             },
             AcpUpdate::Complete {
                 usage: None,
@@ -1033,6 +1062,7 @@ mod tests {
             status: "completed".into(),
             content: Some("tiny".into()),
             locations: vec![],
+            raw_input: None,
         };
         assert!(!needs_truncation(&small));
 
@@ -1041,6 +1071,7 @@ mod tests {
             status: "completed".into(),
             content: Some("x".repeat(MAX_TOOL_CONTENT_BYTES + 1)),
             locations: vec![],
+            raw_input: None,
         };
         assert!(needs_truncation(&big));
 
@@ -1060,18 +1091,21 @@ mod tests {
                 title: "edit".into(),
                 locations: vec![("a.rs".into(), Some(1))],
                 timestamp: None,
+                raw_input: None,
             },
             AcpUpdate::ToolCallUpdate {
                 id: "t1".into(),
                 status: "".into(),
                 content: None,
                 locations: vec![("a.rs".into(), Some(1)), ("b.rs".into(), Some(2))],
+                raw_input: None,
             },
             AcpUpdate::ToolCallUpdate {
                 id: "t1".into(),
                 status: "completed".into(),
                 content: None,
                 locations: vec![("b.rs".into(), Some(2)), ("c.rs".into(), None)],
+                raw_input: None,
             },
             AcpUpdate::Complete {
                 usage: None,

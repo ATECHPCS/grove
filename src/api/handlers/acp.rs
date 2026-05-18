@@ -122,6 +122,8 @@ enum ServerMessage {
         title: String,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         locations: Vec<LocationMsg>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        raw_input: Option<serde_json::Value>,
     },
     ToolCallUpdate {
         id: String,
@@ -129,6 +131,8 @@ enum ServerMessage {
         content: Option<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         locations: Vec<LocationMsg>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        raw_input: Option<serde_json::Value>,
     },
     PermissionRequest {
         id: String,
@@ -357,6 +361,7 @@ impl From<AcpUpdate> for ServerMessage {
                 id,
                 title,
                 locations,
+                raw_input,
                 ..
             } => ServerMessage::ToolCall {
                 id,
@@ -365,12 +370,14 @@ impl From<AcpUpdate> for ServerMessage {
                     .into_iter()
                     .map(|(path, line)| LocationMsg { path, line })
                     .collect(),
+                raw_input,
             },
             AcpUpdate::ToolCallUpdate {
                 id,
                 status,
                 content,
                 locations,
+                raw_input,
             } => ServerMessage::ToolCallUpdate {
                 id,
                 status,
@@ -379,6 +386,7 @@ impl From<AcpUpdate> for ServerMessage {
                     .into_iter()
                     .map(|(path, line)| LocationMsg { path, line })
                     .collect(),
+                raw_input,
             },
             AcpUpdate::PermissionRequest {
                 id,
