@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.8] - 2026-05-18
+
+### Added
+
+- **ACP per-prompt config + queue** — Mode/model/thought_level now ride along with each prompt as `QueuedConfig`, applied via SetSessionMode/Model/ConfigOption right before send, so config follows the message instead of being a separate global setter. Rapid-fire prompts enqueue into `pending_queue` (with QueueUpdate events) instead of overwriting a single slot and silently dropping N-1 messages. Shell-mode terminals survive enqueue/drain.
+- **Excalidraw libraries** — New `/library` PUT/GET/DELETE backend (atomic file-rename writes, 10k-item / 64 MiB caps, HashMap-indexed upsert, groupIds rewrite on instantiate) plus an `#addLibrary=` hash handler with HTTPS-only URL validation (http allowed only on localhost), install-confirm dialog, and BroadcastChannel ping so peer Sketch tabs refresh.
+- **VirtualizedMarkdownRenderer** — Long markdown messages now render through react-virtuoso with CSS Custom Highlight API search, chunked RAF scanning, per-block match buckets, cross-text-node range extension, refcounted instance-scoped highlight names (so split previews don't clobber each other), heading anchor spans for hash nav, and tuple-tracked scroll dedupe so streaming search doesn't jump the viewport.
+- **Tool-call request/response inline view** — TaskChat surfaces `tool_call.raw_input` end-to-end (ACP → WS → history.jsonl, back-compat via `#[serde(default)]`), renders background tools (Bash/Grep without locations) as action chips showing what was inspected, splits expanded panels into REQUEST + RESPONSE, and adds single-click inline mini-diffs with +/- coloring for Edit chips (separate ↗ button now handles file-jump).
+
+### Improved
+
+- **CI matrix targets shipped surface** — Check and Clippy jobs now run on macos-latest, `--target aarch64-apple-darwin --release --features gui`, matching what users actually download instead of catching only debug-mode regressions.
+
+### Fixed
+
+- **BranchDrawer remote checkout no longer detaches HEAD** — Strip the `<remote>/` prefix before `git checkout` so DWIM creates a local tracking branch (was checking out the remote ref directly and leaving HEAD detached, showing "unknown" branch).
+
 ## [0.10.7] - 2026-05-11
 
 ### Added
