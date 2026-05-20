@@ -49,14 +49,15 @@ fn toggle_main_window_visibility(app: tauri::AppHandle) -> Result<(), String> {
     if window.is_visible().map_err(|e| e.to_string())? {
         #[cfg(target_os = "macos")]
         {
+            if !macos_app_is_active() {
+                window.show().map_err(|e| e.to_string())?;
+                window.set_focus().map_err(|e| e.to_string())?;
+                macos_activate_app();
+                return Ok(());
+            }
+
             if window.is_fullscreen().map_err(|e| e.to_string())? {
-                if macos_app_is_active() {
-                    macos_hide_app();
-                } else {
-                    window.show().map_err(|e| e.to_string())?;
-                    window.set_focus().map_err(|e| e.to_string())?;
-                    macos_activate_app();
-                }
+                macos_hide_app();
                 return Ok(());
             }
         }
@@ -64,6 +65,8 @@ fn toggle_main_window_visibility(app: tauri::AppHandle) -> Result<(), String> {
     } else {
         window.show().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())?;
+        #[cfg(target_os = "macos")]
+        macos_activate_app();
     }
 
     Ok(())
