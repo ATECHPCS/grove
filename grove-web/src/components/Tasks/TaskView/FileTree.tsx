@@ -13,6 +13,8 @@ interface FileTreeProps {
   onSubmitPath?: (name: string) => void;
   onCancelPath?: () => void;
   onExpandDir?: (path: string) => Promise<DirEntry[]>;
+  onMoveFile?: (source: string, destination: string) => void;
+  onUploadFile?: (parentPath: string, file: File) => void;
 }
 
 export function FileTree({
@@ -24,11 +26,66 @@ export function FileTree({
   onSubmitPath,
   onCancelPath,
   onExpandDir,
+  onMoveFile,
+  onUploadFile,
 }: FileTreeProps) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const [isTreeDragOver, setIsTreeDragOver] = useState(false);
+
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsTreeDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsTreeDragOver(false);
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsTreeDragOver(false);
+
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      if (onUploadFile) {
+        for (let i = 0; i < e.dataTransfer.files.length; i++) {
+          const file = e.dataTransfer.files[i];
+          onUploadFile("", file);
+        }
+      }
+    } else {
+      const sourcePath = e.dataTransfer.getData('application/x-grove-file-path');
+      if (!sourcePath) return;
+
+      const fileName = sourcePath.split('/').pop() || sourcePath;
+      const destPath = fileName; // Move to root
+
+      if (sourcePath === destPath) return;
+
+      if (onMoveFile) {
+        onMoveFile(sourcePath, destPath);
+      }
+    }
+  }, [onMoveFile, onUploadFile]);
 
   return (
-    <div className="flex flex-col text-sm overflow-y-auto h-full py-1">
+    <div
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
+      className={`flex flex-col text-sm overflow-y-auto h-full py-1 transition-all duration-200 relative
+        ${isTreeDragOver ? "bg-[var(--color-highlight)]/5 border-2 border-dashed border-[var(--color-highlight)]/30 rounded-lg m-1" : ""}
+      `}
+    >
       {creatingPath && creatingPath.parentPath === '' && (
         <InlinePathInput
           type={creatingPath.type}
@@ -52,6 +109,8 @@ export function FileTree({
           onCancelPath={onCancelPath}
           inputRef={inputRef}
           onExpandDir={onExpandDir}
+          onMoveFile={onMoveFile}
+          onUploadFile={onUploadFile}
         />
       ))}
     </div>
@@ -120,6 +179,8 @@ interface FileTreeItemProps {
   onCancelPath?: () => void;
   inputRef?: React.RefObject<HTMLInputElement | null>;
   onExpandDir?: (path: string) => Promise<DirEntry[]>;
+  onMoveFile?: (source: string, destination: string) => void;
+  onUploadFile?: (parentPath: string, file: File) => void;
 }
 
 function FileTreeItem({
@@ -133,6 +194,8 @@ function FileTreeItem({
   onCancelPath,
   inputRef,
   onExpandDir,
+  onMoveFile,
+  onUploadFile,
 }: FileTreeItemProps) {
   // Lazy mode: always start collapsed (load on first click).
   // Static mode: auto-expand root level (depth < 1).
@@ -142,6 +205,8 @@ function FileTreeItem({
   const [expandError, setExpandError] = useState<string | null>(null);
   const loadedRef = useRef(false);
   const isSelected = !node.isDir && selectedFile === node.path;
+  const [isDragOver, setIsDragOver] = useState(false);
+
 
   const handleClick = useCallback(async () => {
     if (node.isDir) {
@@ -196,22 +261,97 @@ function FileTreeItem({
   // Lazy mode: use loaded children state; static mode: use node.children from props.
   const displayChildren = onExpandDir ? (children ?? []) : (node.children ?? []);
 
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      // Determine folder target path
+      let parentPath = "";
+      if (node.isDir) {
+        parentPath = node.path;
+      } else {
+        const parts = node.path.split('/');
+        parts.pop();
+        parentPath = parts.join('/');
+      }
+
+      if (onUploadFile) {
+        for (let i = 0; i < e.dataTransfer.files.length; i++) {
+          const file = e.dataTransfer.files[i];
+          onUploadFile(parentPath, file);
+        }
+      }
+    } else {
+      const sourcePath = e.dataTransfer.getData('application/x-grove-file-path');
+      if (!sourcePath) return;
+
+      // Determine parent path
+      let parentPath = "";
+      if (node.isDir) {
+        parentPath = node.path;
+      } else {
+        const parts = node.path.split('/');
+        parts.pop();
+        parentPath = parts.join('/');
+      }
+
+      const fileName = sourcePath.split('/').pop() || sourcePath;
+      const destPath = parentPath ? `${parentPath}/${fileName}` : fileName;
+
+      if (sourcePath === destPath) return;
+
+      // Prevent dragging a directory into its own descendant
+      if (destPath === sourcePath || destPath.startsWith(sourcePath + '/')) {
+        console.warn("Cannot move a directory into itself or its subdirectories");
+        return;
+      }
+
+      if (onMoveFile) {
+        onMoveFile(sourcePath, destPath);
+      }
+    }
+  }, [node, onMoveFile, onUploadFile]);
+
   return (
     <>
       <button
         onClick={handleClick}
         onContextMenu={handleContextMenu}
+        onDragEnter={handleDragEnter}
+        onDragLeave={handleDragLeave}
+        onDragOver={handleDragOver}
+        onDrop={handleDrop}
         title={expandError ?? undefined}
         className={`
-          flex items-center gap-1 w-full text-left px-2 py-0.5 hover:bg-[var(--color-bg-tertiary)] transition-colors
-          ${isSelected ? "bg-[var(--color-highlight)]/15 text-[var(--color-highlight)]" : "text-[var(--color-text-muted)]"}
+          flex items-center gap-1 w-full text-left px-2 py-0.5 hover:bg-[var(--color-bg-tertiary)] transition-all duration-150 relative
+          ${isSelected ? "bg-[var(--color-highlight)]/15 text-[var(--color-highlight)]" : "text-[var(--color-text)] opacity-80 hover:opacity-100"}
+          ${isDragOver ? "bg-[var(--color-highlight)]/10 border-l-2 border-[var(--color-highlight)] text-[var(--color-highlight)] pl-3" : ""}
         `}
         style={{ paddingLeft: `${depth * 16 + 8}px` }}
-        draggable={!node.isDir}
+        draggable={true}
         onDragStart={(e) => {
-          if (node.isDir) return;
-          e.dataTransfer.effectAllowed = 'copy';
+          e.dataTransfer.effectAllowed = 'move';
           e.dataTransfer.setData('application/x-grove-file-path', node.path);
+          e.dataTransfer.setData('application/x-grove-file-is-dir', node.isDir ? 'true' : 'false');
           e.dataTransfer.setData('text/plain', node.path);
         }}
       >
@@ -266,6 +406,8 @@ function FileTreeItem({
               onCancelPath={onCancelPath}
               inputRef={inputRef}
               onExpandDir={onExpandDir}
+              onMoveFile={onMoveFile}
+              onUploadFile={onUploadFile}
             />
           ))}
         </>

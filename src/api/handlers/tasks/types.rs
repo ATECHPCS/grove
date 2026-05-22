@@ -345,6 +345,13 @@ pub struct CopyFileRequest {
     pub destination: String,
 }
 
+/// Move file request
+#[derive(Debug, Deserialize)]
+pub struct MoveFileRequest {
+    pub source: String,
+    pub destination: String,
+}
+
 /// File system operation response
 #[derive(Debug, Serialize)]
 pub struct FsOperationResponse {

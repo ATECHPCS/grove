@@ -58,6 +58,7 @@ export {
   createFile,
   createDirectory,
   deleteFileOrDir,
+  moveFileOrDir,
   listChats,
   createChat,
   updateChatTitle,

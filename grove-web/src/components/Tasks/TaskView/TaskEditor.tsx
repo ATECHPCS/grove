@@ -5,6 +5,7 @@ import { Button } from "../../ui";
 import { FileTree } from "./FileTree";
 import type { FileTreeNode } from "../../../utils/fileTree";
 import { useIsMobile } from "../../../hooks";
+import { useTheme } from "../../../context";
 import {
   getTaskDirEntries,
   getFileContent,
@@ -12,6 +13,7 @@ import {
   createFile,
   createDirectory,
   deleteFileOrDir,
+  moveFileOrDir,
   lookupSymbol,
   listTasks,
   getConfig,
@@ -377,8 +379,40 @@ function dirEntriesToNodes(entries: { path: string; is_dir: boolean }[]): FileTr
 
 export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onToggleFullscreen, hideHeader = false }: TaskEditorProps) {
   const { isMobile } = useIsMobile();
+  const { theme } = useTheme();
   const [fileNodes, setFileNodes] = useState<FileTreeNode[]>([]);
   const [treeKey, setTreeKey] = useState(0);
+  const [monacoInstance, setMonacoInstance] = useState<any>(null);
+
+  // Dynamically adapt Monaco Editor background and text colors to match active theme
+  useEffect(() => {
+    if (!monacoInstance) return;
+
+    const isLight = theme.id.includes('light') || theme.id.includes('latte') || theme.id.includes('dawn');
+    
+    // For light mode comments, we use a darker gray to improve readability on light backgrounds.
+    // Standard comments are often too faint.
+    const commentColor = isLight ? '5e6e7a' : '9ca3af'; 
+    const commentDocColor = isLight ? '4b5563' : '9ca3af';
+
+    monacoInstance.editor.defineTheme('grove-theme', {
+      base: isLight ? 'vs' : 'vs-dark',
+      inherit: true,
+      rules: [
+        { token: 'comment', foreground: commentColor },
+        { token: 'comment.doc', foreground: commentDocColor },
+      ],
+      colors: {
+        'editor.background': theme.colors.bg,
+        'editor.foreground': theme.colors.text,
+        'editor.lineHighlightBackground': isLight ? '#00000008' : '#ffffff08',
+        'editorGutter.background': theme.colors.bg,
+        'editorLineNumber.foreground': isLight ? '#6b7280' : '#888888',
+        'editorLineNumber.activeForeground': theme.colors.text,
+      }
+    });
+    monacoInstance.editor.setTheme('grove-theme');
+  }, [theme, monacoInstance]);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [fileTreeVisible, setFileTreeVisible] = useState(true);
   const [fileContent, setFileContent] = useState<string>('');
@@ -648,6 +682,50 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
     await reloadFiles();
   }, [projectId, taskId, reloadFiles]);
 
+  // Move file/directory callback
+  const handleMoveFile = useCallback(async (source: string, destination: string) => {
+    try {
+      await moveFileOrDir(projectId, taskId, source, destination);
+      await reloadFiles();
+      
+      // If the currently selected file was moved, select the new path
+      if (selectedFile === source) {
+        setSelectedFile(destination);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(`Failed to move: ${msg}`);
+    }
+  }, [projectId, taskId, reloadFiles, selectedFile]);
+
+  // Upload/dropped OS file callback
+  const handleUploadFile = useCallback(async (parentPath: string, file: File) => {
+    try {
+      // Read the file as text
+      const content = await file.text();
+      const fileName = file.name;
+      const fullPath = parentPath ? `${parentPath}/${fileName}` : fileName;
+
+      await createFile(projectId, taskId, fullPath, content);
+      await reloadFiles();
+      
+      // Select newly uploaded file
+      setSelectedFile(fullPath);
+      setLoading(true);
+      setModified(false);
+      setError(null);
+      
+      const res = await getFileContent(projectId, taskId, fullPath);
+      setFileContent(res.content);
+      editorContentRef.current = res.content;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(`Failed to upload file: ${msg}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [projectId, taskId, reloadFiles]);
+
   // New file handler
   const handleNewFile = useCallback((parentPath?: string) => {
     const basePath = parentPath || "";
@@ -843,6 +921,8 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
               onSubmitPath={handleSubmitPath}
               onCancelPath={handleCancelPath}
               onExpandDir={handleExpandDir}
+              onMoveFile={handleMoveFile}
+              onUploadFile={handleUploadFile}
             />
           </div>
         )}
@@ -875,6 +955,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
               onChange={handleEditorChange}
               onMount={(editor, monaco) => {
                 editorRef.current = editor;
+                setMonacoInstance(monaco);
                 const sessionId = editor.getId?.() as string | undefined;
                 if (sessionId) {
                   editorRegistry.set(sessionId, {
@@ -908,7 +989,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
                 void ensureDefinitionProvidersRegistered(monaco);
                 void ensureGlobalEditorServiceHook(editor);
               }}
-              theme="vs-dark"
+              theme="grove-theme"
               options={{
                 minimap: { enabled: false },
                 fontSize: 13,

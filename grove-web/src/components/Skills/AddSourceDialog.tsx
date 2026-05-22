@@ -8,8 +8,21 @@ import { addSource, updateSource } from "../../api";
 import type { SkillSource } from "../../api";
 
 function extractNameFromUrl(url: string): string {
-  const cleaned = url.trim().replace(/\/+$/, "").replace(/\.git$/, "");
-  const segments = cleaned.split(/[/:\\]/).filter(Boolean);
+  let cleaned = url.trim();
+  if (/^https?:\/\//i.test(cleaned)) {
+    try {
+      const parsed = parseGitInput(cleaned);
+      if (parsed.url) {
+        cleaned = parsed.url;
+      }
+    } catch {
+      // ignore and use raw
+    }
+  }
+  // Remove trailing slashes and any trailing .git (including multiple .git)
+  cleaned = cleaned.replace(/\/+$/, "").replace(/(?:\.git)+$/i, "");
+  // Split on delimiters (including ? and # to strip queries/fragments)
+  const segments = cleaned.split(/[/:\\?#]/).filter(Boolean);
   return segments.length > 0 ? segments[segments.length - 1] : "";
 }
 
@@ -35,39 +48,62 @@ function parseGitInput(raw: string): { url: string; subpath?: string } {
     if (tokens.length > 0) input = tokens[0];
   }
 
-  // Tree/blob URL on any host — split on the literal `/tree/` or `/blob/`
-  // (with optional GitLab `-/` prefix) instead of relying on a backtracking
-  // regex. The previous expression had lazy `.+?` followed by alternation,
-  // which can catastrophically backtrack on long inputs without a `/tree/`
-  // segment. The split approach is O(n) and immune.
-  //   GitHub / Gitea:        <base>/(tree|blob)/<branch>/<subpath>
-  //   GitLab (incl. nested): <base>/-/(tree|blob)/<branch>/<subpath>
+  // HTTP/HTTPS URLs
   if (/^https?:\/\//i.test(input)) {
-    const markerMatch = input.match(/\/(?:-\/)?(?:tree|blob)\//i);
-    if (markerMatch && markerMatch.index !== undefined && markerMatch.index > 0) {
-      const base = input.slice(0, markerMatch.index).replace(/\.git$/i, "");
-      const afterMarker = input.slice(markerMatch.index + markerMatch[0].length);
-      // Drop the branch (first segment) and any trailing slash.
-      const slashIdx = afterMarker.indexOf("/");
-      const rawSub = slashIdx >= 0 ? afterMarker.slice(slashIdx + 1) : "";
-      const subpath = rawSub.replace(/\/+$/, "");
-      return { url: `${base}.git`, subpath: subpath || undefined };
+    try {
+      const urlObj = new URL(input);
+      let pathname = urlObj.pathname;
+
+      // Look for web UI markers to split the repo URL and extract optional subpath.
+      // Matches standard paths like tree, blob, pulls, issues, merge_requests, etc.
+      const markerMatch = pathname.match(
+        /\/(?:-\/)?(?:tree|blob|pulls|pull|issues|issue|merge_requests|actions|projects|wiki|releases|tags|commits|commit|branches|milestones|settings)(?:\/|$)/i
+      );
+
+      let subpath: string | undefined;
+
+      if (markerMatch && markerMatch.index !== undefined && markerMatch.index > 0) {
+        const repoPathname = pathname.slice(0, markerMatch.index);
+        const marker = markerMatch[0];
+
+        // Extract subpath only for tree/blob markers
+        if (/\/tree\//i.test(marker) || /\/blob\//i.test(marker)) {
+          const remaining = pathname.slice(markerMatch.index + marker.length);
+          const parts = remaining.split("/").filter(Boolean);
+          if (parts.length > 1) {
+            subpath = parts.slice(1).join("/");
+          }
+        }
+
+        pathname = repoPathname;
+      }
+
+      // Clean up trailing slash and any trailing .git (handling duplicate .git too)
+      const cleanPathname = pathname.replace(/\/+$/, "").replace(/(?:\.git)+$/i, "");
+
+      if (cleanPathname && cleanPathname !== "/") {
+        urlObj.pathname = cleanPathname + ".git";
+      } else {
+        urlObj.pathname = cleanPathname;
+      }
+
+      // Clear out query parameters and hashes from the repository URL
+      urlObj.search = "";
+      urlObj.hash = "";
+
+      return {
+        url: urlObj.toString(),
+        subpath: subpath || undefined,
+      };
+    } catch {
+      // Fallback if URL parsing fails
     }
   }
 
-  // Generic https repo URL (any host, ≥2 path segments) — normalize to .git suffix.
-  // Lazy `*?` on extra segments lets nested paths match while still allowing a
-  // trailing `.git` to be stripped.
-  const httpsMatch = input.match(
-    /^(https?:\/\/[^/]+\/[^/]+\/[^/]+(?:\/[^/]+)*?)(?:\.git)?\/?$/i,
-  );
-  if (httpsMatch) {
-    return { url: `${httpsMatch[1]}.git` };
-  }
-
-  // SSH form — leave as-is (already canonical)
+  // SSH form — leave as-is (already canonical, but clean up duplicate .git)
   if (/^git@[^:]+:[^/]+\/.+/.test(input)) {
-    return { url: input.endsWith(".git") ? input : `${input}.git` };
+    const cleanedSsh = input.replace(/\/+$/, "").replace(/(?:\.git)+$/i, "");
+    return { url: `${cleanedSsh}.git` };
   }
 
   // Bare owner/repo shortcut

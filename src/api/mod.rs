@@ -497,6 +497,10 @@ pub fn create_api_router() -> Router {
             "/projects/{id}/tasks/{taskId}/fs/copy",
             post(handlers::tasks::copy_file),
         )
+        .route(
+            "/projects/{id}/tasks/{taskId}/fs/move",
+            post(handlers::tasks::move_file),
+        )
         // Task Stats API
         .route(
             "/projects/{id}/tasks/{taskId}/stats",

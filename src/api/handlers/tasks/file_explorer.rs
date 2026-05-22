@@ -806,3 +806,99 @@ pub async fn copy_file(
         message: format!("Copied {} to {}", req.source, req.destination),
     }))
 }
+
+/// POST /api/v1/projects/{id}/tasks/{taskId}/fs/move
+pub async fn move_file(
+    Path((id, task_id)): Path<(String, String)>,
+    Json(req): Json<MoveFileRequest>,
+) -> Result<Json<FsOperationResponse>, (StatusCode, Json<ApiError>)> {
+    let (_project, project_key) = find_project_by_id(&id).map_err(|s| {
+        (
+            s,
+            Json(ApiError {
+                error: "Project not found".to_string(),
+            }),
+        )
+    })?;
+
+    let task = tasks::get_task(&project_key, &task_id)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: format!("Failed to load task: {}", e),
+                }),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: "Task not found".to_string(),
+                }),
+            )
+        })?;
+
+    let source_path = resolve_safe_path(&task.worktree_path, &req.source)?;
+    let dest_path = resolve_safe_path(&task.worktree_path, &req.destination)?;
+
+    if !source_path.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("Source file or directory not found: {}", req.source),
+            }),
+        ));
+    }
+
+    if source_path == dest_path {
+        return Ok(Json(FsOperationResponse {
+            success: true,
+            message: format!("Source and destination are identical: {}", req.source),
+        }));
+    }
+
+    if dest_path.starts_with(&source_path) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "Cannot move a directory into itself or its subdirectories".to_string(),
+            }),
+        ));
+    }
+
+    if dest_path.exists() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: format!("Destination already exists: {}", req.destination),
+            }),
+        ));
+    }
+
+    if let Some(parent) = dest_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: format!("Failed to create parent directories: {}", e),
+                }),
+            )
+        })?;
+    }
+
+    std::fs::rename(&source_path, &dest_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("Failed to move file/directory: {}", e),
+            }),
+        )
+    })?;
+
+    Ok(Json(FsOperationResponse {
+        success: true,
+        message: format!("Moved {} to {}", req.source, req.destination),
+    }))
+}
+

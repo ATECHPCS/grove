@@ -3022,6 +3022,60 @@ export function TaskChat({
               break;
           }
         }
+        // Hydrate session settings/metadata from session.json snapshot when no live
+        // session_ready was buffered. Covers cold-open and chat-switch before live WS events arrive.
+        const hadSessionReady = buffered.some((e) => e.type === "session_ready");
+        if (!hadSessionReady && res.session) {
+          const s = res.session;
+          if (s.available_modes?.length) {
+            setModeOptions(
+              s.available_modes.map(([id, name]) => ({
+                label: name,
+                value: id,
+              })),
+            );
+          }
+          if (s.current_mode_id) setPermissionLevel(s.current_mode_id);
+          if (s.available_models?.length) {
+            setModelOptions(
+              s.available_models.map(([id, name]) => ({
+                label: name,
+                value: id,
+              })),
+            );
+          }
+          if (s.current_model_id) setSelectedModel(s.current_model_id);
+          if (s.available_thought_levels?.length) {
+            setThoughtLevelOptions(
+              s.available_thought_levels.map(([id, name]) => ({
+                label: name,
+                value: id,
+              })),
+            );
+          }
+          if (s.current_thought_level_id)
+            setThoughtLevel(s.current_thought_level_id);
+          if (s.thought_level_config_id)
+            setThoughtLevelConfigId(s.thought_level_config_id);
+          if (s.prompt_capabilities) {
+            setPromptCaps({
+              image: s.prompt_capabilities.image ?? false,
+              audio: s.prompt_capabilities.audio ?? false,
+              embeddedContext:
+                s.prompt_capabilities.embedded_context ?? false,
+            });
+          }
+          if (s.available_commands?.length) {
+            setSlashCommands(
+              s.available_commands.map((c) => ({
+                name: c.name,
+                description: c.description,
+                input_hint: c.input_hint,
+              })),
+            );
+          }
+        }
+
         // Hydrate context window from session.json snapshot when no live
         // usage_update was buffered. Covers chat-switch back to a chat whose
         // WS is already in wsMapRef — backend only auto-pushes UsageUpdate on
@@ -3252,9 +3306,15 @@ export function TaskChat({
             }
             return null;
           });
-          setMessages((prev) =>
-            pruneActiveChatMessages(reduceHistoryMessages(prev, msg)),
-          );
+          setMessages((prev) => {
+            const updated = prev.map((m) =>
+              m.type === "auth_required" &&
+              (m.status === "idle" || m.status === "in_progress")
+                ? { ...m, status: "succeeded" as const }
+                : m
+            );
+            return pruneActiveChatMessages(reduceHistoryMessages(updated, msg));
+          });
           updateBusy(false);
           onChatBecameIdle?.();
           break;
@@ -6179,6 +6239,16 @@ export function TaskChat({
                           index={activeAuthMessageIndex}
                           agentLabel={agentLabel}
                           onAuthLogin={handleAuthLogin}
+                          onDismiss={(idx) => {
+                            setMessages((prev) =>
+                              prev.map((m, i) =>
+                                i === idx && m.type === "auth_required"
+                                  ? { ...m, status: "succeeded" }
+                                  : m
+                              )
+                            );
+                            setShowAuthPanel(false);
+                          }}
                         />
                       )}
 
@@ -7362,11 +7432,13 @@ function AuthRequiredPanel({
   index,
   agentLabel,
   onAuthLogin,
+  onDismiss,
 }: {
   message: Extract<ChatMessage, { type: "auth_required" }>;
   index: number;
   agentLabel?: string;
   onAuthLogin?: (index: number, methodId: string) => void;
+  onDismiss?: (index: number) => void;
 }) {
   const agentDisplay = message.agentName || agentLabel || "Agent";
   const hasMethods = message.methods.length > 0;
@@ -7398,7 +7470,15 @@ function AuthRequiredPanel({
     message.status === "in_progress" || message.status === "succeeded";
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-3 relative pr-6">
+      <button
+        type="button"
+        onClick={() => onDismiss?.(index)}
+        className="absolute top-0 right-0 rounded-md p-1 text-[var(--color-text-muted)] transition-colors hover:bg-[color-mix(in_srgb,var(--color-text)_10%,transparent)] hover:text-[var(--color-text)]"
+        title="Dismiss"
+      >
+        <X className="h-3.5 w-3.5" />
+      </button>
       <div className="flex items-start gap-2">
         <AlertTriangle className="h-4 w-4 shrink-0 text-[var(--color-warning)] mt-0.5" />
         <div className="min-w-0 flex-1">

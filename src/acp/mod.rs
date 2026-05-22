@@ -2148,6 +2148,19 @@ async fn drive_session(
         acp::Error::internal_error().data(format!("{}", e))
     }
 
+    fn is_auth_required_error(e: &acp::Error) -> bool {
+        if i32::from(e.code) == -32000 {
+            return true;
+        }
+        let err_msg = e.to_string();
+        err_msg.contains("Failed to authenticate")
+            || err_msg.contains("authentication_failed")
+            || err_msg.contains("Invalid authentication credentials")
+            || err_msg.contains("401 Unauthorized")
+            || err_msg.contains("401 Invalid authentication")
+    }
+
+
     // The agent_graph MCP token is generated and registered in `run_acp_session`
     // BEFORE the agent subprocess is spawned, so that the token is present in
     // the agent's environment (`GROVE_MCP_TOKEN`) — needed by `grove mcp-bridge`
@@ -2273,7 +2286,7 @@ async fn drive_session(
                     .await
                 {
                     Ok(r) => break r,
-                    Err(e) if i32::from(e.code) == -32000 => {
+                    Err(e) if is_auth_required_error(&e) => {
                         let methods = handle
                             .auth_methods
                             .lock()
@@ -2540,6 +2553,14 @@ async fn drive_session(
     *handle.current_model_id.lock().unwrap() = current_model_id.clone();
     *handle.current_thought_level_id.lock().unwrap() = current_thought_level_id.clone();
     *handle.thought_level_config_id.lock().unwrap() = thought_level_config_id.clone();
+
+    if let Some(ref chat_id) = handle.chat_id {
+        if let Some(existing) = read_session_metadata(&handle.project_key, &handle.task_id, chat_id) {
+            if let Some(usage) = existing.current_usage {
+                *handle.current_usage.lock().unwrap() = Some(usage);
+            }
+        }
+    }
 
     handle.emit(AcpUpdate::SessionReady {
         session_id,
@@ -2878,10 +2899,7 @@ async fn drive_session(
                     Err(e) => {
                         handle.emit(AcpUpdate::Busy { value: false });
                         // -32000 AuthRequired:转登录流程,不当一般错误报。
-                        // 用 i32 比较避免依赖具体 ErrorCode 路径(0.11 之后
-                        // 已 stable,但 Other(_) 兜底变体的存在意味着直接
-                        // match Pattern 不一定 exhaustive)。
-                        if i32::from(e.code) == -32000 {
+                        if is_auth_required_error(&e) {
                             let methods = handle
                                 .auth_methods
                                 .lock()
@@ -4047,7 +4065,22 @@ pub fn read_session_metadata(
 ) -> Option<SessionMetadata> {
     let path = session_json_path(project_key, task_id, chat_id);
     let data = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&data).ok()
+    let mut meta: SessionMetadata = serde_json::from_str(&data).ok()?;
+
+    // If there is an active local session running, the in-memory usage
+    // snapshot is the real source of truth. We merge it in so the frontend
+    // gets the real-time context window usage immediately on page load/history fetch
+    // without waiting for the next turn to complete and write to disk.
+    let session_key = format!("{}:{}:{}", project_key, task_id, chat_id);
+    if let Some(handle) = get_session_handle(&session_key) {
+        if let Ok(guard) = handle.current_usage.lock() {
+            if let Some(ref snapshot) = *guard {
+                meta.current_usage = Some(snapshot.clone());
+            }
+        }
+    }
+
+    Some(meta)
 }
 
 /// 原子写 session.json（先写 tmp 再 rename）
@@ -4064,10 +4097,9 @@ fn write_session_metadata(project_key: &str, task_id: &str, chat_id: &str, meta:
     }
 }
 
-/// 清理 socket 和 session.json 文件
+/// 清理 socket 文件
 fn cleanup_socket_files(project_key: &str, task_id: &str, chat_id: &str) {
     let _ = std::fs::remove_file(sock_path(project_key, task_id, chat_id));
-    let _ = std::fs::remove_file(session_json_path(project_key, task_id, chat_id));
 }
 
 /// Socket listener：接受连接，分发命令到 session handle（Unix only）
@@ -4224,7 +4256,6 @@ pub fn discover_session(
                 Err(_) => {
                     // Stale socket，清理
                     let _ = std::fs::remove_file(&sp);
-                    let _ = std::fs::remove_file(session_json_path(project_key, task_id, chat_id));
                 }
             }
         }

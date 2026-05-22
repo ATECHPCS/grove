@@ -849,6 +849,27 @@ export async function deleteFileOrDir(
   );
 }
 
+interface MoveFileRequest {
+  source: string;
+  destination: string;
+}
+
+/**
+ * Move or rename a file or directory in a task's worktree
+ */
+export async function moveFileOrDir(
+  projectId: string,
+  taskId: string,
+  source: string,
+  destination: string
+): Promise<FsOperationResponse> {
+  return apiClient.post<MoveFileRequest, FsOperationResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/fs/move`,
+    { source, destination }
+  );
+}
+
+
 // ============================================================================
 // Chat History & Take Control API (read-only observation mode)
 // ============================================================================
@@ -857,6 +878,23 @@ interface SessionMetadata {
   pid: number;
   agent_name: string;
   agent_version: string;
+  available_modes?: [string, string][] | null;
+  current_mode_id?: string | null;
+  available_models?: [string, string][] | null;
+  current_model_id?: string | null;
+  available_thought_levels?: [string, string][] | null;
+  current_thought_level_id?: string | null;
+  thought_level_config_id?: string | null;
+  prompt_capabilities?: {
+    image?: boolean;
+    audio?: boolean;
+    embedded_context?: boolean;
+  } | null;
+  available_commands?: {
+    name: string;
+    description: string;
+    input_hint?: string;
+  }[] | null;
   current_usage?: {
     used: number;
     size: number;

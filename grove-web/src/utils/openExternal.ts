@@ -73,3 +73,28 @@ export function installExternalLinkInterceptor(): void {
     true, // capture phase — beat React synthetic-event handlers
   );
 }
+
+/**
+ * Install a global window-level drag and drop event listener that prevents
+ * the default browser behavior of navigating to dropped files. This prevents
+ * the entire webview from reloading/navigating and displaying unstyled,
+ * raw files (which often results in Mojibake encoding issues).
+ */
+export function installGlobalDragDropInterceptor(): void {
+  window.addEventListener(
+    "dragover",
+    (event) => {
+      event.preventDefault();
+    },
+    false,
+  );
+
+  window.addEventListener(
+    "drop",
+    (event) => {
+      event.preventDefault();
+    },
+    false,
+  );
+}
+
