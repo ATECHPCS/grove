@@ -15,10 +15,16 @@ import {
   FileArchive,
   File,
   Link as LinkIcon,
+  MessageSquare,
+  Bot,
+  Briefcase,
 } from "lucide-react";
 import type { FilteredMentionItem, MentionItem } from "../../utils/fileMention";
 import { agentIconComponent } from "../../utils/agentIcon";
 import { VSCodeIcon } from "./VSCodeIcon";
+import { getProjectStyle } from "../../utils/projectStyle";
+import { useTheme } from "../../context";
+
 
 /**
  * Pick an icon for a mention item. Category-intrinsic concepts (Instruction,
@@ -28,6 +34,12 @@ import { VSCodeIcon } from "./VSCodeIcon";
 function iconFor(
   item: Pick<MentionItem, "category" | "path" | "isDir" | "kind" | "agentName">,
 ) {
+  if (item.category === "category_selector") {
+    if (item.path === "conversation") return MessageSquare;
+    if (item.path === "file") return Folder;
+    if (item.path === "agent") return Bot;
+    if (item.path === "project") return Briefcase;
+  }
   // Agent-graph kinds: render the underlying agent's brand icon when known.
   // `agentIconComponent` already falls back to lucide Bot for unknown keys,
   // so this branch is total.
@@ -211,6 +223,11 @@ const MentionRow = memo(function MentionRow({
 
   const hasFriendlyName = item.displayName !== undefined;
   const label = item.displayName ?? item.path;
+
+  const { theme } = useTheme();
+  const isProjectItem = item.category === "Coding Project" || item.category === "Studio Project" || item.category === "Project Root";
+  const projectStyle = isProjectItem ? getProjectStyle(item.sessionId || item.path, theme.accentPalette) : null;
+
   return (
     <button
       ref={ref}
@@ -223,7 +240,14 @@ const MentionRow = memo(function MentionRow({
           : "hover:bg-[var(--color-bg-secondary)]"
       }`}
     >
-      {item.kind && item.kind !== "file" ? (
+      {projectStyle ? (
+        <div
+          className="w-5 h-5 rounded flex items-center justify-center shrink-0"
+          style={{ backgroundColor: projectStyle.color.bg }}
+        >
+          <projectStyle.Icon className="w-3 h-3" style={{ color: projectStyle.color.fg }} />
+        </div>
+      ) : item.kind && item.kind !== "file" || item.category === "category_selector" ? (
         createElement(iconFor(item), {
           className: "w-3.5 h-3.5 shrink-0",
         })

@@ -78,7 +78,7 @@ import {
   agentIconUrl,
   usePersonaRegistry,
 } from "../../../utils/agentIcon";
-import type { MentionItem } from "../../../utils/fileMention";
+import type { MentionItem, FilteredMentionItem } from "../../../utils/fileMention";
 import { getMentionCandidates } from "../../../api";
 import { useProject } from "../../../context/ProjectContext";
 import { useConfig } from "../../../context/ConfigContext";
@@ -123,6 +123,7 @@ import {
   updateNotes,
 } from "../../../api";
 import type { ChatSessionResponse, CustomAgentServer } from "../../../api";
+import { listProjects, getProject, listResources, type ProjectListItem } from "../../../api/projects";
 import { openExternalUrl } from "../../../utils/openExternal";
 import "./task-chat.css";
 
@@ -1732,6 +1733,20 @@ export function TaskChat({
   // Agent-graph @-mention candidates (spawn / send / reply). Cohabits the
   // same `@` popover as file mentions — see `combinedMentionItems`.
   const [agentMentionItems, setAgentMentionItems] = useState<MentionItem[]>([]);
+
+  // States for multi-level category @-mention menu
+  const [activeCategory, setActiveCategory] = useState<string | null>(null);
+  const [allProjects, setAllProjects] = useState<ProjectListItem[]>([]);
+  const [projectFiles, setProjectFiles] = useState<{ [projId: string]: string[] }>({});
+  const [loadingProjId, setLoadingProjId] = useState<string | null>(null);
+
+  const CATEGORY_SELECTORS = useMemo<MentionItem[]>(() => [
+    { path: "conversation", displayName: "Conversation", category: "category_selector", kind: "chat_history", isDir: false },
+    { path: "file", displayName: "Files", category: "category_selector", kind: "file", isDir: true },
+    { path: "agent", displayName: "Agents", category: "category_selector", kind: "agent_spawn", isDir: false },
+    { path: "project", displayName: "Projects", category: "category_selector", kind: "file", isDir: true },
+  ], []);
+
   const [promptCaps, setPromptCaps] = useState<PromptCaps>({
     image: false,
     audio: false,
@@ -1922,10 +1937,7 @@ export function TaskChat({
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
   }, []);
-  // Close search when switching chats — set-state-during-render with a
-  // prev-prop guard avoids the setState-in-effect cascading-render warning.
-  // Mount: prev === current means no reset fires — intentional, search is
-  // already closed at mount.
+
   const [prevChatIdForSearch, setPrevChatIdForSearch] = useState(activeChatId);
   if (activeChatId !== prevChatIdForSearch) {
     setPrevChatIdForSearch(activeChatId);
@@ -1933,13 +1945,6 @@ export function TaskChat({
     setChatSearchQuery("");
   }
 
-  // Filtered slash commands based on current input — substring match on
-  // command name only. Name-only avoids the old noise bug where matching
-  // against description surfaced /review when the user typed /compact.
-  // Substring (vs. prefix) gives middle-match support: `/view` finds
-  // `/review`, `/plan` finds `/superpowers:write-plan`.
-  // Defer the filter string so heavy filter+dropdown re-renders happen at
-  // lower priority — keystrokes stay responsive while the dropdown catches up.
   const deferredSlashFilter = useDeferredValue(slashFilter);
   const filteredSlashCommands = useMemo(() => {
     if (!deferredSlashFilter) return slashCommands;
@@ -1949,7 +1954,6 @@ export function TaskChat({
     );
   }, [slashCommands, deferredSlashFilter]);
 
-  // Build mention items (files + directories) from flat file list
   const mentionItems = useMemo(
     () =>
       isStudioProject
@@ -1958,22 +1962,148 @@ export function TaskChat({
     [isStudioProject, taskFiles, sketchMeta],
   );
 
-  // Combined `@` mention list — agent-graph candidates first (more salient
-  // for inter-session work), then files. Single dropdown, single fuzzy
-  // filter, three+ groups via `category`.
   const combinedMentionItems = useMemo(
     () => [...agentMentionItems, ...mentionItems],
     [agentMentionItems, mentionItems],
   );
 
-  // Filtered files based on @ input. Defer the filter string so the fuzzy
-  // match (O(n) over potentially thousands of files) runs at low priority and
-  // doesn't block typing.
   const deferredFileFilter = useDeferredValue(fileFilter);
-  const filteredFiles = useMemo(
-    () => filterMentionItems(combinedMentionItems, deferredFileFilter),
-    [combinedMentionItems, deferredFileFilter],
-  );
+  const filteredFiles = useMemo(() => {
+    // 1. Separate combined items into categories
+    const conversationItems = combinedMentionItems.filter(item => 
+      item.kind === "chat_history"
+    );
+
+    const agentItems = combinedMentionItems.filter(item => 
+      item.kind === "agent_spawn" || 
+      item.kind === "agent_send" || 
+      item.kind === "agent_reply"
+    );
+
+    const fileItems = combinedMentionItems.filter(item => 
+      !conversationItems.includes(item) && 
+      !agentItems.includes(item)
+    );
+
+    // 2. Filter based on activeCategory
+    if (activeCategory === "conversation") {
+      return filterMentionItems(conversationItems, deferredFileFilter, 20);
+    }
+    if (activeCategory === "agent") {
+      return filterMentionItems(agentItems, deferredFileFilter, 20);
+    }
+    if (activeCategory === "file") {
+      return filterMentionItems(fileItems, deferredFileFilter, 20);
+    }
+
+    if (activeCategory === "project") {
+      const slashIdx = deferredFileFilter.indexOf("/");
+      if (slashIdx >= 0) {
+        // User typed "@project:MyProject/something"
+        const projectName = deferredFileFilter.slice(0, slashIdx).toLowerCase();
+        const subFilter = deferredFileFilter.slice(slashIdx + 1);
+        
+        // Find matching project
+        const project = allProjects.find(p => p.name.toLowerCase() === projectName);
+        if (project) {
+          const files = projectFiles[project.id];
+          if (files) {
+            // First item: Select Project Root Path!
+            const rootItem: MentionItem = {
+              path: project.path, // absolute root path
+              isDir: true,
+              displayName: project.name,
+              category: "Project Root",
+              kind: "file",
+              sessionId: project.id,
+            };
+            
+            const fileItemsList: MentionItem[] = files.map(filePath => {
+              const absPath = `${project.path}/${filePath}`;
+              const isDir = filePath.endsWith("/");
+              const display = filePath;
+              const categoryBadge = project.project_type === "studio" ? "Shared Asset" : "Project File";
+              
+              return {
+                path: absPath,
+                isDir,
+                displayName: display,
+                category: categoryBadge,
+                kind: "file",
+              };
+            });
+            
+            // Filter files
+            const filteredFilesList = filterMentionItems(fileItemsList, subFilter, 20);
+            
+            // If the query is empty or matches "Select", put the root item at the top!
+            if (!subFilter || rootItem.displayName?.toLowerCase().includes(subFilter.toLowerCase())) {
+              return [{ ...rootItem, score: 9999, indices: [] }, ...filteredFilesList] as FilteredMentionItem[];
+            }
+            
+            return filteredFilesList;
+          } else {
+            // While files are loading, show a loading status row!
+            return [
+              {
+                path: `loading-${project.id}`,
+                isDir: false,
+                displayName: `Loading files for ${project.name}...`,
+                category: "Loading",
+                kind: "file",
+              } as MentionItem
+            ].map(i => ({ ...i, score: 0, indices: [] })) as FilteredMentionItem[];
+          }
+        }
+      }
+      
+      // If no project selected yet or no slash typed, list matching projects!
+      const projectItems: MentionItem[] = allProjects.map(p => ({
+        path: p.name, // path holds project name for Category trigger
+        isDir: p.project_type === "studio",
+        displayName: p.name,
+        category: p.project_type === "studio" ? "Studio Project" : "Coding Project",
+        kind: p.project_type === "studio" ? "agent_spawn" : "file",
+        sessionId: p.id,
+      }));
+      
+      return filterMentionItems(projectItems, deferredFileFilter, 15);
+    }
+
+    // 3. Aggregated Search (activeCategory is null)
+    if (!deferredFileFilter) {
+      // Empty query: Show Category Selectors at the top!
+      const selectors = CATEGORY_SELECTORS.map(s => ({
+        ...s,
+        score: 0,
+        indices: [],
+      }));
+      
+      // Also append top 2-3 items from conversation, agent for quick access
+      const quickConvs = conversationItems.slice(0, 3).map(i => ({ ...i, score: 0, indices: [] }));
+      const quickAgents = agentItems.slice(0, 3).map(i => ({ ...i, score: 0, indices: [] }));
+      
+      return [...selectors, ...quickConvs, ...quickAgents] as FilteredMentionItem[];
+    }
+
+    // Non-empty query: search across all categories (with limited files to avoid noise)
+    const matchedSelectors = filterMentionItems(CATEGORY_SELECTORS, deferredFileFilter, 4);
+    const matchedConvs = filterMentionItems(conversationItems, deferredFileFilter, 10);
+    const matchedAgents = filterMentionItems(agentItems, deferredFileFilter, 10);
+    const matchedFiles = filterMentionItems(fileItems, deferredFileFilter, 5); // Limit files to 5 in aggregated search to avoid clutter!
+
+    // Combine them, sort by score descending
+    const combined = [...matchedConvs, ...matchedAgents, ...matchedFiles];
+    const sortedCombined = combined.sort((a, b) => b.score - a.score);
+    return [...matchedSelectors, ...sortedCombined];
+  }, [
+    combinedMentionItems,
+    deferredFileFilter,
+    activeCategory,
+    allProjects,
+    projectFiles,
+    CATEGORY_SELECTORS,
+  ]);
 
   // ACP agent availability check is encapsulated in useACPAvailability.
 
@@ -2093,6 +2223,15 @@ export function TaskChat({
       listSketches(projectId, task.id).catch(() => {});
     }
   }, [projectId, task.id, isStudioProject]);
+
+  const refreshProjectsIfNeeded = useCallback(() => {
+    if (allProjects.length > 0) return;
+    listProjects()
+      .then((res) => {
+        setAllProjects(res.projects || []);
+      })
+      .catch(() => {});
+  }, [allProjects.length]);
 
   // Initial load on mount / task switch. refreshTaskFilesIfNeeded is a
   // useCallback whose deps are [projectId, task.id, isStudioProject], so
@@ -4610,6 +4749,37 @@ export function TaskChat({
     [],
   );
 
+  const triggerProjectFilesLoad = useCallback((projectName: string) => {
+    const project = allProjects.find(p => p.name.toLowerCase() === projectName.toLowerCase());
+    if (!project) return;
+    if (projectFiles[project.id] || loadingProjId === project.id) return;
+    
+    setLoadingProjId(project.id);
+    if (project.project_type === "studio") {
+      listResources(project.id)
+        .then(res => {
+          const paths = res.files.map(f => f.path);
+          setProjectFiles(prev => ({ ...prev, [project.id]: paths }));
+        })
+        .catch(() => {})
+        .finally(() => setLoadingProjId(null));
+    } else {
+      getProject(project.id)
+        .then(projDetail => {
+          const localTask = projDetail.local_task;
+          if (localTask) {
+            getTaskFiles(project.id, localTask.id)
+              .then(res => {
+                setProjectFiles(prev => ({ ...prev, [project.id]: res.files || [] }));
+              })
+              .catch(() => {});
+          }
+        })
+        .catch(() => {})
+        .finally(() => setLoadingProjId(null));
+    }
+  }, [allProjects, projectFiles, loadingProjId]);
+
   /** Detect /slash or @file at cursor position in contentEditable */
   const handleInput = useCallback(() => {
     // Trailing 500ms debounce: usual case where the user pauses typing
@@ -4722,22 +4892,57 @@ export function TaskChat({
     // Scan backwards from cursor to find "@" or "/" (@ takes priority over /)
     let slashIdx = -1;
     let atIdx = -1;
-    for (let i = offset - 1; i >= 0; i--) {
-      if (text[i] === "@") {
-        if (i === 0 || /\s/.test(text[i - 1])) atIdx = i;
-        break;
+
+    // Find last @ before cursor
+    const lastAt = text.lastIndexOf("@", offset - 1);
+    if (lastAt >= 0 && (lastAt === 0 || /\s/.test(text[lastAt - 1]))) {
+      const segment = text.slice(lastAt, offset);
+      const hasCategory = segment.startsWith("@project:") || 
+                          segment.startsWith("@file:") || 
+                          segment.startsWith("@agent:") || 
+                          segment.startsWith("@conversation:");
+      const hasNoSpaces = !/\s/.test(segment);
+      if (hasCategory || hasNoSpaces) {
+        atIdx = lastAt;
       }
-      if (text[i] === "/") {
-        // Record slash position for /commands, but don't break — paths like @src/main contain /
-        if (slashIdx < 0 && (i === 0 || /\s/.test(text[i - 1]))) slashIdx = i;
-        continue;
+    }
+
+    // Find last / before cursor
+    const lastSlash = text.lastIndexOf("/", offset - 1);
+    if (lastSlash >= 0 && (lastSlash === 0 || /\s/.test(text[lastSlash - 1]))) {
+      const segment = text.slice(lastSlash, offset);
+      if (!/\s/.test(segment)) {
+        slashIdx = lastSlash;
       }
-      if (/\s/.test(text[i])) break;
     }
     if (atIdx >= 0 && (taskFiles.length > 0 || agentMentionItems.length > 0)) {
       refreshTaskFilesIfNeeded();
       refreshAgentMentionCandidates();
-      setFileFilter(text.slice(atIdx + 1, offset));
+      refreshProjectsIfNeeded();
+      
+      const mentionText = text.slice(atIdx + 1, offset);
+      let cat: string | null = null;
+      let filter = mentionText;
+      
+      const colonIdx = mentionText.indexOf(":");
+      if (colonIdx >= 0) {
+        const possibleCat = mentionText.slice(0, colonIdx).toLowerCase();
+        if (["conversation", "file", "agent", "project"].includes(possibleCat)) {
+          cat = possibleCat;
+          filter = mentionText.slice(colonIdx + 1);
+        }
+      }
+
+      if (cat === "project") {
+        const slashIdx = filter.indexOf("/");
+        if (slashIdx >= 0) {
+          const projectName = filter.slice(0, slashIdx);
+          triggerProjectFilesLoad(projectName);
+        }
+      }
+      
+      setActiveCategory(cat);
+      setFileFilter(filter);
       setShowFileMenu(true);
       setFileSelectedIdx(0);
       setShowSlashMenu(false);
@@ -4746,9 +4951,11 @@ export function TaskChat({
       setShowSlashMenu(true);
       setSlashSelectedIdx(0);
       setShowFileMenu(false);
+      setActiveCategory(null);
     } else {
       setShowSlashMenu(false);
       setShowFileMenu(false);
+      setActiveCategory(null);
     }
   }, [
     checkContent,
@@ -4759,6 +4966,8 @@ export function TaskChat({
     agentMentionItems.length,
     refreshTaskFilesIfNeeded,
     refreshAgentMentionCandidates,
+    refreshProjectsIfNeeded,
+    triggerProjectFilesLoad,
     getActiveChatId,
   ]);
 
@@ -4829,18 +5038,60 @@ export function TaskChat({
       const offset = range.startOffset;
       // Find the "@" start
       let atIdx = -1;
-      for (let i = offset - 1; i >= 0; i--) {
-        if (text[i] === "@") {
-          if (i === 0 || /\s/.test(text[i - 1])) atIdx = i;
-          break;
+      const lastAt = text.lastIndexOf("@", offset - 1);
+      if (lastAt >= 0 && (lastAt === 0 || /\s/.test(text[lastAt - 1]))) {
+        const segment = text.slice(lastAt, offset);
+        const hasCategory = segment.startsWith("@project:") || 
+                            segment.startsWith("@file:") || 
+                            segment.startsWith("@agent:") || 
+                            segment.startsWith("@conversation:");
+        const hasNoSpaces = !/\s/.test(segment);
+        if (hasCategory || hasNoSpaces) {
+          atIdx = lastAt;
         }
-        if (/\s/.test(text[i])) break;
       }
       if (atIdx < 0) return;
       const before = text.slice(0, atIdx);
       const after = text.slice(offset);
       const parent = node.parentNode;
       if (!parent) return;
+
+      if (category === "category_selector") {
+        const categoryText = `@${filePath}:`;
+        const newTextNode = document.createTextNode(before + categoryText + after);
+        parent.replaceChild(newTextNode, node);
+        
+        const newRange = document.createRange();
+        newRange.setStart(newTextNode, before.length + categoryText.length);
+        newRange.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(newRange);
+        
+        setActiveCategory(filePath);
+        setFileFilter("");
+        setShowFileMenu(true);
+        setFileSelectedIdx(0);
+        return;
+      }
+
+      if (category === "Coding Project" || category === "Studio Project") {
+        const projectText = `@project:${filePath}/`;
+        const newTextNode = document.createTextNode(before + projectText + after);
+        parent.replaceChild(newTextNode, node);
+        
+        const newRange = document.createRange();
+        newRange.setStart(newTextNode, before.length + projectText.length);
+        newRange.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(newRange);
+        
+        setActiveCategory("project");
+        setFileFilter(`${filePath}/`);
+        setShowFileMenu(true);
+        setFileSelectedIdx(0);
+        triggerProjectFilesLoad(filePath);
+        return;
+      }
 
       const matched = filteredFiles.find(
         (f) => f.path === filePath && (f.category ?? "") === (category ?? ""),
@@ -4862,9 +5113,10 @@ export function TaskChat({
       sel.removeAllRanges();
       sel.addRange(newRange);
       setShowFileMenu(false);
+      setActiveCategory(null);
       checkContent();
     },
-    [checkContent, filteredFiles],
+    [checkContent, filteredFiles, triggerProjectFilesLoad],
   );
 
   /** Delegated click handler for chip close buttons */
@@ -5223,6 +5475,7 @@ export function TaskChat({
         if (e.key === "Escape") {
           e.preventDefault();
           setShowFileMenu(false);
+          setActiveCategory(null);
           return;
         }
       }
