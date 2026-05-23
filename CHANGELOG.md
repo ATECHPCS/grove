@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.9] - 2026-05-23
+
+### Added
+
+- **ACP agent marketplace + per-chat terminal launch mode** — Marketplace modal merges the CDN ACP registry (1 h cached) with 13 grove-supplement builtins (icons + `terminal_profile`) into one view; installs agents via npx (version-pinned), per-platform binary tarball under `~/.grove/agents/`, or uvx. New `installed_agents` SQLite table owns per-agent preferences (`launch_mode`, `args_override`, `env_override`, `install_path`), with auto-detected agents getting an `install_method=External` stub row on first preference touch. `ChatSession.launch_mode` (`acp` | `terminal`) is snapshotted at chat creation and immutable; terminal-mode chats spawn the agent CLI under a PTY (claude only, via `--session-id <uuid>`) and bridge stdin/stdout over WebSocket so claude persists its own conversation across reconnects. Both ACP and PTY launchers honor overrides via `storage::installed_agents::spawn_for`, which pins `npx`/`uvx` versions, falls back to PATH when `install_path` goes missing, and recovers interrupted installs on boot. Alias map keeps legacy ids working (`claude` ↔ `claude-acp` etc.); `grove mcp` + `mcp-bridge` are auto-injected via `--mcp-config` for terminal mode; AgentPicker filters to installed agents and Marketplace becomes the install/uninstall/configure surface.
+- **Repository URL smart parsing** — Skills page Add Source now parses git-hosting URLs with the standard `URL` API instead of a backtracking regex: strips `/pulls`/`/issues`/`/actions`/`/settings` web routes back to the canonical repo URL, safely extracts `tree`/`blob` subpaths, and de-dupes `.git.git` via idempotent `(?:\.git)+$` suffix strip. `extractNameFromUrl` reuses the parsed URL so name fields auto-fill the repo name alone, not query parameters.
+- **Drag-and-drop file moves + OS-file drops** — New `/fs/move` backend handler safely renames/moves files and directories inside the worktree; FileTree and TaskEditor accept drags onto folders or the tree root, and dropped local OS files are read and written to the target path. Window-level `installGlobalDragDropInterceptor` blocks the default browser navigate-away when files miss a drop target. Monaco editor's `grove-theme` now syncs background/foreground/line-numbers/comment colors to the active system theme.
+- **Cold-open chat hydration** — `session.json` is retained across socket cleanup/discovery so historical models, available modes, thought level, and usage metrics survive. TaskChat reads the snapshot on page load and chat switch, showing correct settings before live WS frames arrive; `auth_required` panels gained a dismiss (`X`) button and auto-clear when the turn completes.
+- **Terminal search** — In-terminal find across xterm.js sessions, with a typed SearchAddon state.
+- **ACP mention category search + root path selection** — Improved category matching in the mention picker, project styling, and explicit root path selection when targeting an ACP session.
+- **GSAP motion across the docs landing site** — Shared GSAP + ScrollTrigger layer wired into all six docs pages from `grove.js`: hero word-by-word reveal with eyebrow/lede/cta/figure cascade, section-label underline draw-in, word-clip reveals on heads + manifesto, alternating-x feature blocks, stagger-up card grids and persona/agent grids, scrubbed-parallax asset shots, scramble FIG.xx caption numbers, magnetic CTAs via `quickTo`, GSAP-driven seamless marquee, and stagger entrance on the page nav. Three-tier degradation (`prefers-reduced-motion` / `?nomotion=1` / CDN load failure) falls back to the original IntersectionObserver CSS reveal.
+
+### Improved
+
+- **Agent install hardened against zip-slip and stale install rows** — Marketplace validates registry-supplied `target.cmd` paths with the same `sanitize_extract_path` used on archive entries; uninstall canonicalizes `install_dir(id, ver)` before `starts_with` checking `agents_root` so a poisoned `install_path` can't redirect `remove_dir_all` outside `~/.grove/agents/`. `patch_agent` rejects `launch_mode` values not in the supplement's `supported_launch_modes` (registry-only agents with no supplement still pass). `recover_orphaned_installing` only flips rows whose `updated_at` is older than 5 minutes, so a fresh boot doesn't kill a concurrent install from a sibling grove process. Agent PTY clamps `cols` (20..=500) and `rows` (5..=200) on the WS upgrade query string.
+- **Lint clean + prod noise removed** — BlitzPage / XTerminal swap setState-in-effect anti-patterns for derived state and input-boundary handlers; terminalCache / TaskEditor type the SearchAddon and Monaco instance states instead of `any`; stray `console.log` / `eprintln!` from per-chat terminal bring-up are gone. Project-git drops the `grove_branches` HashSet and two task loads that became dead after the rebase-target filter was removed.
+
+### Fixed
+
+- **macOS window toggle no longer needs a double press** — When the window is visible but the app isn't active, focus/activate instead of hiding, and ensure `macos_activate_app` runs when showing from a hidden state. Removes the "first press hides, second press shows" behaviour when Grove is in the background.
+- **Rebase target branch filtering** — Restored the correct filter so the rebase target picker no longer lists branches that don't belong on the candidate list.
+
 ## [0.10.8] - 2026-05-18
 
 ### Added
