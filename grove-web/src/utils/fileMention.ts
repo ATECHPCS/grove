@@ -10,7 +10,8 @@ export type MentionKind =
   | "agent_spawn"
   | "agent_send"
   | "agent_reply"
-  | "chat_history";
+  | "chat_history"
+  | "browsertabs";
 
 export interface MentionItem {
   path: string;
@@ -42,6 +43,8 @@ export interface MentionItem {
   agentIconId?: string;
   /** Chat-history: absolute path to that chat's history.jsonl (kind: chat_history). */
   historyPath?: string;
+  /** Browser-tabs: URL to the tab's favicon when known. */
+  favIconUrl?: string;
 }
 
 export interface FilteredMentionItem extends MentionItem {

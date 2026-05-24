@@ -133,6 +133,18 @@ pub fn create_api_router() -> Router {
             "/url/metadata",
             post(handlers::url_metadata::fetch_url_metadata),
         )
+        // Browser Extension WebSocket integration
+        .route("/extension/ws", get(handlers::extension::ws_handler))
+        // Browser Extension Query Tabs integration
+        .route(
+            "/extension/tabs",
+            get(handlers::extension::get_extension_tabs),
+        )
+        // Browser Extension Proxy Command integration
+        .route(
+            "/extension/command",
+            post(handlers::extension::handle_extension_command),
+        )
         // Folder selection API
         .route("/browse-folder", get(handlers::folder::browse_folder))
         // Read file API (for Plan File rendering)
@@ -993,6 +1005,27 @@ pub async fn start_server(
         Err(e) => {
             eprintln!(
                 "[agent_graph_mcp] failed to bind listener: {} — agent_graph tools disabled",
+                e
+            );
+        }
+    }
+
+    // Eager-init the Chrome companion auth token so `~/.grove/extension-token`
+    // exists from boot. Users wire this into the Chrome popup; the file must
+    // be readable at the moment they look for it.
+    match crate::api::handlers::extension::get_or_create_extension_token() {
+        Ok(_) => {
+            // Success goes on stdout alongside the other startup banners so
+            // wrappers that grep for "Grove …" / "extension auth token at" see
+            // a consistent stream.
+            println!(
+                "[extension] auth token at {}",
+                crate::api::handlers::extension::extension_token_path().display()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "[extension] failed to bootstrap auth token: {} — Chrome companion connections will be rejected",
                 e
             );
         }

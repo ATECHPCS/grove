@@ -33,6 +33,13 @@ pub struct ConfigResponse {
     /// frontend gate platform-specific UI (IDE picker, Terminal picker)
     /// without doing a separate `listApplications` round-trip.
     pub platform: &'static str,
+    pub browser_control: BrowserControlConfigDto,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BrowserControlConfigDto {
+    pub enabled: bool,
+    pub auto_groups: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -198,6 +205,10 @@ impl From<&Config> for ConfigResponse {
             },
             terminal_multiplexer: config.terminal_multiplexer.to_string(),
             platform: current_platform(),
+            browser_control: BrowserControlConfigDto {
+                enabled: config.browser_control.enabled,
+                auto_groups: config.browser_control.auto_groups,
+            },
         }
     }
 }
@@ -213,8 +224,15 @@ pub struct ConfigPatchRequest {
     pub hooks: Option<HooksConfigPatch>,
     pub notifications: Option<NotificationsConfigPatch>,
     pub indexing: Option<IndexingConfigPatch>,
+    pub browser_control: Option<BrowserControlConfigPatch>,
     /// Terminal 模式使用的复用器 ("tmux" | "zellij")
     pub terminal_multiplexer: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BrowserControlConfigPatch {
+    pub enabled: Option<bool>,
+    pub auto_groups: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -463,6 +481,16 @@ pub async fn patch_config(
                 .into_iter()
                 .filter(|l| known.contains(l.as_str()))
                 .collect();
+        }
+    }
+
+    // Apply browser_control patch
+    if let Some(bc_patch) = patch.browser_control {
+        if let Some(v) = bc_patch.enabled {
+            config.browser_control.enabled = v;
+        }
+        if let Some(v) = bc_patch.auto_groups {
+            config.browser_control.auto_groups = v;
         }
     }
 

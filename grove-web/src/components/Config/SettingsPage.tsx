@@ -19,6 +19,7 @@ import {
   Wrench,
   Link,
   Plus,
+  Globe,
   X,
   Volume2,
   Bot,
@@ -51,7 +52,7 @@ import {
   setCustomAgentPersonas as setCustomAgentPersonasIconRegistry,
   loadCustomAgentPersonas as loadCustomAgentPersonasIcon,
 } from "../../utils/agentIcon";
-import { useIsMobile } from "../../hooks";
+import { useIsMobile, useExtensionConnection } from "../../hooks";
 import { formatShortcut } from "../AI/utils";
 
 interface SettingsPageProps {
@@ -216,6 +217,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
     hooks: false,
     indexing: false,
     mcp: false,
+    browserControl: false,
   });
 
   // Environment state
@@ -302,6 +304,12 @@ export function SettingsPage({ config }: SettingsPageProps) {
   const indexingAddBtnRef = useRef<HTMLButtonElement>(null);
   const indexingPickerRef = useRef<HTMLDivElement>(null);
   const [indexingPickerPos, setIndexingPickerPos] = useState<{ top: number; left: number } | null>(null);
+
+  // Browser Control state
+  const [browserControlEnabled, setBrowserControlEnabled] = useState(true);
+  const [browserControlAutoGroups, setBrowserControlAutoGroups] = useState(true);
+  // Shared module-level poll — single fetch per 5s for the whole app.
+  const extensionConnected = useExtensionConnection();
 
   // Anchor the language picker to the trigger button. Wrapped in
   // useCallback so the effect can call it without doing setState
@@ -448,6 +456,11 @@ export function SettingsPage({ config }: SettingsPageProps) {
       setIndexingEnabled(cfg.indexing.enabled);
       setIndexingDisabledLangs(cfg.indexing.disabled_languages ?? []);
       setIndexingSupportedLangs(cfg.indexing.supported_languages ?? []);
+    }
+
+    if (cfg.browser_control) {
+      setBrowserControlEnabled(cfg.browser_control.enabled ?? true);
+      setBrowserControlAutoGroups(cfg.browser_control.auto_groups ?? true);
     }
 
     setIsLoaded(true);
@@ -626,6 +639,10 @@ export function SettingsPage({ config }: SettingsPageProps) {
         enabled: indexingEnabled,
         disabled_languages: indexingDisabledLangs,
       },
+      browser_control: {
+        enabled: browserControlEnabled,
+        auto_groups: browserControlAutoGroups,
+      },
     };
     try {
       await patchConfig(patch);
@@ -634,7 +651,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
     } catch {
       console.error("Failed to save config");
     }
-  }, [isLoaded, selectedLayout, agentCommand, acpAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, refreshGlobalConfig]);
+  }, [isLoaded, selectedLayout, agentCommand, acpAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, refreshGlobalConfig]);
 
   // Handle theme change with immediate save
   const handleThemeChange = useCallback((newThemeId: string) => {
@@ -656,7 +673,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
     }, 500); // 500ms debounce
 
     return () => clearTimeout(timer);
-  }, [selectedLayout, agentCommand, acpAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, isLoaded, saveConfig]);
+  }, [selectedLayout, agentCommand, acpAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, isLoaded, saveConfig]);
 
   useEffect(() => {
     if (!isRecordingWindowShortcut) return;
@@ -1086,7 +1103,7 @@ env_vars = [
           title="Agent"
           description={isChatAvailable ? "Ready" : "Need Setup"}
           icon={Bot}
-          iconColor={isChatAvailable ? "var(--color-success)" : "var(--color-warning)"}
+          iconColor={isChatAvailable ? "#a855f7" : "var(--color-warning)"}
           isOpen={openSections.chat}
           onToggle={() => toggleSection("chat")}
         >
@@ -1225,7 +1242,7 @@ env_vars = [
               : `${dependencyInfo[terminalMultiplexer]?.name || terminalMultiplexer}`
           }
           icon={Terminal}
-          iconColor={isTerminalAvailable ? "var(--color-success)" : "var(--color-warning)"}
+          iconColor={isTerminalAvailable ? "#0ea5e9" : "var(--color-warning)"}
           isOpen={openSections.terminal}
           onToggle={() => toggleSection("terminal")}
         >
@@ -1394,13 +1411,115 @@ env_vars = [
           </div>
         </Section>
 
+        {/* Browser Control Section */}
+        <Section
+          id="browserControl"
+          title="Browser Control"
+          description="AI browser automation with dynamic Chrome Companion extension"
+          icon={Globe}
+          iconColor="#10b981"
+          isOpen={openSections.browserControl}
+          onToggle={() => toggleSection("browserControl")}
+        >
+          <div className="space-y-6">
+            {/* AI Browser Action settings — Allow toggle + Sandbox + Tab Groups
+                form one logical group: master switch and its two sub-modes.
+                Sandbox / Tab Groups rows gray out when the master is off; the
+                master row stays interactive. */}
+            <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] divide-y divide-[var(--color-border)]">
+              {/* Master toggle */}
+              <div className="flex items-center justify-between p-4">
+                <div>
+                  <span className="text-sm font-semibold text-[var(--color-text)] select-none block">
+                    Allow AI Browser Action
+                  </span>
+                  <span className="text-xs text-[var(--color-text-muted)] select-none">
+                    Grant AI agents permission to open, read, and interact with web pages inside your active Chrome browser.
+                  </span>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={browserControlEnabled}
+                    onChange={(e) => setBrowserControlEnabled(e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-9 h-5 bg-[var(--color-border)] peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-[var(--color-highlight)]"></div>
+                </label>
+              </div>
+
+              {/* Tab Groups Organizer */}
+              <div className={`flex items-center justify-between p-4 ${!browserControlEnabled ? 'opacity-50 pointer-events-none' : ''}`}>
+                <div>
+                  <span className="text-sm font-semibold text-[var(--color-text)] select-none block">
+                    Tab Groups Organizer
+                  </span>
+                  <span className="text-xs text-[var(--color-text-muted)] select-none">
+                    Automatically organize tabs opened by the AI into project-scoped Chrome Tab Groups to keep your browser neat and tidy.
+                  </span>
+                </div>
+                <label className={`relative inline-flex items-center select-none ${browserControlEnabled ? 'cursor-pointer' : 'cursor-not-allowed'}`}>
+                  <input
+                    type="checkbox"
+                    checked={browserControlAutoGroups}
+                    disabled={!browserControlEnabled}
+                    onChange={(e) => setBrowserControlAutoGroups(e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-9 h-5 bg-[var(--color-border)] peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-[var(--color-highlight)] peer-disabled:opacity-50"></div>
+                </label>
+              </div>
+            </div>
+
+            {/* Chrome Companion — independent capability: a runtime status card
+                + install entry point, unrelated to the AI Browser Action group. */}
+            <div className="p-4 bg-[var(--color-bg-secondary)] rounded-xl border border-[var(--color-border)] space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <span className="text-sm font-semibold text-[var(--color-text)] select-none block">
+                    Chrome Companion (Extension)
+                  </span>
+                  <span className="text-xs text-[var(--color-text-muted)] select-none">
+                    Control active browser sessions via the companion extension, inheriting all SSO login states, cookies, and active forms.
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 px-3 py-1 bg-[var(--color-bg-tertiary)] rounded-full border border-[var(--color-border)]">
+                  <div
+                    className={`w-2 h-2 rounded-full ${extensionConnected ? 'animate-pulse' : ''}`}
+                    style={{
+                      background: `var(--color-${extensionConnected ? 'success' : 'error'})`,
+                      boxShadow: `0 0 8px color-mix(in srgb, var(--color-${extensionConnected ? 'success' : 'error'}) 50%, transparent)`,
+                    }}
+                  />
+                  <span className="text-xs font-medium text-[var(--color-text)] select-none">
+                    {extensionConnected ? 'Connected' : 'Disconnected'}
+                  </span>
+                </div>
+              </div>
+              <div className="flex items-center justify-between text-xs pt-2 border-t border-[var(--color-border)]">
+                <span className="text-[var(--color-text-muted)] select-none">
+                  Extension not installed? Load the compiled package in Chrome Developer Mode to enable active tab sync.
+                </span>
+                <a
+                  href="https://github.com/GarrickZ2/grove/tree/main/grove-extension"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-1 text-[var(--color-highlight)] hover:underline"
+                >
+                  Download Package <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
+            </div>
+          </div>
+        </Section>
+
         {/* Appearance Section */}
         <Section
           id="appearance"
           title="Appearance"
           description={`Theme: ${theme.name}`}
           icon={Palette}
-          iconColor="var(--color-highlight)"
+          iconColor="#ec4899"
           isOpen={openSections.appearance}
           onToggle={() => toggleSection("appearance")}
         >
@@ -1471,7 +1590,7 @@ env_vars = [
           title="General"
           description="Default IDE and terminal application"
           icon={Wrench}
-          iconColor="var(--color-highlight)"
+          iconColor="#64748b"
           isOpen={openSections.devtools}
           onToggle={() => toggleSection("devtools")}
         >
@@ -1579,7 +1698,7 @@ env_vars = [
           title="AutoLink"
           description={`${autoLinkPatterns.length} patterns configured`}
           icon={Link}
-          iconColor="var(--color-purple)"
+          iconColor="#6366f1"
           isOpen={openSections.autolink}
           onToggle={() => toggleSection("autolink")}
         >
@@ -2139,7 +2258,7 @@ env_vars = [
           title="MCP Server"
           description="AI agent integration via MCP protocol"
           icon={Plug}
-          iconColor="#8b5cf6"
+          iconColor="#14b8a6"
           isOpen={openSections.mcp}
           onToggle={() => toggleSection("mcp")}
         >

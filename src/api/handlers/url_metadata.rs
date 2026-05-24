@@ -41,7 +41,15 @@ pub async fn fetch_url_metadata(
         ));
     }
 
-    // Do the blocking fetch on a worker thread so we don't stall the runtime.
+    // 1. Try to fetch title via the companion extension proxy first (if the extension is connected)
+    if let Some(title) = crate::api::handlers::extension::proxy_fetch_title(&url).await {
+        return Ok(Json(UrlMetadataResponse {
+            title,
+            description: None,
+        }));
+    }
+
+    // 2. Do the blocking fetch on a worker thread so we don't stall the runtime.
     let meta = tokio::task::spawn_blocking(move || fetch_blocking(&url))
         .await
         .unwrap_or_else(|_| UrlMetadataResponse::default());

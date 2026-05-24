@@ -144,6 +144,10 @@ pub struct ResourceFile {
     pub size: u64,
     pub modified_at: String,
     pub is_dir: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub favicon: Option<String>,
 }
 
 /// Resource list response

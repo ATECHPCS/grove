@@ -10,6 +10,7 @@ pub mod common;
 pub mod config;
 pub mod custom_agent;
 pub mod env;
+pub mod extension;
 pub mod folder;
 pub mod git;
 pub mod hooks;

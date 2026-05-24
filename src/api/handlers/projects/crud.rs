@@ -102,12 +102,31 @@ pub(crate) fn list_resource_files(
             .strip_prefix(base)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| name.clone());
+
+        let mut url_val = None;
+        let mut favicon_val = None;
+
+        if !meta.is_dir() && name.ends_with(".link.json") {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if let Some(u) = val.get("url").and_then(|u| u.as_str()) {
+                        url_val = Some(u.to_string());
+                    }
+                    if let Some(f) = val.get("favicon").and_then(|f| f.as_str()) {
+                        favicon_val = Some(f.to_string());
+                    }
+                }
+            }
+        }
+
         files.push(ResourceFile {
             name: name.clone(),
             path: rel_path,
             size: if meta.is_file() { meta.len() } else { 0 },
             modified_at: crate::api::handlers::studio_common::format_modified_time(&meta),
             is_dir: meta.is_dir(),
+            url: url_val,
+            favicon: favicon_val,
         });
     }
     files.sort_by(|a, b| {

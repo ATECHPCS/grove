@@ -162,6 +162,8 @@ pub async fn upload_resource(
             size: f.size,
             modified_at: f.modified_at,
             is_dir: f.is_dir,
+            url: None,
+            favicon: None,
         })
         .collect();
     Ok(Json(files))
@@ -188,6 +190,7 @@ pub async fn create_resource_link(
         &request.name,
         &request.url,
         request.description.as_deref(),
+        request.favicon.as_deref(),
     )?;
 
     Ok(Json(ResourceFile {
@@ -196,6 +199,8 @@ pub async fn create_resource_link(
         size: uploaded.size,
         modified_at: uploaded.modified_at,
         is_dir: false,
+        url: Some(request.url),
+        favicon: request.favicon,
     }))
 }
 
@@ -219,6 +224,7 @@ pub async fn update_resource_link(
         &request.name,
         &request.url,
         request.description.as_deref(),
+        request.favicon.as_deref(),
     )?;
 
     Ok(Json(ResourceFile {
@@ -227,6 +233,8 @@ pub async fn update_resource_link(
         size: updated.size,
         modified_at: updated.modified_at,
         is_dir: false,
+        url: Some(request.url),
+        favicon: request.favicon,
     }))
 }
 

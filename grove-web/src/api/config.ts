@@ -87,6 +87,13 @@ export interface NotificationsConfig {
   menubar_shortcut?: string | null;
 }
 
+export interface BrowserControlConfig {
+  /** Master switch — when false the AI cannot drive the user's browser at all. */
+  enabled?: boolean;
+  /** Auto-organize AI-opened tabs into per-task Chrome Tab Groups. */
+  auto_groups?: boolean;
+}
+
 export interface Config {
   theme: ThemeConfig;
   layout: LayoutConfig;
@@ -97,6 +104,7 @@ export interface Config {
   hooks: HooksConfig;
   notifications: NotificationsConfig;
   indexing: IndexingConfig;
+  browser_control: BrowserControlConfig;
   platform: string; // "macos" | "windows" | "linux"
 }
 
@@ -115,6 +123,7 @@ interface ConfigPatch {
   hooks?: Partial<HooksConfig>;
   notifications?: Partial<NotificationsConfig>;
   indexing?: IndexingConfigPatch;
+  browser_control?: Partial<BrowserControlConfig>;
 }
 
 // Application info for picker

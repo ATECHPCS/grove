@@ -1,5 +1,6 @@
 import { createElement, type ReactNode } from "react";
 import { agentIconComponent, resolveAgentIcon } from "../../../utils/agentIcon";
+import { openExternalUrl } from "../../../utils/openExternal";
 import type { GroveMetaEnvelope } from "../../../utils/groveMeta";
 
 /**
@@ -48,6 +49,12 @@ interface AgentInjectData {
   name: string;
   msg_id?: string;
   agent?: string;
+}
+
+interface BrowserTabData {
+  url: string;
+  title?: string;
+  tab_id?: number;
 }
 
 interface PreviewCommentData {
@@ -171,6 +178,66 @@ function renderUserRemindBadge(env: GroveMetaEnvelope): ReactNode {
   );
 }
 
+/** Browser-tab @-mention chip — same visual language as the chip the user
+ *  saw in the input box (favicon + title pill). Title is truncated so a long
+ *  Open Graph description doesn't blow up the message bubble. Same threshold
+ *  as the composer chip (`MAX_CHIP_TITLE = 40` in TaskChat.tsx) so a tab
+ *  reads identically on send and on replay. */
+const BROWSER_TAB_MAX_TITLE = 40;
+function renderBrowserTab(env: GroveMetaEnvelope): ReactNode {
+  const data = env.data as unknown as BrowserTabData;
+  const url = data.url;
+  const rawTitle = data.title || url;
+  const title =
+    rawTitle.length > BROWSER_TAB_MAX_TITLE
+      ? `${rawTitle.slice(0, BROWSER_TAB_MAX_TITLE).trimEnd()}…`
+      : rawTitle;
+  let faviconUrl = "";
+  try {
+    const domain = new URL(url).hostname;
+    faviconUrl = `https://www.google.com/s2/favicons?sz=32&domain=${domain}`;
+  } catch {
+    faviconUrl = "";
+  }
+  const tooltip = `${rawTitle} (${url})${
+    typeof data.tab_id === "number" ? ` · tab_id=${data.tab_id}` : ""
+  }`;
+  return (
+    <button
+      type="button"
+      onClick={() => openExternalUrl(url)}
+      title={tooltip}
+      className="inline-flex items-center gap-1 align-baseline rounded-full px-2 py-px text-[12px] font-medium leading-tight cursor-pointer"
+      style={{
+        background: "color-mix(in srgb, var(--color-bg-secondary) 80%, var(--color-bg))",
+        border: "1px solid color-mix(in srgb, var(--color-border) 65%, transparent)",
+        color: "var(--color-accent)",
+        margin: "0 2px",
+        verticalAlign: "baseline",
+      }}
+    >
+      {faviconUrl && (
+        <img
+          src={faviconUrl}
+          alt=""
+          width={13}
+          height={13}
+          style={{
+            display: "inline-block",
+            verticalAlign: "middle",
+            flexShrink: 0,
+            borderRadius: 2,
+          }}
+          onError={(e) => {
+            e.currentTarget.style.display = "none";
+          }}
+        />
+      )}
+      <span className="max-w-[260px] truncate">{title}</span>
+    </button>
+  );
+}
+
 function renderPreviewCommentCard(env: GroveMetaEnvelope): ReactNode {
   const data = env.data as unknown as PreviewCommentData;
   const filePath = data.filePath || "";
@@ -236,6 +303,7 @@ export const GROVE_META_RENDERERS: Record<string, Renderer> = {
   agent_inject_reply: (env) => renderAgentInjectBadge(env, "reply"),
   user_remind: (env) => renderUserRemindBadge(env),
   preview_comment: (env) => renderPreviewCommentCard(env),
+  browser_tab: (env) => renderBrowserTab(env),
 };
 
 /** Render an envelope, falling back to `systemPrompt` text on unknown type or

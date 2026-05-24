@@ -81,7 +81,7 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
   const [addLinkOpen, setAddLinkOpen] = useState(false);
   const [editLink, setEditLink] = useState<{
     file: ArtifactFile;
-    initial: { name: string; url: string; description?: string };
+    initial: { name: string; url: string; description?: string; favicon?: string };
   } | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const dragCountRef = useRef(0);
@@ -482,7 +482,7 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
       }
       setEditLink({
         file,
-        initial: { name: parsed.name, url: parsed.url, description: parsed.description },
+        initial: { name: parsed.name, url: parsed.url, description: parsed.description, favicon: parsed.favicon },
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load link");
@@ -1191,9 +1191,19 @@ function FileCard({
       onMouseLeave={e => e.currentTarget.style.background = "transparent"}
     >
       {isLink ? (
-        <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0"
-          style={{ background: "color-mix(in srgb, var(--color-highlight) 10%, transparent)", border: "1px solid color-mix(in srgb, var(--color-highlight) 25%, transparent)" }}>
-          <LinkIcon className="w-4 h-4" style={{ color: "var(--color-highlight)" }} />
+        <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0 overflow-hidden bg-[var(--color-bg-secondary)] border border-[var(--color-border)]">
+          {file.favicon ? (
+            <img
+              src={file.favicon}
+              alt=""
+              className="w-5 h-5 object-contain"
+              onError={(e) => {
+                e.currentTarget.style.display = 'none';
+              }}
+            />
+          ) : (
+            <LinkIcon className="w-4 h-4" style={{ color: "var(--color-highlight)" }} />
+          )}
         </div>
       ) : isImage && projectId ? (
         <div className="w-9 h-9 rounded-lg overflow-hidden shrink-0"

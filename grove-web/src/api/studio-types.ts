@@ -10,6 +10,8 @@ export interface StudioFileEntry {
   size: number;
   modified_at: string;
   is_dir: boolean;
+  url?: string;
+  favicon?: string;
 }
 
 /** A work-directory symlink entry. */

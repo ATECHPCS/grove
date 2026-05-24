@@ -1,0 +1,28 @@
+{
+  "name": "grove-extension",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite build --watch --mode development",
+    "build": "tsc && vite build",
+    "zip": "cd dist && zip -r ../grove-extension.zip ./*",
+    "lint": "eslint src/ --max-warnings 0"
+  },
+  "dependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "lucide-react": "^0.563.0"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.306",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "typescript": "~5.9.3",
+    "vite": "^6.0.0",
+    "ws": "^8.18.0",
+    "@types/ws": "^8.5.14"
+  }
+}

@@ -60,3 +60,14 @@ pub fn ensure_task_active(project_key: &str, task_id: &str, worktree_path: &str)
 
     crate::symbols::on_watch_started(project_key, task_id, Path::new(worktree_path));
 }
+
+/// Global session for the connected browser companion extension.
+/// Manages the WebSocket channel and handles async request-response mapping.
+pub struct ExtensionSession {
+    pub sender: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    pub pending_requests:
+        std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>,
+}
+
+pub static EXTENSION_SESSION: Lazy<RwLock<Option<ExtensionSession>>> =
+    Lazy::new(|| RwLock::new(None));

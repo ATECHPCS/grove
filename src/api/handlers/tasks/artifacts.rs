@@ -63,9 +63,25 @@ fn list_dir_recursive(
                 size: 0,
                 modified_at: studio_common::format_modified_time(&meta),
                 is_dir: true,
+                url: None,
+                favicon: None,
             });
             files.extend(list_dir_recursive(base, &path, category));
         } else {
+            let mut url_val = None;
+            let mut favicon_val = None;
+            if name.ends_with(".link.json") {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        if let Some(u) = val.get("url").and_then(|u| u.as_str()) {
+                            url_val = Some(u.to_string());
+                        }
+                        if let Some(f) = val.get("favicon").and_then(|f| f.as_str()) {
+                            favicon_val = Some(f.to_string());
+                        }
+                    }
+                }
+            }
             files.push(ArtifactFile {
                 name,
                 path: rel_str,
@@ -73,6 +89,8 @@ fn list_dir_recursive(
                 size: meta.len(),
                 modified_at: studio_common::format_modified_time(&meta),
                 is_dir: false,
+                url: url_val,
+                favicon: favicon_val,
             });
         }
     }
@@ -332,6 +350,8 @@ pub async fn upload_artifact(
             size: f.size,
             modified_at: f.modified_at,
             is_dir: f.is_dir,
+            url: None,
+            favicon: None,
         })
         .collect();
     Ok(Json(files))
@@ -363,6 +383,7 @@ pub async fn create_artifact_link(
         &request.name,
         &request.url,
         request.description.as_deref(),
+        request.favicon.as_deref(),
     )?;
 
     Ok(Json(ArtifactFile {
@@ -372,6 +393,8 @@ pub async fn create_artifact_link(
         size: uploaded.size,
         modified_at: uploaded.modified_at,
         is_dir: false,
+        url: Some(request.url),
+        favicon: request.favicon,
     }))
 }
 
@@ -407,6 +430,7 @@ pub async fn update_artifact_link(
         &request.name,
         &request.url,
         request.description.as_deref(),
+        request.favicon.as_deref(),
     )?;
 
     Ok(Json(ArtifactFile {
@@ -416,6 +440,8 @@ pub async fn update_artifact_link(
         size: updated.size,
         modified_at: updated.modified_at,
         is_dir: false,
+        url: Some(request.url),
+        favicon: request.favicon,
     }))
 }
 

@@ -18,6 +18,7 @@ import {
   MessageSquare,
   Bot,
   Briefcase,
+  Globe,
 } from "lucide-react";
 import type { FilteredMentionItem, MentionItem } from "../../utils/fileMention";
 import { agentIconComponent } from "../../utils/agentIcon";
@@ -39,11 +40,13 @@ function iconFor(
     if (item.path === "file") return Folder;
     if (item.path === "agent") return Bot;
     if (item.path === "project") return Briefcase;
+    if (item.path === "browsertabs") return Globe;
   }
   // Agent-graph kinds: render the underlying agent's brand icon when known.
   // `agentIconComponent` already falls back to lucide Bot for unknown keys,
   // so this branch is total.
   if (item.kind && item.kind !== "file") {
+    if (item.kind === "browsertabs") return Globe;
     return agentIconComponent(item.agentName);
   }
   if (item.path.toLowerCase().endsWith(".link.json")) return LinkIcon;
@@ -228,6 +231,22 @@ const MentionRow = memo(function MentionRow({
   const isProjectItem = item.category === "Coding Project" || item.category === "Studio Project" || item.category === "Project Root";
   const projectStyle = isProjectItem ? getProjectStyle(item.sessionId || item.path, theme.accentPalette) : null;
 
+  let resolvedFavicon: string | null = null;
+  if (item.kind === "browsertabs" && item.category !== "category_selector") {
+    if (item.favIconUrl && item.favIconUrl.startsWith("http")) {
+      resolvedFavicon = item.favIconUrl;
+    } else {
+      try {
+        const domain = new URL(item.path).hostname;
+        resolvedFavicon = `https://www.google.com/s2/favicons?sz=32&domain=${domain}`;
+      } catch {
+        // Bad URL — leave favicon blank, the kind/category fallback icons
+        // below will render instead.
+        resolvedFavicon = "";
+      }
+    }
+  }
+
   return (
     <button
       ref={ref}
@@ -247,6 +266,15 @@ const MentionRow = memo(function MentionRow({
         >
           <projectStyle.Icon className="w-3 h-3" style={{ color: projectStyle.color.fg }} />
         </div>
+      ) : resolvedFavicon ? (
+        <img
+          src={resolvedFavicon}
+          alt=""
+          className="w-3.5 h-3.5 object-contain shrink-0 rounded-sm"
+          onError={(e) => {
+            e.currentTarget.style.display = 'none';
+          }}
+        />
       ) : item.kind && item.kind !== "file" || item.category === "category_selector" ? (
         createElement(iconFor(item), {
           className: "w-3.5 h-3.5 shrink-0",

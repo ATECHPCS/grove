@@ -257,6 +257,8 @@ pub struct Config {
     pub notifications: NotificationsConfig,
     #[serde(default)]
     pub indexing: IndexingConfig,
+    #[serde(default)]
+    pub browser_control: BrowserControlConfig,
 
     /// Storage layout version (None = legacy, "1.0" = task-centric layout)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -335,10 +337,30 @@ impl Default for NotificationsConfig {
     }
 }
 
-/// MCP Server 配置（预留扩展）
+/// MCP Server Config (Reserved for future extension)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct McpConfig {
-    // 预留字段，目前仅用于显示配置说明
+    // Reserved field, currently only used to show config explanation
+}
+
+/// AI Browser Control Config
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserControlConfig {
+    /// Grant permission for AI to automate actions in your active Chrome browser
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Enable project/task-specific Chrome Tab Group isolation management
+    #[serde(default = "default_true")]
+    pub auto_groups: bool,
+}
+
+impl Default for BrowserControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_groups: true,
+        }
+    }
 }
 
 /// Symbol-indexing config (cmd+click navigation).

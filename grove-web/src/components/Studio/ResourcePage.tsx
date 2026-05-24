@@ -110,7 +110,7 @@ export function ResourcePage() {
   const [isAddingWorkdir, setIsAddingWorkdir] = useState(false);
   const [editLink, setEditLink] = useState<{
     file: ResourceFile;
-    initial: { name: string; url: string; description?: string };
+    initial: { name: string; url: string; description?: string; favicon?: string };
   } | null>(null);
 
   // File manager state
@@ -574,7 +574,7 @@ export function ResourcePage() {
     }
     setEditLink({
       file,
-      initial: { name: parsed.name, url: parsed.url, description: parsed.description },
+      initial: { name: parsed.name, url: parsed.url, description: parsed.description, favicon: parsed.favicon },
     });
   }, [projectId]);
 
@@ -1695,13 +1695,24 @@ function ResourceFileRow({
         e.currentTarget.style.background = "color-mix(in srgb, var(--color-bg) 44%, transparent)";
         e.currentTarget.style.borderColor = "color-mix(in srgb, var(--color-border) 75%, transparent)";
       }}>
-      <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0"
+      <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 overflow-hidden bg-[var(--color-bg-secondary)] border border-[var(--color-border)]"
         style={{
           background: isLink ? "color-mix(in srgb, var(--color-highlight) 10%, transparent)" : "var(--color-bg)",
           border: isLink ? "1px solid color-mix(in srgb, var(--color-highlight) 25%, transparent)" : undefined,
         }}>
         {isLink
-          ? <LinkIcon className="w-4 h-4" style={{ color: "var(--color-highlight)" }} />
+          ? (file.favicon ? (
+              <img
+                src={file.favicon}
+                alt=""
+                className="w-5 h-5 object-contain"
+                onError={(e) => {
+                  e.currentTarget.style.display = 'none';
+                }}
+              />
+            ) : (
+              <LinkIcon className="w-4 h-4" style={{ color: "var(--color-highlight)" }} />
+            ))
           : <VSCodeIcon filename={file.name} size={16} />}
       </div>
       <div className="flex-1 min-w-0" onClick={e => { if (isRenaming) e.stopPropagation(); }}>

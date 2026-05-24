@@ -10,6 +10,7 @@ export interface LinkFileContent {
   url: string;
   description?: string;
   created_at?: string;
+  favicon?: string;
 }
 
 export function isLinkFile(filename: string): boolean {

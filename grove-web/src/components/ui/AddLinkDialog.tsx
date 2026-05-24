@@ -4,9 +4,11 @@
 // Description (optional). Caller passes an async `onSubmit` that persists
 // the link via the appropriate backend endpoint.
 
-import { useEffect, useRef, useState } from "react";
-import { Link as LinkIcon, Loader2, X } from "lucide-react";
+import { useEffect, useRef, useState, useMemo } from "react";
+import { Link as LinkIcon, Loader2, X, Globe } from "lucide-react";
 import { fetchUrlMetadata, type ApiError } from "../../api";
+import { listExtensionTabs, type ExtensionTab } from "../../api/extension";
+import { useExtensionConnection } from "../../hooks";
 import { hostnameOf } from "./linkFile";
 
 interface AddLinkDialogProps {
@@ -14,11 +16,11 @@ interface AddLinkDialogProps {
   title?: string;
   /** Pre-filled values for edit mode. When provided, metadata auto-fetch
    *  is skipped on open so a user-saved name isn't overwritten. */
-  initial?: { name: string; url: string; description?: string };
+  initial?: { name: string; url: string; description?: string; favicon?: string };
   /** Text shown on the confirm button. Defaults to "Add Link". */
   submitLabel?: string;
   onClose: () => void;
-  onSubmit: (payload: { name: string; url: string; description?: string }) => Promise<void>;
+  onSubmit: (payload: { name: string; url: string; description?: string; favicon?: string }) => Promise<void>;
 }
 
 function deriveFallbackName(url: string): string {
@@ -41,6 +43,27 @@ function deriveFallbackName(url: string): string {
   return u.hostname;
 }
 
+function deriveFaviconUrl(urlStr: string): string {
+  try {
+    const u = new URL(urlStr);
+    return `https://www.google.com/s2/favicons?sz=64&domain=${u.hostname}`;
+  } catch {
+    return "";
+  }
+}
+
+function urlsMatch(urlA: string, urlB: string): boolean {
+  const clean = (uStr: string) => {
+    try {
+      const u = new URL(uStr.trim());
+      return (u.origin + u.pathname).toLowerCase().replace(/\/$/, "");
+    } catch {
+      return uStr.trim().toLowerCase().split(/[?#]/)[0].replace(/\/$/, "");
+    }
+  };
+  return clean(urlA) === clean(urlB);
+}
+
 export function AddLinkDialog({ open, title = "Add Link", initial, submitLabel, onClose, onSubmit }: AddLinkDialogProps) {
   const [url, setUrl] = useState("");
   const [name, setName] = useState("");
@@ -55,6 +78,25 @@ export function AddLinkDialog({ open, title = "Add Link", initial, submitLabel, 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const urlInputRef = useRef<HTMLInputElement | null>(null);
+
+  // States for extension tabs integration. `extensionConnected` comes from
+  // the shared poll (one fetch per 5s across all components). `extensionTabs`
+  // is a per-dialog snapshot fetched on open.
+  const extensionConnected = useExtensionConnection();
+  const [extensionTabs, setExtensionTabs] = useState<ExtensionTab[]>([]);
+  const [showDropdown, setShowDropdown] = useState(false);
+
+  // Favicon is purely derived from `url` + `extensionTabs` — prefer the
+  // exact `favIconUrl` from the matched open browser tab (Chrome resolved
+  // it from the real page), otherwise fall back to google's s2 favicons
+  // service. Computed via useMemo to avoid the in-effect setState pattern
+  // that React lints reject.
+  const favicon = useMemo(() => {
+    const trimmed = url.trim();
+    if (!/^https?:\/\/\S+$/i.test(trimmed)) return "";
+    const matched = extensionTabs.find((t) => urlsMatch(t.url, trimmed));
+    return matched?.favIconUrl ?? deriveFaviconUrl(trimmed);
+  }, [url, extensionTabs]);
 
   // Reset state on open/close so a cancelled dialog doesn't leak stale input.
   // Uses the documented "Adjusting state on prop change" pattern (compared to
@@ -73,17 +115,40 @@ export function AddLinkDialog({ open, title = "Add Link", initial, submitLabel, 
     setMetadataLoading(false);
     setSubmitting(false);
     setError(null);
+    setShowDropdown(false);
   } else if (!open && lastOpenKey?.open) {
+    // Closing — drop any tabs cached during this session so a re-open
+    // shows a clean state and doesn't leak the previous browser snapshot.
     setLastOpenKey({ open, initial });
+    setExtensionTabs([]);
   }
   // Focus the URL field so users can immediately paste, after the reset above.
   useEffect(() => {
     if (open) urlInputRef.current?.focus();
   }, [open, initial]);
 
+  // Fetch extension tabs when the modal is opened.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const tabs = await listExtensionTabs();
+        if (cancelled) return;
+        setExtensionTabs(tabs);
+      } catch {
+        if (cancelled) return;
+        setExtensionTabs([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
   // `name` is read inside the metadata-fetch effect only as a gate (skip if
   // already filled). Keep it in a ref so we read the latest value without
-  // re-firing the effect on every keystroke.
+  // re-firing the effect on keystrokes.
   const nameRef = useRef(name);
   useEffect(() => {
     nameRef.current = name;
@@ -103,8 +168,7 @@ export function AddLinkDialog({ open, title = "Add Link", initial, submitLabel, 
   }
 
   // Debounced metadata fetch. Skipped entirely when the Name field already
-  // has content (edit mode, or user typed a name first) — no point spending
-  // a network round-trip and flashing a spinner when we won't use the result.
+  // has content (edit mode, or user typed a name first).
   useEffect(() => {
     if (!open) return;
     if (nameTouched || nameRef.current.trim()) return;
@@ -114,6 +178,18 @@ export function AddLinkDialog({ open, title = "Add Link", initial, submitLabel, 
     let cancelled = false;
     const handle = setTimeout(async () => {
       if (cancelled) return;
+
+      // 1. Try to find a matching open browser tab for instant autofill.
+      // Favicon is derived from (url, extensionTabs) via useMemo — no setter
+      // call needed here.
+      const matched = extensionTabs.find(t => urlsMatch(t.url, trimmed));
+      if (matched) {
+        setName(matched.title);
+        setMetadataLoading(false);
+        return;
+      }
+
+      // 2. Fall back to url/metadata scraper
       let metaTitle: string | null = null;
       let metaFailed = false;
       try {
@@ -138,7 +214,15 @@ export function AddLinkDialog({ open, title = "Add Link", initial, submitLabel, 
       clearTimeout(handle);
       setMetadataLoading(false);
     };
-  }, [url, open, nameTouched]);
+  }, [url, open, nameTouched, extensionTabs]);
+
+  const filteredTabs = useMemo(() => {
+    return extensionTabs.filter(tab => {
+      if (!url.trim()) return true;
+      const query = url.toLowerCase();
+      return tab.title.toLowerCase().includes(query) || tab.url.toLowerCase().includes(query);
+    });
+  }, [extensionTabs, url]);
 
   if (!open) return null;
 
@@ -154,6 +238,7 @@ export function AddLinkDialog({ open, title = "Add Link", initial, submitLabel, 
       name: name.trim(),
       url: url.trim(),
       description: trimmedDesc ? trimmedDesc : undefined,
+      favicon: favicon.trim() ? favicon.trim() : undefined,
     };
     let succeeded = false;
     let caught: unknown = null;
@@ -218,18 +303,30 @@ export function AddLinkDialog({ open, title = "Add Link", initial, submitLabel, 
           </button>
         </div>
         <div className="p-4 space-y-3">
-          <label className="block">
+          <label className="block relative">
             <span
-              className="text-[11px] font-medium uppercase tracking-wide"
+              className="text-[11px] font-medium uppercase tracking-wide flex items-center justify-between"
               style={{ color: "var(--color-text-muted)" }}
             >
               Link
+              {extensionConnected && (
+                <span className="text-[9px] text-[var(--color-highlight)] flex items-center gap-1 normal-case font-normal">
+                  <Globe className="w-2.5 h-2.5" /> Extension Connected (open tabs ready)
+                </span>
+              )}
             </span>
             <input
               ref={urlInputRef}
               type="url"
               value={url}
               onChange={(e) => setUrl(e.target.value)}
+              // Only show the open-tabs dropdown when the field is empty —
+              // otherwise re-focusing while editing a URL pops noise back
+              // over the autocomplete the user is trying to type.
+              onFocus={() => {
+                if (url.trim() === "") setShowDropdown(true);
+              }}
+              onBlur={() => setTimeout(() => setShowDropdown(false), 250)}
               placeholder="https://example.com/page"
               className="mt-1 w-full px-3 py-2 text-sm rounded-md outline-none focus:ring-1"
               style={{
@@ -238,6 +335,44 @@ export function AddLinkDialog({ open, title = "Add Link", initial, submitLabel, 
                 color: "var(--color-text)",
               }}
             />
+            {extensionConnected && showDropdown && filteredTabs.length > 0 && (
+              <div
+                className="absolute left-0 right-0 mt-1 max-h-48 overflow-y-auto rounded-md shadow-lg border z-50 py-1"
+                style={{
+                  background: "var(--color-bg)",
+                  borderColor: "var(--color-border)",
+                }}
+              >
+                {filteredTabs.map((tab, idx) => (
+                  <button
+                    key={idx}
+                    type="button"
+                    onMouseDown={(e) => {
+                      e.preventDefault(); // prevent input blur
+                      setUrl(tab.url);
+                      setName(tab.title);
+                      // Favicon derives from (url, extensionTabs) via useMemo.
+                      setNameTouched(true);
+                      setShowDropdown(false);
+                    }}
+                    className="w-full text-left px-3 py-2 text-xs flex items-center gap-2 hover:bg-[var(--color-bg-tertiary)] transition-colors"
+                  >
+                    <img
+                      src={tab.favIconUrl || deriveFaviconUrl(tab.url)}
+                      alt=""
+                      className="w-4 h-4 object-contain rounded-sm shrink-0"
+                      onError={(e) => {
+                        e.currentTarget.style.display = 'none';
+                      }}
+                    />
+                    <div className="truncate flex-1">
+                      <div className="font-medium text-[var(--color-text)] truncate">{tab.title}</div>
+                      <div className="text-[10px] text-[var(--color-text-muted)] truncate">{tab.url}</div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
             {url && (
               <div
                 className="mt-1 text-[11px] truncate"
@@ -257,21 +392,34 @@ export function AddLinkDialog({ open, title = "Add Link", initial, submitLabel, 
                 <Loader2 className="w-3 h-3 animate-spin" />
               )}
             </span>
-            <input
-              type="text"
-              value={name}
-              onChange={(e) => {
-                setName(e.target.value);
-                setNameTouched(true);
-              }}
-              placeholder="Auto-filled from link title"
-              className="mt-1 w-full px-3 py-2 text-sm rounded-md outline-none focus:ring-1"
-              style={{
-                background: "var(--color-bg-secondary)",
-                border: "1px solid var(--color-border)",
-                color: "var(--color-text)",
-              }}
-            />
+            <div className="mt-1 flex gap-2 items-center">
+              {favicon && (
+                <img
+                  src={favicon}
+                  alt=""
+                  className="w-6 h-6 object-contain rounded-md border p-0.5 shrink-0 bg-[var(--color-bg-secondary)]"
+                  style={{ borderColor: "var(--color-border)" }}
+                  onError={(e) => {
+                    e.currentTarget.style.display = 'none';
+                  }}
+                />
+              )}
+              <input
+                type="text"
+                value={name}
+                onChange={(e) => {
+                  setName(e.target.value);
+                  setNameTouched(true);
+                }}
+                placeholder="Auto-filled from link title"
+                className="w-full px-3 py-2 text-sm rounded-md outline-none focus:ring-1"
+                style={{
+                  background: "var(--color-bg-secondary)",
+                  border: "1px solid var(--color-border)",
+                  color: "var(--color-text)",
+                }}
+              />
+            </div>
           </label>
           <label className="block">
             <span

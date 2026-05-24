@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Grove Companion",
+  "version": "1.0.0",
+  "description": "Companion extension for Grove desktop app to sync browser tabs and titles.",
+  "permissions": [
+    "activeTab",
+    "alarms",
+    "scripting",
+    "tabs",
+    "storage",
+    "tabGroups"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "icons": {
+    "32": "icons/32.png",
+    "128": "icons/128.png"
+  },
+  "action": {
+    "default_popup": "index.html",
+    "default_title": "Grove Companion",
+    "default_icon": {
+      "32": "icons/32.png",
+      "128": "icons/128.png"
+    }
+  },
+  "background": {
+    "service_worker": "assets/background.js",
+    "type": "module"
+  }
+}

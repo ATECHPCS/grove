@@ -333,9 +333,41 @@ jobs:
           cp "$DMG" "grove-${TAG}-universal-apple-darwin.dmg"
           gh release upload "${TAG}" "grove-${TAG}-universal-apple-darwin.dmg" --clobber
 
+  # Build Chrome extension and upload to release assets
+  build-extension:
+    needs: [create-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.14.0'
+          cache: 'pnpm'
+          cache-dependency-path: grove-extension/pnpm-lock.yaml
+      - name: Build Extension
+        run: |
+          cd grove-extension
+          pnpm install --frozen-lockfile
+          pnpm run build
+      - name: Zip extension dist
+        run: |
+          cd grove-extension/dist
+          zip -r ../../grove-extension-${{ needs.create-release.outputs.tag }}.zip ./*
+      - name: Upload to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ needs.create-release.outputs.tag }} --clobber \
+            grove-extension-${{ needs.create-release.outputs.tag }}.zip
+
   # Publish the release
   publish-release:
-    needs: [create-release, build-macos-arm, build-macos-intel, build-linux-x64, build-linux-arm, build-linux-gui-x64, build-macos-dmg, build-windows-x64]
+    needs: [create-release, build-macos-arm, build-macos-intel, build-linux-x64, build-linux-arm, build-linux-gui-x64, build-macos-dmg, build-windows-x64, build-extension]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

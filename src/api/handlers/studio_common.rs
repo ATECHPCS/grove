@@ -370,6 +370,8 @@ pub struct CreateLinkRequest {
     pub url: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub favicon: Option<String>,
     /// Optional subdirectory relative to the base dir (e.g. for nested resource folders).
     #[serde(default)]
     pub path: Option<String>,
@@ -386,6 +388,7 @@ pub fn write_link_file(
     name: &str,
     url: &str,
     description: Option<&str>,
+    favicon: Option<&str>,
 ) -> Result<UploadedFile, ApiErr> {
     let trimmed_name = name.trim();
     if trimmed_name.is_empty() {
@@ -427,6 +430,7 @@ pub fn write_link_file(
         "name": trimmed_name,
         "url": trimmed_url,
         "description": description.map(|d| d.trim()).filter(|d| !d.is_empty()),
+        "favicon": favicon.map(|f| f.trim()).filter(|f| !f.is_empty()),
         "created_at": created_at,
     });
     let body = serde_json::to_vec_pretty(&payload).map_err(|e| {
@@ -493,6 +497,7 @@ pub fn update_link_file(
     new_name: &str,
     new_url: &str,
     new_description: Option<&str>,
+    new_favicon: Option<&str>,
 ) -> Result<UploadedFile, ApiErr> {
     let trimmed_name = new_name.trim();
     if trimmed_name.is_empty() {
@@ -559,6 +564,7 @@ pub fn update_link_file(
         "name": trimmed_name,
         "url": trimmed_url,
         "description": new_description.map(|d| d.trim()).filter(|d| !d.is_empty()),
+        "favicon": new_favicon.map(|f| f.trim()).filter(|f| !f.is_empty()),
         "created_at": created_at,
     });
     let body = serde_json::to_vec_pretty(&payload).map_err(|e| {

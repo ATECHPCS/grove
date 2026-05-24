@@ -80,6 +80,8 @@ import {
 } from "../../../utils/agentIcon";
 import type { MentionItem, FilteredMentionItem } from "../../../utils/fileMention";
 import { getMentionCandidates } from "../../../api";
+import { listExtensionTabs } from "../../../api/extension";
+import { useExtensionConnection } from "../../../hooks";
 import { useProject } from "../../../context/ProjectContext";
 import { useConfig } from "../../../context/ConfigContext";
 import { usePreviewComments, type PreviewCommentDraft } from "../../../context";
@@ -1027,6 +1029,73 @@ function createFileChip(
   return chip;
 }
 
+/** Create a dynamic browser tab mention pill DOM element.
+ *
+ * `tabId` is the Chrome tab id (when known); stored on the chip so that
+ * `getPromptFromEditable` can serialize it into a `<grove-meta>` envelope —
+ * giving downstream agents enough info to drive the tab via the
+ * `grove_browser_*` MCP tools.
+ */
+function createBrowserTabChip(url: string, title: string, tabId?: number): HTMLSpanElement {
+  const chip = document.createElement("span");
+  chip.contentEditable = "false";
+  chip.dataset.mentionKind = "browsertabs";
+  chip.dataset.tabUrl = url;
+  chip.dataset.tabTitle = title;
+  if (typeof tabId === "number" && Number.isFinite(tabId)) {
+    chip.dataset.tabId = String(tabId);
+  }
+  chip.title = `${title} (${url})`;
+
+  chip.style.cssText =
+    "display:inline-flex;align-items:center;gap:4px;padding:1px 8px;border-radius:9999px;" +
+    "background:color-mix(in srgb,var(--color-bg-secondary) 80%,var(--color-bg));" +
+    "border:1px solid color-mix(in srgb,var(--color-border) 65%,transparent);" +
+    "font-size:12px;font-weight:500;color:var(--color-accent);" +
+    "margin:0 2px;user-select:none;vertical-align:baseline;line-height:1.5;";
+
+  let faviconUrl = "";
+  try {
+    const domain = new URL(url).hostname;
+    faviconUrl = `https://www.google.com/s2/favicons?sz=32&domain=${domain}`;
+  } catch {
+    // Bad URL — leave favicon empty; the chip stays readable without an icon.
+  }
+
+  if (faviconUrl) {
+    const img = document.createElement("img");
+    img.src = faviconUrl;
+    img.alt = "";
+    img.width = 13;
+    img.height = 13;
+    img.style.cssText =
+      "display:inline-block;vertical-align:middle;flex-shrink:0;border-radius:2px;";
+    img.onerror = () => {
+      img.style.display = "none";
+    };
+    chip.appendChild(img);
+  }
+
+  const label = document.createElement("span");
+  // Long titles (e.g. an Open Graph description scraped from <meta>) blow
+  // up the chat input box and the chip itself. Truncate visually while
+  // keeping the full title in dataset.tabTitle for serialization.
+  const MAX_CHIP_TITLE = 40;
+  label.textContent =
+    title.length > MAX_CHIP_TITLE ? `${title.slice(0, MAX_CHIP_TITLE).trimEnd()}…` : title;
+  label.style.cssText = "max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+  chip.appendChild(label);
+
+  const closeBtn = document.createElement("span");
+  closeBtn.dataset.chipClose = "true";
+  closeBtn.textContent = "\u00d7";
+  closeBtn.style.cssText =
+    "margin-left:2px;cursor:pointer;opacity:0.6;font-size:13px;line-height:1;color:var(--color-accent);";
+  chip.appendChild(closeBtn);
+
+  return chip;
+}
+
 /**
  * Create an agent-graph @-mention pill. Three kinds, all rendered as a single
  * non-editable inline atom. Metadata is stored on dataset attrs and consumed
@@ -1173,7 +1242,44 @@ function getPromptFromEditable(el: HTMLElement): string {
     if (node.nodeType === Node.TEXT_NODE) {
       parts.push(node.textContent || "");
     } else if (node instanceof HTMLElement) {
-      if (node.dataset.mentionKind && node.dataset.mentionKind !== "file") {
+      if (node.dataset.mentionKind === "browsertabs") {
+        const url = node.dataset.tabUrl || "";
+        const title = node.dataset.tabTitle || "";
+        const tabIdRaw = node.dataset.tabId;
+        const tabId = tabIdRaw ? Number(tabIdRaw) : undefined;
+        if (url) {
+          // Standard <grove-meta v=1> envelope:
+          // - `type` dispatches to a frontend renderer (browser_tab → pill chip)
+          // - `data` carries the machine-readable payload
+          // - `system-prompt` is the human-readable fallback used by the agent
+          //   AND by the UI when the renderer is missing / errors
+          const data: { url: string; title: string; tab_id?: number } = {
+            url,
+            title,
+          };
+          if (typeof tabId === "number" && Number.isFinite(tabId)) {
+            data.tab_id = tabId;
+          }
+          const tabIdHint =
+            typeof tabId === "number" && Number.isFinite(tabId)
+              ? ` Use this tab_id (${tabId}) with the grove_browser_* MCP tools to drive the tab.`
+              : "";
+          const envelope = {
+            v: 1,
+            type: "browser_tab",
+            data,
+            "system-prompt": `Browser tab reference: ${title || url} (${url}).${tabIdHint}`,
+          };
+          // Encode `<` / `>` as unicode escapes so a title containing
+          // `</grove-meta>` doesn't accidentally close the envelope tag
+          // (the receiver's non-greedy regex matches the first
+          // `</grove-meta>` and would feed truncated JSON to JSON.parse).
+          const safeJson = JSON.stringify(envelope)
+            .replace(/</g, "\\u003c")
+            .replace(/>/g, "\\u003e");
+          parts.push(`<grove-meta>${safeJson}</grove-meta>`);
+        }
+      } else if (node.dataset.mentionKind && node.dataset.mentionKind !== "file") {
         parts.push(expandAgentMentionChip(node));
       } else if (node.dataset.command) {
         parts.push(`/${node.dataset.command}`);
@@ -1736,16 +1842,56 @@ export function TaskChat({
 
   // States for multi-level category @-mention menu
   const [activeCategory, setActiveCategory] = useState<string | null>(null);
+  const [browserTabs, setBrowserTabs] = useState<MentionItem[]>([]);
+
+  useEffect(() => {
+    if (activeCategory !== "browsertabs") return;
+    let active = true;
+    void (async () => {
+      let tabs: Awaited<ReturnType<typeof listExtensionTabs>> = [];
+      try {
+        tabs = await listExtensionTabs();
+      } catch {
+        // Extension offline / backend unreachable — render an empty list
+        // rather than a fake fallback tab.
+      }
+      if (!active) return;
+      const items: MentionItem[] = tabs.map((tab) => ({
+        path: tab.url,
+        displayName: tab.title || tab.url,
+        category: "Browser Tab",
+        kind: "browsertabs",
+        isDir: false,
+        sessionId: tab.id?.toString(),
+        favIconUrl: tab.favIconUrl,
+      }));
+      setBrowserTabs(items);
+    })();
+    return () => {
+      active = false;
+    };
+  }, [activeCategory]);
+
+  // Shared module-level poll — single fetch per 5s shared with SettingsPage
+  // and AddLinkDialog instead of N independent intervals across open tasks.
+  const isExtensionConnected = useExtensionConnection();
+
   const [allProjects, setAllProjects] = useState<ProjectListItem[]>([]);
   const [projectFiles, setProjectFiles] = useState<{ [projId: string]: string[] }>({});
   const [loadingProjId, setLoadingProjId] = useState<string | null>(null);
 
-  const CATEGORY_SELECTORS = useMemo<MentionItem[]>(() => [
-    { path: "conversation", displayName: "Conversation", category: "category_selector", kind: "chat_history", isDir: false },
-    { path: "file", displayName: "Files", category: "category_selector", kind: "file", isDir: true },
-    { path: "agent", displayName: "Agents", category: "category_selector", kind: "agent_spawn", isDir: false },
-    { path: "project", displayName: "Projects", category: "category_selector", kind: "file", isDir: true },
-  ], []);
+  const CATEGORY_SELECTORS = useMemo<MentionItem[]>(() => {
+    const base: MentionItem[] = [
+      { path: "conversation", displayName: "Conversation", category: "category_selector", kind: "chat_history", isDir: false },
+      { path: "file", displayName: "Files", category: "category_selector", kind: "file", isDir: true },
+      { path: "agent", displayName: "Agents", category: "category_selector", kind: "agent_spawn", isDir: false },
+      { path: "project", displayName: "Projects", category: "category_selector", kind: "file", isDir: true },
+    ];
+    if (isExtensionConnected) {
+      base.push({ path: "browsertabs", displayName: "Browser Tabs", category: "category_selector", kind: "browsertabs", isDir: false });
+    }
+    return base;
+  }, [isExtensionConnected]);
 
   const [promptCaps, setPromptCaps] = useState<PromptCaps>({
     image: false,
@@ -1993,6 +2139,9 @@ export function TaskChat({
     if (activeCategory === "file") {
       return filterMentionItems(fileItems, deferredFileFilter, 20);
     }
+    if (activeCategory === "browsertabs") {
+      return filterMentionItems(browserTabs, deferredFileFilter, 20);
+    }
 
     if (activeCategory === "project") {
       const slashIdx = deferredFileFilter.indexOf("/");
@@ -2101,6 +2250,7 @@ export function TaskChat({
     allProjects,
     projectFiles,
     CATEGORY_SELECTORS,
+    browserTabs,
   ]);
 
   // ACP agent availability check is encapsulated in useACPAvailability.
@@ -4141,7 +4291,7 @@ export function TaskChat({
         reader.readAsDataURL(blob);
       } catch {
         setMessages((prev) =>
-          appendSystemMessage(prev, `不支持的图片格式（${file.name}），请转换为 JPEG 或 PNG 后重试。`),
+          appendSystemMessage(prev, `Unsupported image format (${file.name}). Please convert to JPEG or PNG and try again.`),
         );
       }
     },
@@ -4918,7 +5068,7 @@ export function TaskChat({
       const colonIdx = mentionText.indexOf(":");
       if (colonIdx >= 0) {
         const possibleCat = mentionText.slice(0, colonIdx).toLowerCase();
-        if (["conversation", "file", "agent", "project"].includes(possibleCat)) {
+        if (["conversation", "file", "agent", "project", "browsertabs"].includes(possibleCat)) {
           cat = possibleCat;
           filter = mentionText.slice(colonIdx + 1);
         }
@@ -5035,7 +5185,8 @@ export function TaskChat({
         const hasCategory = segment.startsWith("@project:") || 
                             segment.startsWith("@file:") || 
                             segment.startsWith("@agent:") || 
-                            segment.startsWith("@conversation:");
+                            segment.startsWith("@conversation:") ||
+                            segment.startsWith("@browsertabs:");
         const hasNoSpaces = !/\s/.test(segment);
         if (hasCategory || hasNoSpaces) {
           atIdx = lastAt;
@@ -5088,7 +5239,13 @@ export function TaskChat({
         (f) => f.path === filePath && (f.category ?? "") === (category ?? ""),
       );
       const chip =
-        matched && matched.kind && matched.kind !== "file"
+        matched && matched.kind === "browsertabs"
+          ? createBrowserTabChip(
+              filePath,
+              displayLabel || filePath,
+              matched.sessionId ? Number(matched.sessionId) : undefined,
+            )
+          : matched && matched.kind && matched.kind !== "file"
           ? createAgentMentionChip(matched)
           : createFileChip(filePath, isDir, displayLabel, category);
 

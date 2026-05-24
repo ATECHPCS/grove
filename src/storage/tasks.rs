@@ -326,6 +326,29 @@ pub fn persist_task_session(
     Ok(())
 }
 
+/// 根据 ACP session_id (chat_id) 反查所属 (project, task_id, task_name)。
+///
+/// 用于 grove_browser_* MCP 工具：caller agent 的 chat_id 通过 URL 路径 token
+/// 拿到后，需要查出对应 task 的 name 作为 Chrome Tab Group 的标题。
+/// 包含已归档任务（agent 在归档完成前还可能继续调用）。
+///
+/// 用单条 SQL JOIN 而不是两次查询 —— `DbGuard` 持有的是 std::sync::MutexGuard，
+/// 同线程二次 `connection()` 会在 macOS pthread 上死锁，把整个 grove 卡死。
+pub fn session_to_task(session_id: &str) -> Result<Option<(String, String, String)>> {
+    let conn = crate::storage::database::connection();
+    let row: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT s.project, s.task_id, t.name \
+             FROM session s \
+             INNER JOIN tasks t ON t.project = s.project AND t.id = s.task_id \
+             WHERE s.session_id = ?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
 /// 根据 task_id 获取活跃任务
 pub fn get_task(project: &str, task_id: &str) -> Result<Option<Task>> {
     let conn = crate::storage::database::connection();

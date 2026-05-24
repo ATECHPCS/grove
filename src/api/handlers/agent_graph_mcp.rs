@@ -41,12 +41,17 @@ use rmcp::{
 };
 use std::sync::RwLock;
 
+use rmcp::schemars;
+use rmcp::schemars::JsonSchema;
+use serde::Deserialize;
+
 use crate::agent_graph::error::AgentGraphError;
 use crate::agent_graph::tools::{
     grove_agent_capability, grove_agent_contacts, grove_agent_reply, grove_agent_send,
     grove_agent_spawn, CapabilityInput, ContactsInput, ReplyInput, SendInput, SpawnInput,
     ToolContext,
 };
+use crate::storage::config;
 
 // ─── Token map (token → caller_chat_id) ───────────────────────────────────────
 
@@ -289,8 +294,13 @@ impl ServerHandler for AgentGraphMcpService {
         _request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let mut tools = self.tool_router.list_all();
+        // Hide browser tools when the user has disabled browser control in Settings.
+        if !config::load_config().browser_control.enabled {
+            tools.retain(|t| !t.name.starts_with("grove_browser_"));
+        }
         Ok(ListToolsResult {
-            tools: self.tool_router.list_all(),
+            tools,
             meta: None,
             next_cursor: None,
         })
@@ -380,9 +390,262 @@ impl AgentGraphMcpService {
             Err(e) => Ok(tool_error(e)),
         }
     }
+
+    // ── Browser tools ────────────────────────────────────────────────────────
+    //
+    // 寻址模型：grove_browser_open 返回 tab_id；后续 snapshot/interact/extract/
+    // screenshot 必须带上该 tab_id，否则报错。group_name 不暴露给 caller —— 后端
+    // 用 caller chat_id 反查 task name 自动注入，作为 Chrome Tab Group 标题。
+    //
+    // 仅当 browser_control.enabled = true 时这些工具可见（参见 list_tools）。
+
+    /// Open a URL in the user's Chrome browser
+    #[tool(
+        name = "grove_browser_open",
+        description = "Open a URL in the user's Chrome browser and return the new tab_id. When browser_control.auto_groups is enabled, the new tab is auto-organized into a Chrome Tab Group named after the current task. Use the returned tab_id with grove_browser_snapshot / _interact / _extract / _screenshot. Requires the Chrome Companion Extension to be connected."
+    )]
+    async fn grove_browser_open_tool(
+        &self,
+        Parameters(input): Parameters<BrowserOpenInput>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let cfg = config::load_config();
+        if !cfg.browser_control.enabled {
+            return Err(McpError::invalid_request(
+                "Browser control is disabled. Enable 'Allow AI Browser Action' in Grove Settings.",
+                None,
+            ));
+        }
+        let group_name = if cfg.browser_control.auto_groups {
+            Some(caller_task_name_from_parts(&parts)?)
+        } else {
+            None
+        };
+        crate::api::handlers::extension::browser_open(&input.url, group_name.as_deref())
+            .await
+            .map_err(|e| McpError::internal_error(e, None))
+            .and_then(|mut res| {
+                if let Some(obj) = res.as_object_mut() {
+                    obj.remove("groupId");
+                }
+                json_success(&res)
+            })
+    }
+
+    /// Take an accessibility-tree snapshot of a specific browser tab
+    #[tool(
+        name = "grove_browser_snapshot",
+        description = "Snapshot a specific browser tab (identified by tab_id from grove_browser_open). Returns a simplified Accessibility Tree with interactive elements tagged @e1, @e2, … for use in grove_browser_interact."
+    )]
+    async fn grove_browser_snapshot_tool(
+        &self,
+        Parameters(input): Parameters<BrowserSnapshotInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let cfg = config::load_config();
+        if !cfg.browser_control.enabled {
+            return Err(McpError::invalid_request(
+                "Browser control is disabled. Enable 'Allow AI Browser Action' in Grove Settings.",
+                None,
+            ));
+        }
+        crate::api::handlers::extension::browser_snapshot(input.tab_id)
+            .await
+            .map_err(|e| McpError::internal_error(e, None))
+            .and_then(|res| json_success(&res))
+    }
+
+    /// Perform a DOM interaction on a specific browser tab
+    #[tool(
+        name = "grove_browser_interact",
+        description = "Perform an interactive DOM gesture on a specific browser tab (identified by tab_id from grove_browser_open). Target elements via @e1/@e2 refs from grove_browser_snapshot, or CSS selectors. Actions: click, dblclick, fill, type, focus, hover, check, uncheck, press."
+    )]
+    async fn grove_browser_interact_tool(
+        &self,
+        Parameters(input): Parameters<BrowserInteractInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let cfg = config::load_config();
+        if !cfg.browser_control.enabled {
+            return Err(McpError::invalid_request(
+                "Browser control is disabled. Enable 'Allow AI Browser Action' in Grove Settings.",
+                None,
+            ));
+        }
+        crate::api::handlers::extension::browser_interact(
+            input.tab_id,
+            &input.action,
+            &input.target,
+            input.value.as_deref(),
+        )
+        .await
+        .map_err(|e| McpError::internal_error(e, None))
+        .and_then(|res| json_success(&res))
+    }
+
+    /// Extract text or HTML content from a specific browser tab
+    #[tool(
+        name = "grove_browser_extract",
+        description = "Extract structured content from a specific browser tab (identified by tab_id from grove_browser_open). extract_type: text (innerText), html (outerHTML), value (input value), url, title. Optionally target a specific element via @e ref or CSS selector."
+    )]
+    async fn grove_browser_extract_tool(
+        &self,
+        Parameters(input): Parameters<BrowserExtractInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let cfg = config::load_config();
+        if !cfg.browser_control.enabled {
+            return Err(McpError::invalid_request(
+                "Browser control is disabled. Enable 'Allow AI Browser Action' in Grove Settings.",
+                None,
+            ));
+        }
+        crate::api::handlers::extension::browser_extract(
+            input.tab_id,
+            &input.extract_type,
+            input.target.as_deref(),
+        )
+        .await
+        .map_err(|e| McpError::internal_error(e, None))
+        .and_then(|res| json_success(&res))
+    }
+
+    /// Capture a screenshot of a specific browser tab
+    #[tool(
+        name = "grove_browser_screenshot",
+        description = "Capture a screenshot of a specific browser tab (identified by tab_id from grove_browser_open). Returns the image as an MCP `image` content (PNG) — the client renders it directly, no base64 in text."
+    )]
+    async fn grove_browser_screenshot_tool(
+        &self,
+        Parameters(input): Parameters<BrowserScreenshotInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let cfg = config::load_config();
+        if !cfg.browser_control.enabled {
+            return Err(McpError::invalid_request(
+                "Browser control is disabled. Enable 'Allow AI Browser Action' in Grove Settings.",
+                None,
+            ));
+        }
+        let res = crate::api::handlers::extension::browser_screenshot(input.tab_id)
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?;
+        // 扩展返回 { success, screenshot: "data:image/png;base64,...." } 或
+        // { success: false, error: "..." }。MCP image content 要求纯 base64 + mime
+        // type 分开，不能把 dataUrl 整段塞进 text —— 那样客户端按 token 计字数,
+        // 一张 PNG 几十万字符直接顶爆上下文窗口。
+        if res.get("success").and_then(|v| v.as_bool()) == Some(false) {
+            let err = res
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("screenshot failed")
+                .to_string();
+            return Err(McpError::internal_error(err, None));
+        }
+        let data_url = res
+            .get("screenshot")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    "extension returned no `screenshot` field".to_string(),
+                    None,
+                )
+            })?;
+        // Strip "data:<mime>;base64," prefix to get raw base64 payload.
+        // Refusing malformed data URLs avoids silently shipping a base64
+        // string that doesn't actually decode to a valid image — the client
+        // would render garbage.
+        let (mime, b64) = match data_url.split_once(",") {
+            Some((header, body)) if header.starts_with("data:") && header.contains(";base64") => {
+                // Extract just the media type (drop any `;param=...` and the
+                // `;base64` suffix). `data:;base64,...` is legal — fall
+                // back to image/png in that case rather than emitting an
+                // empty mime that confuses the MCP client.
+                let after_data = header.trim_start_matches("data:");
+                let mime = after_data
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let mime = if mime.is_empty() {
+                    "image/png".to_string()
+                } else {
+                    mime
+                };
+                (mime, body.to_string())
+            }
+            _ => {
+                return Err(McpError::internal_error(
+                    "extension returned malformed screenshot payload (expected data:<mime>;base64,<...>)"
+                        .to_string(),
+                    None,
+                ));
+            }
+        };
+        Ok(CallToolResult::success(vec![Content::image(b64, mime)]))
+    }
+}
+
+// ─── Browser tool parameter types ─────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BrowserOpenInput {
+    /// The URL to open in the user's Chrome browser
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BrowserSnapshotInput {
+    /// Chrome tab id returned by grove_browser_open
+    pub tab_id: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BrowserInteractInput {
+    /// Chrome tab id returned by grove_browser_open
+    pub tab_id: u32,
+    /// DOM action to perform: click, dblclick, fill, type, focus, hover, check, uncheck, press
+    pub action: String,
+    /// Target element — @e1/@e2 reference from grove_browser_snapshot, or a CSS selector
+    pub target: String,
+    /// Text to fill/type or key name to press (required for fill, type, press)
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BrowserExtractInput {
+    /// Chrome tab id returned by grove_browser_open
+    pub tab_id: u32,
+    /// What to extract: text (innerText), html (outerHTML), value (input value), url, title
+    pub extract_type: String,
+    /// Optional element reference (@e1) or CSS selector; omit to target the whole tab
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BrowserScreenshotInput {
+    /// Chrome tab id returned by grove_browser_open
+    pub tab_id: u32,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// 从 caller chat_id 反查 task name（用作 Chrome Tab Group 标题）。
+///
+/// 反查失败一律报错（caller_unknown / task_not_found），不静默 fallback —— 多
+/// agent 并发场景下静默 fallback 会把 tab 堆到错误的 group 里，调试代价远高于
+/// 直接报错。
+fn caller_task_name_from_parts(parts: &Parts) -> Result<String, McpError> {
+    let cx = caller_context_from_parts(parts)?;
+    let chat_id = cx.caller_chat_id.clone();
+    let lookup = crate::storage::tasks::session_to_task(&chat_id).map_err(|e| {
+        McpError::internal_error(format!("session_to_task lookup failed: {e}"), None)
+    })?;
+    let (_project, _task_id, task_name) = lookup.ok_or_else(|| {
+        McpError::invalid_request(
+            format!("caller_unknown: chat_id {chat_id} is not bound to any task"),
+            None,
+        )
+    })?;
+    Ok(task_name)
+}
 
 /// Extract caller_chat_id from the request URL path token. Returns
 /// `caller_unknown` McpError if the path doesn't match `/mcp/{token}` or the
@@ -658,7 +921,12 @@ mod tests {
         assert!(names.contains(&"grove_agent_reply".to_string()));
         assert!(names.contains(&"grove_agent_contacts".to_string()));
         assert!(names.contains(&"grove_agent_capability".to_string()));
-        assert_eq!(names.len(), 5);
+        assert!(names.contains(&"grove_browser_open".to_string()));
+        assert!(names.contains(&"grove_browser_snapshot".to_string()));
+        assert!(names.contains(&"grove_browser_interact".to_string()));
+        assert!(names.contains(&"grove_browser_extract".to_string()));
+        assert!(names.contains(&"grove_browser_screenshot".to_string()));
+        assert_eq!(names.len(), 10);
     }
 
     /// End-to-end test of the HTTP transport: real axum listener bound on a
