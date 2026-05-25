@@ -145,6 +145,31 @@ pub fn create_api_router() -> Router {
             "/extension/command",
             post(handlers::extension::handle_extension_command),
         )
+        // Companion package download (zip of grove-extension/dist)
+        .route(
+            "/extension/download",
+            get(handlers::extension::download_extension),
+        )
+        // Install companion to user-chosen directory for Chrome Load Unpacked
+        .route(
+            "/extension/install",
+            post(handlers::extension::install_extension_to_disk),
+        )
+        // Native folder picker for choosing the install location
+        .route(
+            "/extension/browse-install-folder",
+            get(handlers::extension::browse_install_folder),
+        )
+        // Reveal the install directory in OS file manager
+        .route(
+            "/extension/reveal-path",
+            post(handlers::extension::reveal_install_path),
+        )
+        // Best-effort launch of chrome://extensions/ for the install wizard
+        .route(
+            "/extension/open-chrome",
+            post(handlers::extension::open_chrome_extensions),
+        )
         // Folder selection API
         .route("/browse-folder", get(handlers::folder::browse_folder))
         // Read file API (for Plan File rendering)
@@ -681,6 +706,25 @@ pub fn create_api_router() -> Router {
             "/taskgroups/{id}/slots/{position}",
             delete(handlers::taskgroups::remove_slot),
         )
+        // Automations API
+        .route(
+            "/projects/{id}/automations",
+            get(handlers::automations::list).post(handlers::automations::create),
+        )
+        .route(
+            "/projects/{id}/automations/{aid}",
+            get(handlers::automations::get)
+                .put(handlers::automations::update)
+                .delete(handlers::automations::delete),
+        )
+        .route(
+            "/projects/{id}/automations/{aid}/trigger",
+            post(handlers::automations::trigger),
+        )
+        .route(
+            "/projects/{id}/automations/{aid}/runs",
+            get(handlers::automations::list_runs),
+        )
         // Walkie-Talkie / Radio
         .route(
             "/radio/connect-info",
@@ -989,6 +1033,25 @@ pub async fn start_server(
         }
     });
 
+    // Automation cron scheduler — fires while Grove is running. Missed runs
+    // during downtime are not back-filled; the next fire window is the next
+    // scheduled tick.
+    //
+    // Sweep any `queued` runs left over from a previous Grove process (whose
+    // ACP subscriber died with the process) into `interrupted` first, so
+    // the run-history UI doesn't display them as "still running forever".
+    let sweep_now = chrono::Utc::now().timestamp();
+    match crate::storage::automations::sweep_interrupted_runs(sweep_now) {
+        Ok(n) if n > 0 => {
+            eprintln!("[automation] swept {n} stale queued run(s) → interrupted");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("[automation] startup sweep failed: {e}");
+        }
+    }
+    crate::automation::scheduler::spawn();
+
     // Start the in-process agent_graph MCP listener (loopback-only). Failure to
     // bind is non-fatal — the rest of the server still boots; ACP sessions will
     // simply spawn without agent_graph tools available.
@@ -1005,27 +1068,6 @@ pub async fn start_server(
         Err(e) => {
             eprintln!(
                 "[agent_graph_mcp] failed to bind listener: {} — agent_graph tools disabled",
-                e
-            );
-        }
-    }
-
-    // Eager-init the Chrome companion auth token so `~/.grove/extension-token`
-    // exists from boot. Users wire this into the Chrome popup; the file must
-    // be readable at the moment they look for it.
-    match crate::api::handlers::extension::get_or_create_extension_token() {
-        Ok(_) => {
-            // Success goes on stdout alongside the other startup banners so
-            // wrappers that grep for "Grove …" / "extension auth token at" see
-            // a consistent stream.
-            println!(
-                "[extension] auth token at {}",
-                crate::api::handlers::extension::extension_token_path().display()
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "[extension] failed to bootstrap auth token: {} — Chrome companion connections will be rejected",
                 e
             );
         }

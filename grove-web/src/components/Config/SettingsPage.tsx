@@ -48,6 +48,7 @@ import {
 import { LayoutEditor, type CustomLayoutConfig, type PaneType, type LayoutNode, createDefaultLayout, countPanes } from "./LayoutEditor";
 import { CustomAgentsModal } from "./CustomAgentsModal";
 import { MarketplaceModal } from "./MarketplaceModal";
+import { InstallExtensionDialog } from "./InstallExtensionDialog";
 import {
   setCustomAgentPersonas as setCustomAgentPersonasIconRegistry,
   loadCustomAgentPersonas as loadCustomAgentPersonasIcon,
@@ -310,6 +311,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
   const [browserControlAutoGroups, setBrowserControlAutoGroups] = useState(true);
   // Shared module-level poll — single fetch per 5s for the whole app.
   const extensionConnected = useExtensionConnection();
+  const [installDialogOpen, setInstallDialogOpen] = useState(false);
 
   // Anchor the language picker to the trigger button. Wrapped in
   // useCallback so the effect can call it without doing setState
@@ -1498,16 +1500,17 @@ env_vars = [
               </div>
               <div className="flex items-center justify-between text-xs pt-2 border-t border-[var(--color-border)]">
                 <span className="text-[var(--color-text-muted)] select-none">
-                  Extension not installed? Load the compiled package in Chrome Developer Mode to enable active tab sync.
+                  {extensionConnected
+                    ? "Companion is installed and connected."
+                    : "Not installed? The bundled installer walks you through it — pick a folder and Grove handles the rest."}
                 </span>
-                <a
-                  href="https://github.com/GarrickZ2/grove/tree/main/grove-extension"
-                  target="_blank"
-                  rel="noopener noreferrer"
+                <button
+                  type="button"
+                  onClick={() => setInstallDialogOpen(true)}
                   className="flex items-center gap-1 text-[var(--color-highlight)] hover:underline"
                 >
-                  Download Package <ExternalLink className="w-3 h-3" />
-                </a>
+                  {extensionConnected ? "Reinstall" : "Install Companion"}
+                </button>
               </div>
             </div>
           </div>
@@ -2382,6 +2385,10 @@ env_vars = [
         open={showMarketplaceModal}
         onClose={() => setShowMarketplaceModal(false)}
       />
+
+      {installDialogOpen && (
+        <InstallExtensionDialog onClose={() => setInstallDialogOpen(false)} />
+      )}
     </motion.div>
   );
 }

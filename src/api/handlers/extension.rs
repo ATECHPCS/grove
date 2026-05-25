@@ -2,18 +2,19 @@
 //! Enables dynamic page sniffing, multi-port discovery, and browser tab queries.
 
 use axum::{
+    body::Body,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::Query,
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    http::{header, StatusCode},
+    response::Response,
     Json,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
-use once_cell::sync::OnceCell;
+use rust_embed::Embed;
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -22,105 +23,18 @@ use crate::api::state::{ExtensionSession, EXTENSION_SESSION};
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-// ─── Extension auth token ────────────────────────────────────────────────────
+// ─── Companion extension package (download + Chrome launcher) ────────────────
 //
-// The Chrome companion authenticates with the loopback WS endpoint using a
-// shared secret persisted under `~/.grove/extension-token`. The file is
-// created once at startup with permissions 0600 on POSIX. Users wire the
-// token into the extension via the popup's Settings field; the extension
-// then appends `?token=<token>` to the WS URL.
-//
-// This token gates which local processes can drive the user's authenticated
-// browser. It is NOT a cross-machine credential — anyone with read access to
-// the user's home directory already has it, but that's the same trust model
-// the rest of `~/.grove/` lives under.
+// In release builds rust-embed bakes the contents of `grove-extension/dist`
+// into the binary. In debug builds it reads from disk on each call, so a
+// `pnpm --filter grove-extension run build` is enough to refresh without
+// re-compiling Rust. The download endpoint zips the embedded files in-memory
+// once, then caches the bytes in a `OnceLock`.
+#[derive(Embed)]
+#[folder = "grove-extension/dist"]
+struct ExtensionAssets;
 
-static EXTENSION_TOKEN: OnceCell<String> = OnceCell::new();
-// Serializes read-or-create within a process so two concurrent
-// `get_or_create_extension_token()` callers don't generate two UUIDs and
-// race their writes. Cross-process races are mitigated by the atomic
-// tmp+rename in `write_token_file` plus re-reading after we lose to
-// another writer.
-static TOKEN_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn token_file_path() -> PathBuf {
-    crate::storage::grove_dir().join("extension-token")
-}
-
-/// Public token path used by `grove extension token` / docs to tell the user
-/// where to read the secret from.
-pub fn extension_token_path() -> PathBuf {
-    token_file_path()
-}
-
-/// Lazily generate (or load) the extension auth token. Reads from disk if
-/// present and non-empty; otherwise generates a fresh UUID-v4 and persists
-/// it with 0600 permissions on POSIX. Safe across threads and best-effort
-/// safe across concurrent grove processes (atomic write + re-read).
-pub fn get_or_create_extension_token() -> Result<String, String> {
-    if let Some(t) = EXTENSION_TOKEN.get() {
-        return Ok(t.clone());
-    }
-    let _guard = TOKEN_INIT_LOCK
-        .lock()
-        .map_err(|_| "token init lock poisoned")?;
-    // Recheck after acquiring — another thread may have populated the cell
-    // while we were waiting.
-    if let Some(t) = EXTENSION_TOKEN.get() {
-        return Ok(t.clone());
-    }
-    let path = token_file_path();
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        let trimmed = content.trim();
-        if !trimmed.is_empty() {
-            let _ = EXTENSION_TOKEN.set(trimmed.to_string());
-            return Ok(trimmed.to_string());
-        }
-    }
-    // Generate fresh and atomically write. simple() drops the hyphens for a
-    // clean 32-char hex string easier to copy/paste.
-    let token = uuid::Uuid::new_v4().simple().to_string();
-    write_token_file(&path, &token)?;
-    // Cross-process race window: another grove may have just written its
-    // own token between our read and write. Re-read after the write to
-    // pick up whichever token actually landed on disk — that keeps every
-    // process consistent with the file, even if it's not the value WE
-    // generated.
-    let final_token = match std::fs::read_to_string(&path) {
-        Ok(c) => {
-            let trimmed = c.trim();
-            if trimmed.is_empty() {
-                token
-            } else {
-                trimmed.to_string()
-            }
-        }
-        Err(_) => token,
-    };
-    let _ = EXTENSION_TOKEN.set(final_token.clone());
-    Ok(final_token)
-}
-
-fn write_token_file(path: &Path, token: &str) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("token path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
-    // Atomic write: write to a per-pid tmp file then rename. Concurrent
-    // readers never observe a half-written file (truncate-then-write
-    // would expose an empty file mid-write).
-    let tmp = parent.join(format!(".extension-token.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, token).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // chmod the tmp before rename so the file is never world-readable
-        // at any point.
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {}", path.display(), e))?;
-    Ok(())
-}
+static EXTENSION_ZIP_CACHE: OnceLock<Vec<u8>> = OnceLock::new();
 
 /// REST endpoint: GET /api/v1/extension/tabs
 /// Fetches all active browser tabs in real-time from the connected extension.
@@ -197,52 +111,12 @@ fn cleanup_request(req_id: &str) {
     }
 }
 
-/// WebSocket Upgrade handler: GET /api/v1/extension/ws?token=<token>
+/// WebSocket Upgrade handler: GET /api/v1/extension/ws
 ///
-/// The Chrome companion must include the shared token (from
-/// `~/.grove/extension-token`) as a query parameter; otherwise the upgrade
-/// is refused. This stops other local processes from impersonating the
-/// extension and driving the user's authenticated browser.
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    Query(params): Query<HashMap<String, String>>,
-) -> Response {
-    let expected = match get_or_create_extension_token() {
-        Ok(t) => t,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("extension token bootstrap failed: {e}"),
-            )
-                .into_response();
-        }
-    };
-    let provided = params.get("token").map(|s| s.as_str()).unwrap_or("");
-    // Constant-time compare to avoid timing oracles. Tokens are short (32
-    // hex chars); `eq` would still be fine in practice, but ct_eq is the
-    // standard recommendation.
-    if provided.len() != expected.len()
-        || !constant_time_eq(provided.as_bytes(), expected.as_bytes())
-    {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "invalid or missing extension token",
-        )
-            .into_response();
-    }
+/// The endpoint is loopback-only (axum binds to 127.0.0.1) — same trust
+/// model as the rest of Grove's local API.
+pub async fn ws_handler(ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(handle_ws)
-}
-
-/// Byte-by-byte equality with no early exit, for token comparison.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for i in 0..a.len() {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
 }
 
 async fn handle_ws(socket: WebSocket) {
@@ -276,14 +150,9 @@ async fn handle_ws(socket: WebSocket) {
         }
     };
     if !claimed {
-        // Politely tell the second connection it's not welcome, then send a
-        // clean Close frame so the client surfaces a normal close handshake
-        // (1008 policy-violation) instead of treating the drop as 1006.
-        let _ = ws_sender
-            .send(Message::Text(
-                "{\"type\":\"AUTH_ERROR\",\"error\":\"another extension instance is already connected\"}".into(),
-            ))
-            .await;
+        // Politely refuse the second connection with a clean Close frame so
+        // the client surfaces a normal close handshake (1008 policy-violation)
+        // instead of treating the drop as 1006.
         let _ = ws_sender
             .send(Message::Close(Some(axum::extract::ws::CloseFrame {
                 code: 1008,
@@ -311,7 +180,6 @@ async fn handle_ws(socket: WebSocket) {
                     if let Some(msg_type) = parsed.get("type").and_then(|v| v.as_str()) {
                         match msg_type {
                             "ALL_TABS_RESPONSE"
-                            | "ACTIVE_TAB_RESPONSE"
                             | "PROXY_FETCH_RESPONSE"
                             | "BROWSER_OPEN_RESPONSE"
                             | "BROWSER_SNAPSHOT_RESPONSE"
@@ -606,4 +474,416 @@ pub async fn browser_screenshot(tab_id: u32) -> Result<serde_json::Value, String
         5000,
     )
     .await
+}
+
+/// Build the companion zip in memory from the embedded `grove-extension/dist`
+/// files. Returns an error if the embed is empty (extension dist not built).
+fn build_extension_zip() -> Result<Vec<u8>, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut any = false;
+    {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for path in ExtensionAssets::iter() {
+            let file = ExtensionAssets::get(&path)
+                .ok_or_else(|| format!("missing embedded asset: {}", path))?;
+            writer
+                .start_file(path.as_ref(), options)
+                .map_err(|e| format!("zip start_file {}: {}", path, e))?;
+            writer
+                .write_all(file.data.as_ref())
+                .map_err(|e| format!("zip write {}: {}", path, e))?;
+            any = true;
+        }
+        writer.finish().map_err(|e| format!("zip finish: {}", e))?;
+    }
+    if !any {
+        return Err(
+            "extension assets are not bundled in this build (build grove-extension first)"
+                .to_string(),
+        );
+    }
+    Ok(buf)
+}
+
+/// GET /api/v1/extension/download — stream the Chrome companion zip.
+/// First call builds the zip from embedded assets; subsequent calls hit the
+/// in-memory cache.
+pub async fn download_extension() -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let bytes: Vec<u8> = if let Some(cached) = EXTENSION_ZIP_CACHE.get() {
+        cached.clone()
+    } else {
+        let built = build_extension_zip()
+            .map_err(|e| ApiError::internal(format!("extension package unavailable: {}", e)))?;
+        let _ = EXTENSION_ZIP_CACHE.set(built.clone());
+        built
+    };
+    let len = bytes.len();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/zip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"grove-companion.zip\"",
+        )
+        .header(header::CONTENT_LENGTH, len)
+        .body(Body::from(bytes))
+        .map_err(|e| ApiError::internal(format!("response build failed: {}", e)))
+}
+
+// ─── Path validation for user-chosen install location ────────────────────────
+//
+// Backend never picks a default — the install wizard requires the user to
+// choose a folder. We only accept absolute paths, and refuse a handful of
+// system locations where writing could corrupt the OS or require sudo.
+
+fn validate_install_path(p: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::path::PathBuf::from(p);
+    if !path.is_absolute() {
+        return Err(format!("path must be absolute: {}", p));
+    }
+    // Reject empty or root-ish directories. Writing to `/` or `/System` etc.
+    // is either harmless-but-noisy (Chrome won't load it) or requires sudo,
+    // which we can't escalate — surface a useful error instead.
+    let forbidden = ["/", "/System", "/usr", "/etc", "/var", "/bin", "/sbin"];
+    for f in forbidden {
+        if path.as_os_str() == std::ffi::OsStr::new(f) {
+            return Err(format!("refusing to install into system path: {}", p));
+        }
+    }
+    Ok(path)
+}
+
+/// Subdirectory name the install wizard creates inside the user-chosen
+/// parent folder. Kept stable so reinstalls + grove upgrades land in the
+/// same place, and Chrome's "Load unpacked" picker shows a recognisable
+/// folder name.
+const COMPANION_SUBDIR: &str = "grove-companion";
+
+#[derive(Debug, serde::Deserialize)]
+pub struct InstallExtensionRequest {
+    /// Absolute path to a PARENT directory the user picked via the install
+    /// wizard's folder picker. Backend creates `<path>/grove-companion/`
+    /// inside it and unpacks the embedded files there — never bare into
+    /// the parent. Wizard always supplies one; there is no backend default.
+    pub path: String,
+}
+
+/// POST /api/v1/extension/install — create `<chosen-parent>/grove-companion/`
+/// and unpack the embedded companion files into it. Returns the absolute
+/// install path (i.e. the subdirectory) so the user can point Chrome's
+/// "Load unpacked" at exactly the directory containing `manifest.json`.
+///
+/// Idempotent: subsequent calls overwrite the existing subdirectory file
+/// by file — we don't delete it first, which would race with Chrome
+/// reading the manifest. Files removed in newer versions stick around as
+/// harmless orphans (Chrome ignores unknown files).
+pub async fn install_extension_to_disk(
+    Json(req): Json<InstallExtensionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    let parent = validate_install_path(&req.path).map_err(ApiError::bad_request)?;
+    // Create the dedicated subfolder. Without this, the user's chosen folder
+    // (e.g. ~/Documents) ends up littered with manifest.json + assets/ —
+    // breaking their organisation and making cleanup hard.
+    let dir = parent.join(COMPANION_SUBDIR);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return Err(ApiError::bad_request(format!(
+            "could not create {}: {}",
+            dir.display(),
+            e
+        )));
+    }
+    let mut written = 0usize;
+    for path in ExtensionAssets::iter() {
+        let file = ExtensionAssets::get(&path)
+            .ok_or_else(|| ApiError::internal(format!("missing embedded asset: {}", path)))?;
+        let dest = dir.join(path.as_ref());
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ApiError::bad_request(format!("could not create {}: {}", parent.display(), e))
+            })?;
+        }
+        std::fs::write(&dest, file.data.as_ref()).map_err(|e| {
+            ApiError::bad_request(format!("could not write {}: {}", dest.display(), e))
+        })?;
+        written += 1;
+    }
+    if written == 0 {
+        return Err(ApiError::internal(
+            "extension assets are not bundled in this build (build grove-extension first)",
+        ));
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "path": dir.display().to_string(),
+        "files": written,
+    })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct RevealPathRequest {
+    pub path: String,
+}
+
+/// POST /api/v1/extension/reveal-path — open the install directory in the
+/// OS file manager so the user can drag-paste the path into Chrome.
+pub async fn reveal_install_path(
+    Json(req): Json<RevealPathRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    let dir = validate_install_path(&req.path).map_err(ApiError::bad_request)?;
+    if !dir.exists() {
+        return Err(ApiError::bad_request(format!(
+            "path does not exist: {}. Install the companion first.",
+            dir.display()
+        )));
+    }
+    let path_str = dir.display().to_string();
+    let spawned = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&path_str).spawn()
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer")
+            .arg(&path_str)
+            .spawn()
+    } else {
+        std::process::Command::new("xdg-open")
+            .arg(&path_str)
+            .spawn()
+    };
+    match spawned {
+        Ok(_) => Ok(Json(json!({ "ok": true, "path": path_str }))),
+        Err(e) => Err(ApiError::internal(format!(
+            "could not open file manager: {}",
+            e
+        ))),
+    }
+}
+
+/// GET /api/v1/extension/browse-install-folder — pop a native folder picker
+/// so the user can choose where the companion gets installed. Returns
+/// `{ path: <abs path> }` on selection or `{ path: null }` if cancelled.
+///
+/// Mirrors `folder::browse_folder` (osascript / zenity / kdialog) but with a
+/// companion-specific prompt — copy-pasting the helper rather than adding
+/// a prompt argument keeps the existing endpoint's signature stable.
+pub async fn browse_install_folder() -> Json<serde_json::Value> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg("POSIX path of (choose folder with prompt \"Where to install Grove Companion?\")")
+            .output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Json(json!({ "path": path }));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let zenity = std::process::Command::new("zenity")
+            .args([
+                "--file-selection",
+                "--directory",
+                "--title=Where to install Grove Companion?",
+            ])
+            .output();
+        if let Ok(output) = zenity {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Json(json!({ "path": path }));
+                }
+            }
+        }
+        let kdialog = std::process::Command::new("kdialog")
+            .args([
+                "--getexistingdirectory",
+                ".",
+                "--title",
+                "Where to install Grove Companion?",
+            ])
+            .output();
+        if let Ok(output) = kdialog {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Json(json!({ "path": path }));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // PowerShell FolderBrowserDialog. The trailing trim removes the
+        // PowerShell-injected newline / CR pair so the path matches what
+        // Chrome's file picker would see.
+        let ps = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = 'Where to install Grove Companion?'; if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }",
+            ])
+            .output();
+        if let Ok(output) = ps {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    return Json(json!({ "path": path }));
+                }
+            }
+        }
+    }
+
+    Json(json!({ "path": serde_json::Value::Null }))
+}
+
+/// POST /api/v1/extension/open-chrome — launch the user's default browser
+/// on `chrome://extensions/`. All Chromium-based browsers (Brave, Edge,
+/// Vivaldi, Arc, Opera) accept the `chrome://` URL and forward to their
+/// internal protocol, so detecting the default browser is enough — no
+/// per-browser URL lookup needed.
+pub async fn open_chrome_extensions(
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
+    let url = "chrome://extensions/";
+    let spawned = open_url_with_default_browser(url);
+    match spawned {
+        Ok(browser) => Ok(Json(json!({ "ok": true, "url": url, "browser": browser }))),
+        Err(e) => Err(ApiError::bad_request(format!(
+            "could not launch browser ({}). Copy {} into your browser's address bar instead.",
+            e, url
+        ))),
+    }
+}
+
+/// Best-effort launch of a `chrome://` URL via the user's default browser.
+/// Returns a human-readable browser identifier on success.
+fn open_url_with_default_browser(url: &str) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(bundle_id) = macos_default_browser_bundle_id() {
+            let r = std::process::Command::new("open")
+                .args(["-b", &bundle_id, url])
+                .spawn();
+            if r.is_ok() {
+                return Ok(bundle_id);
+            }
+        }
+        // Fallback: try Chrome by bundle id, then by app name, then a
+        // hard-coded Chromium family. `open` with a `chrome://` URL but
+        // no `-a` / `-b` won't dispatch to the default browser because
+        // chrome:// is not a universal scheme.
+        for (label, bundle) in [
+            ("Chrome", "com.google.Chrome"),
+            ("Brave", "com.brave.Browser"),
+            ("Edge", "com.microsoft.edgemac"),
+            ("Arc", "company.thebrowser.Browser"),
+            ("Vivaldi", "com.vivaldi.Vivaldi"),
+            ("Opera", "com.operasoftware.Opera"),
+        ] {
+            if std::process::Command::new("open")
+                .args(["-b", bundle, url])
+                .spawn()
+                .is_ok()
+            {
+                return Ok(label.to_string());
+            }
+        }
+        Err("no Chromium-based browser found".to_string())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // `xdg-settings get default-web-browser` returns a .desktop file name
+        // (e.g. `brave-browser.desktop`). Map it to an exec command via
+        // `xdg-mime` indirection if possible, otherwise just run the desktop
+        // file's binary stem.
+        if let Ok(output) = std::process::Command::new("xdg-settings")
+            .args(["get", "default-web-browser"])
+            .output()
+        {
+            if output.status.success() {
+                let desktop = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                // strip .desktop and any "browser-" prefix — gets us a
+                // sensible binary name in 90% of cases (firefox, brave-browser,
+                // google-chrome, microsoft-edge, opera, vivaldi, chromium).
+                let binary = desktop.trim_end_matches(".desktop").to_string();
+                if !binary.is_empty() {
+                    if std::process::Command::new(&binary).arg(url).spawn().is_ok() {
+                        return Ok(binary);
+                    }
+                }
+            }
+        }
+        for cmd in [
+            "google-chrome",
+            "chromium",
+            "brave-browser",
+            "microsoft-edge",
+            "vivaldi",
+            "opera",
+        ] {
+            if std::process::Command::new(cmd).arg(url).spawn().is_ok() {
+                return Ok(cmd.to_string());
+            }
+        }
+        Err("no Chromium-based browser found".to_string())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Detection on Windows is fiddly (HKCU\\...\\UserChoice + ProgId
+        // command lookup). For now, try the common Chromium browsers in
+        // turn — defaults work for ~95% of Windows users.
+        let _ = url;
+        let candidates = [
+            ("Chrome", "chrome"),
+            ("Edge", "msedge"),
+            ("Brave", "brave"),
+            ("Vivaldi", "vivaldi"),
+            ("Opera", "opera"),
+        ];
+        for (label, exe) in candidates {
+            let r = std::process::Command::new("cmd")
+                .args(["/C", "start", "", exe, url])
+                .spawn();
+            if r.is_ok() {
+                return Ok(label.to_string());
+            }
+        }
+        Err("no Chromium-based browser found".to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_default_browser_bundle_id() -> Option<String> {
+    // LaunchServices stores per-scheme handlers in
+    // `~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist`.
+    // For the default browser specifically, look for the `LSHandlerURLScheme = http`
+    // entry — its `LSHandlerRoleAll` is the bundle id of the user's default
+    // browser app. The plist is a binary-format plist, so we use the `plist`
+    // crate already in dependencies.
+    let home = dirs::home_dir()?;
+    let plist_path = home
+        .join("Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist");
+    let value: plist::Value = plist::from_file(&plist_path).ok()?;
+    let handlers = value.as_dictionary()?.get("LSHandlers")?.as_array()?;
+    for handler in handlers {
+        let dict = handler.as_dictionary()?;
+        if dict
+            .get("LSHandlerURLScheme")
+            .and_then(|v| v.as_string())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+            == Some("http")
+        {
+            if let Some(role) = dict.get("LSHandlerRoleAll").and_then(|v| v.as_string()) {
+                return Some(role.to_string());
+            }
+        }
+    }
+    None
 }

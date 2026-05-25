@@ -1,7 +1,7 @@
 // Grove Chrome Companion extension API — proxies tab queries through the
 // connected extension over the backend WebSocket bridge. Going through
 // apiClient (not raw fetch) keeps mobile-mode HMAC signing intact.
-import { apiClient } from './client';
+import { apiClient, appendHmacToUrl } from './client';
 
 /** A browser tab as reported by the Chrome companion extension. */
 export interface ExtensionTab {
@@ -36,4 +36,59 @@ export async function pingExtension(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * URL to the companion zip download endpoint, pre-signed for HMAC mobile
+ * mode. Use as `<a href={url} download>` — backend sets Content-Disposition.
+ */
+export async function getCompanionDownloadUrl(): Promise<string> {
+  return appendHmacToUrl('/api/v1/extension/download');
+}
+
+/**
+ * Ask the backend to launch Chrome on `chrome://extensions/`. Best-effort —
+ * resolves on success, rejects with the backend's user-facing message
+ * when Chrome isn't on PATH (caller should show a "copy URL" fallback).
+ */
+export async function openChromeExtensions(): Promise<{ ok: boolean; url: string }> {
+  return apiClient.post<undefined, { ok: boolean; url: string }>(
+    '/api/v1/extension/open-chrome',
+  );
+}
+
+/**
+ * Unpack the embedded companion into the user-chosen directory. The path
+ * must come from `browseInstallFolder` — backend rejects relative paths and
+ * a small set of system locations. Idempotent: subsequent calls overwrite
+ * the directory file by file.
+ */
+export async function installCompanion(
+  path: string,
+): Promise<{ ok: boolean; path: string; files: number }> {
+  return apiClient.post<{ path: string }, { ok: boolean; path: string; files: number }>(
+    '/api/v1/extension/install',
+    { path },
+  );
+}
+
+/**
+ * Open the install directory in the OS file manager (Finder / Explorer /
+ * xdg-open). Caller must supply the same path that was used for install.
+ */
+export async function revealCompanionPath(
+  path: string,
+): Promise<{ ok: boolean; path: string }> {
+  return apiClient.post<{ path: string }, { ok: boolean; path: string }>(
+    '/api/v1/extension/reveal-path',
+    { path },
+  );
+}
+
+/**
+ * Pop a native OS folder picker so the user can choose where to install
+ * the companion. Resolves with `path: null` when the user cancels.
+ */
+export async function browseInstallFolder(): Promise<{ path: string | null }> {
+  return apiClient.get<{ path: string | null }>('/api/v1/extension/browse-install-folder');
 }

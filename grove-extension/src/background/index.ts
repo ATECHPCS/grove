@@ -222,9 +222,9 @@ function extractContentInjected(
 // ==========================================
 // 🔌 Connection to Local Grove App (WebSocket)
 // ==========================================
-const PORT_RANGE_START = 3000;
+const PORT_RANGE_START = 3001;
 const PORT_RANGE_END = 3010;
-let activePort = 3000;
+let activePort = 3001;
 let groveWs: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -256,7 +256,7 @@ async function findGrovePort(): Promise<number> {
     }
   }
 
-  // 2. Scan ports in parallel (3000 to 3010)
+  // 2. Scan ports in parallel (3001 to 3010)
   console.log(`[Grove Background] Scanning ports ${PORT_RANGE_START} to ${PORT_RANGE_END}...`);
   const scanPromises: Promise<number | null>[] = [];
   for (let port = PORT_RANGE_START; port <= PORT_RANGE_END; port++) {
@@ -278,22 +278,15 @@ async function findGrovePort(): Promise<number> {
   }
 
   // Fallback to default
-  console.log(`[Grove Background] No active server found. Falling back to port 3000.`);
-  activePort = 3000;
-  return 3000;
+  console.log(`[Grove Background] No active server found. Falling back to port 3001.`);
+  activePort = 3001;
+  return 3001;
 }
 
-async function getStoredToken(): Promise<string> {
-  if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return '';
-  const data = await chrome.storage.local.get('grove_token');
-  return typeof data.grove_token === 'string' ? data.grove_token.trim() : '';
-}
-
-// In-flight guard. Without this, GROVE_TOKEN_UPDATED arriving while a
-// prior connect is still inside `await findGrovePort()` / `await
-// getStoredToken()` triggers a second connect that races the first —
-// two `groveWs = new WebSocket(...)` assignments and an orphaned
-// onclose handler scheduling a stale reconnect.
+// In-flight guard. Without this, a triggering event arriving while a
+// prior connect is still inside `await findGrovePort()` triggers a
+// second connect that races the first — two `groveWs = new WebSocket(...)`
+// assignments and an orphaned onclose handler scheduling a stale reconnect.
 let connectInFlight = false;
 
 async function connectToGrove() {
@@ -305,35 +298,19 @@ async function connectToGrove() {
   connectInFlight = true;
   try {
     const port = await findGrovePort();
-    const token = await getStoredToken();
-    if (!token) {
-      console.warn(
-        '[Grove Background] No auth token in storage — open the popup and paste the token from ~/.grove/extension-token. Skipping connect.',
-      );
-      // Retry later so the user gets a connection once they save a token
-      // (the popup also signals GROVE_TOKEN_UPDATED for an immediate
-      // reconnect).
-      reconnectTimer = setTimeout(connectToGrove, 15000);
-      return;
-    }
-    const url = `ws://localhost:${port}/api/v1/extension/ws?token=${encodeURIComponent(token)}`;
-    console.log(`[Grove Background] Connecting to ws://localhost:${port}/api/v1/extension/ws (token attached)`);
+    const url = `ws://localhost:${port}/api/v1/extension/ws`;
+    console.log(`[Grove Background] Connecting to ${url}`);
 
     const myWs = new WebSocket(url);
     groveWs = myWs;
     // All event handlers below close over `myWs` and bail out if a newer
     // connection has replaced it (`groveWs !== myWs`). Without this, a
-    // late-firing `onopen` from a closed-mid-handshake socket can clear the
-    // auth-error after the new socket already opened, or an in-flight
-    // `onerror` probe from socket A can overwrite the success of socket B.
+    // late-firing handler from a closed-mid-handshake socket can stomp on
+    // the new socket's state.
 
     myWs.onopen = () => {
       if (groveWs !== myWs) return;
       console.log(`[Grove Background] Connected to Grove Local Server on port ${port}.`);
-      // Clear any stale auth-error surface once a fresh connection lands.
-      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-        void chrome.storage.local.set({ grove_auth_error: '' });
-      }
     };
 
     myWs.onmessage = async (event) => {
@@ -356,34 +333,6 @@ async function connectToGrove() {
     myWs.onerror = (err) => {
       if (groveWs !== myWs) return;
       console.error('[Grove Background] Grove socket error:', err);
-      // The most common path here is a 401 on upgrade (wrong/missing token).
-      // Surface it to the popup so the user knows to fix the token instead of
-      // watching a silent reconnect loop. The error event itself doesn't carry
-      // a status code, so we make a best-effort `fetch(/auth/info)` probe; if
-      // the server is up, the WS error is almost certainly auth-related.
-      // The probe is scoped to THIS socket — if a newer connection replaces
-      // `groveWs` before the probe resolves, we discard the result rather than
-      // overwriting the new connection's auth-error state.
-      void (async () => {
-        try {
-          const probe = await fetch(`http://localhost:${port}/api/v1/auth/info`);
-          if (
-            groveWs === myWs &&
-            probe.ok &&
-            typeof chrome !== 'undefined' &&
-            chrome.storage &&
-            chrome.storage.local
-          ) {
-            await chrome.storage.local.set({
-              grove_auth_error:
-                'Could not authenticate with Grove. Check the token in the Auth Token field matches ~/.grove/extension-token.',
-            });
-          }
-        } catch {
-          // server down — leave grove_auth_error untouched (port discovery
-          // will report "disconnected" elsewhere).
-        }
-      })();
     };
   } finally {
     connectInFlight = false;
@@ -424,31 +373,6 @@ async function handleGroveMessage(msg: any) {
   if (!groveWs || groveWs.readyState !== WebSocket.OPEN) return;
 
   switch (msg.type) {
-    case 'AUTH_ERROR': {
-      // Backend told us why it's refusing the WS (duplicate connection,
-      // bad token, etc.). Persist so the popup can show it next to the
-      // Auth Token field — otherwise the user only sees a silent
-      // reconnect loop.
-      const errMsg = typeof msg.error === 'string' ? msg.error : 'Auth error';
-      console.warn(`[Grove Background] AUTH_ERROR from server: ${errMsg}`);
-      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-        await chrome.storage.local.set({ grove_auth_error: errMsg });
-      }
-      break;
-    }
-
-    case 'GET_ACTIVE_TAB': {
-      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        const tab = tabs[0];
-        groveWs?.send(JSON.stringify({
-          type: 'ACTIVE_TAB_RESPONSE',
-          id: msg.id,
-          data: tab ? { title: tab.title, url: tab.url } : null
-        }));
-      });
-      break;
-    }
-
     case 'GET_ALL_TABS': {
       chrome.tabs.query({}, (tabs) => {
         const tabList = tabs.map(t => ({ id: t.id, title: t.title, url: t.url, favIconUrl: t.favIconUrl }));
@@ -751,21 +675,6 @@ chrome.runtime.onMessage.addListener((message) => {
         connectToGrove();
       }
     })();
-    return;
-  }
-  if (message?.type === 'GROVE_TOKEN_UPDATED') {
-    // Popup just saved a new token. Bounce the WS so the next connect
-    // attempt picks it up from chrome.storage.local.
-    console.log('[Grove Background] Auth token updated — reconnecting.');
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
-    if (groveWs && groveWs.readyState !== WebSocket.CLOSED) {
-      groveWs.close();
-    } else {
-      connectToGrove();
-    }
     return;
   }
 });
