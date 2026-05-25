@@ -26,6 +26,72 @@ export function NewTaskDialog({ isOpen, onClose, onCreate, isLoading, externalEr
   const [isLoadingBranches, setIsLoadingBranches] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
+  const [isDragging, setIsDragging] = useState(false);
+
+  // Mirror the ACP Chat drop-handler pattern (TaskChat.tsx:5388-5403):
+  // `dragover` fires continuously while the cursor hovers the target, so we
+  // toggle `isDragging` from there. `dragenter` + counter is fragile across
+  // browsers (some browsers strip `dataTransfer.items` on enter for security
+  // reasons, so length is 0 and `isDragging` never flips true). Leave uses
+  // the `currentTarget.contains(relatedTarget)` trick to ignore enters into
+  // child nodes — otherwise hovering over the inner overlay would toggle.
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+      setIsDragging(false);
+    }
+  }, []);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+
+    const files = e.dataTransfer.files;
+    if (files && files.length > 0) {
+      const file = files[0];
+      const fileName = file.name.toLowerCase();
+      if (
+        fileName.endsWith(".md") ||
+        fileName.endsWith(".markdown") ||
+        fileName.endsWith(".txt") ||
+        file.type === "text/markdown" ||
+        file.type === "text/plain"
+      ) {
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          const content = event.target?.result;
+          if (typeof content !== "string") return;
+          setNotes(content);
+          // Auto-derive a task name from the document's first non-empty
+          // line when the user hasn't typed one yet. Strips Markdown
+          // heading markers from both ends (`# Title` and the rare
+          // closing-`#` style `# Title #`) and surrounding whitespace.
+          // We use a functional setState so we read the latest taskName
+          // even though the FileReader callback closes over stale state.
+          const firstMeaningful = content
+            .split(/\r?\n/)
+            .map((line) =>
+              line
+                .trim()
+                .replace(/^#+\s*/, "")
+                .replace(/\s*#+$/, "")
+                .trim(),
+            )
+            .find((s) => s.length > 0);
+          if (firstMeaningful) {
+            setTaskName((prev) => (prev.trim() ? prev : firstMeaningful));
+          }
+        };
+        reader.readAsText(file);
+      }
+    }
+  }, []);
+
+
   // Load branches and reset target when dialog opens (skip for Studio)
   useEffect(() => {
     if (isOpen && selectedProject && !isStudio) {
@@ -79,6 +145,7 @@ export function NewTaskDialog({ isOpen, onClose, onCreate, isLoading, externalEr
     setNotes("");
     setError("");
     setShowBranchDropdown(false);
+    setIsDragging(false);
     onClose();
   };
 
@@ -152,16 +219,62 @@ export function NewTaskDialog({ isOpen, onClose, onCreate, isLoading, externalEr
                       <span className="text-xs font-normal">(optional)</span>
                     </div>
                   </label>
-                  <textarea
-                    value={notes}
-                    onChange={(e) => setNotes(e.target.value)}
-                    placeholder="Describe the task, requirements, or any relevant context..."
-                    rows={4}
-                    className="w-full px-3 py-2 bg-[var(--color-bg)] border border-[var(--color-border)] rounded-lg
-                      text-sm text-[var(--color-text)] placeholder:text-[var(--color-text-muted)] resize-none
-                      focus:outline-none focus:border-[var(--color-highlight)] focus:ring-1 focus:ring-[var(--color-highlight)]
-                      transition-all duration-200"
-                  />
+                  {/* Drop zone container. Styling mirrors TaskChat's chatbox
+                      drop-active treatment (TaskView/task-chat.css) — a
+                      subtle ring on the container plus an absolutely-
+                      positioned overlay with an animated dashed border and
+                      a pop-in inner pill. The overlay uses
+                      `pointer-events-none` so the textarea below it still
+                      receives the eventual `drop`. */}
+                  <div
+                    className={`relative rounded-lg transition-shadow duration-150 ${
+                      isDragging
+                        ? "shadow-[0_0_0_1px_var(--color-highlight),0_0_0_6px_color-mix(in_srgb,var(--color-highlight)_14%,transparent)]"
+                        : ""
+                    }`}
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                  >
+                    <textarea
+                      value={notes}
+                      onChange={(e) => setNotes(e.target.value)}
+                      placeholder="Describe the task, requirements, or any relevant context...  (or drop a .md / .txt file)"
+                      rows={4}
+                      className={`w-full px-3 py-2 bg-[var(--color-bg)] border rounded-lg
+                        text-sm text-[var(--color-text)] placeholder:text-[var(--color-text-muted)] resize-none
+                        focus:outline-none focus:ring-1 transition-colors duration-200
+                        ${
+                          isDragging
+                            ? "border-[var(--color-highlight)] ring-1 ring-[var(--color-highlight)]"
+                            : "border-[var(--color-border)] focus:border-[var(--color-highlight)] focus:ring-[var(--color-highlight)]"
+                        }`}
+                    />
+                    {isDragging && (
+                      <div
+                        aria-hidden
+                        className="absolute inset-0 rounded-lg pointer-events-none flex items-center justify-center
+                                   bg-[color-mix(in_srgb,var(--color-highlight)_8%,transparent)]
+                                   backdrop-blur-[2px]"
+                        style={{ animation: "dropFadeIn 120ms ease-out" }}
+                      >
+                        {/* Dashed ring inset slightly so it sits cleanly
+                            inside the textarea's own border. */}
+                        <div className="absolute inset-[3px] rounded-md border-[1.5px] border-dashed
+                                        border-[color-mix(in_srgb,var(--color-highlight)_75%,transparent)]" />
+                        <div
+                          className="relative inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full
+                                     bg-[color-mix(in_srgb,var(--color-bg)_92%,transparent)]
+                                     text-[var(--color-highlight)] text-xs font-semibold
+                                     shadow-[0_8px_24px_rgba(0,0,0,0.18),0_0_0_1px_color-mix(in_srgb,var(--color-highlight)_35%,transparent)]"
+                          style={{ animation: "dropPop 180ms cubic-bezier(0.2, 0.9, 0.3, 1.2)" }}
+                        >
+                          <FileText className="w-3.5 h-3.5" />
+                          <span>Drop a Markdown file to fill notes</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
 
                 {/* Target Branch (selectable) — hidden for Studio */}

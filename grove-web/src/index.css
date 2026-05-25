@@ -190,6 +190,20 @@ body {
   }
 }
 
+/* File-drop overlay animations — used by NewTaskDialog (and any future
+   drop zone that wants the same feedback as TaskChat's chatbox overlay).
+   Identical curves to task-chat.css's chatbox-drop-* keyframes so the
+   feel matches across surfaces. */
+@keyframes dropFadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes dropPop {
+  0%   { transform: translateY(4px) scale(0.96); opacity: 0; }
+  100% { transform: translateY(0)   scale(1);    opacity: 1; }
+}
+
 /* Blitz loading shimmer sweep */
 @keyframes shimmer {
   0% {
