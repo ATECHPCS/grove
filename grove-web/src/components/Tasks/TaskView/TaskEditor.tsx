@@ -1,7 +1,27 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import Editor, { type Monaco } from "@monaco-editor/react";
-import { X, FileCode, Loader2, Save, Maximize2, Minimize2, PanelLeftOpen, PanelLeftClose, RefreshCw, AlertCircle } from "lucide-react";
-import { Button, getPreviewType } from "../../ui";
+import { X, FileCode, Eye, Columns2, Loader2, Save, Maximize2, Minimize2, PanelLeftOpen, PanelLeftClose, RefreshCw, AlertCircle } from "lucide-react";
+import { Button, getPreviewType, ImageLightbox } from "../../ui";
+import { getPreviewRenderer } from "../../Review/previewRenderers";
+
+function rewriteHtmlUrls(html: string, projectId: string, taskId: string, parentDir: string): string {
+  const apiBase = `/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=`;
+  return html.replace(
+    /(src|href)\s*=\s*(['"])([^'"]+)\2/gi,
+    (match, attr, quote, url) => {
+      const trimmedUrl = url.trim();
+      if (
+        /^(https?:\/\/|\/\/|data:|blob:|mailto:|tel:|#)/i.test(trimmedUrl) ||
+        trimmedUrl.startsWith('/')
+      ) {
+        return match;
+      }
+      const resolvedPath = parentDir + trimmedUrl;
+      const rewrittenUrl = apiBase + encodeURIComponent(resolvedPath);
+      return `${attr}=${quote}${rewrittenUrl}${quote}`;
+    }
+  );
+}
 import { FileTree } from "./FileTree";
 import type { FileTreeNode } from "../../../utils/fileTree";
 import { useIsMobile } from "../../../hooks";
@@ -75,6 +95,8 @@ function getLanguage(filePath: string): string {
     svg: 'xml',
     kdl: 'plaintext',
     lock: 'plaintext',
+    mmd: 'mermaid',
+    mermaid: 'mermaid',
   };
   // Handle special filenames
   const name = filePath.split('/').pop()?.toLowerCase() || '';
@@ -377,6 +399,53 @@ function dirEntriesToNodes(entries: { path: string; is_dir: boolean }[]): FileTr
     });
 }
 
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const registerMermaidLanguage = (monaco: any) => {
+  if (!monaco) return;
+  if (monaco.languages.getLanguages().some((lang: any) => lang.id === 'mermaid')) {
+    return;
+  }
+
+  monaco.languages.register({ id: 'mermaid' });
+
+  monaco.languages.setMonarchTokensProvider('mermaid', {
+    keywords: [
+      'graph', 'flowchart', 'sequenceDiagram', 'gantt', 'classDiagram',
+      'stateDiagram', 'stateDiagram-v2', 'erDiagram', 'pie', 'journey',
+      'gitGraph', 'subgraph', 'end', 'direction', 'style', 'classDef',
+      'class', 'click', 'linkStyle', 'callback'
+    ],
+    arrows: [
+      '-->', '---', '-.->', '==>', '-->|', '-.->|', '==>|',
+      '<-.-', '<--', '<==', '<-->', '<==>', '<--|', '==|', '--|'
+    ],
+    tokenizer: {
+      root: [
+        // Comments
+        [/%%.*$/, 'comment'],
+        
+        // Strings
+        [/"[^"]*"/, 'string'],
+        
+        // Keywords
+        [/[a-zA-Z-v2]+/, {
+          cases: {
+            '@keywords': 'keyword',
+            '@default': 'identifier'
+          }
+        }],
+
+        // Arrows / connectors
+        [/(-{2,}>|\.-{2,}>|={2,}>|-{2,}|<-{2,}|<={2,})/, 'tag'],
+
+        // Labels / shapes
+        [/[{}()[\]]+/, 'delimiter'],
+      ]
+    }
+  });
+};
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
 export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onToggleFullscreen, hideHeader = false }: TaskEditorProps) {
   const { isMobile } = useIsMobile();
   const { theme } = useTheme();
@@ -421,6 +490,10 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
   const [refreshing, setRefreshing] = useState(false);
   const [modified, setModified] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<'code' | 'preview' | 'split'>('code');
+  const [contentVersion, setContentVersion] = useState(0);
+  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
+  const [lightboxSvg, setLightboxSvg] = useState<string | null>(null);
   const editorContentRef = useRef<string>('');
 
   // Symbol jump (cmd+click navigation):
@@ -499,6 +572,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
     setLoading(true);
     setModified(false);
     setError(null);
+    setViewMode('code');
 
     // On mobile, close file tree after selecting
     if (isMobile) setFileTreeVisible(false);
@@ -554,8 +628,18 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
     if (value !== undefined) {
       editorContentRef.current = value;
       setModified(true);
+      setContentVersion(v => v + 1);
     }
   }, []);
+
+  // Debounce preview content updates in Split View
+  useEffect(() => {
+    if (viewMode !== 'split') return;
+    const t = setTimeout(() => {
+      setFileContent(editorContentRef.current);
+    }, 300);
+    return () => clearTimeout(t);
+  }, [contentVersion, viewMode]);
 
   // Save file
   const handleSave = useCallback(async () => {
@@ -673,6 +757,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
     setLoading(true);
     setModified(false);
     setError(null);
+    setViewMode('code');
     try {
       const res = await getFileContent(projectId, taskId, path);
       setFileContent(res.content);
@@ -728,6 +813,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
       setLoading(true);
       setModified(false);
       setError(null);
+      setViewMode('code');
       
       const res = await getFileContent(projectId, taskId, fullPath);
       setFileContent(res.content);
@@ -802,6 +888,14 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
 
   // Breadcrumb from file path
   const breadcrumb = selectedFile ? selectedFile.split('/') : [];
+
+  const renderer = selectedFile ? getPreviewRenderer(selectedFile) : undefined;
+  const isPreviewable = renderer && renderer.id !== 'source' && renderer.id !== 'image';
+
+  // Calculate relative base path for HTML preview
+  const parentDirPath = selectedFile && selectedFile.includes('/')
+    ? selectedFile.substring(0, selectedFile.lastIndexOf('/')) + '/'
+    : '';
 
   return (
     <div className={`h-full min-h-0 flex-1 flex flex-col bg-[var(--color-bg-secondary)] overflow-hidden ${fullscreen ? '' : 'rounded-lg border border-[var(--color-border)]'}`}>
@@ -905,7 +999,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
             }}
           >
             {/* Collapse button inside sidebar header */}
-            <div className="flex items-center justify-between px-2 py-1.5 border-b border-[var(--color-border)]">
+            <div className="flex items-center justify-between px-2 h-[38px] bg-[var(--color-bg)] border-b border-[var(--color-border)] select-none">
               <span className="text-xs font-medium text-[var(--color-text-muted)] uppercase tracking-wider pl-1">Files</span>
               <div className="flex items-center gap-0.5">
                 <button
@@ -943,6 +1037,43 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
 
         {/* Editor area */}
         <div className="flex-1 flex flex-col min-w-0">
+          {selectedFile && isPreviewable && (
+            <div className="flex items-center justify-between px-4 h-[38px] bg-[var(--color-bg)] border-b border-[var(--color-border)] text-xs flex-shrink-0 select-none">
+              <span className="text-[var(--color-text-muted)] font-medium">
+                {renderer?.label}
+              </span>
+              <div className="flex items-center gap-1 bg-[var(--color-bg-secondary)] border border-[var(--color-border)] p-0.5 rounded-md">
+                <button
+                  onClick={() => setViewMode('code')}
+                  className={`px-2 py-1 rounded transition-colors flex items-center gap-1 font-medium cursor-pointer ${viewMode === 'code' ? 'bg-[var(--color-bg)] text-[var(--color-text)] shadow-sm' : 'text-[var(--color-text-muted)] hover:text-[var(--color-text)]'}`}
+                >
+                  <FileCode className="w-3.5 h-3.5" />
+                  Code
+                </button>
+                <button
+                  onClick={() => {
+                    setFileContent(editorContentRef.current);
+                    setViewMode('split');
+                  }}
+                  className={`px-2 py-1 rounded transition-colors flex items-center gap-1 font-medium cursor-pointer ${viewMode === 'split' ? 'bg-[var(--color-bg)] text-[var(--color-text)] shadow-sm' : 'text-[var(--color-text-muted)] hover:text-[var(--color-text)]'}`}
+                >
+                  <Columns2 className="w-3.5 h-3.5" />
+                  Split
+                </button>
+                <button
+                  onClick={() => {
+                    setFileContent(editorContentRef.current);
+                    setViewMode('preview');
+                  }}
+                  className={`px-2 py-1 rounded transition-colors flex items-center gap-1 font-medium cursor-pointer ${viewMode === 'preview' ? 'bg-[var(--color-bg)] text-[var(--color-text)] shadow-sm' : 'text-[var(--color-text-muted)] hover:text-[var(--color-text)]'}`}
+                >
+                  <Eye className="w-3.5 h-3.5" />
+                  Preview
+                </button>
+              </div>
+            </div>
+          )}
+
           {loading ? (
             <div className="flex-1 flex items-center justify-center">
               <Loader2 className="w-8 h-8 text-[var(--color-text-muted)] animate-spin" />
@@ -976,7 +1107,8 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
                     <img
                       src={`/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(selectedFile)}`}
                       alt={selectedFile}
-                      className="max-w-full max-h-[70vh] object-contain block"
+                      className="max-w-full max-h-[70vh] object-contain block cursor-pointer hover:opacity-90 transition-opacity"
+                      onClick={() => setLightboxUrl(`/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(selectedFile)}`)}
                       onError={(e) => {
                         (e.target as HTMLImageElement).style.display = 'none';
                         (e.target as HTMLImageElement).nextElementSibling?.classList.remove('hidden');
@@ -997,6 +1129,83 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
                   </div>
                 </div>
               </div>
+            ) : viewMode === 'preview' && isPreviewable ? (
+              <div className="flex-1 overflow-auto bg-[var(--color-bg)] p-6">
+                {renderer?.renderFull({
+                  content: renderer.contentType === 'url'
+                    ? `/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(selectedFile)}`
+                    : (renderer.id === 'html' ? rewriteHtmlUrls(fileContent, projectId, taskId, parentDirPath) : fileContent),
+                  fileName: selectedFile,
+                  sketchContext: { projectId, taskId },
+                  onImageClick: (url) => setLightboxUrl(url),
+                  onSvgClick: (svg) => setLightboxSvg(svg),
+                })}
+              </div>
+            ) : viewMode === 'split' && isPreviewable ? (
+              <div className="flex-1 flex min-h-0 min-w-0 divide-x divide-[var(--color-border)] overflow-hidden">
+                <div className="flex-1 min-w-0 h-full">
+                  <Editor
+                    height="100%"
+                    language={getLanguage(selectedFile)}
+                    value={fileContent}
+                    onChange={handleEditorChange}
+                    onMount={(editor, monaco) => {
+                      editorRef.current = editor;
+                      setMonacoInstance(monaco);
+                      registerMermaidLanguage(monaco);
+                      const sessionId = editor.getId?.() as string | undefined;
+                      if (sessionId) {
+                        editorRegistry.set(sessionId, {
+                          projectId,
+                          taskId,
+                          monaco,
+                          selectedFileRef,
+                          pendingJumpRef,
+                          handleSelectFileRef,
+                          editor,
+                        });
+                        editor.onDidDispose?.(() => {
+                          editorRegistry.delete(sessionId);
+                        });
+                      }
+                      const underlineDisposables = attachUnderlineListeners(editor, monaco);
+                      editor.onDidDispose?.(() => {
+                        for (const d of underlineDisposables) {
+                          try {
+                            d.dispose();
+                          } catch {
+                            // Already disposed internally
+                          }
+                        }
+                      });
+                      void ensureDefinitionProvidersRegistered(monaco);
+                      void ensureGlobalEditorServiceHook(editor);
+                    }}
+                    theme="grove-theme"
+                    options={{
+                      minimap: { enabled: false },
+                      fontSize: 13,
+                      lineNumbers: 'on',
+                      scrollBeyondLastLine: false,
+                      wordWrap: 'on',
+                      automaticLayout: true,
+                      padding: { top: 8 },
+                      renderWhitespace: 'selection',
+                    }}
+                  />
+                </div>
+                <div className="flex-1 min-w-0 h-full overflow-auto bg-[var(--color-bg)] p-6">
+                  {renderer?.renderFull({
+                    content: renderer.contentType === 'url'
+                      ? `/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(selectedFile)}`
+                      : (renderer.id === 'html' ? rewriteHtmlUrls(fileContent, projectId, taskId, parentDirPath) : fileContent),
+                    fileName: selectedFile,
+                    sketchContext: { projectId, taskId },
+                    onImageClick: (url) => setLightboxUrl(url),
+                    onSvgClick: (svg) => setLightboxSvg(svg),
+                  })}
+                </div>
+              </div>
             ) : (
               <Editor
                 height="100%"
@@ -1006,6 +1215,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
                 onMount={(editor, monaco) => {
                   editorRef.current = editor;
                   setMonacoInstance(monaco);
+                  registerMermaidLanguage(monaco);
                   const sessionId = editor.getId?.() as string | undefined;
                   if (sessionId) {
                     editorRegistry.set(sessionId, {
@@ -1088,6 +1298,17 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
           setDeleteTarget(null);
         }}
       />
+
+      {(lightboxUrl || lightboxSvg) && (
+        <ImageLightbox
+          imageUrl={lightboxUrl}
+          svgContent={lightboxSvg}
+          onClose={() => {
+            setLightboxUrl(null);
+            setLightboxSvg(null);
+          }}
+        />
+      )}
     </div>
   );
 }
