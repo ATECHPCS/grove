@@ -1004,15 +1004,19 @@ struct ReplyReviewResult {
 // ============================================================================
 
 /// Normalize raw agent name from session.json to a display-friendly name.
-/// Matches on whitespace/hyphen/underscore-separated tokens so e.g. "openai-proxy"
-/// won't be mis-tagged as "Codex" via a naive substring match.
+/// Matches on whitespace/hyphen/underscore/slash-separated tokens so e.g.
+/// "openai-proxy" or "@agentclientprotocol/claude-agent-acp" resolve correctly.
 fn normalize_agent_name(raw: &str) -> String {
     let lower = raw.to_lowercase();
-    let has_token = |needle: &str| {
-        lower
-            .split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '.')
-            .any(|tok| tok == needle)
-    };
+    let tokens: Vec<&str> = lower
+        .split(|c: char| {
+            c.is_whitespace() || c == '-' || c == '_' || c == '.' || c == '/' || c == '@'
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let has_token = |needle: &str| tokens.contains(&needle);
+
     if has_token("claude") {
         return "Claude Code".to_string();
     }
@@ -4062,11 +4066,7 @@ mod tests {
         assert_tool_rejected(&resp_7);
 
         let resp_8 = client
-            .call_tool(
-                8,
-                "start_chat",
-                json!({"project_id": "x", "task_id": "y"}),
-            )
+            .call_tool(8, "start_chat", json!({"project_id": "x", "task_id": "y"}))
             .await;
         assert_tool_rejected(&resp_8);
 
@@ -4089,11 +4089,7 @@ mod tests {
         assert_tool_rejected(&resp_10);
 
         let resp_11 = client
-            .call_tool(
-                11,
-                "list_chats",
-                json!({"project_id": "x", "task_id": "y"}),
-            )
+            .call_tool(11, "list_chats", json!({"project_id": "x", "task_id": "y"}))
             .await;
         assert_tool_rejected(&resp_11);
 

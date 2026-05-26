@@ -71,14 +71,14 @@ const AGENT_TABLE: AgentRow[] = [
     label: "Claude Code",
     staticFile: "claude-color.svg",
     Component: Claude.Color,
-    aliases: ["claude-code", "claude-color", "claude code"],
+    aliases: ["claude-code", "claude-color", "claude code", "claude-agent-acp", "claude-code-acp", "@agentclientprotocol/claude-agent-acp"],
   },
   {
     key: "codex",
     label: "CodeX",
     staticFile: "openai.svg",
     Component: OpenAI,
-    aliases: ["openai"],
+    aliases: ["openai", "codex-acp", "@zed-industries/codex-acp"],
   },
   {
     key: "gemini",
@@ -106,6 +106,7 @@ const AGENT_TABLE: AgentRow[] = [
     label: "Hermes",
     staticFile: "hermes.svg",
     Component: Hermes,
+    aliases: ["hermes acp"],
   },
   {
     key: "junie",
@@ -126,14 +127,14 @@ const AGENT_TABLE: AgentRow[] = [
     label: "Kiro",
     staticFile: "kiro.svg",
     Component: Kiro,
-    aliases: ["kiro-cli"],
+    aliases: ["kiro-cli", "kiro-cli acp"],
   },
   {
     key: "openclaw",
     label: "OpenClaw",
     staticFile: "openclaw-color.svg",
     Component: OpenClaw.Color,
-    aliases: ["openclaw-color"],
+    aliases: ["openclaw-color", "openclaw acp"],
   },
   {
     key: "opencode",
