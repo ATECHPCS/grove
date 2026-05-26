@@ -1096,7 +1096,9 @@ pub async fn grove_agent_set_title(
 
     let trimmed_title = input.title.trim();
     if trimmed_title.is_empty() {
-        return Err(AgentGraphError::Internal("title cannot be empty".to_string()));
+        return Err(AgentGraphError::Internal(
+            "title cannot be empty".to_string(),
+        ));
     }
 
     tasks::update_chat_title(&project_key, &task_id, &caller_chat.id, trimmed_title)

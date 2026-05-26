@@ -92,24 +92,28 @@ export function NewTaskDialog({ isOpen, onClose, onCreate, isLoading, externalEr
   }, []);
 
 
-  // Load branches and reset target when dialog opens (skip for Studio)
+  // Load branches when dialog opens.
+  // Form state (taskName / notes / error / dropdown / dragging) is reset by
+  // the parent's `key={isOpen ? "open" : "closed"}` remount — useState
+  // defaults take over, so no manual reset here. That also keeps the user's
+  // in-progress input safe when `selectedProject` changes mid-dialog.
   useEffect(() => {
-    if (isOpen && selectedProject && !isStudio) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setTargetBranch(selectedProject.currentBranch || "main");
-
-      setIsLoadingBranches(true);
-      getBranches(selectedProject.id, "local")
-        .then((res) => {
-          setBranches(res.branches.map((b) => b.name));
-        })
-        .catch(() => {
-          setBranches([]);
-        })
-        .finally(() => {
-          setIsLoadingBranches(false);
-        });
-    }
+    if (!isOpen || !selectedProject || isStudio) return;
+    /* eslint-disable react-hooks/set-state-in-effect --
+     * setting branch and async-loading branch list on open. */
+    setTargetBranch(selectedProject.currentBranch || "main");
+    setIsLoadingBranches(true);
+    getBranches(selectedProject.id, "local")
+      .then((res) => {
+        setBranches(res.branches.map((b) => b.name));
+      })
+      .catch(() => {
+        setBranches([]);
+      })
+      .finally(() => {
+        setIsLoadingBranches(false);
+      });
+    /* eslint-enable react-hooks/set-state-in-effect */
   }, [isOpen, selectedProject, isStudio]);
 
   // Click outside to close dropdown
