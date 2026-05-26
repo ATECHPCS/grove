@@ -51,6 +51,7 @@ import {
   Bookmark,
   Search,
   User,
+  ListChecks,
 } from "lucide-react";
 import { iconUrlForFile } from "../../ui/iconUrl";
 import {
@@ -73,6 +74,8 @@ import {
   parseGroveMetaSegments,
 } from "../../../utils/groveMeta";
 import { renderGroveMetaEnvelope } from "./groveMetaRenderers";
+import { FormPill } from "./FormPill";
+import type { AskFormDefinition } from "./formPillTypes";
 import {
   agentIconComponent,
   agentIconUrl,
@@ -308,6 +311,22 @@ interface TurnUsageData {
   cachedReadTokens?: number;
 }
 
+type AskFormMessage = {
+  /** Special-case rendering of the `ask_form` MCP tool call: instead of a
+   *  collapsed tool card we show an interactive form (FormPill). The agent
+   *  hits `ask_form` → ACP transports the tool_call event to chat → here we
+   *  detect it and create this message variant; the user fills it and we send
+   *  the markdown answers back through the regular user-prompt channel. */
+  type: "ask_form";
+  /** ACP tool_call id. Stable across tool_call_update events. */
+  id: string;
+  /** Direct passthrough of `tool_call.raw_input`. */
+  definition: AskFormDefinition;
+  /** Set to true locally once the user submits / skips / cancels — the next
+   *  render returns null so the pill disappears. */
+  resolved?: boolean;
+};
+
 type ChatMessage =
   | {
       type: "user";
@@ -332,6 +351,7 @@ type ChatMessage =
     }
   | { type: "thinking"; content: string; collapsed: boolean; complete: boolean }
   | ToolMessage
+  | AskFormMessage
   | { type: "system"; content: string }
   | PermissionMessage
   | { type: "terminal_output"; chunks: string[]; exitCode?: number | null }
@@ -530,6 +550,14 @@ function extractRenderItemText(item: RenderItem): string {
         return m.content;
       case "tool":
         return [m.title, m.content ?? ""].filter(Boolean).join("\n");
+      case "ask_form":
+        return [
+          m.definition.title,
+          m.definition.description ?? "",
+          ...m.definition.questions.map((q) => q.title),
+        ]
+          .filter(Boolean)
+          .join("\n");
       case "permission":
         return m.description;
       case "terminal_output":
@@ -561,6 +589,8 @@ function getAutoScrollTailSignature(messages: ChatMessage[]): string {
           return `thinking:${message.complete ? 1 : 0}:${message.content.length}`;
         case "tool":
           return `tool:${message.id}:${message.status}:${(message.content ?? "").length}`;
+        case "ask_form":
+          return `ask_form:${message.id}:${message.resolved ? 1 : 0}`;
         case "system":
           return `system:${message.content.length}`;
         case "permission":
@@ -971,6 +1001,7 @@ function createFileChip(
   isDir = false,
   displayLabel?: string,
   category?: string,
+  favIconUrl?: string,
 ): HTMLSpanElement {
   const chip = document.createElement("span");
   chip.contentEditable = "false";
@@ -998,25 +1029,36 @@ function createFileChip(
     : iconUrlForFile(baseName, { isFolder: isDir });
 
   const img = document.createElement("img");
-  img.src = iconUrl;
+  img.src = favIconUrl || iconUrl;
   img.alt = "";
   img.width = 13;
   img.height = 13;
   img.style.cssText =
     "display:inline-block;vertical-align:middle;flex-shrink:0;";
-  // Hide the broken-image glyph if the CDN is blocked / offline.
-  // The chip's text label is still meaningful without the icon.
-  img.onerror = () => {
-    img.style.display = "none";
-  };
+  if (favIconUrl) {
+    img.style.borderRadius = "2px";
+    img.style.objectFit = "contain";
+    img.onerror = () => {
+      img.src = iconUrl;
+      img.onerror = () => {
+        img.style.display = "none";
+      };
+      img.style.borderRadius = "0";
+    };
+  } else {
+    // Hide the broken-image glyph if the CDN is blocked / offline.
+    // The chip's text label is still meaningful without the icon.
+    img.onerror = () => {
+      img.style.display = "none";
+    };
+  }
   chip.appendChild(img);
 
   const label = document.createElement("span");
-  if (displayLabel) {
-    label.textContent = displayLabel;
-  } else {
-    label.textContent = isDir ? filePath : filePath.split("/").pop() || filePath;
-  }
+  const text = displayLabel || (isDir ? filePath : filePath.split("/").pop() || filePath);
+  const MAX_CHIP_TITLE = 40;
+  label.textContent = text.length > MAX_CHIP_TITLE ? `${text.slice(0, MAX_CHIP_TITLE).trimEnd()}…` : text;
+  label.style.cssText = "max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
   chip.appendChild(label);
 
   const closeBtn = document.createElement("span");
@@ -1447,6 +1489,27 @@ function reduceHistoryMessages(
           options: msg.options ?? [],
         },
       ];
+    case "ask_form": {
+      // grove_ask_form MCP tool pushes this directly via AcpUpdate::AskForm.
+      // Idempotent on form_id: duplicate broadcasts (e.g. reconnect replay
+      // before the history-persistence exclusion takes effect) merge in
+      // place instead of stacking pills.
+      const formId = typeof msg.form_id === "string" ? msg.form_id : "";
+      // Empty form_id can't dedup correctly — the first empty-id form would
+      // block every subsequent form. Drop malformed payloads outright.
+      if (!formId) return messages;
+      if (messages.some((m) => m.type === "ask_form" && m.id === formId)) {
+        return messages;
+      }
+      return [
+        ...messages,
+        {
+          type: "ask_form",
+          id: formId,
+          definition: msg.definition as AskFormDefinition,
+        },
+      ];
+    }
     case "permission_response":
       return resolveLatestPendingPermission(
         messages,
@@ -1711,6 +1774,7 @@ export function TaskChat({
   const [planFileContent, setPlanFileContent] = useState("");
   const [showPlanFile, setShowPlanFile] = useState(false);
   const [showPermissionPanel, setShowPermissionPanel] = useState(false);
+  const [showFormPanel, setShowFormPanel] = useState(false);
   const [showAuthPanel, setShowAuthPanel] = useState(false);
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [showSlashMenu, setShowSlashMenu] = useState(false);
@@ -1792,6 +1856,7 @@ export function TaskChat({
   const slashMenuRef = useRef<HTMLDivElement>(null);
   const slashItemRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const [taskFiles, setTaskFiles] = useState<string[]>([]);
+  const [taskFilesMeta, setTaskFilesMeta] = useState<import("../../../api/tasks").FileMetadata[]>([]);
   const [sketchMeta, setSketchMeta] = useState<SketchMeta[]>([]);
   const taskFilesFetchTimeRef = useRef(0);
   const taskFilesLoadingRef = useRef(false);
@@ -1977,6 +2042,16 @@ export function TaskChat({
         ) ?? null,
     [messages],
   );
+  /** Latest unresolved ask_form message. Drives the composer panel + pill. */
+  type AskFormMsg = Extract<ChatMessage, { type: "ask_form" }>;
+  const activeFormMessage = useMemo(
+    () =>
+      [...messages]
+        .reverse()
+        .find((m): m is AskFormMsg => m.type === "ask_form" && !m.resolved) ??
+      null,
+    [messages],
+  );
   /** 最近一条仍在生效的 auth_required(succeeded 视为已结束,自动让位)。
    *  composer panel 据此渲染登录卡片,与 PermissionRequest 共用同一套 panel
    *  机制 — 优先级最高,因为没登录前其它操作都不能进行。 */
@@ -2009,15 +2084,17 @@ export function TaskChat({
       ? "auth"
       : showPermissionPanel && activePermissionMessage
         ? "permission"
-        : showPlan && hasTodoPanel
-          ? "todo"
-          : showPlanFile && hasPlanPanel
-            ? "plan"
-            : showPendingQueue && hasPendingPanel
-              ? "pending"
-              : showPreviewComments && hasPreviewCommentsPanel
-                ? "previewComments"
-                : null;
+        : showFormPanel && activeFormMessage
+          ? "ask_form"
+          : showPlan && hasTodoPanel
+            ? "todo"
+            : showPlanFile && hasPlanPanel
+              ? "plan"
+              : showPendingQueue && hasPendingPanel
+                ? "pending"
+                : showPreviewComments && hasPreviewCommentsPanel
+                  ? "previewComments"
+                  : null;
   const composerPanelOpen = activeComposerPanel !== null;
 
   // When a permission message appears, force the permission panel open and
@@ -2037,6 +2114,22 @@ export function TaskChat({
       setShowPreviewComments(false);
     } else {
       setShowPermissionPanel(false);
+    }
+  }
+
+  // Same prev-prop pattern for ask_form: auto-open the form panel when a new
+  // ask_form message arrives, auto-close when it resolves.
+  const [prevActiveFormMessage, setPrevActiveFormMessage] = useState(activeFormMessage);
+  if (activeFormMessage !== prevActiveFormMessage) {
+    setPrevActiveFormMessage(activeFormMessage);
+    if (activeFormMessage) {
+      setShowFormPanel(true);
+      setShowPlan(false);
+      setShowPlanFile(false);
+      setShowPendingQueue(false);
+      setShowPreviewComments(false);
+    } else {
+      setShowFormPanel(false);
     }
   }
 
@@ -2101,9 +2194,9 @@ export function TaskChat({
   const mentionItems = useMemo(
     () =>
       isStudioProject
-        ? buildStudioMentionItems(taskFiles, sketchMeta)
+        ? buildStudioMentionItems(taskFiles, sketchMeta, taskFilesMeta)
         : buildMentionItems(taskFiles),
-    [isStudioProject, taskFiles, sketchMeta],
+    [isStudioProject, taskFiles, sketchMeta, taskFilesMeta],
   );
 
   const combinedMentionItems = useMemo(
@@ -2361,6 +2454,7 @@ export function TaskChat({
     getTaskFiles(projectId, task.id)
       .then((res) => {
         setTaskFiles(res.files);
+        setTaskFilesMeta(res.metadata || []);
       })
       .catch(() => {})
       .finally(() => {
@@ -3575,6 +3669,9 @@ export function TaskChat({
           setShowPermissionPanel(false);
           setMessages((prev) => reduceHistoryMessages(prev, msg));
           break;
+        case "ask_form":
+          setMessages((prev) => reduceHistoryMessages(prev, msg));
+          break;
         case "complete":
           setAutoExpandSectionId((prev) => {
             if (prev) {
@@ -4398,7 +4495,9 @@ export function TaskChat({
       prev.map((m) =>
         m.type === "permission" && !m.resolved
           ? { ...m, resolved: "Cancelled" }
-          : m,
+          : m.type === "ask_form" && !m.resolved
+            ? { ...m, resolved: true }
+            : m,
       ),
     );
     pollingOffsetRef.current = 0;
@@ -4853,6 +4952,46 @@ export function TaskChat({
     setEditingPendingValue("");
   }, []);
 
+  /** Submit an ask_form response as a regular user prompt. Mirrors the queue /
+   *  prompt branch in onSendPrompt — busy session gets queued, idle session
+   *  posts directly. Attachments are always empty (form responses are pure
+   *  text). The form-pill resolution itself is handled separately by
+   *  resolveAskForm so the markdown send and the local UI removal aren't
+   *  coupled to each other. */
+  const sendFormResponse = useCallback(
+    (text: string) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+      enableAutoStickToBottom("auto");
+      wsRef.current.send(
+        JSON.stringify(
+          isBusy
+            ? {
+                type: "queue_message",
+                text,
+                attachments: [],
+                config: buildPromptConfig(),
+              }
+            : {
+                type: "prompt",
+                text,
+                attachments: [],
+                config: buildPromptConfig(),
+              },
+        ),
+      );
+      onUserMessageSent?.();
+    },
+    [isBusy, enableAutoStickToBottom, buildPromptConfig, onUserMessageSent],
+  );
+
+  const resolveAskForm = useCallback((id: string) => {
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.type === "ask_form" && m.id === id ? { ...m, resolved: true } : m,
+      ),
+    );
+  }, []);
+
   /** Respond to a permission request. `requestId` correlates with the server's
    * live pending permission so a stale dialog (rendered from history but
    * already cancelled by reconcile) can't be silently accepted. */
@@ -5247,7 +5386,13 @@ export function TaskChat({
             )
           : matched && matched.kind && matched.kind !== "file"
           ? createAgentMentionChip(matched)
-          : createFileChip(filePath, isDir, displayLabel, category);
+          : createFileChip(
+              filePath,
+              isDir,
+              displayLabel || (matched?.displayName ?? ""),
+              category,
+              matched?.favIconUrl
+            );
 
       const frag = document.createDocumentFragment();
       if (before) frag.appendChild(document.createTextNode(before));
@@ -5337,7 +5482,14 @@ export function TaskChat({
     (filePath: string, clientX: number, clientY: number) => {
       const el = editableRef.current;
       if (!el) return;
-      const chip = createFileChip(filePath, false);
+      const matched = filteredFiles.find((f) => f.path === filePath);
+      const chip = createFileChip(
+        filePath,
+        false,
+        matched?.displayName,
+        matched?.category,
+        matched?.favIconUrl
+      );
 
       // Resolve a Range at the drop point. caretRangeFromPoint is WebKit/Blink;
       // caretPositionFromPoint is the standard. Try both.
@@ -5381,7 +5533,7 @@ export function TaskChat({
 
       checkContent();
     },
-    [checkContent],
+    [checkContent, filteredFiles],
   );
 
   /** Drag & drop handlers */
@@ -6683,6 +6835,20 @@ export function TaskChat({
                             </div>
                           </div>
                         )}
+                      {activeComposerPanel === "ask_form" &&
+                        activeFormMessage && (
+                          <FormPill
+                            key={activeFormMessage.id}
+                            definition={activeFormMessage.definition}
+                            onSubmit={(text) => {
+                              sendFormResponse(text);
+                              resolveAskForm(activeFormMessage.id);
+                            }}
+                            onDismiss={() => {
+                              resolveAskForm(activeFormMessage.id);
+                            }}
+                          />
+                        )}
                     </div>
                   </motion.div>
                 )}
@@ -6883,6 +7049,7 @@ export function TaskChat({
                           setShowPlan(next);
                           if (next) {
                             setShowPermissionPanel(false);
+                            setShowFormPanel(false);
                             setShowPlanFile(false);
                             setShowPendingQueue(false);
                             setShowPreviewComments(false);
@@ -6912,6 +7079,7 @@ export function TaskChat({
                           setShowPlanFile(next);
                           if (next) {
                             setShowPermissionPanel(false);
+                            setShowFormPanel(false);
                             setShowPlan(false);
                             setShowPendingQueue(false);
                             setShowPreviewComments(false);
@@ -6934,6 +7102,7 @@ export function TaskChat({
                           setShowPendingQueue(next);
                           if (next) {
                             setShowPermissionPanel(false);
+                            setShowFormPanel(false);
                             setShowPlan(false);
                             setShowPlanFile(false);
                             setShowPreviewComments(false);
@@ -6971,6 +7140,35 @@ export function TaskChat({
                         <span>Permission Request</span>
                       </button>
                     )}
+                    {activeFormMessage && (
+                      <button
+                        onClick={() => {
+                          const next = !showFormPanel;
+                          setShowFormPanel(next);
+                          if (next) {
+                            // auth + permission outrank ask_form in
+                            // activeComposerPanel — clear them too, otherwise
+                            // the form pane silently queues open and pops
+                            // unexpectedly once the higher-priority panel
+                            // closes.
+                            setShowAuthPanel(false);
+                            setShowPermissionPanel(false);
+                            setShowPlan(false);
+                            setShowPlanFile(false);
+                            setShowPendingQueue(false);
+                            setShowPreviewComments(false);
+                          }
+                        }}
+                        className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
+                          activeComposerPanel === "ask_form"
+                            ? "bg-[color-mix(in_srgb,var(--color-highlight)_18%,transparent)] text-[var(--color-highlight)]"
+                            : "border border-[color-mix(in_srgb,var(--color-highlight)_24%,transparent)] bg-[color-mix(in_srgb,var(--color-highlight)_6%,transparent)] text-[color-mix(in_srgb,var(--color-highlight)_96%,white_8%)] hover:bg-[color-mix(in_srgb,var(--color-highlight)_12%,transparent)]"
+                        }`}
+                      >
+                        <ListChecks className="h-3 w-3" />
+                        <span>Survey</span>
+                      </button>
+                    )}
                     {hasPreviewCommentsPanel && (
                       <button
                         onClick={() => {
@@ -6978,6 +7176,7 @@ export function TaskChat({
                           setShowPreviewComments(next);
                           if (next) {
                             setShowPermissionPanel(false);
+                            setShowFormPanel(false);
                             setShowPlan(false);
                             setShowPlanFile(false);
                             setShowPendingQueue(false);
@@ -7764,6 +7963,10 @@ const MessageItem = memo(function MessageItem({
     case "tool":
       // Tools are rendered via ToolSectionView; skip here
       return null;
+    case "ask_form":
+      // Rendered in the composer panel (chip + expandable panel above the
+      // input), not inline in the message stream.
+      return null;
     case "system": {
       const displayContent =
         message.content === "$$CONNECTED$$"
@@ -8369,7 +8572,7 @@ function formatInspectionCount(count: number): string | null {
   return `${count} inspection step${count !== 1 ? "s" : ""}`;
 }
 
-function truncateChipLabel(label: string, maxLength = 72): string {
+function truncateChipLabel(label: string, maxLength = 64): string {
   const singleLine = label.replace(/\s+/g, " ").trim();
   if (singleLine.length <= maxLength) return singleLine;
   return `${singleLine.slice(0, maxLength - 1)}…`;
@@ -8707,7 +8910,7 @@ function ActionChip({
       type="button"
       onClick={handleClick}
       disabled={!isInteractive}
-      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] transition-colors ${
+      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] transition-colors max-w-[320px] ${
         isInteractive
           ? "cursor-pointer hover:brightness-110"
           : "cursor-default"
@@ -8722,7 +8925,7 @@ function ActionChip({
       ) : (
         renderActionKindIcon(item.kind)
       )}
-      <span className="truncate max-w-[280px]">{item.label}</span>
+      <span className="truncate">{item.label}</span>
       {trailingHint}
     </button>
   );
@@ -8881,18 +9084,19 @@ function ExpandableFileChipGroup({
         if (!entry.isDirectory)
           onFileClick?.(entry.path, entry.line, entry.mode);
       }}
-      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] ${
+      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] max-w-[320px] ${
         entry.isDirectory
           ? "bg-[color-mix(in_srgb,var(--color-bg-secondary)_80%,var(--color-bg))] text-[var(--color-text-muted)] border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] disabled:cursor-default disabled:opacity-85"
           : getStatusChipClasses(entry.status ?? "completed", muted)
       }`}
+      title={entry.path}
     >
       <VSCodeIcon
-        filename={entry.label}
+        filename={entry.path.split("/").pop() || entry.label}
         size={13}
         isFolder={entry.isDirectory}
       />
-      {entry.label}
+      <span className="truncate">{entry.label}</span>
     </button>
   );
 
@@ -9147,12 +9351,13 @@ const ToolSectionView = memo(function ToolSectionView({
                               });
                             }}
                             disabled={!hasDiff}
-                            className={`inline-flex items-center gap-1.5 ${hasDiff ? "cursor-pointer" : "cursor-default"}`}
+                            className={`inline-flex items-center gap-1.5 ${hasDiff ? "cursor-pointer" : "cursor-default"} max-w-[320px]`}
+                            title={path}
                           >
                             <VSCodeIcon filename={item.label} size={13} />
-                            <span>{item.label}</span>
+                            <span className="truncate">{item.label}</span>
                             {(item.additions > 0 || item.deletions > 0) && (
-                              <span className="text-[10px]">
+                              <span className="text-[10px] shrink-0">
                                 <span className="text-[var(--color-success)]">
                                   +{item.additions}
                                 </span>

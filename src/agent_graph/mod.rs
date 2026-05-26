@@ -24,6 +24,7 @@
 //!   head of the prompt body (see `inject::build_injected_prompt`) is woven in
 //!   for AI context + frontend rendering and is not the source of truth.
 
+pub mod ask_form;
 pub mod error;
 pub mod inject;
 pub mod tools;

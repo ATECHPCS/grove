@@ -45,11 +45,12 @@ use rmcp::schemars;
 use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::agent_graph::ask_form;
 use crate::agent_graph::error::AgentGraphError;
 use crate::agent_graph::tools::{
     grove_agent_capability, grove_agent_contacts, grove_agent_reply, grove_agent_send,
-    grove_agent_spawn, grove_agent_set_title, CapabilityInput, ContactsInput, ReplyInput,
-    SendInput, SpawnInput, SetTitleInput, ToolContext,
+    grove_agent_set_title, grove_agent_spawn, CapabilityInput, ContactsInput, ReplyInput,
+    SendInput, SetTitleInput, SpawnInput, ToolContext,
 };
 use crate::storage::config;
 
@@ -402,6 +403,22 @@ impl AgentGraphMcpService {
     ) -> Result<CallToolResult, McpError> {
         let cx = caller_context_from_parts(&parts)?;
         match grove_agent_set_title(&cx, input).await {
+            Ok(out) => json_success(&out),
+            Err(e) => Ok(tool_error(e)),
+        }
+    }
+
+    #[tool(
+        name = "ask_form",
+        description = "Ask the user to fill out a structured form when you need several decisions at once — much better than asking many questions in plain text. Question types: single_choice, multi_choice, text, textarea, number, rating (fixed 1-5 stars), boolean (fixed Yes/No). Every question is skippable by the user; choice questions automatically include a 'Custom' free-text input — do NOT add a custom option to your `options` list. Returns immediately with status='created' once the form is dispatched to the UI. Your turn ends normally after this call — the user's answers will arrive as a separate user prompt in the next turn (formatted as a numbered markdown list where each line is `N. <question title>: <answer>`), so do not poll, do not call other tools waiting on the response, and do not assume the user has answered before that next prompt arrives."
+    )]
+    async fn grove_ask_form_tool(
+        &self,
+        Parameters(input): Parameters<ask_form::AskFormInput>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let cx = caller_context_from_parts(&parts)?;
+        match ask_form::grove_ask_form(&cx, input).await {
             Ok(out) => json_success(&out),
             Err(e) => Ok(tool_error(e)),
         }
@@ -943,7 +960,8 @@ mod tests {
         assert!(names.contains(&"browser_extract".to_string()));
         assert!(names.contains(&"browser_screenshot".to_string()));
         assert!(names.contains(&"set_title".to_string()));
-        assert_eq!(names.len(), 11);
+        assert!(names.contains(&"ask_form".to_string()));
+        assert_eq!(names.len(), 12);
     }
 
     /// End-to-end test of the HTTP transport: real axum listener bound on a

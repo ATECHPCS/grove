@@ -228,6 +228,16 @@ pub enum AcpUpdate {
         description: String,
         options: Vec<PermOptionData>,
     },
+    /// Structured form dispatched to the chat UI by the `ask_form` MCP tool.
+    /// Carries the full form definition inline so the frontend can render a
+    /// FormPill straight from this event — no rawInput sniffing on tool_call.
+    /// Treated as transient UI (excluded from history persistence) so the
+    /// form disappears cleanly on refresh; the user's actual answers travel
+    /// back as a regular user prompt (which IS persisted as user content).
+    AskForm {
+        form_id: String,
+        definition: crate::agent_graph::ask_form::AskFormInput,
+    },
     /// 用户对权限请求的响应（记录到历史用于回放）
     PermissionResponse {
         #[serde(default)]

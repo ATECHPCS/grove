@@ -139,6 +139,13 @@ enum ServerMessage {
         description: String,
         options: Vec<PermOptionMsg>,
     },
+    /// Structured form pushed from the backend's `ask_form` MCP tool. Carries
+    /// the full form definition inline; frontend renders a FormPill from it.
+    /// Mirrors `AcpUpdate::AskForm` on the wire.
+    AskForm {
+        form_id: String,
+        definition: crate::agent_graph::ask_form::AskFormInput,
+    },
     PermissionResponse {
         id: String,
         option_id: String,
@@ -407,6 +414,13 @@ impl From<AcpUpdate> for ServerMessage {
             AcpUpdate::PermissionResponse { id, option_id } => {
                 ServerMessage::PermissionResponse { id, option_id }
             }
+            AcpUpdate::AskForm {
+                form_id,
+                definition,
+            } => ServerMessage::AskForm {
+                form_id,
+                definition,
+            },
             AcpUpdate::Complete {
                 stop_reason,
                 usage,

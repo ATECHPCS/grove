@@ -76,6 +76,11 @@ pub fn should_persist(update: &AcpUpdate) -> bool {
             | AcpUpdate::AvailableCommands { .. }
             | AcpUpdate::QueueUpdate { .. }
             | AcpUpdate::ConnectPhase { .. }
+            // Forms are transient UI dispatched by the `ask_form` MCP tool.
+            // The user's answers come back as a regular user prompt (persisted
+            // as user content); the form definition itself should not write
+            // to history — on refresh the FormPill cleanly disappears.
+            | AcpUpdate::AskForm { .. }
     )
 }
 

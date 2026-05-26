@@ -707,7 +707,14 @@ fn create_task_inner(
              - **Documentation**: Write in Markdown format.\n\
              - **Diagrams**: Use [Mermaid](https://mermaid.js.org/) for flowcharts and sequence diagrams; use [D2](https://d2lang.com/) for architecture and system diagrams.\n\
              - **Sketches**: When you want to show the user a visual — a system diagram, a UI mock, a whiteboard-style explanation — prefer the Grove sketch tools (`grove_sketch_read_me` once, then `grove_sketch_draw`) over ASCII art or lengthy prose descriptions. After drawing, reference the sketch in your chat reply with `sketch://<sketch-id>` (the full id returned by the draw call). Grove renders this as a clickable chip the user can open to see the canvas.\n\
-             - **Demos**: Use JSX/React components for interactive demos and visual presentations.\n",
+             - **Demos**: Use JSX/React components for interactive demos and visual presentations.\n\
+             \n\
+             ## Asking the User (Structured Forms)\n\
+             \n\
+             When you need several answers from the user at once — an interview, a design brief, scoping a piece of work, picking among multiple knobs — **call the `ask_form` MCP tool** instead of dumping a numbered list of questions into chat. A structured form is far easier for the user to scan and fill than a wall of inline questions, and prevents partial-answer drift (the user replies to the first item and skips the rest).\n\
+             \n\
+             - **When to use**: interview / discovery, requirements gathering, design intake, persona / brand briefs, any decision involving 3+ knobs, or anywhere you'd otherwise write \"I have a few questions: 1)… 2)… 3)…\" in chat.\n\
+             - **When NOT to use**: a single clarifying question (just ask in chat), or a yes/no inside a fast back-and-forth — forms have weight, only reach for one when question count or structure earns it.\n",
         );
         std::fs::write(task_dir.join("AGENTS.md"), &agents_md)?;
 
