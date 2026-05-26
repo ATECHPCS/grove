@@ -69,17 +69,20 @@ pub fn list_workdir_entries(dir: &std::path::Path) -> Vec<WorkDirectoryEntry> {
     entries_out
 }
 
-/// Replace characters that are unsafe in symlink names.
+/// Replace characters that are unsafe in symlink names and truncate to a safe length.
 pub fn sanitize_symlink_name(name: &str) -> String {
-    name.chars()
-        .map(|ch| match ch {
+    let mut out = String::with_capacity(name.len().min(200));
+    for ch in name.chars() {
+        if out.len() + ch.len_utf8() > 200 {
+            break;
+        }
+        let sanitized = match ch {
             '/' | '\\' | ':' | '\0' => '_',
             _ => ch,
-        })
-        .collect::<String>()
-        .trim()
-        .trim_matches('.')
-        .to_string()
+        };
+        out.push(sanitized);
+    }
+    out.trim().trim_matches('.').to_string()
 }
 
 /// Derive a unique symlink name inside `dir` based on the file name of
@@ -463,12 +466,15 @@ pub fn write_link_file(
     })
 }
 
-/// Convert a human name into a filename-safe slug. Preserves unicode
-/// word chars; collapses everything else to `-`.
+/// Convert a human name into a filename-safe slug, truncated to a safe length.
+/// Preserves unicode word chars; collapses everything else to `-`.
 fn slugify_for_filename(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
+    let mut out = String::with_capacity(input.len().min(200));
     let mut last_dash = false;
     for ch in input.chars() {
+        if out.len() + ch.len_utf8() > 200 {
+            break;
+        }
         if ch.is_alphanumeric() || ch == '_' {
             out.push(ch);
             last_dash = false;
@@ -685,4 +691,51 @@ pub fn delete_path_contained(base_dir: &Path, relative_path: &str) -> Result<(),
         )
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_slugify_for_filename() {
+        assert_eq!(slugify_for_filename("Hello World"), "Hello-World");
+        assert_eq!(slugify_for_filename("  spaces  "), "spaces");
+        assert_eq!(slugify_for_filename("---dashes---"), "dashes");
+        assert_eq!(slugify_for_filename("!@#$%^&*()"), "link");
+        assert_eq!(slugify_for_filename("unicode_世界"), "unicode_世界");
+    }
+
+    #[test]
+    fn test_slugify_truncation() {
+        let long_name = "a".repeat(300);
+        let slug = slugify_for_filename(&long_name);
+        assert_eq!(slug.len(), 200);
+        assert!(slug.chars().all(|c| c == 'a'));
+
+        // Test multi-byte truncation
+        let long_unicode = "世界".repeat(100); // 100 * 6 = 600 bytes
+        let slug = slugify_for_filename(&long_unicode);
+        assert!(slug.len() <= 200);
+        assert!(long_unicode.starts_with(&slug));
+    }
+
+    #[test]
+    fn test_sanitize_symlink_name() {
+        assert_eq!(sanitize_symlink_name("my:folder"), "my_folder");
+        assert_eq!(sanitize_symlink_name("path/to/dir"), "path_to_dir");
+        assert_eq!(sanitize_symlink_name(".hidden"), "hidden");
+    }
+
+    #[test]
+    fn test_sanitize_symlink_truncation() {
+        let long_name = "b".repeat(300);
+        let sanitized = sanitize_symlink_name(&long_name);
+        assert_eq!(sanitized.len(), 200);
+
+        let long_unicode = "你好".repeat(100); // 100 * 6 = 600 bytes
+        let sanitized = sanitize_symlink_name(&long_unicode);
+        assert!(sanitized.len() <= 200);
+        assert!(long_unicode.starts_with(&sanitized));
+    }
 }

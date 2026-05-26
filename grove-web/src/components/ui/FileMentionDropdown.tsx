@@ -232,18 +232,19 @@ const MentionRow = memo(function MentionRow({
   const projectStyle = isProjectItem ? getProjectStyle(item.sessionId || item.path, theme.accentPalette) : null;
 
   let resolvedFavicon: string | null = null;
-  if (item.kind === "browsertabs" && item.category !== "category_selector") {
-    if (item.favIconUrl && item.favIconUrl.startsWith("http")) {
-      resolvedFavicon = item.favIconUrl;
-    } else {
-      try {
-        const domain = new URL(item.path).hostname;
-        resolvedFavicon = `https://www.google.com/s2/favicons?sz=32&domain=${domain}`;
-      } catch {
-        // Bad URL — leave favicon blank, the kind/category fallback icons
-        // below will render instead.
-        resolvedFavicon = "";
-      }
+  // Only allow https favicons — Studio `.link.json` files are agent-authored
+  // and can carry arbitrary URLs, so reject http://, javascript:, data:, etc.
+  // See `MentionItem.favIconUrl` in utils/fileMention.ts for the trust note.
+  if (item.favIconUrl && item.favIconUrl.startsWith("https://")) {
+    resolvedFavicon = item.favIconUrl;
+  } else if (item.kind === "browsertabs" && item.category !== "category_selector") {
+    try {
+      const domain = new URL(item.path).hostname;
+      resolvedFavicon = `https://www.google.com/s2/favicons?sz=32&domain=${domain}`;
+    } catch {
+      // Bad URL — leave favicon blank, the kind/category fallback icons
+      // below will render instead.
+      resolvedFavicon = "";
     }
   }
 

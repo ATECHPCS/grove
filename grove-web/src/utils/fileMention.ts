@@ -43,7 +43,16 @@ export interface MentionItem {
   agentIconId?: string;
   /** Chat-history: absolute path to that chat's history.jsonl (kind: chat_history). */
   historyPath?: string;
-  /** Browser-tabs: URL to the tab's favicon when known. */
+  /**
+   * Favicon URL shown next to the mention.
+   *
+   * **Trust boundary**: for `browsertabs` items this comes from the user's
+   * own browser. For Studio Input/Output/Shared items this comes from an
+   * agent-authored `.link.json` sidecar — treat as untrusted. The dropdown
+   * renderer (FileMentionDropdown) only fetches URLs that start with
+   * `https://` to keep `http://`, `javascript:`, `data:`, and similar
+   * schemes out of `<img src>`.
+   */
   favIconUrl?: string;
 }
 
@@ -268,10 +277,12 @@ function isLink(path: string): boolean {
 export function buildStudioMentionItems(
   files: string[],
   sketches: SketchNameMeta[],
+  metadata?: import("../api/tasks").FileMetadata[],
 ): MentionItem[] {
   const items: MentionItem[] = [];
   const seenSketchDirs = new Set<string>();
   const sketchNameById = new Map(sketches.map((s) => [s.id, s.name] as const));
+  const metaMap = new Map(metadata?.map((m) => [m.path, m]) || []);
 
   const stripPrefix = (path: string, prefix: string) =>
     path.startsWith(prefix) ? path.slice(prefix.length) : path;
@@ -285,6 +296,7 @@ export function buildStudioMentionItems(
   };
 
   for (const file of files) {
+    const meta = metaMap.get(file);
     if (file === "instructions.md") {
       push({ path: file, isDir: false, displayName: "Instruction", category: "Instruction" });
       continue;
@@ -316,6 +328,7 @@ export function buildStudioMentionItems(
           isDir: false,
           displayName: linky ? stripLinkSuffix(name) : name,
           category: linky ? "Input · Link" : "Input",
+          favIconUrl: meta?.favicon,
         });
       }
       continue;
@@ -329,6 +342,7 @@ export function buildStudioMentionItems(
           isDir: false,
           displayName: linky ? stripLinkSuffix(name) : name,
           category: linky ? "Output · Link" : "Output",
+          favIconUrl: meta?.favicon,
         });
       }
       continue;
@@ -347,6 +361,7 @@ export function buildStudioMentionItems(
           isDir: false,
           displayName: linky ? stripLinkSuffix(name) : name,
           category: linky ? "Shared Resource · Link" : "Shared Resource",
+          favIconUrl: meta?.favicon,
         });
       }
       continue;

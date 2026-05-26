@@ -359,7 +359,39 @@ pub async fn list_files(
         Err(_) => list_files_fs(&task.worktree_path),
     };
 
-    Ok(Json(FilesResponse { files }))
+    let worktree_path_owned = task.worktree_path.clone();
+    let files_for_blocking = files.clone();
+    let metadata = tokio::task::spawn_blocking(move || {
+        let mut metadata = Vec::new();
+        let worktree_path = std::path::Path::new(&worktree_path_owned);
+        for file in &files_for_blocking {
+            if file.ends_with(".link.json") {
+                let full_path = worktree_path.join(file);
+                if let Ok(bytes) = std::fs::read(&full_path) {
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        if let Some(f) = val.get("favicon").and_then(|f| f.as_str()) {
+                            metadata.push(crate::api::handlers::tasks::types::FileMetadata {
+                                path: file.clone(),
+                                favicon: Some(f.to_string()),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        metadata
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(FilesResponse {
+        files,
+        metadata: if metadata.is_empty() {
+            None
+        } else {
+            Some(metadata)
+        },
+    }))
 }
 
 /// GET /api/v1/projects/{id}/tasks/{taskId}/file?path=src/main.rs
