@@ -277,6 +277,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
   const [customLayoutsLoaded, setCustomLayoutsLoaded] = useState(false); // Track if custom layouts were loaded from API
   const [isLayoutEditorOpen, setIsLayoutEditorOpen] = useState(false);
   const [isCustomThemeDialogOpen, setIsCustomThemeDialogOpen] = useState(false);
+  const [isImportThemeDialogOpen, setIsImportThemeDialogOpen] = useState(false);
 
   const [hooksResponseSoundEnabled, setHooksResponseSoundEnabled] = useState(true);
   const [hooksResponseSound, setHooksResponseSound] = useState("Glass");
@@ -699,6 +700,15 @@ export function SettingsPage({ config }: SettingsPageProps) {
   const handleSaveCustomTheme = useCallback((newTheme: Theme) => {
     setAppearance({ customThemes: [...customThemes, newTheme] });
   }, [customThemes, setAppearance]);
+
+  const handleExportTheme = useCallback((themeToExport: Theme) => {
+    // Export essential fields, omit ID to allow clean import
+    const { id, isCustom, ...rest } = themeToExport as any;
+    const json = JSON.stringify(rest, null, 2);
+    navigator.clipboard.writeText(json).then(() => {
+      alert("Theme configuration copied to clipboard!");
+    });
+  }, []);
 
   // Auto-save when any config value changes (debounced)
   useEffect(() => {
@@ -1565,13 +1575,22 @@ env_vars = [
             <div className="flex flex-col gap-4">
               <div className="flex items-center justify-between">
                 <div className="text-sm font-medium text-[var(--color-text)] select-none">Appearance Mode</div>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={() => setIsCustomThemeDialogOpen(true)}
-                >
-                  <Plus className="w-3.5 h-3.5 mr-1" /> Create Theme
-                </Button>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => setIsImportThemeDialogOpen(true)}
+                  >
+                    <Download className="w-3.5 h-3.5 mr-1" /> Import Theme
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => setIsCustomThemeDialogOpen(true)}
+                  >
+                    <Plus className="w-3.5 h-3.5 mr-1" /> Create Theme
+                  </Button>
+                </div>
               </div>
               <div className="flex p-1 bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-xl max-w-sm">
                 {(["auto", "light", "dark"] as const).map((m) => (
@@ -1620,17 +1639,30 @@ env_vars = [
                       </div>
                       <div className="text-xs font-medium text-[var(--color-text)] truncate">{t.name}</div>
                       {t.isCustom && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            const newCustoms = customThemes.filter((ct: any) => ct.id !== t.id);
-                            const nextLightThemeId = lightThemeId === t.id ? "light" : lightThemeId;
-                            setAppearance({ customThemes: newCustoms, lightThemeId: nextLightThemeId });
-                          }}
-                          className="absolute bottom-1 right-1 p-1 text-[var(--color-text-muted)] hover:text-[var(--color-error)] opacity-0 group-hover:opacity-100 transition-opacity"
-                        >
-                          <Trash2 className="w-3 h-3" />
-                        </button>
+                        <div className="absolute top-1 right-1 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleExportTheme(t);
+                            }}
+                            title="Export Theme"
+                            className="p-1 text-[var(--color-text-muted)] hover:text-[var(--color-highlight)] bg-[var(--color-bg)]/80 backdrop-blur rounded-md border border-[var(--color-border)] shadow-sm"
+                          >
+                            <Share2 className="w-3 h-3" />
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const newCustoms = customThemes.filter((ct: any) => ct.id !== t.id);
+                              const nextLightThemeId = lightThemeId === t.id ? "light" : lightThemeId;
+                              setAppearance({ customThemes: newCustoms, lightThemeId: nextLightThemeId });
+                            }}
+                            title="Delete Theme"
+                            className="p-1 text-[var(--color-text-muted)] hover:text-[var(--color-error)] bg-[var(--color-bg)]/80 backdrop-blur rounded-md border border-[var(--color-border)] shadow-sm"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        </div>
                       )}
                     </motion.button>
                   ))}
@@ -1669,17 +1701,30 @@ env_vars = [
                       </div>
                       <div className="text-xs font-medium text-[var(--color-text)] truncate">{t.name}</div>
                       {t.isCustom && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            const newCustoms = customThemes.filter((ct: any) => ct.id !== t.id);
-                            const nextDarkThemeId = darkThemeId === t.id ? "dark" : darkThemeId;
-                            setAppearance({ customThemes: newCustoms, darkThemeId: nextDarkThemeId });
-                          }}
-                          className="absolute bottom-1 right-1 p-1 text-[var(--color-text-muted)] hover:text-[var(--color-error)] opacity-0 group-hover:opacity-100 transition-opacity"
-                        >
-                          <Trash2 className="w-3 h-3" />
-                        </button>
+                        <div className="absolute top-1.5 right-1.5 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleExportTheme(t);
+                            }}
+                            title="Export Theme"
+                            className="p-1 text-[var(--color-text-muted)] hover:text-[var(--color-highlight)] bg-[var(--color-bg)]/80 backdrop-blur rounded-md border border-[var(--color-border)] shadow-sm"
+                          >
+                            <Share2 className="w-3 h-3" />
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const newCustoms = customThemes.filter((ct: any) => ct.id !== t.id);
+                              const nextDarkThemeId = darkThemeId === t.id ? "dark" : darkThemeId;
+                              setAppearance({ customThemes: newCustoms, darkThemeId: nextDarkThemeId });
+                            }}
+                            title="Delete Theme"
+                            className="p-1 text-[var(--color-text-muted)] hover:text-[var(--color-error)] bg-[var(--color-bg)]/80 backdrop-blur rounded-md border border-[var(--color-border)] shadow-sm"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        </div>
                       )}
                     </motion.button>
                   ))}
@@ -2497,6 +2542,12 @@ env_vars = [
         isOpen={isCustomThemeDialogOpen}
         onClose={() => setIsCustomThemeDialogOpen(false)}
         onSave={handleSaveCustomTheme}
+      />
+
+      <ImportThemeDialog
+        isOpen={isImportThemeDialogOpen}
+        onClose={() => setIsImportThemeDialogOpen(false)}
+        onImport={handleSaveCustomTheme}
       />
     </motion.div>
   );
