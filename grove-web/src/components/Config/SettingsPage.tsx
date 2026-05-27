@@ -33,7 +33,7 @@ import {
 } from "lucide-react";
 import { Button, Combobox, AppPicker, AgentPicker, agentOptions, ideAppOptions, terminalAppOptions, CustomAgentModal, VSCodeIcon } from "../ui";
 import type { ComboboxOption } from "../ui";
-import { useTheme, useConfig } from "../../context";
+import { useTheme, useConfig, useBanner } from "../../context";
 import { type Theme } from "../../context/ThemeContext";
 import {
   getConfig,
@@ -53,7 +53,6 @@ import { LayoutEditor, type CustomLayoutConfig, type PaneType, type LayoutNode, 
 import { CustomAgentsModal } from "./CustomAgentsModal";
 import { MarketplaceModal } from "./MarketplaceModal";
 import { CustomThemeDialog } from "./CustomThemeDialog";
-import { ImportThemeDialog } from "./ImportThemeDialog";
 import { InstallExtensionDialog } from "./InstallExtensionDialog";
 import {
   setCustomAgentPersonas as setCustomAgentPersonasIconRegistry,
@@ -277,7 +276,9 @@ export function SettingsPage({ config }: SettingsPageProps) {
   const [customLayoutsLoaded, setCustomLayoutsLoaded] = useState(false); // Track if custom layouts were loaded from API
   const [isLayoutEditorOpen, setIsLayoutEditorOpen] = useState(false);
   const [isCustomThemeDialogOpen, setIsCustomThemeDialogOpen] = useState(false);
-  const [isImportThemeDialogOpen, setIsImportThemeDialogOpen] = useState(false);
+  const [isDraggingTheme, setIsDraggingTheme] = useState(false);
+
+  const { showBanner } = useBanner();
 
   const [hooksResponseSoundEnabled, setHooksResponseSoundEnabled] = useState(true);
   const [hooksResponseSound, setHooksResponseSound] = useState("Glass");
@@ -701,14 +702,56 @@ export function SettingsPage({ config }: SettingsPageProps) {
     setAppearance({ customThemes: [...customThemes, newTheme] });
   }, [customThemes, setAppearance]);
 
+  const processThemeData = useCallback((text: string) => {
+    try {
+      const parsed = JSON.parse(text);
+      // Basic validation
+      if (!parsed.name || !parsed.colors || typeof parsed.isLight !== 'boolean') {
+        throw new Error("Invalid theme format.");
+      }
+      const newTheme: Theme = {
+        ...parsed,
+        id: `custom-${Date.now()}`,
+        isCustom: true
+      };
+      setAppearance({ customThemes: [...customThemes, newTheme] });
+      showBanner(`Theme "${newTheme.name}" imported successfully!`, "success");
+    } catch (e: any) {
+      showBanner(`Import failed: ${e.message}`, "error");
+    }
+  }, [customThemes, setAppearance, showBanner]);
+
+  const handleImportFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (re) => {
+        const text = re.target?.result as string;
+        processThemeData(text);
+      };
+      reader.readAsText(file);
+    }
+  };
+
   const handleExportTheme = useCallback((themeToExport: Theme) => {
-    // Export essential fields, omit ID to allow clean import
     const { id, isCustom, ...rest } = themeToExport as any;
     const json = JSON.stringify(rest, null, 2);
-    navigator.clipboard.writeText(json).then(() => {
-      alert("Theme configuration copied to clipboard!");
-    });
-  }, []);
+    
+    try {
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${themeToExport.name.replace(/\s+/g, "_").toLowerCase()}.grovetheme`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showBanner(`Theme "${themeToExport.name}" exported to file!`, "success");
+    } catch (err) {
+      showBanner(`Download failed: ${err}`, "error");
+    }
+  }, [showBanner]);
 
   // Auto-save when any config value changes (debounced)
   useEffect(() => {
@@ -1570,25 +1613,48 @@ env_vars = [
           isOpen={openSections.appearance}
           onToggle={() => toggleSection("appearance")}
         >
-          <div className="space-y-6">
+          <div className="space-y-8">
             {/* Mode Selection & Action Header */}
-            <div className="flex flex-col gap-4">
+            <div 
+              onDragOver={(e) => { e.preventDefault(); setIsDraggingTheme(true); }}
+              onDragLeave={() => setIsDraggingTheme(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setIsDraggingTheme(false);
+                const file = e.dataTransfer.files?.[0];
+                if (file) {
+                  const reader = new FileReader();
+                  reader.onload = (re) => processThemeData(re.target?.result as string);
+                  reader.readAsText(file);
+                }
+              }}
+              className={`flex flex-col gap-4 transition-all ${isDraggingTheme ? 'p-4 rounded-xl border-2 border-dashed border-[var(--color-highlight)] bg-[var(--color-highlight)]/5' : ''}`}
+            >
               <div className="flex items-center justify-between">
-                <div className="text-sm font-medium text-[var(--color-text)] select-none">Appearance Mode</div>
+                <div className="text-xs font-bold text-[var(--color-text-muted)] uppercase tracking-wider select-none">
+                  {isDraggingTheme ? "Drop file to import theme" : "Appearance Mode"}
+                </div>
                 <div className="flex items-center gap-2">
+                  <input 
+                    type="file" 
+                    id="theme-import-input" 
+                    className="hidden" 
+                    accept=".grovetheme,.json" 
+                    onChange={handleImportFile} 
+                  />
                   <Button
                     variant="secondary"
                     size="sm"
-                    onClick={() => setIsImportThemeDialogOpen(true)}
+                    onClick={() => document.getElementById('theme-import-input')?.click()}
                   >
-                    <Download className="w-3.5 h-3.5 mr-1" /> Import Theme
+                    <Download className="w-3.5 h-3.5 mr-1.5" /> Import
                   </Button>
                   <Button
                     variant="secondary"
                     size="sm"
                     onClick={() => setIsCustomThemeDialogOpen(true)}
                   >
-                    <Plus className="w-3.5 h-3.5 mr-1" /> Create Theme
+                    <Plus className="w-3.5 h-3.5 mr-1.5" /> Create
                   </Button>
                 </div>
               </div>
@@ -1597,12 +1663,12 @@ env_vars = [
                   <button
                     key={m}
                     onClick={() => handleModeChange(m)}
-                    className={`flex-1 py-1.5 text-xs font-medium rounded-lg transition-all
+                    className={`flex-1 py-1.5 text-xs font-semibold uppercase tracking-wider rounded-lg transition-all
                       ${mode === m 
                         ? "bg-[var(--color-bg)] text-[var(--color-text)] shadow-sm border border-[var(--color-border)]" 
                         : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]"}`}
                   >
-                    {m === "auto" ? "Auto" : m === "light" ? "Light" : "Dark"}
+                    {m}
                   </button>
                 ))}
               </div>
@@ -1610,8 +1676,8 @@ env_vars = [
 
             {/* Light Themes */}
             {(mode === "auto" || mode === "light") && (
-              <div>
-                <div className="text-sm font-medium text-[var(--color-text-muted)] mb-3 select-none">
+              <div className="space-y-4">
+                <div className="text-xs font-bold text-[var(--color-text-muted)] uppercase tracking-wider">
                   {mode === "auto" ? "Preferred Light Theme" : "Light Themes"}
                 </div>
                 <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
@@ -2542,12 +2608,6 @@ env_vars = [
         isOpen={isCustomThemeDialogOpen}
         onClose={() => setIsCustomThemeDialogOpen(false)}
         onSave={handleSaveCustomTheme}
-      />
-
-      <ImportThemeDialog
-        isOpen={isImportThemeDialogOpen}
-        onClose={() => setIsImportThemeDialogOpen(false)}
-        onImport={handleSaveCustomTheme}
       />
     </motion.div>
   );

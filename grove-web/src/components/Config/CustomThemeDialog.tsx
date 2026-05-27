@@ -113,7 +113,7 @@ export function CustomThemeDialog({ isOpen, onClose, onSave }: CustomThemeDialog
               <div className="space-y-3">
                 <label className="block text-[10px] font-bold text-[var(--color-text-muted)] uppercase tracking-tight">Base Template</label>
                 <div className="grid grid-cols-2 gap-1">
-                  {builtInThemes.map(t => (
+                  {builtInThemes.filter(t => t.isLight === isLight).map(t => (
                     <button
                       key={t.id}
                       onClick={() => handleBaseChange(t.id)}

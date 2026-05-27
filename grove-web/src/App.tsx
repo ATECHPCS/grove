@@ -26,7 +26,7 @@ import { UpdateBanner } from "./components/ui/UpdateBanner";
 import { CommandPalette } from "./components/ui/CommandPalette";
 import { ProjectCommandPalette } from "./components/ui/ProjectCommandPalette";
 import { TaskCommandPalette } from "./components/ui/TaskCommandPalette";
-import { ThemeProvider, ProjectProvider, TerminalThemeProvider, NotificationProvider, ConfigProvider, CommandPaletteProvider, PreviewCommentProvider, useProject, useCommandPalette, useTheme, useConfig } from "./context";
+import { ThemeProvider, BannerProvider, ProjectProvider, TerminalThemeProvider, NotificationProvider, ConfigProvider, CommandPaletteProvider, PreviewCommentProvider, useProject, useCommandPalette, useTheme, useConfig } from "./context";
 import { ConfirmDialog } from "./components/Dialogs";
 import { useReportDebugId } from "./perf/debugIdsStore";
 import { AuthGate } from "./components/AuthGate";
@@ -1104,32 +1104,36 @@ function App() {
   if (reviewMatch) {
     return (
       <ThemeProvider>
-        <PreviewCommentProvider>
-          <DiffReviewPage projectId={reviewMatch[1]} taskId={reviewMatch[2]} />
-        </PreviewCommentProvider>
+        <BannerProvider>
+          <PreviewCommentProvider>
+            <DiffReviewPage projectId={reviewMatch[1]} taskId={reviewMatch[2]} />
+          </PreviewCommentProvider>
+        </BannerProvider>
       </ThemeProvider>
     );
   }
 
   return (
     <ThemeProvider>
-      <AuthGate>
-        <ConfigProvider>
-          <TerminalThemeProvider>
-            <ProjectProvider>
-              <NotificationProvider>
-                <CommandPaletteProvider>
-                  <PreviewCommentProvider>
-                    <OptionalPerfProfiler id="App">
-                      <AppContent />
-                    </OptionalPerfProfiler>
-                  </PreviewCommentProvider>
-                </CommandPaletteProvider>
-              </NotificationProvider>
-            </ProjectProvider>
-          </TerminalThemeProvider>
-        </ConfigProvider>
-      </AuthGate>
+      <BannerProvider>
+        <AuthGate>
+          <ConfigProvider>
+            <TerminalThemeProvider>
+              <ProjectProvider>
+                <NotificationProvider>
+                  <CommandPaletteProvider>
+                    <PreviewCommentProvider>
+                      <OptionalPerfProfiler id="App">
+                        <AppContent />
+                      </OptionalPerfProfiler>
+                    </PreviewCommentProvider>
+                  </CommandPaletteProvider>
+                </NotificationProvider>
+              </ProjectProvider>
+            </TerminalThemeProvider>
+          </ConfigProvider>
+        </AuthGate>
+      </BannerProvider>
     </ThemeProvider>
   );
 }

@@ -1,4 +1,5 @@
 export { ThemeProvider, useTheme, builtInThemes } from "./ThemeContext";
+export { BannerProvider, useBanner } from "./BannerContext";
 
 export { ProjectProvider, useProject } from "./ProjectContext";
 
