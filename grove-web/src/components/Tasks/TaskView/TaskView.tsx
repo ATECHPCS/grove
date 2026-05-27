@@ -461,6 +461,7 @@ export const TaskView = forwardRef<TaskViewHandle, TaskViewProps>((props, ref) =
       <div className="flex-1 min-h-0 relative">
         {layoutMode === "ide" ? (
           <IDELayoutContainer
+            key={`${projectId}-${task.id}`}
             ref={ideLayoutRef}
             task={task}
             projectId={projectId}
@@ -469,6 +470,7 @@ export const TaskView = forwardRef<TaskViewHandle, TaskViewProps>((props, ref) =
           />
         ) : (
           <FlexLayoutContainer
+            key={`${projectId}-${task.id}`}
             ref={layoutRef}
             task={task}
             projectId={projectId}

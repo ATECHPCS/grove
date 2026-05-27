@@ -210,10 +210,12 @@ export function TasksPage({ initialTaskId, initialChatId, initialViewMode, onNav
   useEffect(() => {
     if (prevProjectIdRef.current !== selectedProject?.id) {
       prevProjectIdRef.current = selectedProject?.id;
-      pageHandlers.setInWorkspace(false);
-      pageHandlers.setSelectedTask(null);
+      if (!initialTaskId) {
+        pageHandlers.setInWorkspace(false);
+        pageHandlers.setSelectedTask(null);
+      }
     }
-  }, [selectedProject?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selectedProject?.id, initialTaskId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Sync selectedTask with latest project data after refresh
   useEffect(() => {
