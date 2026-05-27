@@ -762,9 +762,37 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
         if (fetchGenRef.current === gen) setLoading(false);
       });
     } else {
-      refetchDiff({ ...currentDiffRefsRef.current, gen }); // pass gen so refetchDiff can discard stale responses
+      // Changes mode: fetch commits first to ensure the version dropdown is up-to-date
+      getCommits(projectId, taskId)
+        .then((commitsData) => {
+          if (fetchGenRef.current !== gen) return;
+          const opts: VersionOption[] = [{ id: 'latest', label: 'Latest' }];
+          if (commitsData && commitsData.commits.length > 0) {
+            const totalCommits = commitsData.commits.length;
+            const startIdx = commitsData.skip_versions ?? 1;
+            for (let i = startIdx; i < totalCommits; i++) {
+              const versionNum = totalCommits - i;
+              opts.push({
+                id: `v${versionNum}`,
+                label: `Version ${versionNum}`,
+                ref: commitsData.commits[i].hash,
+              });
+            }
+          }
+          opts.push({ id: 'target', label: 'Base' });
+          setVersions(opts);
+
+          // Resolve Refs using the freshly fetched Version list
+          const fromOpt = opts.find((v) => v.id === fromVersion);
+          const toOpt = opts.find((v) => v.id === toVersion);
+          refetchDiff({ fromRef: fromOpt?.ref, toRef: toOpt?.ref, gen });
+        })
+        .catch(() => {
+          if (fetchGenRef.current !== gen) return;
+          refetchDiff({ ...currentDiffRefsRef.current, gen });
+        });
     }
-  }, [viewMode, focusMode, projectId, taskId, appendLazyFiles, refetchDiff]);
+  }, [viewMode, focusMode, projectId, taskId, fromVersion, toVersion, appendLazyFiles, refetchDiff]);
 
   // Version change handlers — directly trigger refetch
   const handleFromVersionChange = useCallback((id: string) => {
@@ -810,19 +838,36 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       }
     }
 
-    const fromOpt = versions.find((v) => v.id === fromVersion);
-    const toOpt = versions.find((v) => v.id === toVersion);
-
     const commentsPromise = getReviewComments(projectId, taskId).then((result) => {
       setComments(result.comments);
       if (result.git_user_name) gitUserNameRef.current = result.git_user_name;
     }).catch(() => null);
 
-    const fromRef = fromOpt?.ref;
-    const toRef = toOpt?.ref;
     let caught: unknown = null;
     try {
       if (viewMode === 'diff') {
+        const commitsData = await getCommits(projectId, taskId).catch(() => null);
+        const opts: VersionOption[] = [{ id: 'latest', label: 'Latest' }];
+        if (commitsData && commitsData.commits.length > 0) {
+          const totalCommits = commitsData.commits.length;
+          const startIdx = commitsData.skip_versions ?? 1;
+          for (let i = startIdx; i < totalCommits; i++) {
+            const versionNum = totalCommits - i;
+            opts.push({
+              id: `v${versionNum}`,
+              label: `Version ${versionNum}`,
+              ref: commitsData.commits[i].hash,
+            });
+          }
+        }
+        opts.push({ id: 'target', label: 'Base' });
+        setVersions(opts);
+
+        const fromOpt = opts.find((v) => v.id === fromVersion);
+        const toOpt = opts.find((v) => v.id === toVersion);
+        const fromRef = fromOpt?.ref;
+        const toRef = toOpt?.ref;
+
         await Promise.all([
           refetchDiff({ fromRef, toRef, keepSelection: true, silent }),
           commentsPromise,
@@ -853,7 +898,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       // Preserve original try/finally semantics: rethrow after cleanup.
       throw caught;
     }
-  }, [versions, fromVersion, toVersion, refetchDiff, projectId, taskId, viewMode, focusMode, appendLazyFiles]);
+  }, [fromVersion, toVersion, refetchDiff, projectId, taskId, viewMode, focusMode, appendLazyFiles]);
 
   const previousChatBusyRef = useRef(!!isChatBusy);
 
