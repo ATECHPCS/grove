@@ -22,21 +22,40 @@ jobs:
         with:
           node-version: '22.14.0'
           cache: pnpm
-          cache-dependency-path: grove-web/pnpm-lock.yaml
-      - name: Install dependencies
+          cache-dependency-path: |
+            grove-web/pnpm-lock.yaml
+            grove-extension/pnpm-lock.yaml
+      - name: Install web dependencies
         run: pnpm install --frozen-lockfile
         working-directory: grove-web
       - name: ESLint
         run: pnpm eslint src/ --max-warnings 0
         working-directory: grove-web
-      - name: Build frontend dist
+      - name: Build web dist
         run: pnpm run build
         working-directory: grove-web
-      - name: Upload dist artifact
+      - name: Upload web dist artifact
         uses: actions/upload-artifact@v4
         with:
           name: grove-web-dist
           path: grove-web/dist
+          retention-days: 1
+          if-no-files-found: error
+      # `extension.rs` embeds `grove-extension/dist` via rust-embed in release
+      # builds. The dist is gitignored, so every Rust job downstream needs it
+      # as an artifact — otherwise `ExtensionAssets` derive emits an empty
+      # struct with no get/iter and the cargo check / clippy / build all fail.
+      - name: Install extension dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: grove-extension
+      - name: Build extension dist
+        run: pnpm run build
+        working-directory: grove-extension
+      - name: Upload extension dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grove-extension-dist
+          path: grove-extension/dist
           retention-days: 1
           if-no-files-found: error
 
@@ -55,11 +74,16 @@ jobs:
           key: macos-arm-gui
           add-job-id-key: false
           save-if: false
-      - name: Download frontend dist
+      - name: Download web dist
         uses: actions/download-artifact@v4
         with:
           name: grove-web-dist
           path: grove-web/dist
+      - name: Download extension dist
+        uses: actions/download-artifact@v4
+        with:
+          name: grove-extension-dist
+          path: grove-extension/dist
       - run: cargo check --release --target aarch64-apple-darwin --features gui
 
   fmt:
@@ -88,11 +112,16 @@ jobs:
           key: macos-arm-gui
           add-job-id-key: false
           save-if: false
-      - name: Download frontend dist
+      - name: Download web dist
         uses: actions/download-artifact@v4
         with:
           name: grove-web-dist
           path: grove-web/dist
+      - name: Download extension dist
+        uses: actions/download-artifact@v4
+        with:
+          name: grove-extension-dist
+          path: grove-extension/dist
       - run: cargo clippy --release --target aarch64-apple-darwin --features gui -- -D warnings
 
   build:
@@ -158,11 +187,16 @@ jobs:
       - name: Install Tauri CLI (macOS only, if not cached)
         if: matrix.os == 'macos-latest' && steps.cache-tauri.outputs.cache-hit != 'true'
         run: cargo install tauri-cli --version "=2.10.0" --locked
-      - name: Download frontend dist
+      - name: Download web dist
         uses: actions/download-artifact@v4
         with:
           name: grove-web-dist
           path: grove-web/dist
+      - name: Download extension dist
+        uses: actions/download-artifact@v4
+        with:
+          name: grove-extension-dist
+          path: grove-extension/dist
       - name: Install musl tools
         if: matrix.cache-key == 'linux-x64-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
