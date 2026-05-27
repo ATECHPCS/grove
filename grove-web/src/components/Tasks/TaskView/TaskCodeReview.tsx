@@ -26,6 +26,7 @@ interface TaskCodeReviewProps {
   navigateToFile?: FileNavRequest | null;
   /** Whether the project is a git repository (non-git projects don't have Changes mode) */
   isGitRepo?: boolean;
+  isChatBusy?: boolean;
 }
 
 export function TaskCodeReview({
@@ -37,13 +38,14 @@ export function TaskCodeReview({
   hideHeader = false,
   navigateToFile,
   isGitRepo,
+  isChatBusy,
 }: TaskCodeReviewProps) {
   const containerClass = `h-full min-h-0 flex-1 flex flex-col bg-[var(--color-bg-secondary)] overflow-hidden ${fullscreen ? '' : 'rounded-lg border border-[var(--color-border)]'}`;
 
   return (
     <motion.div
       initial={{ x: "100%", opacity: 0 }}
-      animate={{ x: 0, opacity: 1 }}
+      animate={{ x: 0, opacity: 1, transitionEnd: { transform: "none" } }}
       exit={{ x: "100%", opacity: 0 }}
       transition={{ type: "spring", damping: 25, stiffness: 200 }}
       className={containerClass}
@@ -82,6 +84,7 @@ export function TaskCodeReview({
           embedded
           navigateToFile={navigateToFile}
           isGitRepo={isGitRepo}
+          isChatBusy={isChatBusy}
         />
       </div>
     </motion.div>

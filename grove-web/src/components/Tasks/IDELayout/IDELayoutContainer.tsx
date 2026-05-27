@@ -709,6 +709,7 @@ export const IDELayoutContainer = forwardRef<IDELayoutHandle, IDELayoutContainer
             <TaskCodeReview
               projectId={projectId} taskId={task.id} navigateToFile={state.fileNavRequest}
               hideHeader fullscreen isGitRepo={isGitRepo} onClose={() => update({ auxVisible: false })}
+              isChatBusy={state.isChatBusy}
             />
           )}
           {type === "artifacts" && isStudio && (

@@ -857,6 +857,7 @@ export const FlexLayoutContainer = forwardRef<
               hideHeader={true}
               fullscreen={true}
               isGitRepo={selectedProject?.isGitRepo}
+              isChatBusy={isChatBusy}
             />
           </div>
         );

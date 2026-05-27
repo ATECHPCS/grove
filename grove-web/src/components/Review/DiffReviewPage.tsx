@@ -44,6 +44,7 @@ interface DiffReviewPageProps {
   navigateToFile?: FileNavRequest | null;
   /** Whether the project is a git repository (non-git projects don't have Changes mode) */
   isGitRepo?: boolean;
+  isChatBusy?: boolean;
 }
 
 interface RefetchDiffOptions {
@@ -51,12 +52,13 @@ interface RefetchDiffOptions {
   toRef?: string;
   keepSelection?: boolean;
   gen?: number;
+  silent?: boolean;
 }
 
 import { getPreviewRenderer } from './previewRenderers';
 
 
-export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, isGitRepo }: DiffReviewPageProps) {
+export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, isGitRepo, isChatBusy }: DiffReviewPageProps) {
   const { isMobile } = useIsMobile();
   const [diffData, setDiffData] = useState<DiffStatsResult | null>(null);
   const [taskPath, setTaskPath] = useState<string | null>(null);
@@ -681,15 +683,29 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
   // Refetch diff for a given from/to ref pair
   // gen: if provided, discard response when fetchGenRef has advanced past this gen
-  const refetchDiff = useCallback(async ({ fromRef, toRef, keepSelection = false, gen }: RefetchDiffOptions = {}) => {
+  const refetchDiff = useCallback(async ({ fromRef, toRef, keepSelection = false, gen, silent = false }: RefetchDiffOptions = {}) => {
     // If no external gen provided, claim a new one so version-change calls also cancel stale fetches
     if (gen === undefined) {
       gen = ++fetchGenRef.current;
     }
 
-    setLoading(true);
-    setFileDiffCache(new Map());
-    loadingDiffsRef.current = new Set();
+    if (!silent) {
+      setLoading(true);
+      setFileDiffCache(new Map());
+      loadingDiffsRef.current = new Set();
+    } else {
+      // In silent mode, only clear the cache of the active selected file
+      // so it is allowed to reload its diff data silently.
+      const selected = selectedFileRef.current;
+      if (selected) {
+        setFileDiffCache((prev) => {
+          const next = new Map(prev);
+          next.delete(selected);
+          return next;
+        });
+      }
+    }
+
     let data: Awaited<ReturnType<typeof getDiffStats>> | null = null;
     let caught: unknown = null;
     try {
@@ -701,7 +717,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       if (fetchGenRef.current !== gen) return;
       const msg = caught instanceof Error ? caught.message : 'Failed to load diff';
       setError(msg);
-      if (fetchGenRef.current === gen) setLoading(false);
+      if (fetchGenRef.current === gen && !silent) setLoading(false);
       return;
     }
     if (fetchGenRef.current !== gen) return; // stale — a newer fetch is running
@@ -717,7 +733,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
         }
       }
     }
-    if (fetchGenRef.current === gen) setLoading(false);
+    if (fetchGenRef.current === gen && !silent) setLoading(false);
   }, [projectId, taskId, loadFileDiff]);
 
   useEffect(() => {
@@ -768,15 +784,31 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   }, [versions, fromVersion, refetchDiff]);
 
   const [refreshing, setRefreshing] = useState(false);
-  const handleRefresh = useCallback(async () => {
-    setRefreshing(true);
-    requestQueue.current = [];
-    activeRequests.current.clear();
-    setLoadingFiles(new Set());
-    setFullFileContents(new Map());
-    setFileDiffCache(new Map());
-    loadingDiffsRef.current = new Set();
-    lazyRootDirEntriesRef.current = [];
+  const handleRefresh = useCallback(async (options?: { silent?: boolean } | unknown) => {
+    const silent = options && typeof options === 'object' && !('nativeEvent' in options || 'preventDefault' in options)
+      ? (options as { silent?: boolean }).silent === true
+      : false;
+    if (!silent) {
+      setRefreshing(true);
+      requestQueue.current = [];
+      activeRequests.current.clear();
+      setLoadingFiles(new Set());
+      setFullFileContents(new Map());
+      setFileDiffCache(new Map());
+      loadingDiffsRef.current = new Set();
+      lazyRootDirEntriesRef.current = [];
+    } else {
+      setFullFileContents(new Map());
+      setLoadingFiles(new Set());
+      const selected = selectedFileRef.current;
+      if (selected) {
+        setFileDiffCache((prev) => {
+          const next = new Map(prev);
+          next.delete(selected);
+          return next;
+        });
+      }
+    }
 
     const fromOpt = versions.find((v) => v.id === fromVersion);
     const toOpt = versions.find((v) => v.id === toVersion);
@@ -792,7 +824,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     try {
       if (viewMode === 'diff') {
         await Promise.all([
-          refetchDiff({ fromRef, toRef, keepSelection: true }),
+          refetchDiff({ fromRef, toRef, keepSelection: true, silent }),
           commentsPromise,
         ]);
       } else if (focusMode) {
@@ -814,12 +846,29 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     } catch (e) {
       caught = e;
     }
-    setRefreshing(false);
+    if (!silent) {
+      setRefreshing(false);
+    }
     if (caught !== null) {
       // Preserve original try/finally semantics: rethrow after cleanup.
       throw caught;
     }
   }, [versions, fromVersion, toVersion, refetchDiff, projectId, taskId, viewMode, focusMode, appendLazyFiles]);
+
+  const previousChatBusyRef = useRef(!!isChatBusy);
+
+  // Auto-refresh silently when Agent finishes a turn (isChatBusy transitions from true to false)
+  useEffect(() => {
+    const wasBusy = previousChatBusyRef.current;
+    const busy = !!isChatBusy;
+    previousChatBusyRef.current = busy;
+
+    if (wasBusy && !busy) {
+      Promise.resolve().then(() => {
+        void handleRefresh({ silent: true }).catch(() => {});
+      });
+    }
+  }, [isChatBusy, handleRefresh]);
 
   const handleSetViewMode = useCallback((nextMode: 'diff' | 'full') => {
     sessionStorage.setItem(viewModeStorageKey, nextMode);
