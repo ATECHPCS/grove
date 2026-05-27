@@ -76,6 +76,7 @@ export function TaskCodeReview({
       {/* Embedded diff review */}
       <div className="flex-1 min-h-0 overflow-hidden">
         <DiffReviewPage
+          key={`${projectId}:${taskId}`}
           projectId={projectId}
           taskId={taskId}
           embedded

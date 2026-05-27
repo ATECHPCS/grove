@@ -88,7 +88,24 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   useEffect(() => {
     selectedFileRef.current = selectedFile;
   }, [selectedFile]);
-  const [viewTypeState, setViewType] = useState<'unified' | 'split'>('unified');
+  // Cached header/version options (workspace + task ID)
+  const headerOptionsStorageKey = `grove:review-options:${projectId}:${taskId}`;
+  const initialCachedOptions = (() => {
+    try {
+      const stored = localStorage.getItem(headerOptionsStorageKey);
+      return stored ? JSON.parse(stored) : null;
+    } catch (e) {
+      console.error("Failed to parse cached review options", e);
+      return null;
+    }
+  })();
+
+  const [viewTypeState, setViewType] = useState<'unified' | 'split'>(() => {
+    if (initialCachedOptions && (initialCachedOptions.viewType === 'unified' || initialCachedOptions.viewType === 'split')) {
+      return initialCachedOptions.viewType;
+    }
+    return 'unified';
+  });
   // On mobile, force unified view (split mode is hidden on mobile anyway).
   const viewType: 'unified' | 'split' = isMobile ? 'unified' : viewTypeState;
   const viewModeStorageKey = `grove:review-mode:${projectId}:${taskId}`;
@@ -155,7 +172,12 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     if (isMobile) setMobileConvSidebarVisible(next);
     else setDesktopConvSidebarVisible(next);
   }, [isMobile]);
-  const [focusMode, setFocusMode] = useState(true); // Default to true for better performance
+  const [focusMode, setFocusMode] = useState<boolean>(() => {
+    if (initialCachedOptions && typeof initialCachedOptions.focusMode === 'boolean') {
+      return initialCachedOptions.focusMode;
+    }
+    return true; // Default to true for better performance
+  });
   const [focusModeWarn, setFocusModeWarn] = useState<string | null>(null);
   const lazyRootDirEntriesRef = useRef<DirEntry[]>([]);
   const [focusFiles, setFocusFiles] = useState<DiffFile[]>([]);
@@ -166,9 +188,24 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   }, [fileDiffCache]);
   const loadingDiffsRef = useRef<Set<string>>(new Set());
   const failedFullFilesRef = useRef<Set<string>>(new Set());
-  const [displayMode, setDisplayMode] = useState<'code' | 'split' | 'preview'>('code');
-  const [fromVersion, setFromVersion] = useState('target');
-  const [toVersion, setToVersion] = useState('latest');
+  const [displayMode, setDisplayMode] = useState<'code' | 'split' | 'preview'>(() => {
+    if (initialCachedOptions && (initialCachedOptions.displayMode === 'code' || initialCachedOptions.displayMode === 'split' || initialCachedOptions.displayMode === 'preview')) {
+      return initialCachedOptions.displayMode;
+    }
+    return 'code';
+  });
+  const [fromVersion, setFromVersion] = useState<string>(() => {
+    if (initialCachedOptions && typeof initialCachedOptions.fromVersion === 'string') {
+      return initialCachedOptions.fromVersion;
+    }
+    return 'target';
+  });
+  const [toVersion, setToVersion] = useState<string>(() => {
+    if (initialCachedOptions && typeof initialCachedOptions.toVersion === 'string') {
+      return initialCachedOptions.toVersion;
+    }
+    return 'latest';
+  });
   const [collapsedCommentIds, setCollapsedCommentIds] = useState<Set<number>>(new Set());
   const [versions, setVersions] = useState<VersionOption[]>([]);
   const currentDiffRefs = useMemo(() => {
@@ -181,6 +218,22 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     currentDiffRefsRef.current = currentDiffRefs;
   }, [currentDiffRefs]);
   const initialCollapseRef = useRef(false);
+
+  // Auto-persist header options when they change
+  useEffect(() => {
+    try {
+      const cached = {
+        fromVersion,
+        toVersion,
+        displayMode,
+        viewType: viewTypeState,
+        focusMode,
+      };
+      localStorage.setItem(headerOptionsStorageKey, JSON.stringify(cached));
+    } catch (e) {
+      console.error("Failed to save review options", e);
+    }
+  }, [headerOptionsStorageKey, fromVersion, toVersion, displayMode, viewTypeState, focusMode]);
 
   // Code search state (Ctrl+F)
   const [codeSearchVisible, setCodeSearchVisible] = useState(false);
@@ -785,17 +838,77 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       // Build per-mode promises BEFORE the try so the conditional
       // expressions don't sit inside a try/catch (React Compiler bails on
       // value blocks within try/catch).
-      let diffPromise: Promise<DiffStatsResult>;
-      if (viewMode === 'diff') {
-        diffPromise = getDiffStats(projectId, taskId);
-      } else {
-        diffPromise = Promise.resolve({ files: [], total_additions: 0, total_deletions: 0 } as DiffStatsResult);
-      }
       let commitsPromise: Promise<Awaited<ReturnType<typeof getCommits>> | null>;
       if (viewMode === 'diff') {
         commitsPromise = getCommits(projectId, taskId).catch(() => null);
       } else {
         commitsPromise = Promise.resolve(null);
+      }
+
+      let diffPromise: Promise<DiffStatsResult>;
+      if (viewMode === 'diff') {
+        const isDefaultVersion = fromVersion === 'target' && toVersion === 'latest';
+        if (isDefaultVersion) {
+          diffPromise = getDiffStats(projectId, taskId);
+        } else {
+          // Resolve custom version hashes from commits list
+          diffPromise = commitsPromise.then(async (commitsData) => {
+            let resolvedFromRef: string | undefined = undefined;
+            let resolvedToRef: string | undefined = undefined;
+            if (commitsData && commitsData.commits.length > 0) {
+              const totalCommits = commitsData.commits.length;
+              const startIdx = commitsData.skip_versions ?? 1;
+              const opts: VersionOption[] = [{ id: 'latest', label: 'Latest' }];
+              for (let i = startIdx; i < totalCommits; i++) {
+                const versionNum = totalCommits - i;
+                opts.push({
+                  id: `v${versionNum}`,
+                  label: `Version ${versionNum}`,
+                  ref: commitsData.commits[i].hash,
+                });
+              }
+              opts.push({ id: 'target', label: 'Base' });
+
+              const fromOpt = opts.find(v => v.id === fromVersion);
+              const toOpt = opts.find(v => v.id === toVersion);
+
+              let finalFrom = fromVersion;
+              let finalTo = toVersion;
+
+              if (!fromOpt) {
+                finalFrom = 'target';
+              } else {
+                resolvedFromRef = fromOpt.ref;
+              }
+
+              if (!toOpt) {
+                finalTo = 'latest';
+              } else {
+                resolvedToRef = toOpt.ref;
+              }
+
+              if (finalFrom !== fromVersion || finalTo !== toVersion) {
+                setFromVersion(finalFrom);
+                setToVersion(finalTo);
+                // Also update localStorage
+                try {
+                  const stored = localStorage.getItem(headerOptionsStorageKey);
+                  const cached = stored ? JSON.parse(stored) : {};
+                  cached.fromVersion = finalFrom;
+                  cached.toVersion = finalTo;
+                  localStorage.setItem(headerOptionsStorageKey, JSON.stringify(cached));
+                } catch (e) {
+                  console.error(e);
+                }
+              }
+            }
+            return getDiffStats(projectId, taskId, resolvedFromRef, resolvedToRef);
+          }).catch(() => {
+            return getDiffStats(projectId, taskId);
+          });
+        }
+      } else {
+        diffPromise = Promise.resolve({ files: [], total_additions: 0, total_deletions: 0 } as DiffStatsResult);
       }
       let filesPromise: Promise<Awaited<ReturnType<typeof getTaskFiles>> | null>;
       if (viewMode === 'full' && !focusMode) {
@@ -864,7 +977,37 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
             }
           }
           opts.push({ id: 'target', label: 'Base' });
-          if (!cancelled) setVersions(opts);
+          if (!cancelled) {
+            setVersions(opts);
+
+            // Validate that cached versions are valid options, if not, fallback to defaults
+            let finalFrom = fromVersion;
+            let finalTo = toVersion;
+            let changed = false;
+
+            if (!opts.some(v => v.id === fromVersion)) {
+              finalFrom = 'target';
+              changed = true;
+            }
+            if (!opts.some(v => v.id === toVersion)) {
+              finalTo = 'latest';
+              changed = true;
+            }
+
+            if (changed) {
+              setFromVersion(finalFrom);
+              setToVersion(finalTo);
+              try {
+                const stored = localStorage.getItem(headerOptionsStorageKey);
+                const cached = stored ? JSON.parse(stored) : {};
+                cached.fromVersion = finalFrom;
+                cached.toVersion = finalTo;
+                localStorage.setItem(headerOptionsStorageKey, JSON.stringify(cached));
+              } catch (e) {
+                console.error(e);
+              }
+            }
+          }
         }
 
         if (!cancelled) {
