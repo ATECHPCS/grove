@@ -1733,6 +1733,7 @@ export function TaskChat({
 
   // ─── Active chat's live state ─────────────────────────────────────────
   const [isConnected, setIsConnected] = useState(false);
+  const [showReconnect, setShowReconnect] = useState(false);
   // Pre-spawn UI hint pushed by backend when an agent is being installed via
   // npx for the first time (~30s on cold cache). Cleared on session_ready or
   // when backend sends phase: "ready". Purely cosmetic — the actual spawn
@@ -3281,6 +3282,23 @@ export function TaskChat({
     },
     [projectId, task.id, getActiveChatId],
   );
+  const handleManualReconnect = useCallback(async () => {
+    if (!activeChatId) return;
+    const ws = wsMapRef.current.get(activeChatId);
+    if (ws) {
+      intentionalCloseRef.current.add(activeChatId);
+      ws.close();
+    }
+    wsMapRef.current.delete(activeChatId);
+    connectingRef.current.delete(activeChatId);
+    setIsConnected(false);
+    
+    setMessages((prev) => appendSystemMessage(prev, "Attempting to manual reconnect..."));
+    
+    await connectChatWs(activeChatId);
+    wsRef.current = wsMapRef.current.get(activeChatId) ?? null;
+  }, [activeChatId, connectChatWs]);
+
   useEffect(() => {
     connectChatWsRef.current = connectChatWs;
   }, [connectChatWs]);
@@ -6124,9 +6142,9 @@ export function TaskChat({
       {!hideHeader && sessionRailCollapsed && (
         <div className="relative z-30 border-b border-[color-mix(in_srgb,var(--color-border)_78%,transparent)] bg-[color-mix(in_srgb,var(--color-bg)_88%,transparent)] backdrop-blur-sm select-none">
           <div className="flex w-full items-center justify-between px-3 py-1.5">
-            <div className="flex flex-1 min-w-0 items-center gap-3 text-sm select-none">
+            <div className="flex flex-1 min-w-0 items-center gap-2 text-sm select-none">
               {activeChat ? (
-                <div className="relative flex-1 min-w-0" ref={chatMenuRef}>
+                <div className="relative min-w-0" ref={chatMenuRef}>
                   {editingTitle?.chatId === activeChat.id &&
                   editingTitle.surface === "header" ? (
                     <div className="flex items-center gap-2">
@@ -6143,7 +6161,7 @@ export function TaskChat({
                         onChange={setEditTitleValue}
                         onSave={handleTitleSave}
                         onCancel={() => setEditingTitle(null)}
-                        className="min-w-0 flex-1 border-b border-[var(--color-highlight)] bg-transparent px-0 py-0 text-sm text-[var(--color-text)] outline-none"
+                        className="min-w-0 w-48 border-b border-[var(--color-highlight)] bg-transparent px-0 py-0 text-sm text-[var(--color-text)] outline-none"
                       />
                     </div>
                   ) : (
@@ -6227,57 +6245,74 @@ export function TaskChat({
                   )}
                 </div>
               ) : (
-                <span className="flex-1 text-[var(--color-text-muted)] truncate">
+                <span className="text-[var(--color-text-muted)] truncate">
                   {agentLabel}
                 </span>
               )}
 
-              <div className="flex shrink-0 items-center gap-1.5">
-                <div className="relative" ref={headerAgentPickerRef}>
-                  <button
-                    onClick={(e) => toggleAgentPicker(e.currentTarget)}
-                    className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-highlight)]"
-                    title="New Session"
-                  >
-                    <Plus className="w-3.5 h-3.5" />
-                    <span>New</span>
-                  </button>
-                </div>
-                {/* Fork 只在 source agent live 且当前空闲、不在登录中时允许。
-                    disabled 而不是隐藏:让用户知道按钮存在,只是当下不能用。 */}
-                {forkCapable && activeChat && (
-                  <button
-                    onClick={() => handleForkChat(activeChat.id)}
-                    disabled={!isConnected || isBusy || !!activeAuthMessage}
-                    className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-highlight)] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-[var(--color-text-muted)]"
-                    title={
-                      !isConnected
-                        ? "Fork unavailable: source session not connected"
-                        : isBusy
-                          ? "Fork unavailable while agent is responding"
-                          : activeAuthMessage
-                            ? "Fork unavailable: finish login first"
-                            : "Fork Session — derive a new session from the current chat, copy the conversation history"
-                    }
-                  >
-                    <GitFork className="w-3.5 h-3.5" />
-                    <span>Fork</span>
-                  </button>
-                )}
+              <div className="relative shrink-0" ref={headerAgentPickerRef}>
+                <button
+                  onClick={(e) => toggleAgentPicker(e.currentTarget)}
+                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-highlight)]"
+                  title="New Session"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>New</span>
+                </button>
               </div>
+              {/* Fork 只在 source agent live 且当前空闲、不在登录中时允许。
+                  disabled 而不是隐藏:让用户知道按钮存在,只是当下不能用。 */}
+              {forkCapable && activeChat && (
+                <button
+                  onClick={() => handleForkChat(activeChat.id)}
+                  disabled={!isConnected || isBusy || !!activeAuthMessage}
+                  className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-highlight)] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-[var(--color-text-muted)]"
+                  title={
+                    !isConnected
+                      ? "Fork unavailable: source session not connected"
+                      : isBusy
+                        ? "Fork unavailable while agent is responding"
+                        : activeAuthMessage
+                          ? "Fork unavailable: finish login first"
+                          : "Fork Session — derive a new session from the current chat, copy the conversation history"
+                  }
+                >
+                  <GitFork className="w-3.5 h-3.5" />
+                  <span>Fork</span>
+                </button>
+              )}
             </div>
 
             <div className="flex shrink-0 items-center gap-1.5 select-none">
               <div
-                className={`w-2.5 h-2.5 rounded-full ${isConnected ? "bg-[var(--color-success)] animate-pulse" : "bg-[var(--color-warning)]"}`}
-              />
-              <span className="text-xs text-[var(--color-text-muted)]">
-                {isConnected
-                  ? "Connected"
-                  : connectPhase === "downloading" && connectPhaseStartedAt
-                    ? <DownloadingLabel startedAt={connectPhaseStartedAt} />
-                    : "Connecting..."}
-              </span>
+                className="flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-opacity"
+                onClick={() => setShowReconnect(!showReconnect)}
+                title="Click to toggle ReConnect option"
+              >
+                <div
+                  className={`w-2.5 h-2.5 rounded-full ${isConnected ? "bg-[var(--color-success)] animate-pulse" : "bg-[var(--color-warning)]"}`}
+                />
+                <span className="text-xs text-[var(--color-text-muted)]">
+                  {isConnected
+                    ? "Connected"
+                    : connectPhase === "downloading" && connectPhaseStartedAt
+                      ? <DownloadingLabel startedAt={connectPhaseStartedAt} />
+                      : "Connecting..."}
+                </span>
+              </div>
+              {showReconnect && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleManualReconnect();
+                    setShowReconnect(false);
+                  }}
+                  className="rounded px-2 py-0.5 text-[10px] font-semibold border border-[var(--color-border)] hover:bg-[var(--color-bg-secondary)] text-[var(--color-text)] transition-colors active:scale-95 animate-in fade-in zoom-in-95 duration-100"
+                  title="Force reconnect WebSocket"
+                >
+                  ReConnect
+                </button>
+              )}
               {onToggleFullscreen && (
                 <button
                   onClick={onToggleFullscreen}
@@ -6320,7 +6355,7 @@ export function TaskChat({
                   <ChevronLeft className="h-3.5 w-3.5" />
                 </button>
                 <div
-                  className="min-w-0 flex-1 flex items-center gap-2"
+                  className="min-w-0 flex items-center gap-2"
                   onDoubleClick={() => {
                     if (!activeChat) return;
                     setEditTitleValue(activeChat.title);
@@ -6352,7 +6387,7 @@ export function TaskChat({
                   ) : (
                     <OverflowTitle
                       text={activeChat?.title ?? "Chats"}
-                      className="flex-1 text-[13px] font-medium text-[var(--color-text)]"
+                      className="text-[13px] font-medium text-[var(--color-text)]"
                     />
                   )}
                 </div>
@@ -6361,7 +6396,11 @@ export function TaskChat({
                 <div className="text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
                   Sessions
                 </div>
-                <div className="flex items-center gap-1.5 text-[11px] text-[var(--color-text-muted)]">
+                <div
+                  className="flex items-center gap-1.5 text-[11px] text-[var(--color-text-muted)] cursor-pointer hover:opacity-80 transition-opacity"
+                  onClick={() => setShowReconnect(!showReconnect)}
+                  title="Click to toggle ReConnect option"
+                >
                   <span
                     className={`h-1.5 w-1.5 rounded-full ${isConnected ? "bg-[var(--color-success)]" : "bg-[var(--color-warning)]"}`}
                   />
@@ -6372,6 +6411,19 @@ export function TaskChat({
                         ? <DownloadingLabel startedAt={connectPhaseStartedAt} compact />
                         : "Connecting..."}
                   </span>
+                  {showReconnect && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleManualReconnect();
+                        setShowReconnect(false);
+                      }}
+                      className="ml-1 rounded bg-[var(--color-bg-secondary)] px-1 py-0.2 text-[9px] font-semibold border border-[var(--color-border)] hover:bg-[var(--color-bg-tertiary)] text-[var(--color-text)] transition-colors active:scale-95 animate-in fade-in zoom-in-95 duration-100"
+                      title="Force reconnect WebSocket"
+                    >
+                      ReConnect
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
@@ -6458,7 +6510,7 @@ export function TaskChat({
                           ) : (
                             <OverflowTitle
                               text={chat.title}
-                              className={`flex-1 text-[12px] leading-5 ${isActive ? "font-medium text-[var(--color-text)]" : ""}`}
+                              className={`text-[12px] leading-5 ${isActive ? "font-medium text-[var(--color-text)]" : ""}`}
                             />
                           )}
                         </div>

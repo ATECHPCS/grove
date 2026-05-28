@@ -216,14 +216,16 @@ const PADDING = { top: 8, right: 12, bottom: 22, left: 45 };
  * Takes control points based on neighboring coordinates to ensure smooth, natural lines
  * that avoid rigid sharp corners while perfectly maintaining stack boundaries.
  */
-function getBezierPath(points: { x: number; y: number }[]): string {
+function getBezierPath(points: { x: number; y: number }[], maxY?: number): string {
   if (points.length === 0) return "";
-  if (points.length === 1) return `M ${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
+  const clampY = (y: number) => (maxY !== undefined ? Math.min(y, maxY) : y);
+
+  if (points.length === 1) return `M ${points[0].x.toFixed(1)},${clampY(points[0].y).toFixed(1)}`;
   if (points.length === 2) {
-    return `M ${points[0].x.toFixed(1)},${points[0].y.toFixed(1)} L ${points[1].x.toFixed(1)},${points[1].y.toFixed(1)}`;
+    return `M ${points[0].x.toFixed(1)},${clampY(points[0].y).toFixed(1)} L ${points[1].x.toFixed(1)},${clampY(points[1].y).toFixed(1)}`;
   }
 
-  let d = `M ${points[0].x.toFixed(1)},${points[0].y.toFixed(1)}`;
+  let d = `M ${points[0].x.toFixed(1)},${clampY(points[0].y).toFixed(1)}`;
   const t = 0.15; // tension factor for smoothing
 
   for (let i = 0; i < points.length - 1; i++) {
@@ -233,12 +235,14 @@ function getBezierPath(points: { x: number; y: number }[]): string {
     const p3 = points[i + 2] ?? p2;
 
     const cp1x = p1.x + (p2.x - p0.x) * t;
-    const cp1y = p1.y + (p2.y - p0.y) * t;
+    const cp1y = clampY(p1.y + (p2.y - p0.y) * t);
 
     const cp2x = p2.x - (p3.x - p1.x) * t;
-    const cp2y = p2.y - (p3.y - p1.y) * t;
+    const cp2y = clampY(p2.y - (p3.y - p1.y) * t);
 
-    d += ` C ${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${p2.x.toFixed(1)},${p2.y.toFixed(1)}`;
+    const p2y = clampY(p2.y);
+
+    d += ` C ${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${p2.x.toFixed(1)},${p2y.toFixed(1)}`;
   }
   return d;
 }
@@ -315,9 +319,9 @@ function Chart({
       botPoints.push({ x, y: yAt(seg.base) });
     });
 
-    const topPath = getBezierPath(topPoints);
+    const topPath = getBezierPath(topPoints, PADDING.top + innerH);
     const botPointsReversed = [...botPoints].reverse();
-    const botPathRaw = getBezierPath(botPointsReversed);
+    const botPathRaw = getBezierPath(botPointsReversed, PADDING.top + innerH);
     // Connect top path to bot path, then close with Z
     const botPath = botPathRaw.replace(/^M/, "L");
     const d = `${topPath} ${botPath} Z`;
