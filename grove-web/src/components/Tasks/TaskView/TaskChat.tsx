@@ -1733,7 +1733,6 @@ export function TaskChat({
 
   // ─── Active chat's live state ─────────────────────────────────────────
   const [isConnected, setIsConnected] = useState(false);
-  const [showReconnect, setShowReconnect] = useState(false);
   // Pre-spawn UI hint pushed by backend when an agent is being installed via
   // npx for the first time (~30s on cold cache). Cleared on session_ready or
   // when backend sends phase: "ready". Purely cosmetic — the actual spawn
@@ -3282,22 +3281,7 @@ export function TaskChat({
     },
     [projectId, task.id, getActiveChatId],
   );
-  const handleManualReconnect = useCallback(async () => {
-    if (!activeChatId) return;
-    const ws = wsMapRef.current.get(activeChatId);
-    if (ws) {
-      intentionalCloseRef.current.add(activeChatId);
-      ws.close();
-    }
-    wsMapRef.current.delete(activeChatId);
-    connectingRef.current.delete(activeChatId);
-    setIsConnected(false);
-    
-    setMessages((prev) => appendSystemMessage(prev, "Attempting to manual reconnect..."));
-    
-    await connectChatWs(activeChatId);
-    wsRef.current = wsMapRef.current.get(activeChatId) ?? null;
-  }, [activeChatId, connectChatWs]);
+
 
   useEffect(() => {
     connectChatWsRef.current = connectChatWs;
@@ -6285,34 +6269,15 @@ export function TaskChat({
 
             <div className="flex shrink-0 items-center gap-1.5 select-none">
               <div
-                className="flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-opacity"
-                onClick={() => setShowReconnect(!showReconnect)}
-                title="Click to toggle ReConnect option"
-              >
-                <div
-                  className={`w-2.5 h-2.5 rounded-full ${isConnected ? "bg-[var(--color-success)] animate-pulse" : "bg-[var(--color-warning)]"}`}
-                />
-                <span className="text-xs text-[var(--color-text-muted)]">
-                  {isConnected
-                    ? "Connected"
-                    : connectPhase === "downloading" && connectPhaseStartedAt
-                      ? <DownloadingLabel startedAt={connectPhaseStartedAt} />
-                      : "Connecting..."}
-                </span>
-              </div>
-              {showReconnect && (
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleManualReconnect();
-                    setShowReconnect(false);
-                  }}
-                  className="rounded px-2 py-0.5 text-[10px] font-semibold border border-[var(--color-border)] hover:bg-[var(--color-bg-secondary)] text-[var(--color-text)] transition-colors active:scale-95 animate-in fade-in zoom-in-95 duration-100"
-                  title="Force reconnect WebSocket"
-                >
-                  ReConnect
-                </button>
-              )}
+                className={`w-2.5 h-2.5 rounded-full ${isConnected ? "bg-[var(--color-success)] animate-pulse" : "bg-[var(--color-warning)]"}`}
+              />
+              <span className="text-xs text-[var(--color-text-muted)]">
+                {isConnected
+                  ? "Connected"
+                  : connectPhase === "downloading" && connectPhaseStartedAt
+                    ? <DownloadingLabel startedAt={connectPhaseStartedAt} />
+                    : "Connecting..."}
+              </span>
               {onToggleFullscreen && (
                 <button
                   onClick={onToggleFullscreen}
@@ -6396,11 +6361,7 @@ export function TaskChat({
                 <div className="text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
                   Sessions
                 </div>
-                <div
-                  className="flex items-center gap-1.5 text-[11px] text-[var(--color-text-muted)] cursor-pointer hover:opacity-80 transition-opacity"
-                  onClick={() => setShowReconnect(!showReconnect)}
-                  title="Click to toggle ReConnect option"
-                >
+                <div className="flex items-center gap-1.5 text-[11px] text-[var(--color-text-muted)]">
                   <span
                     className={`h-1.5 w-1.5 rounded-full ${isConnected ? "bg-[var(--color-success)]" : "bg-[var(--color-warning)]"}`}
                   />
@@ -6411,20 +6372,6 @@ export function TaskChat({
                         ? <DownloadingLabel startedAt={connectPhaseStartedAt} compact />
                         : "Connecting..."}
                   </span>
-                  {showReconnect && (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleManualReconnect();
-                        setShowReconnect(false);
-                      }}
-                      className="ml-1 rounded bg-[var(--color-bg-secondary)] px-1 py-0.2 text-[9px] font-semibold border border-[var(--color-border)] hover:bg-[var(--color-bg-tertiary)] text-[var(--color-text)] transition-colors active:scale-95 animate-in fade-in zoom-in-95 duration-100"
-                      title="Force reconnect WebSocket"
-                    >
-                      ReConnect
-                    </button>
-                  )}
-                </div>
               </div>
             </div>
 

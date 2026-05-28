@@ -2525,16 +2525,11 @@ async fn drive_session(
                 saved_id
             }
             Err(load_err) => {
-                // Agent 不认识 saved_id(典型场景:fork 出来的 chat 首次打开
-                // 但 agent 进程已重启;或 session 过期)。告诉用户,然后起一个
-                // 全新 session — 但保留磁盘 history,用户仍能看到之前的对话。
+                let err_msg = format!("Resume session failed: {}", load_err);
                 handle.emit(AcpUpdate::Error {
-                    message: format!(
-                        "Resume session failed; starting fresh agent context. Prior history preserved on disk. ({})",
-                        load_err
-                    ),
+                    message: err_msg.clone(),
                 });
-                create_new_session!(true)
+                return Err(acp::Error::internal_error().data(err_msg));
             }
         }
     } else {
