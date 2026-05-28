@@ -227,19 +227,25 @@ fn main() -> io::Result<()> {
                 update::detect_install_method(),
                 update::InstallMethod::AppBundle
             ) {
-                let port = config
+                let (port, remote_url) = config
                     .last_launch
                     .as_ref()
                     .and_then(|ll| {
-                        if let storage::config::LastLaunch::Gui { port } = ll {
-                            Some(*port)
+                        if let storage::config::LastLaunch::Gui { port, remote_url } = ll {
+                            Some((*port, remote_url.clone()))
                         } else {
                             None
                         }
                     })
-                    .unwrap_or(3001);
+                    .unwrap_or((3001, None));
                 return {
-                    let (command, from_replay) = (Commands::Gui { port }, false);
+                    let (command, from_replay) = (
+                        Commands::Gui {
+                            port,
+                            remote_url: remote_url.clone(),
+                        },
+                        false,
+                    );
                     // 保存 last_launch
                     if let Some(last_launch) = command.to_last_launch() {
                         let mut cfg = storage::config::load_config();
@@ -250,12 +256,7 @@ fn main() -> io::Result<()> {
                     tokio::runtime::Runtime::new()
                         .expect("Failed to create tokio runtime")
                         .block_on(async {
-                            cli::gui::execute(if let Commands::Gui { port } = command {
-                                port
-                            } else {
-                                3001
-                            })
-                            .await;
+                            cli::gui::execute(port, remote_url).await;
                         });
                     let _ = from_replay;
                     Ok(())
@@ -333,11 +334,16 @@ fn main() -> io::Result<()> {
             #[cfg(not(windows))]
             cli::fp::execute();
         }
-        Commands::Web { port, no_open, dev } => {
+        Commands::Web {
+            port,
+            no_open,
+            dev,
+            remote_url,
+        } => {
             tokio::runtime::Runtime::new()
                 .expect("Failed to create tokio runtime")
                 .block_on(async {
-                    cli::web::execute(port, no_open, dev).await;
+                    cli::web::execute(port, no_open, dev, remote_url).await;
                 });
         }
         Commands::Mobile {
@@ -360,25 +366,25 @@ fn main() -> io::Result<()> {
         Commands::Diff { task_id, port } => {
             cli::diff::execute(task_id, port);
         }
-        Commands::Gui { port } => {
+        Commands::Gui { port, remote_url } => {
             #[cfg(feature = "gui")]
             {
                 // When launched from CLI (not AppBundle), daemonize so the
                 // terminal is released immediately.  The child re-execs itself
                 // with GROVE_GUI_DAEMON=1 and runs the actual GUI.
-                if cli::gui::try_daemonize(port) {
+                if cli::gui::try_daemonize(port, remote_url.as_deref()) {
                     return Ok(()); // parent exits, child runs in background
                 }
 
                 tokio::runtime::Runtime::new()
                     .expect("Failed to create tokio runtime")
                     .block_on(async {
-                        cli::gui::execute(port).await;
+                        cli::gui::execute(port, remote_url).await;
                     });
             }
             #[cfg(not(feature = "gui"))]
             {
-                let _ = port;
+                let _ = (port, remote_url);
                 eprintln!("GUI mode is not available in this build.");
                 eprintln!();
                 eprintln!("To enable GUI support, rebuild with the 'gui' feature:");

@@ -3,6 +3,7 @@ import { useWalkieTalkie } from "../../hooks/useWalkieTalkie";
 import { useAudioRecorder } from "../../hooks/useAudioRecorder";
 import { getAudioSettings, transcribeAudio } from "../../api/ai";
 import { builtInThemes, type Theme } from "../../context/ThemeContext";
+import { getConfig, type CustomThemeConfig } from "../../api/config";
 import type { TargetMode } from "../../api/walkieTalkie";
 import type { ChatRef } from "../../data/types";
 import GroupSelector from "./GroupSelector";
@@ -46,28 +47,117 @@ export function RadioPage() {
     }).catch((err) => { console.warn("[Radio] Failed to fetch audio settings, using defaults:", err); });
   }, []);
 
+  // Custom themes cached in a ref (not state) so the apply-theme effect
+  // doesn't self-trigger when it sets the value. Refetched from
+  // /api/v1/config only when the broadcast id can't be resolved against
+  // the existing cache, or for "auto" with empty slot cache.
+  const customThemesRef = useRef<Theme[]>([]);
+  // Cached light/dark slot ids from /api/v1/config so repeated "auto"
+  // broadcasts don't refetch each time — slot config rarely changes within
+  // a session, and a stale slot just means the next manual theme broadcast
+  // refreshes everything.
+  const autoSlotsRef = useRef<{ light: string; dark: string } | null>(null);
+
   // Apply theme from desktop via WS
   useEffect(() => {
     if (!state.theme) return;
-    const systemIsDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-    let resolved = (builtInThemes as Theme[]).find((t: Theme) => t.id === state.theme);
-    if (!resolved || resolved.id === "auto") {
-      resolved = (builtInThemes as Theme[]).find((t: Theme) => t.id === (systemIsDark ? "dark" : "light")) ?? builtInThemes[1];
+    let cancelled = false;
+    const applyResolved = (resolved: Theme) => {
+      const root = document.documentElement;
+      const c = resolved.colors;
+      root.style.setProperty("--color-bg", c.bg);
+      root.style.setProperty("--color-bg-secondary", c.bgSecondary);
+      root.style.setProperty("--color-bg-tertiary", c.bgTertiary);
+      root.style.setProperty("--color-border", c.border);
+      root.style.setProperty("--color-text", c.text);
+      root.style.setProperty("--color-text-muted", c.textMuted);
+      root.style.setProperty("--color-highlight", c.highlight);
+      root.style.setProperty("--color-accent", c.accent);
+      root.style.setProperty("--color-success", c.success);
+      root.style.setProperty("--color-warning", c.warning);
+      root.style.setProperty("--color-error", c.error);
+      root.style.setProperty("--color-info", c.info);
+    };
+
+    const resolveAndApply = (allThemes: Theme[], targetId: string) => {
+      const systemIsDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      const resolved =
+        allThemes.find((t) => t.id === targetId) ??
+        allThemes.find((t) => t.id === (systemIsDark ? "dark" : "light")) ??
+        builtInThemes[0];
+      applyResolved(resolved);
+    };
+
+    // Determine if we need to fetch /api/v1/config:
+    //   - "auto" with no cached slot info — we need the user's light_theme/dark_theme slot
+    //   - id not in our cached theme list — likely a custom theme we haven't seen
+    const cached = [...builtInThemes, ...customThemesRef.current];
+    const isAuto = state.theme === "auto";
+    const needsConfig = isAuto
+      ? autoSlotsRef.current === null
+      : !cached.some((t) => t.id === state.theme);
+
+    if (!needsConfig) {
+      const targetId = isAuto
+        ? (window.matchMedia("(prefers-color-scheme: dark)").matches
+            ? (autoSlotsRef.current!.dark || "dark")
+            : (autoSlotsRef.current!.light || "light"))
+        : state.theme;
+      resolveAndApply(cached, targetId);
+      return;
     }
-    const root = document.documentElement;
-    const c = resolved.colors;
-    root.style.setProperty("--color-bg", c.bg);
-    root.style.setProperty("--color-bg-secondary", c.bgSecondary);
-    root.style.setProperty("--color-bg-tertiary", c.bgTertiary);
-    root.style.setProperty("--color-border", c.border);
-    root.style.setProperty("--color-text", c.text);
-    root.style.setProperty("--color-text-muted", c.textMuted);
-    root.style.setProperty("--color-highlight", c.highlight);
-    root.style.setProperty("--color-accent", c.accent);
-    root.style.setProperty("--color-success", c.success);
-    root.style.setProperty("--color-warning", c.warning);
-    root.style.setProperty("--color-error", c.error);
-    root.style.setProperty("--color-info", c.info);
+
+    const controller = new AbortController();
+    getConfig(controller.signal).then((cfg) => {
+      if (cancelled) return;
+      const customs: Theme[] = (cfg.theme.custom_themes ?? []).map((ct: CustomThemeConfig) => ({
+        id: ct.id,
+        name: ct.name,
+        isLight: ct.is_light,
+        isCustom: true,
+        accentPalette: ct.accent_palette,
+        colors: {
+          bg: ct.colors.bg,
+          bgSecondary: ct.colors.bg_secondary,
+          bgTertiary: ct.colors.bg_tertiary,
+          border: ct.colors.border,
+          text: ct.colors.text,
+          textMuted: ct.colors.text_muted,
+          highlight: ct.colors.highlight,
+          accent: ct.colors.accent,
+          success: ct.colors.success,
+          warning: ct.colors.warning,
+          error: ct.colors.error,
+          info: ct.colors.info,
+        },
+      }));
+      customThemesRef.current = customs;
+      autoSlotsRef.current = {
+        light: cfg.theme.light_theme || "light",
+        dark: cfg.theme.dark_theme || "dark",
+      };
+      const all = [...builtInThemes, ...customs];
+
+      // Resolve "auto" against the user's configured slot using THIS device's
+      // system color scheme (not the desktop's). Slot may itself be a custom
+      // theme id (e.g. user picked Catppuccin as dark slot).
+      let targetId = state.theme!;
+      if (targetId === "auto") {
+        const systemIsDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+        targetId = systemIsDark
+          ? autoSlotsRef.current.dark
+          : autoSlotsRef.current.light;
+      }
+      resolveAndApply(all, targetId);
+    }).catch(() => {
+      if (cancelled) return;
+      // Best-effort fallback on fetch failure — try with cached.
+      resolveAndApply(cached, state.theme!);
+    });
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [state.theme]);
 
   // Local state

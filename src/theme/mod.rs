@@ -67,6 +67,37 @@ impl Theme {
         ]
     }
 
+    /// 是否为 light 主题(用于 Web ThemeConfig 的 light_theme / dark_theme 槽位选择)。
+    /// Auto 既非 light 也非 dark,调用方应单独处理。
+    pub fn is_light(&self) -> bool {
+        matches!(
+            self,
+            Theme::Light
+                | Theme::SolarizedLight
+                | Theme::GithubLight
+                | Theme::RosePineDawn
+                | Theme::CatppuccinLatte
+        )
+    }
+
+    /// Web ThemeConfig 中使用的 theme id(kebab-case)。`Auto` 没有对应 id。
+    pub fn web_id(&self) -> Option<&'static str> {
+        Some(match self {
+            Theme::Auto => return None,
+            Theme::Light => "light",
+            Theme::SolarizedLight => "solarized-light",
+            Theme::GithubLight => "github-light",
+            Theme::RosePineDawn => "rose-pine-dawn",
+            Theme::CatppuccinLatte => "catppuccin-latte",
+            Theme::Dark => "dark",
+            Theme::Dracula => "dracula",
+            Theme::Nord => "nord",
+            Theme::Gruvbox => "gruvbox",
+            Theme::TokyoNight => "tokyo-night",
+            Theme::Catppuccin => "catppuccin",
+        })
+    }
+
     /// 从名称创建主题（用于配置加载）
     /// 支持两种格式：label（如 "Dark", "Tokyo Night"）和 id（如 "dark", "tokyo-night"）
     pub fn from_name(name: &str) -> Self {

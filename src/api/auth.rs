@@ -254,8 +254,6 @@ pub async fn auth_middleware(
     (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
 }
 
-// ─── Public endpoints (not behind middleware) ────────────────────────────────
-
 #[derive(Serialize)]
 pub struct AuthInfoResponse {
     pub required: bool,

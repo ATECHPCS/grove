@@ -354,9 +354,13 @@ pub async fn patch_config(
             }
         }
         if let Some(custom_themes) = theme_patch.custom_themes {
-            // Assume custom themes change implies theme changed for simplicity
-            theme_changed = true;
-            config.theme.custom_themes = custom_themes;
+            // Only flip theme_changed if the list actually differs from what's
+            // on disk. Otherwise every Settings-page mount hydrates the same
+            // value and triggers a redundant Radio ThemeChanged broadcast.
+            if config.theme.custom_themes != custom_themes {
+                theme_changed = true;
+                config.theme.custom_themes = custom_themes;
+            }
         }
     }
 
@@ -535,13 +539,14 @@ pub async fn patch_config(
     // Notify Radio clients if theme changed
     if theme_changed {
         use crate::api::handlers::walkie_talkie::{broadcast_radio_event, RadioEvent};
-        // Use the current active theme name or the first selected theme
-        let name = if config.theme.mode == "auto" {
-            config.theme.light_theme.clone()
-        } else if config.theme.mode == "dark" {
-            config.theme.dark_theme.clone()
-        } else {
-            config.theme.light_theme.clone()
+        // For "auto" mode, send the literal "auto" string so the Radio client
+        // can resolve against ITS OWN system color scheme. Hardcoding a slot
+        // id here would force every Radio client onto the desktop's guess
+        // regardless of the device's actual dark/light preference.
+        let name = match config.theme.mode.as_str() {
+            "light" => config.theme.light_theme.clone(),
+            "dark" => config.theme.dark_theme.clone(),
+            _ => "auto".to_string(),
         };
         broadcast_radio_event(RadioEvent::ThemeChanged { name });
     }

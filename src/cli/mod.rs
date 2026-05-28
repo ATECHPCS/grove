@@ -56,6 +56,11 @@ pub enum Commands {
         /// Development mode (run Vite dev server with HMR)
         #[arg(long)]
         dev: bool,
+        /// Connect to a remote Grove server instead of starting a local one.
+        /// The local web server will only serve the frontend; all API calls
+        /// will be proxied/directed to this URL (e.g. http://192.168.1.5:3001).
+        #[arg(long, value_name = "URL")]
+        remote_url: Option<String>,
     },
     /// Open diff review for a task in the browser
     Diff {
@@ -70,6 +75,11 @@ pub enum Commands {
         /// Port for the internal API server
         #[arg(short, long, default_value_t = 3001)]
         port: u16,
+        /// Connect to a remote Grove server instead of starting a local one.
+        /// The Tauri window will load the remote URL directly without starting
+        /// a local API server (e.g. http://192.168.1.5:3001).
+        #[arg(long, value_name = "URL")]
+        remote_url: Option<String>,
     },
     /// Start an interactive ACP chat session with an AI agent
     Acp {
@@ -130,10 +140,16 @@ impl Commands {
     pub fn to_last_launch(&self) -> Option<LastLaunch> {
         match self {
             Commands::Tui => Some(LastLaunch::Tui),
-            Commands::Web { port, no_open, dev } => Some(LastLaunch::Web {
+            Commands::Web {
+                port,
+                no_open,
+                dev,
+                remote_url,
+            } => Some(LastLaunch::Web {
                 port: *port,
                 no_open: *no_open,
                 dev: *dev,
+                remote_url: remote_url.clone(),
             }),
             Commands::Mobile {
                 port,
@@ -154,7 +170,10 @@ impl Commands {
                 public: *public,
                 private: *private,
             }),
-            Commands::Gui { port } => Some(LastLaunch::Gui { port: *port }),
+            Commands::Gui { port, remote_url } => Some(LastLaunch::Gui {
+                port: *port,
+                remote_url: remote_url.clone(),
+            }),
             _ => None,
         }
     }
@@ -165,10 +184,16 @@ impl LastLaunch {
     pub fn to_command(&self) -> Commands {
         match self {
             LastLaunch::Tui => Commands::Tui,
-            LastLaunch::Web { port, no_open, dev } => Commands::Web {
+            LastLaunch::Web {
+                port,
+                no_open,
+                dev,
+                remote_url,
+            } => Commands::Web {
                 port: *port,
                 no_open: *no_open,
                 dev: *dev,
+                remote_url: remote_url.clone(),
             },
             LastLaunch::Mobile {
                 port,
@@ -189,7 +214,10 @@ impl LastLaunch {
                 public: *public,
                 private: *private,
             },
-            LastLaunch::Gui { port } => Commands::Gui { port: *port },
+            LastLaunch::Gui { port, remote_url } => Commands::Gui {
+                port: *port,
+                remote_url: remote_url.clone(),
+            },
         }
     }
 }

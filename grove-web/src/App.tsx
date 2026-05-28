@@ -1073,6 +1073,10 @@ function AppContent() {
           covers actual card content. z-[45] sits above the sidebar (z-40)
           but below modals/popovers (z-50+).
 
+          ⚠ Z-INDEX CONTRACT: any clickable UI placed in the top 24px must
+          use z-50 or higher, otherwise this drag strip will swallow its
+          mousedown events.
+
           data-tauri-drag-region: gives us double-click-maximize for free.
           data-window-drag-strip: picked up by the document-level mousedown
             listener in the parent useEffect to trigger startDragging(). */}
@@ -1110,7 +1114,7 @@ function AppContent() {
                window edges. left tracks the sidebar collapsed state so
                the gap stays visually consistent in both modes. */}
             <main
-              className={`fixed top-3 right-3 bottom-3 rounded-2xl bg-[var(--color-bg)] transition-[left] duration-200 ease-out ${isFullWidthPage && !isDashboardPage ? "overflow-hidden" : "overflow-y-auto"}`}
+              className={`fixed top-3 right-3 bottom-3 rounded-2xl bg-[var(--color-bg)] transition-[left] duration-200 ease-in-out ${isFullWidthPage && !isDashboardPage ? "overflow-hidden" : "overflow-y-auto"}`}
               style={{
                 left: effectiveSidebarCollapsed ? "96px" : "280px",
                 boxShadow:

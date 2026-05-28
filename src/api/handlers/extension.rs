@@ -36,6 +36,28 @@ struct ExtensionAssets;
 
 static EXTENSION_ZIP_CACHE: OnceLock<Vec<u8>> = OnceLock::new();
 
+/// REST endpoint: GET /api/v1/extension/status
+/// Lightweight probe — returns whether the Chrome companion extension is
+/// currently connected over WebSocket. Pure read of EXTENSION_SESSION,
+/// doesn't go through the WS bridge, so it's cheap enough to call on
+/// page mount without polling.
+pub async fn get_extension_status() -> Json<serde_json::Value> {
+    let connected = match EXTENSION_SESSION.read() {
+        Ok(guard) => guard.is_some(),
+        Err(poisoned) => {
+            // Lock poisoning means some writer panicked while holding the lock.
+            // Don't silently report `connected=false` — surface it so the
+            // underlying writer crash can be diagnosed. Then degrade gracefully.
+            eprintln!(
+                "[grove] WARN: EXTENSION_SESSION RwLock poisoned: {}",
+                poisoned
+            );
+            false
+        }
+    };
+    Json(json!({ "connected": connected }))
+}
+
 /// REST endpoint: GET /api/v1/extension/tabs
 /// Fetches all active browser tabs in real-time from the connected extension.
 pub async fn get_extension_tabs() -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {

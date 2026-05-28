@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { getDiffStats, getSingleFileDiff, createInlineComment, createFileComment, createProjectComment, deleteComment as apiDeleteComment, replyReviewComment as apiReplyComment, updateCommentStatus as apiUpdateCommentStatus, getFileContent, editComment as apiEditComment, editReply as apiEditReply, deleteReply as apiDeleteReply, bulkDeleteComments as apiBulkDeleteComments } from '../../api/review';
 import type { DiffFile, DiffStatsResult } from '../../api/review';
 import { getReviewComments, getCommits, getTaskFiles, getTaskDirEntries, listTasks } from '../../api/tasks';
-import type { ReviewCommentEntry, ReviewCommentsResponse, DirEntry } from '../../api/tasks';
+import type { ReviewCommentEntry, ReviewCommentsResponse, DirEntry, CommitsResponse } from '../../api/tasks';
 import { buildMentionItems } from '../../utils/fileMention';
 
 export interface VersionOption {
@@ -16,6 +16,50 @@ export interface CommentAnchor {
   side: 'ADD' | 'DELETE';
   startLine: number;
   endLine: number;
+}
+
+/** Build VersionOption[] from a commits response: Latest + Version N..1 + Base. */
+function buildVersionOpts(commitsData: CommitsResponse | null | undefined): VersionOption[] {
+  const opts: VersionOption[] = [{ id: 'latest', label: 'Latest' }];
+  // Every commit between Base..HEAD gets its own Version entry. When working
+  // tree is clean the newest commit (commits[0]) ends up identical to Latest;
+  // selecting it produces a diff of 0, which is fine — users explicitly want
+  // each commit pickable in the selector. (Previous logic skipped the leading
+  // commits with the same tree as HEAD via `skip_versions`, which silently
+  // dropped commits[0] in the common clean-worktree case.)
+  if (commitsData && commitsData.commits.length > 0) {
+    const totalCommits = commitsData.commits.length;
+    for (let i = 0; i < totalCommits; i++) {
+      const versionNum = totalCommits - i;
+      opts.push({
+        id: `v${versionNum}`,
+        label: `Version ${versionNum}`,
+        ref: commitsData.commits[i].hash,
+      });
+    }
+  }
+  opts.push({ id: 'target', label: 'Base' });
+  return opts;
+}
+
+/** Validate that fromVersion/toVersion still exist in opts; fall back to Base/Latest if not. */
+function reconcileVersionSelection(
+  opts: VersionOption[],
+  fromVersion: string,
+  toVersion: string,
+): { from: string; to: string; changed: boolean } {
+  let from = fromVersion;
+  let to = toVersion;
+  let changed = false;
+  if (!opts.some((v) => v.id === fromVersion)) {
+    from = 'target';
+    changed = true;
+  }
+  if (!opts.some((v) => v.id === toVersion)) {
+    to = 'latest';
+    changed = true;
+  }
+  return { from, to, changed };
 }
 import { FileTreeSidebar } from './FileTreeSidebar';
 import { DiffFileView, resetGlobalMatchIndex } from './DiffFileView';
@@ -90,17 +134,18 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   useEffect(() => {
     selectedFileRef.current = selectedFile;
   }, [selectedFile]);
-  // Cached header/version options (workspace + task ID)
+  // Cached header/version options (workspace + task ID). Memoized so we don't
+  // re-read + re-parse localStorage on every render — the parsed value only
+  // feeds useState lazy initializers below, so once-per-key is enough.
   const headerOptionsStorageKey = `grove:review-options:${projectId}:${taskId}`;
-  const initialCachedOptions = (() => {
+  const initialCachedOptions = useMemo(() => {
     try {
       const stored = localStorage.getItem(headerOptionsStorageKey);
       return stored ? JSON.parse(stored) : null;
-    } catch (e) {
-      console.error("Failed to parse cached review options", e);
+    } catch {
       return null;
     }
-  })();
+  }, [headerOptionsStorageKey]);
 
   const [viewTypeState, setViewType] = useState<'unified' | 'split'>(() => {
     if (initialCachedOptions && (initialCachedOptions.viewType === 'unified' || initialCachedOptions.viewType === 'split')) {
@@ -219,19 +264,40 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   useEffect(() => {
     currentDiffRefsRef.current = currentDiffRefs;
   }, [currentDiffRefs]);
+  // Mirror version selection into refs so the mode-switch effect can read the
+  // latest values without depending on them (depending on them would re-fire
+  // the entire effect — spinner flash, scroll reset, double-fetch — on every
+  // dropdown click).
+  const fromVersionRef = useRef(fromVersion);
+  const toVersionRef = useRef(toVersion);
+  useEffect(() => { fromVersionRef.current = fromVersion; }, [fromVersion]);
+  useEffect(() => { toVersionRef.current = toVersion; }, [toVersion]);
   const initialCollapseRef = useRef(false);
 
-  // Auto-persist header options when they change
+  // Auto-persist header options when they change. Dedupe: only write when the
+  // serialized payload actually differs from the last write — the effect fires
+  // on every render where deps change, but other reducers may flip a dep back
+  // to its prior value (initial-load reconcile, mode switch, etc.) yielding a
+  // byte-identical payload that doesn't need a synchronous localStorage write.
+  //
+  // Initialize from the cached options snapshot the useState initializers also
+  // pulled from — so the first effect run with state-equal-to-cache doesn't
+  // produce a redundant rewrite of the same payload on every mount.
+  const lastPersistedRef = useRef<string>(
+    initialCachedOptions ? JSON.stringify(initialCachedOptions) : "",
+  );
   useEffect(() => {
+    const serialized = JSON.stringify({
+      fromVersion,
+      toVersion,
+      displayMode,
+      viewType: viewTypeState,
+      focusMode,
+    });
+    if (serialized === lastPersistedRef.current) return;
     try {
-      const cached = {
-        fromVersion,
-        toVersion,
-        displayMode,
-        viewType: viewTypeState,
-        focusMode,
-      };
-      localStorage.setItem(headerOptionsStorageKey, JSON.stringify(cached));
+      localStorage.setItem(headerOptionsStorageKey, serialized);
+      lastPersistedRef.current = serialized;
     } catch (e) {
       console.error("Failed to save review options", e);
     }
@@ -762,29 +828,32 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
         if (fetchGenRef.current === gen) setLoading(false);
       });
     } else {
-      // Changes mode: fetch commits first to ensure the version dropdown is up-to-date
+      // Changes mode: fetch commits first to ensure the version dropdown is up-to-date.
+      // Read fromVersion/toVersion via refs so an in-mode dropdown change doesn't
+      // re-fire this whole effect (spinner flash + scroll reset + double-fetch).
       getCommits(projectId, taskId)
         .then((commitsData) => {
           if (fetchGenRef.current !== gen) return;
-          const opts: VersionOption[] = [{ id: 'latest', label: 'Latest' }];
-          if (commitsData && commitsData.commits.length > 0) {
-            const totalCommits = commitsData.commits.length;
-            const startIdx = commitsData.skip_versions ?? 1;
-            for (let i = startIdx; i < totalCommits; i++) {
-              const versionNum = totalCommits - i;
-              opts.push({
-                id: `v${versionNum}`,
-                label: `Version ${versionNum}`,
-                ref: commitsData.commits[i].hash,
-              });
-            }
-          }
-          opts.push({ id: 'target', label: 'Base' });
+          const opts = buildVersionOpts(commitsData);
           setVersions(opts);
 
+          // Reconcile cached selection against the fresh opts (a commit could
+          // have been rewritten by an amend/reset since we last looked).
+          const { from, to, changed } = reconcileVersionSelection(
+            opts,
+            fromVersionRef.current,
+            toVersionRef.current,
+          );
+          if (changed) {
+            setFromVersion(from);
+            setToVersion(to);
+            fromVersionRef.current = from;
+            toVersionRef.current = to;
+          }
+
           // Resolve Refs using the freshly fetched Version list
-          const fromOpt = opts.find((v) => v.id === fromVersion);
-          const toOpt = opts.find((v) => v.id === toVersion);
+          const fromOpt = opts.find((v) => v.id === from);
+          const toOpt = opts.find((v) => v.id === to);
           refetchDiff({ fromRef: fromOpt?.ref, toRef: toOpt?.ref, gen });
         })
         .catch(() => {
@@ -792,7 +861,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
           refetchDiff({ ...currentDiffRefsRef.current, gen });
         });
     }
-  }, [viewMode, focusMode, projectId, taskId, fromVersion, toVersion, appendLazyFiles, refetchDiff]);
+  }, [viewMode, focusMode, projectId, taskId, appendLazyFiles, refetchDiff]);
 
   // Version change handlers — directly trigger refetch
   const handleFromVersionChange = useCallback((id: string) => {
@@ -812,10 +881,11 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   }, [versions, fromVersion, refetchDiff]);
 
   const [refreshing, setRefreshing] = useState(false);
-  const handleRefresh = useCallback(async (options?: { silent?: boolean } | unknown) => {
-    const silent = options && typeof options === 'object' && !('nativeEvent' in options || 'preventDefault' in options)
-      ? (options as { silent?: boolean }).silent === true
-      : false;
+  const doRefresh = useCallback(async (silent: boolean) => {
+    // Claim a new fetch generation so the commits+versions write below doesn't
+    // race against a concurrent refetch from another caller (manual click while
+    // auto-refresh is in flight, etc.).
+    const gen = ++fetchGenRef.current;
     if (!silent) {
       setRefreshing(true);
       requestQueue.current = [];
@@ -826,8 +896,9 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       loadingDiffsRef.current = new Set();
       lazyRootDirEntriesRef.current = [];
     } else {
-      setFullFileContents(new Map());
-      setLoadingFiles(new Set());
+      // Silent path: only invalidate the active file's caches. Wiping
+      // fullFileContents/loadingFiles globally would flash the visible file's
+      // content during an "Agent turn finished" auto-refresh.
       const selected = selectedFileRef.current;
       if (selected) {
         setFileDiffCache((prev) => {
@@ -835,10 +906,23 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
           next.delete(selected);
           return next;
         });
+        setFullFileContents((prev) => {
+          if (!prev.has(selected)) return prev;
+          const next = new Map(prev);
+          next.delete(selected);
+          return next;
+        });
+        setLoadingFiles((prev) => {
+          if (!prev.has(selected)) return prev;
+          const next = new Set(prev);
+          next.delete(selected);
+          return next;
+        });
       }
     }
 
     const commentsPromise = getReviewComments(projectId, taskId).then((result) => {
+      if (fetchGenRef.current !== gen) return;
       setComments(result.comments);
       if (result.git_user_name) gitUserNameRef.current = result.git_user_name;
     }).catch(() => null);
@@ -847,35 +931,36 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     try {
       if (viewMode === 'diff') {
         const commitsData = await getCommits(projectId, taskId).catch(() => null);
-        const opts: VersionOption[] = [{ id: 'latest', label: 'Latest' }];
-        if (commitsData && commitsData.commits.length > 0) {
-          const totalCommits = commitsData.commits.length;
-          const startIdx = commitsData.skip_versions ?? 1;
-          for (let i = startIdx; i < totalCommits; i++) {
-            const versionNum = totalCommits - i;
-            opts.push({
-              id: `v${versionNum}`,
-              label: `Version ${versionNum}`,
-              ref: commitsData.commits[i].hash,
-            });
-          }
-        }
-        opts.push({ id: 'target', label: 'Base' });
+        if (fetchGenRef.current !== gen) return;
+        const opts = buildVersionOpts(commitsData);
         setVersions(opts);
 
-        const fromOpt = opts.find((v) => v.id === fromVersion);
-        const toOpt = opts.find((v) => v.id === toVersion);
-        const fromRef = fromOpt?.ref;
-        const toRef = toOpt?.ref;
+        // Reconcile cached selection against the fresh opts so the selector
+        // doesn't display a Version that no longer exists in the commit list.
+        const { from, to, changed } = reconcileVersionSelection(
+          opts,
+          fromVersionRef.current,
+          toVersionRef.current,
+        );
+        if (changed) {
+          setFromVersion(from);
+          setToVersion(to);
+          fromVersionRef.current = from;
+          toVersionRef.current = to;
+        }
+
+        const fromOpt = opts.find((v) => v.id === from);
+        const toOpt = opts.find((v) => v.id === to);
 
         await Promise.all([
-          refetchDiff({ fromRef, toRef, keepSelection: true, silent }),
+          refetchDiff({ fromRef: fromOpt?.ref, toRef: toOpt?.ref, keepSelection: true, silent, gen }),
           commentsPromise,
         ]);
       } else if (focusMode) {
         await Promise.all([
           commentsPromise,
           getTaskDirEntries(projectId, taskId, '').then((result) => {
+            if (fetchGenRef.current !== gen) return;
             lazyRootDirEntriesRef.current = result.entries;
             appendLazyFiles(result.entries);
           }).catch(() => null),
@@ -884,6 +969,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
         await Promise.all([
           commentsPromise,
           getTaskFiles(projectId, taskId).then((result) => {
+            if (fetchGenRef.current !== gen) return;
             setAllFiles(result.files);
           }).catch(() => null),
         ]);
@@ -891,18 +977,29 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     } catch (e) {
       caught = e;
     }
-    if (!silent) {
+    if (!silent && fetchGenRef.current === gen) {
       setRefreshing(false);
     }
     if (caught !== null) {
-      // Preserve original try/finally semantics: rethrow after cleanup.
       throw caught;
     }
-  }, [fromVersion, toVersion, refetchDiff, projectId, taskId, viewMode, focusMode, appendLazyFiles]);
+  }, [refetchDiff, projectId, taskId, viewMode, focusMode, appendLazyFiles]);
+
+  // Two callers: the manual refresh button / hotkey-r path (loud, shows
+  // spinner) and the agent-turn-finished auto-refresh path (silent). Splitting
+  // them avoids the previous duck-typing of the click event vs an options object.
+  const handleRefresh = useCallback(() => {
+    void doRefresh(false).catch(() => {});
+  }, [doRefresh]);
+  const handleSilentRefresh = useCallback(() => {
+    void doRefresh(true).catch(() => {});
+  }, [doRefresh]);
 
   const previousChatBusyRef = useRef(!!isChatBusy);
 
-  // Auto-refresh silently when Agent finishes a turn (isChatBusy transitions from true to false)
+  // Auto-refresh silently when Agent finishes a turn (isChatBusy transitions from true to false).
+  // Only fires when a parent passes isChatBusy (TaskView embedding); the standalone
+  // /review/... route doesn't supply it, so silent auto-refresh is off there.
   useEffect(() => {
     const wasBusy = previousChatBusyRef.current;
     const busy = !!isChatBusy;
@@ -910,10 +1007,10 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
     if (wasBusy && !busy) {
       Promise.resolve().then(() => {
-        void handleRefresh({ silent: true }).catch(() => {});
+        handleSilentRefresh();
       });
     }
-  }, [isChatBusy, handleRefresh]);
+  }, [isChatBusy, handleSilentRefresh]);
 
   const handleSetViewMode = useCallback((nextMode: 'diff' | 'full') => {
     sessionStorage.setItem(viewModeStorageKey, nextMode);
@@ -950,18 +1047,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
             let resolvedFromRef: string | undefined = undefined;
             let resolvedToRef: string | undefined = undefined;
             if (commitsData && commitsData.commits.length > 0) {
-              const totalCommits = commitsData.commits.length;
-              const startIdx = commitsData.skip_versions ?? 1;
-              const opts: VersionOption[] = [{ id: 'latest', label: 'Latest' }];
-              for (let i = startIdx; i < totalCommits; i++) {
-                const versionNum = totalCommits - i;
-                opts.push({
-                  id: `v${versionNum}`,
-                  label: `Version ${versionNum}`,
-                  ref: commitsData.commits[i].hash,
-                });
-              }
-              opts.push({ id: 'target', label: 'Base' });
+              const opts = buildVersionOpts(commitsData);
 
               const fromOpt = opts.find(v => v.id === fromVersion);
               const toOpt = opts.find(v => v.id === toVersion);
@@ -984,16 +1070,8 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
               if (finalFrom !== fromVersion || finalTo !== toVersion) {
                 setFromVersion(finalFrom);
                 setToVersion(finalTo);
-                // Also update localStorage
-                try {
-                  const stored = localStorage.getItem(headerOptionsStorageKey);
-                  const cached = stored ? JSON.parse(stored) : {};
-                  cached.fromVersion = finalFrom;
-                  cached.toVersion = finalTo;
-                  localStorage.setItem(headerOptionsStorageKey, JSON.stringify(cached));
-                } catch (e) {
-                  console.error(e);
-                }
+                // localStorage persistence is handled by the "Auto-persist
+                // header options" effect — no need to mirror writes here.
               }
             }
             return getDiffStats(projectId, taskId, resolvedFromRef, resolvedToRef);
@@ -1057,49 +1135,21 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
         // Build version options: Latest, Version N..1, Base (newest first)
         // skip_versions = number of leading commits equivalent to Latest
         {
-          const opts: VersionOption[] = [{ id: 'latest', label: 'Latest' }];
-          if (commitsData && commitsData.commits.length > 0) {
-            const totalCommits = commitsData.commits.length;
-            const startIdx = commitsData.skip_versions ?? 1;
-            for (let i = startIdx; i < totalCommits; i++) {
-              const versionNum = totalCommits - i;
-              opts.push({
-                id: `v${versionNum}`,
-                label: `Version ${versionNum}`,
-                ref: commitsData.commits[i].hash,
-              });
-            }
-          }
-          opts.push({ id: 'target', label: 'Base' });
+          const opts = buildVersionOpts(commitsData);
           if (!cancelled) {
             setVersions(opts);
-
-            // Validate that cached versions are valid options, if not, fallback to defaults
-            let finalFrom = fromVersion;
-            let finalTo = toVersion;
-            let changed = false;
-
-            if (!opts.some(v => v.id === fromVersion)) {
-              finalFrom = 'target';
-              changed = true;
-            }
-            if (!opts.some(v => v.id === toVersion)) {
-              finalTo = 'latest';
-              changed = true;
-            }
-
+            const { from: finalFrom, to: finalTo, changed } = reconcileVersionSelection(
+              opts,
+              fromVersion,
+              toVersion,
+            );
             if (changed) {
               setFromVersion(finalFrom);
               setToVersion(finalTo);
-              try {
-                const stored = localStorage.getItem(headerOptionsStorageKey);
-                const cached = stored ? JSON.parse(stored) : {};
-                cached.fromVersion = finalFrom;
-                cached.toVersion = finalTo;
-                localStorage.setItem(headerOptionsStorageKey, JSON.stringify(cached));
-              } catch (e) {
-                console.error(e);
-              }
+              fromVersionRef.current = finalFrom;
+              toVersionRef.current = finalTo;
+              // localStorage persistence is handled by the "Auto-persist header
+              // options" effect (line ~226) — no need to mirror writes here.
             }
           }
         }

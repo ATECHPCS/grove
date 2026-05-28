@@ -19,7 +19,12 @@ export function BannerProvider({ children }: { children: ReactNode }) {
   const [banners, setBanners] = useState<BannerMessage[]>([]);
 
   const showBanner = useCallback((message: string, type: BannerType = "info", duration = 3000) => {
-    const id = Math.random().toString(36).substring(2, 9);
+    // crypto.randomUUID is supported in all Tauri webviews (Wry / WebKit / WebView2).
+    // Prevents the previous Date.now()-collision issue when several banners fire
+    // within the same millisecond (e.g. batch theme imports).
+    const id = (typeof crypto !== "undefined" && "randomUUID" in crypto)
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
     setBanners((prev) => [...prev, { id, message, type, duration }]);
   }, []);
 
@@ -30,18 +35,20 @@ export function BannerProvider({ children }: { children: ReactNode }) {
   return (
     <BannerContext.Provider value={{ showBanner }}>
       {children}
-      {/* Container for stacked banners if multiple occur */}
-      <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[10001] flex flex-col gap-2 pointer-events-none">
+      {/* Single fixed anchor for the banner stack; individual PopBanners are
+          flow children so they truly stack instead of overlapping on the same
+          fixed coordinates. AnimatePresence reads exit props off the direct
+          PopBanner (motion.div), so exit animations fire correctly. */}
+      <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[10001] flex flex-col items-center gap-2 pointer-events-none">
         <AnimatePresence>
           {banners.map((b) => (
-            <div key={b.id} className="pointer-events-auto">
-              <PopBanner
-                message={b.message}
-                type={b.type}
-                duration={b.duration}
-                onClose={() => removeBanner(b.id)}
-              />
-            </div>
+            <PopBanner
+              key={b.id}
+              message={b.message}
+              type={b.type}
+              duration={b.duration}
+              onClose={() => removeBanner(b.id)}
+            />
           ))}
         </AnimatePresence>
       </div>

@@ -164,8 +164,8 @@ interface ApplicationsResponse {
 }
 
 // API functions
-export async function getConfig(): Promise<Config> {
-  return apiClient.get<Config>('/api/v1/config');
+export async function getConfig(signal?: AbortSignal): Promise<Config> {
+  return apiClient.get<Config>('/api/v1/config', signal);
 }
 
 export async function patchConfig(patch: ConfigPatch): Promise<Config> {

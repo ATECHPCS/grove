@@ -950,8 +950,31 @@ impl App {
     pub fn new() -> Self {
         // 加载配置
         let config = storage::config::load_config();
-        let theme = Theme::from_name(&config.theme.name);
         let last_system_dark = detect_system_theme();
+        // 优先按 mode + 对应 slot 解析(Web 端写的就是 mode/light_theme/dark_theme,
+        // 完全不写 name); auto 时用终端 dark/light 偏好选 slot,与 Web 行为对齐;
+        // 都缺失时退回 legacy name 字段。
+        let theme = match config.theme.mode.as_str() {
+            "light" if !config.theme.light_theme.is_empty() => {
+                Theme::from_name(&config.theme.light_theme)
+            }
+            "dark" if !config.theme.dark_theme.is_empty() => {
+                Theme::from_name(&config.theme.dark_theme)
+            }
+            "auto" => {
+                let slot = if last_system_dark {
+                    &config.theme.dark_theme
+                } else {
+                    &config.theme.light_theme
+                };
+                if slot.is_empty() {
+                    Theme::Auto
+                } else {
+                    Theme::from_name(slot)
+                }
+            }
+            _ => Theme::from_name(&config.theme.name),
+        };
         let colors = get_theme_colors(theme);
 
         // 检查更新
@@ -1245,14 +1268,34 @@ impl App {
 
     /// 保存主题配置到文件
     fn save_theme_config(&self) {
-        use storage::config::{load_config, save_config, ThemeConfig};
+        use storage::config::{load_config, save_config};
         let mut config = load_config();
-        let name = self.ui.theme.label().to_string();
-        config.theme = ThemeConfig {
-            name: name.clone(),
-            mode: name.to_lowercase(),
-            ..Default::default()
-        };
+        let theme = self.ui.theme;
+        // 保留 light_theme / dark_theme / custom_themes（旧实现用
+        // `..Default::default()` 把这些字段全抹掉）。
+        // 对应 Web ThemeContext 的 light_theme / dark_theme / mode 三字段：
+        //   Auto         → mode=auto（不动 slot）
+        //   光系主题      → mode=light + light_theme=&lt;id&gt;
+        //   暗系主题      → mode=dark  + dark_theme=&lt;id&gt;
+        // 旧版本只更新 name，但 Web ThemeContext 根本不读 name，所以 TUI 改
+        // 主题在 Web 端不会生效。
+        config.theme.name = theme.label().to_string();
+        match theme {
+            Theme::Auto => {
+                config.theme.mode = "auto".to_string();
+            }
+            t => {
+                if let Some(id) = t.web_id() {
+                    if t.is_light() {
+                        config.theme.mode = "light".to_string();
+                        config.theme.light_theme = id.to_string();
+                    } else {
+                        config.theme.mode = "dark".to_string();
+                        config.theme.dark_theme = id.to_string();
+                    }
+                }
+            }
+        }
         let _ = save_config(&config);
     }
 

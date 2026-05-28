@@ -32,14 +32,19 @@ export function PopBanner({ message, type = "info", duration = 3000, onClose }: 
     info: "var(--color-highlight)",
   };
 
+  // Positioning is handled by the BannerProvider stack container; this card
+  // is just a relative-flow item so multiple banners actually stack instead of
+  // piling on the same fixed coordinates.
   return (
     <motion.div
-      initial={{ opacity: 0, y: -20, x: "-50%" }}
-      animate={{ opacity: 1, y: 0, x: "-50%" }}
-      exit={{ opacity: 0, y: -20, x: "-50%" }}
+      role="status"
+      aria-live="polite"
+      initial={{ opacity: 0, y: -20 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -20 }}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={() => setIsHovered(false)}
-      className="fixed top-4 left-1/2 z-[10001] min-w-[300px] max-w-md shadow-2xl rounded-xl border bg-[var(--color-bg-secondary)] overflow-hidden"
+      className="pointer-events-auto min-w-[300px] max-w-md shadow-2xl rounded-xl border bg-[var(--color-bg-secondary)] overflow-hidden"
       style={{ borderColor: borderColors[type] }}
     >
       <div className="px-4 py-3 flex items-center justify-between gap-3">

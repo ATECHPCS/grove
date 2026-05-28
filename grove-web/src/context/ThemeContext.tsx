@@ -1,6 +1,7 @@
-import { createContext, useContext, useState, useEffect, useMemo, useCallback } from "react";
+import { createContext, useContext, useState, useEffect, useMemo, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
 import { apiClient } from "../api/client";
+import type { CustomThemeConfig } from "../api/config";
 
 // Theme definitions matching TUI themes
 export interface ThemeColors {
@@ -386,7 +387,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const loadTheme = async () => {
       try {
-        const config = await apiClient.get<{ theme?: { mode: string; light_theme: string; dark_theme: string; custom_themes?: any[] } }>("/api/v1/config");
+        const config = await apiClient.get<{ theme?: { mode: string; light_theme: string; dark_theme: string; custom_themes?: CustomThemeConfig[] } }>("/api/v1/config");
         const t = config.theme;
         if (t) {
           if (t.mode) setMode(t.mode as ThemeMode);
@@ -464,11 +465,21 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     root.style.setProperty("--color-info", colors.info);
   }, [theme]);
 
+  // Abort in-flight setAppearance PATCH before sending a new one. Rapid mode
+  // toggles (A→B→A within 100ms) would otherwise produce overlapping requests
+  // whose backend completion order may not match send order.
+  const appearancePatchAbortRef = useRef<AbortController | null>(null);
   const setAppearance = useCallback(async (params: { mode?: ThemeMode; lightThemeId?: string; darkThemeId?: string; customThemes?: Theme[] }) => {
     if (params.mode !== undefined) setMode(params.mode);
     if (params.lightThemeId !== undefined) setLightThemeId(params.lightThemeId);
     if (params.darkThemeId !== undefined) setDarkThemeId(params.darkThemeId);
     if (params.customThemes !== undefined) setCustomThemes(params.customThemes);
+
+    if (appearancePatchAbortRef.current) {
+      appearancePatchAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    appearancePatchAbortRef.current = controller;
 
     // Persist to backend
     try {
@@ -498,22 +509,27 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
             is_light: ct.isLight,
           }))
         }
-      });
+      }, controller.signal);
     } catch (error) {
+      // AbortError is expected when a newer setAppearance call superseded us.
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      const err = error as { name?: string };
+      if (err?.name === "AbortError") return;
       console.error("Failed to save appearance to backend:", error);
     }
   }, []);
 
+  // Memoize the context value so consumers (MarkdownRenderer, TaskEditor,
+  // Terminal theme provider, etc.) don't re-render on every ThemeProvider
+  // render. Without this, the 5 internal useState + system theme listener +
+  // focus event listener churn the value identity multiple times per second.
+  const contextValue = useMemo(
+    () => ({ theme, mode, lightThemeId, darkThemeId, customThemes, themes: allThemes, setAppearance }),
+    [theme, mode, lightThemeId, darkThemeId, customThemes, allThemes, setAppearance],
+  );
+
   return (
-    <ThemeContext.Provider value={{ 
-      theme, 
-      mode, 
-      lightThemeId, 
-      darkThemeId, 
-      customThemes, 
-      themes: allThemes,
-      setAppearance 
-    }}>
+    <ThemeContext.Provider value={contextValue}>
       {children}
     </ThemeContext.Provider>
   );

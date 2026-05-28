@@ -177,6 +177,10 @@ pub enum LastLaunch {
         no_open: bool,
         #[serde(default)]
         dev: bool,
+        /// Remote server URL (e.g. http://192.168.1.5:3001). When set, no local
+        /// API server is started; the frontend connects to this URL instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_url: Option<String>,
     },
     Mobile {
         #[serde(default = "default_web_port")]
@@ -199,6 +203,10 @@ pub enum LastLaunch {
     Gui {
         #[serde(default = "default_gui_port")]
         port: u16,
+        /// Remote server URL. When set, Tauri loads this URL directly and no
+        /// local API server is started.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_url: Option<String>,
     },
 }
 
@@ -215,8 +223,15 @@ impl LastLaunch {
     pub fn display_label(&self) -> String {
         match self {
             LastLaunch::Tui => "tui".to_string(),
-            LastLaunch::Web { port, dev, .. } => {
-                if *dev {
+            LastLaunch::Web {
+                port,
+                dev,
+                remote_url,
+                ..
+            } => {
+                if let Some(url) = remote_url {
+                    format!("web --remote-url {} (port {})", url, port)
+                } else if *dev {
                     format!("web --dev (port {})", port)
                 } else {
                     format!("web (port {})", port)
@@ -229,7 +244,15 @@ impl LastLaunch {
                     format!("mobile (port {})", port)
                 }
             }
-            LastLaunch::Gui { port } => format!("gui (port {})", port),
+            LastLaunch::Gui {
+                port, remote_url, ..
+            } => {
+                if let Some(url) = remote_url {
+                    format!("gui --remote-url {} (port {})", url, port)
+                } else {
+                    format!("gui (port {})", port)
+                }
+            }
         }
     }
 }
@@ -456,7 +479,7 @@ impl Default for LayoutConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CustomThemeColors {
     #[serde(default)]
     pub bg: String,
@@ -484,7 +507,7 @@ pub struct CustomThemeColors {
     pub info: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CustomThemeConfig {
     #[serde(default)]
     pub id: String,
@@ -498,10 +521,18 @@ pub struct CustomThemeConfig {
     pub is_light: bool,
 }
 
-fn default_theme_name() -> String { "auto".to_string() }
-fn default_theme_mode() -> String { "auto".to_string() }
-fn default_light_theme() -> String { "light".to_string() }
-fn default_dark_theme() -> String { "dark".to_string() }
+fn default_theme_name() -> String {
+    "auto".to_string()
+}
+fn default_theme_mode() -> String {
+    "auto".to_string()
+}
+fn default_light_theme() -> String {
+    "light".to_string()
+}
+fn default_dark_theme() -> String {
+    "dark".to_string()
+}
 
 /// 主题配置
 #[derive(Debug, Clone, Serialize, Deserialize)]

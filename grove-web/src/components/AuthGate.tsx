@@ -17,6 +17,17 @@ interface AuthGateProps {
 
 type AuthState = "loading" | "authenticated" | "needs_auth";
 
+/** Base URL for raw auth probes (pre-auth, so we can't use apiClient).
+ *
+ * Priority:
+ *   1. window.__GROVE_API_BASE__ — injected by `grove web --remote-url`
+ *   2. '' — relative to current origin (local mode)
+ */
+function getAuthBase(): string {
+  const g = window as unknown as Record<string, unknown>;
+  return (typeof g.__GROVE_API_BASE__ === "string" && g.__GROVE_API_BASE__) || "";
+}
+
 export function AuthGate({ children }: AuthGateProps) {
   const [authState, setAuthState] = useState<AuthState>("loading");
   const [skInput, setSkInput] = useState("");
@@ -33,8 +44,7 @@ export function AuthGate({ children }: AuthGateProps) {
       // global apiClient would attach signed headers, which the server's
       // /auth/verify path is allowed to ignore but which require us to
       // already know the SK is valid — chicken-and-egg.
-      // eslint-disable-next-line no-restricted-syntax
-      const resp = await fetch("/api/v1/auth/verify", {
+      const resp = await fetch(`${getAuthBase()}/api/v1/auth/verify`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ proof }),
@@ -85,14 +95,16 @@ export function AuthGate({ children }: AuthGateProps) {
       try {
         // Intentional raw fetch: pre-auth probe to discover if the server
         // requires HMAC signing at all. apiClient assumes a valid SK exists.
-        // eslint-disable-next-line no-restricted-syntax
-        const resp = await fetch("/api/v1/auth/info");
+        const resp = await fetch(`${getAuthBase()}/api/v1/auth/info`);
         if (!resp.ok) {
           // If auth/info fails, assume no auth needed (backwards compat)
           setAuthState("authenticated");
           return;
         }
         const info = await resp.json();
+        if (info && (info.remote || info.required)) {
+          (window as unknown as Record<string, unknown>).__GROVE_REMOTE__ = true;
+        }
         if (!info.required) {
           setAuthState("authenticated");
           return;

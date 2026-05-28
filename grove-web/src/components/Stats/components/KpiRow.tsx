@@ -43,7 +43,7 @@ export function KpiRow({
   unit,
   averageRates,
 }: KpiRowProps) {
-  const getValue = (k: KpiData | undefined) => {
+  const getValue = (k: KpiData | undefined): number => {
     if (!k) return 0;
     if (unit === "cost") {
       const cost_in_est = k.tokens_in * averageRates.input;
@@ -62,6 +62,16 @@ export function KpiRow({
           case "cached": return cost_cached_est * ratio;
           case "output": return cost_out_est * ratio;
         }
+      } else if (k.cost_total > 0) {
+        // cost_total > 0 but no token-derived split — match TokenSplitBar's
+        // three-way fallback so the KPI card sums to cost_total instead of
+        // showing all components as $0.
+        const third = k.cost_total / 3;
+        switch (metricType) {
+          case "input":
+          case "cached":
+          case "output": return third;
+        }
       } else {
         switch (metricType) {
           case "input": return cost_in_est;
@@ -69,6 +79,7 @@ export function KpiRow({
           case "output": return cost_out_est;
         }
       }
+      return 0;
     } else {
       switch (metricType) {
         case "total": return k.tokens_total;
@@ -76,6 +87,7 @@ export function KpiRow({
         case "cached": return k.tokens_cached;
         case "output": return k.tokens_out;
       }
+      return 0;
     }
   };
 
@@ -213,7 +225,13 @@ function TokenSplitBar({
       cost_cached *= ratio;
       cost_out *= ratio;
     } else {
-      cost_in = kpi.cost_total;
+      // No token-derived split available — distribute evenly across the three
+      // segments so the bar doesn't render 100% "input" color. Matches
+      // ActivityOverTime's bucketValue fallback for the same shape.
+      const third = kpi.cost_total / 3;
+      cost_in = third;
+      cost_cached = third;
+      cost_out = third;
     }
   }
 

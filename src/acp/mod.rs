@@ -2525,11 +2525,11 @@ async fn drive_session(
                 saved_id
             }
             Err(load_err) => {
-                let err_msg = format!("Resume session failed: {}", load_err);
-                handle.emit(AcpUpdate::Error {
-                    message: err_msg.clone(),
-                });
-                return Err(acp::Error::internal_error().data(err_msg));
+                // Don't emit AcpUpdate::Error here — run_acp_session's caller
+                // already emits a single error message when this function returns
+                // Err(...). Double-emitting shows the user the same banner twice.
+                return Err(acp::Error::internal_error()
+                    .data(format!("Resume session failed: {}", load_err)));
             }
         }
     } else {
@@ -2874,7 +2874,10 @@ async fn drive_session(
                         });
                         // Layer A: persist per-turn usage to SQLite for stats.
                         // Best-effort — a write error here must not fail the turn.
-                        let cost_owned = handle.current_usage.lock().ok()
+                        let cost_owned = handle
+                            .current_usage
+                            .lock()
+                            .ok()
                             .and_then(|g| g.as_ref().and_then(|s| s.cost.clone()));
                         if let (Some(usage), Some(chat_id)) =
                             (&turn_usage, config.chat_id.as_deref())

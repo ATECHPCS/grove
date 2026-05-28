@@ -206,11 +206,16 @@ export function TasksPage({ initialTaskId, initialChatId, initialViewMode, onNav
     // close it. handleCloseTask is useCallback-stable.
   }, [exitWorkspaceSignal]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Reset workspace state when project changes (sidebar switch or notification navigation)
+  // Reset workspace state when project changes (sidebar switch or notification navigation).
+  // initialTaskId only suppresses the reset on the FIRST render where prevProjectIdRef
+  // is still undefined (initial mount with a notification-target task) — otherwise a
+  // stale initialTaskId that never matches activeTasks would freeze the workspace open
+  // across all subsequent project switches.
   useEffect(() => {
     if (prevProjectIdRef.current !== selectedProject?.id) {
+      const isInitialMount = prevProjectIdRef.current === undefined;
       prevProjectIdRef.current = selectedProject?.id;
-      if (!initialTaskId) {
+      if (!isInitialMount || !initialTaskId) {
         pageHandlers.setInWorkspace(false);
         pageHandlers.setSelectedTask(null);
       }

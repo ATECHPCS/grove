@@ -12,6 +12,8 @@ interface LogoBrandProps {
 export function LogoBrand({ mode, onToggle }: LogoBrandProps) {
   const isBlitz = mode === "blitz";
 
+  const isRemote = typeof window !== "undefined" && !!(window as unknown as Record<string, unknown>).__GROVE_REMOTE__;
+
   return (
     <button
       onClick={onToggle}
@@ -24,7 +26,14 @@ export function LogoBrand({ mode, onToggle }: LogoBrandProps) {
 
       <div className="flex flex-col items-start -space-y-0.5">
         {/* GROVE title — vectorized wordmark */}
-        <GroveWordmark height={16} />
+        <div className="flex items-center gap-1.5">
+          <GroveWordmark height={16} />
+          {isRemote && (
+            <span className="px-1 py-0.25 text-[7px] font-black uppercase tracking-widest rounded bg-[var(--color-highlight)]/10 text-[var(--color-highlight)] border border-[var(--color-highlight)]/20 shadow-sm shadow-[var(--color-highlight)]/5 select-none">
+              Remote
+            </span>
+          )}
+        </div>
 
         {/* Mode label — different personality & transition */}
         <AnimatePresence mode="wait">

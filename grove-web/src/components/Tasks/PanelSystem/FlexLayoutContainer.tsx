@@ -225,8 +225,12 @@ export const FlexLayoutContainer = forwardRef<
   FlexLayoutContainerProps
 >(({ task, projectId, initialLayout, onLayoutChange, fullscreen = false, onToggleFullscreen }, ref) => {
   const { terminalAvailable } = useConfig();
-  const { selectedProject } = useProject();
-  const isStudio = selectedProject?.projectType === 'studio';
+  const { selectedProject, projects } = useProject();
+  // Resolve project from the task's projectId, not the globally-selected one:
+  // Blitz can open a task from a different project than the sidebar selection.
+  const taskProject = projects.find((p) => p.id === projectId) ?? selectedProject;
+  const isStudio = taskProject?.projectType === 'studio';
+  const taskIsGitRepo = taskProject?.isGitRepo;
 
   const layoutStorageKey = `grove-flexlayout-${projectId}-${task.id}`;
 
@@ -856,7 +860,7 @@ export const FlexLayoutContainer = forwardRef<
               navigateToFile={fileNavRequest}
               hideHeader={true}
               fullscreen={true}
-              isGitRepo={selectedProject?.isGitRepo}
+              isGitRepo={taskIsGitRepo}
               isChatBusy={isChatBusy}
             />
           </div>
@@ -934,7 +938,7 @@ export const FlexLayoutContainer = forwardRef<
       default:
         return <div className="p-4 text-[var(--color-text-muted)]">Unknown panel type: {component}</div>;
     }
-  }, [projectId, task, model, closeTabById, navigateToFile, fileNavRequest, artifactPreviewRequest, lastChatIdleAt, isChatBusy, handleChatBecameIdle, handleBusyStateChange, selectedProject?.isGitRepo]);
+  }, [projectId, task, model, closeTabById, navigateToFile, fileNavRequest, artifactPreviewRequest, lastChatIdleAt, isChatBusy, handleChatBecameIdle, handleBusyStateChange, taskIsGitRepo]);
 
   // Track empty state
   const [isEmpty, setIsEmpty] = useState(() => getAllTabs().length === 0);

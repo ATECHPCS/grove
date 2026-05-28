@@ -83,8 +83,7 @@ import {
 } from "../../../utils/agentIcon";
 import type { MentionItem, FilteredMentionItem } from "../../../utils/fileMention";
 import { getMentionCandidates } from "../../../api";
-import { listExtensionTabs } from "../../../api/extension";
-import { useExtensionConnection } from "../../../hooks";
+import { listExtensionTabs, getExtensionStatus } from "../../../api/extension";
 import { useProject } from "../../../context/ProjectContext";
 import { useConfig } from "../../../context/ConfigContext";
 import { usePreviewComments, type PreviewCommentDraft } from "../../../context";
@@ -1722,6 +1721,27 @@ export function TaskChat({
   const wsMapRef = useRef<Map<string, WebSocket>>(new Map());
   // Track intentionally closed WebSockets (don't auto-reconnect these)
   const intentionalCloseRef = useRef<Set<string>>(new Set());
+  // Per-chat reconnect attempt count for exponential backoff. Reset on
+  // successful open. Stops auto-reconnect after WS_MAX_RECONNECT_ATTEMPTS
+  // to avoid hammering the agent on permanent failures (e.g. stale saved_id).
+  const reconnectAttemptRef = useRef<Map<string, number>>(new Map());
+  // Track scheduled reconnect timers so they can be cancelled on unmount /
+  // chat switch / intentional close — otherwise an in-flight 30s backoff
+  // resurrects a zombie WebSocket after the component is gone, triggering
+  // setState on an unmounted component.
+  const reconnectTimerRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  // Helper: clear any pending reconnect for a chat. Call before any path that
+  // removes the chat (delete, ChatListChanged prune, Take Control). Without
+  // this, a backoff-scheduled timer fires later, tries to connect a now-gone
+  // chat, gets 404, loops the 5-attempt ladder pointlessly.
+  const cancelPendingReconnectRef = useRef((chatId: string) => {
+    const timer = reconnectTimerRef.current.get(chatId);
+    if (timer) {
+      clearTimeout(timer);
+      reconnectTimerRef.current.delete(chatId);
+    }
+    reconnectAttemptRef.current.delete(chatId);
+  });
   // Track in-flight connection attempts to prevent async TOCTOU race
   const connectingRef = useRef<Set<string>>(new Set());
   // Debounce timer for auto-saving composer draft to localStorage
@@ -1876,10 +1896,14 @@ export function TaskChat({
   const [sketchMeta, setSketchMeta] = useState<SketchMeta[]>([]);
   const taskFilesFetchTimeRef = useRef(0);
   const taskFilesLoadingRef = useRef(false);
-  const { selectedProject } = useProject();
+  const { selectedProject, projects } = useProject();
   const { config: appConfig } = useConfig();
   const { drafts: previewCommentDrafts, removeDraft: removePreviewCommentDraft, clearDrafts: clearPreviewCommentDrafts } = usePreviewComments();
-  const isStudioProject = selectedProject?.projectType === "studio";
+  // Resolve project from the task's own projectId, not the globally-selected
+  // one — Blitz can open a task from a different project than the sidebar
+  // selection (same pattern as TaskInfoPanel / FlexLayoutContainer).
+  const taskProject = projects.find((p) => p.id === projectId) ?? selectedProject;
+  const isStudioProject = taskProject?.projectType === "studio";
   const chatRenderWindowSettings = useMemo(
     () =>
       normalizeChatRenderWindowSettings(
@@ -1953,9 +1977,15 @@ export function TaskChat({
     };
   }, [activeCategory]);
 
-  // Shared module-level poll — single fetch per 5s shared with SettingsPage
-  // and AddLinkDialog instead of N independent intervals across open tasks.
-  const isExtensionConnected = useExtensionConnection();
+  // Fetched once on mount. No polling — if the user plugs in the extension
+  // after opening this chat, they need to reload the tab to see
+  // `@browsertabs:` in the mention category list.
+  const [isExtensionConnected, setIsExtensionConnected] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    getExtensionStatus().then((c) => { if (!cancelled) setIsExtensionConnected(c); });
+    return () => { cancelled = true; };
+  }, []);
 
   const [allProjects, setAllProjects] = useState<ProjectListItem[]>([]);
   const [projectFiles, setProjectFiles] = useState<{ [projId: string]: string[] }>({});
@@ -2284,9 +2314,14 @@ export function TaskChat({
             };
             
             // Extract directories from flat project files to allow selecting folders!
+            // Defensive normalization: strip trailing slash so dir-listed entries
+            // (like "src/lib/") don't double-count, and skip empty / absolute paths
+            // since `${project.path}/${dirPath}` only makes sense for relative input.
             const dirs = new Set<string>();
             for (const file of files) {
-              const parts = file.split("/");
+              const normalized = file.replace(/\/+$/, "");
+              if (!normalized || normalized.startsWith("/")) continue;
+              const parts = normalized.split("/");
               for (let i = 1; i < parts.length; i++) {
                 dirs.add(parts.slice(0, i).join("/"));
               }
@@ -3104,6 +3139,7 @@ export function TaskChat({
           ws.close();
           wsMapRef.current.delete(chatId);
           perChatStateRef.current.delete(chatId);
+          cancelPendingReconnectRef.current(chatId);
         });
 
         setChats(fresh);
@@ -3227,11 +3263,32 @@ export function TaskChat({
       const ws = new WebSocket(url);
       wsMapRef.current.set(chatId, ws);
 
-      ws.onopen = () => {};
+      ws.onopen = () => {
+        // Successful connect — reset backoff so the next disconnect retries fast.
+        reconnectAttemptRef.current.delete(chatId);
+      };
 
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
+          // Permanent-failure check: if backend says "Resume session failed"
+          // (commit 5ec92be), the saved_id is stale and retries with the same
+          // id will keep failing. Mark this chat as intentionally closing so
+          // the onclose handler skips the exponential-backoff ladder.
+          //
+          // Use `includes` (not `startsWith`) because run_acp_session's caller
+          // wraps the inner error: the message may arrive as the raw
+          // "Resume session failed: ..." OR as the wrapped
+          // "ACP session error: Internal error: \"Resume session failed: ...\"".
+          // Substring match survives either format.
+          if (
+            data?.type === "error" &&
+            typeof data.message === "string" &&
+            data.message.includes("Resume session failed")
+          ) {
+            intentionalCloseRef.current.add(chatId);
+            cancelPendingReconnectRef.current(chatId);
+          }
           if (chatId === getActiveChatId()) {
             if (historyLoadingRef.current) {
               wsEventBufferRef.current.push(data);
@@ -3260,8 +3317,29 @@ export function TaskChat({
         // Skip if this was an intentional close (unmount, chat switch, etc.)
         if (intentionalCloseRef.current.has(chatId)) {
           intentionalCloseRef.current.delete(chatId);
+          cancelPendingReconnectRef.current(chatId);
         } else {
-          setTimeout(() => {
+          // Exponential backoff: 1s, 2s, 4s, 8s, 16s — cap at 30s. Give up after 5
+          // attempts to avoid hammering the agent on permanent failures (stale
+          // saved_id, agent crashed). User can manually retry by re-opening the chat.
+          const attempt = reconnectAttemptRef.current.get(chatId) ?? 0;
+          const WS_MAX_RECONNECT_ATTEMPTS = 5;
+          if (attempt >= WS_MAX_RECONNECT_ATTEMPTS) {
+            if (chatId === getActiveChatId()) {
+              setMessages((prev) =>
+                appendSystemMessage(
+                  prev,
+                  "Unable to reconnect after multiple attempts. Reopen the chat to retry.",
+                ),
+              );
+            }
+            reconnectAttemptRef.current.delete(chatId);
+            return;
+          }
+          const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
+          reconnectAttemptRef.current.set(chatId, attempt + 1);
+          const timer = setTimeout(() => {
+            reconnectTimerRef.current.delete(chatId);
             if (!wsMapRef.current.has(chatId)) {
               connectChatWsRef.current(chatId).then(() => {
                 if (chatId === getActiveChatId()) {
@@ -3269,7 +3347,8 @@ export function TaskChat({
                 }
               });
             }
-          }, 1000);
+          }, delay);
+          reconnectTimerRef.current.set(chatId, timer);
         }
       };
 
@@ -3527,11 +3606,18 @@ export function TaskChat({
     // resolved mode and routes the chat correctly (ACP WS vs PTY-only).
   }, [activeChatId, activeChat?.launch_mode, connectChatWs, projectId, task.id, updateBusy, chatRenderWindowSettings, updateHiddenMessageCount, getActiveChatId]);
 
-  // Cleanup all WebSockets on unmount
+  // Cleanup all WebSockets on unmount, plus any pending reconnect timers —
+  // otherwise an in-flight backoff timer fires after unmount and creates a
+  // zombie WS that calls setState on a gone component.
   useEffect(() => {
     const wsMap = wsMapRef.current;
     const intentional = intentionalCloseRef.current;
+    const timers = reconnectTimerRef.current;
+    const attempts = reconnectAttemptRef.current;
     return () => {
+      timers.forEach((t) => clearTimeout(t));
+      timers.clear();
+      attempts.clear();
       wsMap.forEach((_, id) => intentional.add(id));
       wsMap.forEach((ws) => ws.close());
       wsMap.clear();
@@ -4227,13 +4313,15 @@ export function TaskChat({
       if (chats.length <= 1) return; // Don't delete the last chat
       try {
         await deleteChat(projectId, task.id, chatId);
-        // Close WebSocket if connected
+        // Close WebSocket if connected; cancel any pending reconnect timer so
+        // it doesn't fire later trying to reconnect a deleted chat.
         const ws = wsMapRef.current.get(chatId);
         if (ws) {
           intentionalCloseRef.current.add(chatId);
           ws.close();
           wsMapRef.current.delete(chatId);
         }
+        cancelPendingReconnectRef.current(chatId);
         perChatStateRef.current.delete(chatId);
         setChats((prev) => {
           const updated = prev.filter((c) => c.id !== chatId);
@@ -4550,7 +4638,9 @@ export function TaskChat({
       ),
     );
     pollingOffsetRef.current = 0;
-    // Reconnect via WebSocket (normal flow)
+    // Reconnect via WebSocket (normal flow). Cancel any pending backoff timer
+    // first so the explicit reconnect path below isn't racing a scheduled one.
+    cancelPendingReconnectRef.current(activeChatId);
     intentionalCloseRef.current.add(activeChatId);
     const existingWs = wsMapRef.current.get(activeChatId);
     if (existingWs) existingWs.close();
@@ -5226,12 +5316,12 @@ export function TaskChat({
     const lastAt = text.lastIndexOf("@", offset - 1);
     if (lastAt >= 0 && (lastAt === 0 || /\s/.test(text[lastAt - 1]))) {
       const segment = text.slice(lastAt, offset);
-      const hasCategory = segment.startsWith("@project:") || 
-                          segment.startsWith("@file:") || 
-                          segment.startsWith("@agent:") || 
+      const hasCategory = segment.startsWith("@project:") ||
+                          segment.startsWith("@file:") ||
+                          segment.startsWith("@agent:") ||
                           segment.startsWith("@conversation:") ||
                           segment.startsWith("@browsertabs:") ||
-                          segment.startsWith("@sketch:");
+                          (isStudioProject && segment.startsWith("@sketch:"));
       const hasNoSpaces = !/\s/.test(segment);
       if (hasCategory || hasNoSpaces) {
         atIdx = lastAt;
@@ -5258,7 +5348,10 @@ export function TaskChat({
       const colonIdx = mentionText.indexOf(":");
       if (colonIdx >= 0) {
         const possibleCat = mentionText.slice(0, colonIdx).toLowerCase();
-        if (["conversation", "file", "agent", "project", "browsertabs", "sketch"].includes(possibleCat)) {
+        const allowedCats = isStudioProject
+          ? ["conversation", "file", "agent", "project", "browsertabs", "sketch"]
+          : ["conversation", "file", "agent", "project", "browsertabs"];
+        if (allowedCats.includes(possibleCat)) {
           cat = possibleCat;
           filter = mentionText.slice(colonIdx + 1);
         }
@@ -5300,6 +5393,7 @@ export function TaskChat({
     refreshProjectsIfNeeded,
     triggerProjectFilesLoad,
     getActiveChatId,
+    isStudioProject,
   ]);
 
   /** Insert a command chip at the current cursor position, replacing the /partial text */
@@ -5372,12 +5466,12 @@ export function TaskChat({
       const lastAt = text.lastIndexOf("@", offset - 1);
       if (lastAt >= 0 && (lastAt === 0 || /\s/.test(text[lastAt - 1]))) {
         const segment = text.slice(lastAt, offset);
-        const hasCategory = segment.startsWith("@project:") || 
-                            segment.startsWith("@file:") || 
-                            segment.startsWith("@agent:") || 
+        const hasCategory = segment.startsWith("@project:") ||
+                            segment.startsWith("@file:") ||
+                            segment.startsWith("@agent:") ||
                             segment.startsWith("@conversation:") ||
                             segment.startsWith("@browsertabs:") ||
-                            segment.startsWith("@sketch:");
+                            (isStudioProject && segment.startsWith("@sketch:"));
         const hasNoSpaces = !/\s/.test(segment);
         if (hasCategory || hasNoSpaces) {
           atIdx = lastAt;
@@ -5461,7 +5555,7 @@ export function TaskChat({
       setActiveCategory(null);
       checkContent();
     },
-    [checkContent, filteredFiles, triggerProjectFilesLoad],
+    [checkContent, filteredFiles, triggerProjectFilesLoad, isStudioProject],
   );
 
   /** Delegated click handler for chip close buttons */
@@ -6128,6 +6222,12 @@ export function TaskChat({
           <div className="flex w-full items-center justify-between px-3 py-1.5">
             <div className="flex flex-1 min-w-0 items-center gap-2 text-sm select-none">
               {activeChat ? (
+                // NB: do NOT add flex-1 here. The title is a sibling of the
+                // New/Fork buttons inside a flex container — flex-1 on the
+                // title makes it consume all remaining width and pushes New/
+                // Fork to the right edge against the Connected indicator,
+                // with a big empty gap after the title. min-w-0 alone is
+                // enough; OverflowTitle inside truncates as needed.
                 <div className="relative min-w-0" ref={chatMenuRef}>
                   {editingTitle?.chatId === activeChat.id &&
                   editingTitle.surface === "header" ? (
@@ -6372,6 +6472,7 @@ export function TaskChat({
                         ? <DownloadingLabel startedAt={connectPhaseStartedAt} compact />
                         : "Connecting..."}
                   </span>
+                </div>
               </div>
             </div>
 
@@ -9290,7 +9391,7 @@ const ToolSectionView = memo(function ToolSectionView({
                 ) : null}
               </div>
               {summary.failureReason && (
-                <div className="mt-1 rounded-lg border border-[color-mix(in_srgb,var(--color-warning)_20%,transparent)] bg-[color-mix(in_srgb,var(--color-warning)_8%,transparent)] px-2.5 py-2 text-xs text-[color-mix(in_srgb,var(--color-warning)_95%,white_4%)]">
+                <div className="mt-1 rounded-lg border border-[color-mix(in_srgb,var(--color-warning)_20%,transparent)] bg-[color-mix(in_srgb,var(--color-warning)_8%,transparent)] px-2.5 py-2 text-xs text-[color-mix(in_srgb,var(--color-warning)_95%,white_4%)] break-all min-w-0">
                   {summary.failureReason}
                 </div>
               )}

@@ -94,8 +94,11 @@ export function TaskInfoPanel({
 }: TaskInfoPanelProps) {
 
   const { isMobile } = useIsMobile();
-  const { selectedProject } = useProject();
-  const isStudio = selectedProject?.projectType === "studio";
+  const { selectedProject, projects } = useProject();
+  // Resolve project from the task's projectId, not the globally-selected one:
+  // Blitz can open a task from a different project than the sidebar selection.
+  const taskProject = projects.find((p) => p.id === projectId) ?? selectedProject;
+  const isStudio = taskProject?.projectType === "studio";
   const TABS = isStudio ? STUDIO_TABS : REPO_TABS;
   const isArchived = task.status === "archived";
   const canOperate = !isArchived;

@@ -122,9 +122,10 @@ export function ProjectStatsPage({ projectId }: ProjectStatsPageProps) {
 
   const allowedBuckets = useMemo(() => ALLOWED_BUCKETS[range], [range]);
 
+  const currentModels = data?.current.models;
   const averageRates = useMemo(() => {
-    return computeAverageRates(data?.current.models ?? []);
-  }, [data]);
+    return computeAverageRates(currentModels ?? []);
+  }, [currentModels]);
 
   const fetchData = useCallback(async () => {
     if (effectiveScope === "project" && !projectId) {

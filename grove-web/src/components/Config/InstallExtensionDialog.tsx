@@ -20,7 +20,7 @@
  *   - POST /api/v1/extension/reveal-path           → file manager on dir
  *   - extension WS handshake (drives `useExtensionConnection`)
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { motion } from "framer-motion";
 import {
@@ -37,8 +37,8 @@ import {
   openChromeExtensions,
   revealCompanionPath,
   browseInstallFolder,
+  getExtensionStatus,
 } from "../../api/extension";
-import { useExtensionConnection } from "../../hooks";
 
 interface Props {
   /** Parent should mount with `{open && <InstallExtensionDialog ... />}`.
@@ -57,7 +57,15 @@ export function InstallExtensionDialog({ onClose }: Props) {
   const [chromeWarning, setChromeWarning] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [revealError, setRevealError] = useState<string | null>(null);
-  const connected = useExtensionConnection();
+  // Extension connection — fetched on dialog mount only. No polling. If the
+  // user plugs in the extension AFTER opening this dialog, closing + reopening
+  // the dialog refreshes the badge (the parent conditionally mounts us).
+  const [connected, setConnected] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    getExtensionStatus().then((c) => { if (!cancelled) setConnected(c); });
+    return () => { cancelled = true; };
+  }, []);
 
   const handleInstall = async () => {
     setInstalling(true);

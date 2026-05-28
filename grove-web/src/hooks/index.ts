@@ -25,5 +25,3 @@ export { useRadioEvents } from "./useRadioEvents";
 export type { RadioEventCallbacks } from "./useRadioEvents";
 
 export { useAddLibraryHashHandler } from "./useAddLibraryHashHandler";
-
-export { useExtensionConnection } from "./useExtensionConnection";

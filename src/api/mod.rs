@@ -16,7 +16,7 @@ pub use state::{init_file_watchers, shutdown_file_watchers};
 
 use axum::{
     body::Body,
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, State},
     http::{header, Response, StatusCode, Uri},
     middleware,
     response::IntoResponse,
@@ -139,6 +139,13 @@ pub fn create_api_router() -> Router {
         .route(
             "/extension/tabs",
             get(handlers::extension::get_extension_tabs),
+        )
+        // Lightweight connection probe — pure check of EXTENSION_SESSION,
+        // doesn't hit the WS bridge. Settings page / install dialog use this
+        // for the status badge instead of polling /tabs.
+        .route(
+            "/extension/status",
+            get(handlers::extension::get_extension_status),
         )
         // Browser Extension Proxy Command integration
         .route(
@@ -799,48 +806,323 @@ pub fn has_embedded_assets() -> bool {
 }
 
 /// Create the full router with static file serving and optional auth
-pub fn create_router(static_dir: Option<PathBuf>, auth: Arc<ServerAuth>) -> Router {
+pub fn create_router(
+    static_dir: Option<PathBuf>,
+    auth: Arc<ServerAuth>,
+    remote_url: Option<String>,
+) -> Router {
+    // Unconditionally install the default CryptoProvider for Rustls
+    // so that tokio-tungstenite TLS handshakes in proxy mode work flawlessly
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let api_router = create_api_router();
+    let api_router = if let Some(remote) = remote_url {
+        create_proxy_router(remote)
+    } else {
+        let api_router = create_api_router();
 
-    // Auth endpoints are NOT protected by middleware
-    let auth_router = Router::new()
-        .route("/auth/info", get(auth::auth_info))
-        .route("/auth/verify", post(auth::auth_verify))
-        .with_state(auth.clone());
+        // Auth endpoints are NOT protected by middleware
+        let auth_router = Router::new()
+            .route("/auth/info", get(auth::auth_info))
+            .route("/auth/verify", post(auth::auth_verify))
+            .with_state(auth.clone());
 
-    // Protected API routes get the HMAC auth layer.
-    let protected_api = api_router.layer(middleware::from_fn_with_state(
-        auth.clone(),
-        auth::auth_middleware,
-    ));
+        // Protected API routes get the HMAC auth layer.
+        let protected_api = api_router.layer(middleware::from_fn_with_state(
+            auth.clone(),
+            auth::auth_middleware,
+        ));
 
-    // CSRF guard wraps EVERYTHING under /api/v1 — including auth_router, so
-    // /auth/verify can't be probed cross-origin. Sec-Fetch-Site / Origin /
-    // Referer are checked for non-safe methods; safe methods (GET/HEAD/OPTIONS,
-    // including WebSocket upgrades and CORS preflight) pass through.
-    let api_v1 = Router::new()
-        .nest("/api/v1", protected_api)
-        .nest("/api/v1", auth_router)
-        .layer(middleware::from_fn(csrf::csrf_middleware));
-
-    let router = api_v1;
+        // CSRF guard wraps EVERYTHING under /api/v1 — including auth_router, so
+        // /auth/verify can't be probed cross-origin. Sec-Fetch-Site / Origin /
+        // Referer are checked for non-safe methods; safe methods (GET/HEAD/OPTIONS,
+        // including WebSocket upgrades and CORS preflight) pass through.
+        Router::new()
+            .nest("/api/v1", protected_api)
+            .nest("/api/v1", auth_router)
+            .layer(middleware::from_fn(csrf::csrf_middleware))
+    };
 
     // Priority: external static_dir > embedded assets
     // Static files are NOT auth-protected (SPA needs to load to show login page)
     if let Some(dir) = static_dir {
         let index_file = dir.join("index.html");
         let serve_dir = ServeDir::new(&dir).not_found_service(ServeFile::new(&index_file));
-        router.fallback_service(serve_dir).layer(cors)
+        api_router.fallback_service(serve_dir).layer(cors)
     } else if has_embedded_assets() {
-        router.fallback(serve_embedded).layer(cors)
+        api_router.fallback(serve_embedded).layer(cors)
     } else {
-        router.layer(cors)
+        api_router.layer(cors)
     }
+}
+
+/// Create a router that proxies all WebSocket and HTTP requests to the remote server.
+pub fn create_proxy_router(remote: String) -> Router {
+    use axum::routing::any;
+    let remote_arc = Arc::new(remote);
+
+    Router::new()
+        // Map all known WebSocket routes
+        .route("/ws", any(ws_proxy_handler))
+        .route("/api/v1/terminal", any(ws_proxy_handler))
+        .route("/api/v1/extension/ws", any(ws_proxy_handler))
+        .route("/api/v1/walkie-talkie/ws", any(ws_proxy_handler))
+        .route("/api/v1/radio/events/ws", any(ws_proxy_handler))
+        .route(
+            "/api/v1/projects/{id}/tasks/{taskId}/terminal",
+            any(ws_proxy_handler),
+        )
+        .route(
+            "/api/v1/projects/{id}/tasks/{taskId}/chats/{chatId}/ws",
+            any(ws_proxy_handler),
+        )
+        .route(
+            "/api/v1/projects/{id}/tasks/{taskId}/chats/{chatId}/agent-pty",
+            any(ws_proxy_handler),
+        )
+        .route(
+            "/api/v1/projects/{id}/tasks/{taskId}/sketches/ws",
+            any(ws_proxy_handler),
+        )
+        // Map all other HTTP requests
+        .route("/api/v1/{*path}", any(http_proxy_handler))
+        .with_state(remote_arc)
+}
+
+/// Handler specifically for proxying WebSockets.
+async fn ws_proxy_handler(
+    State(remote_url): State<Arc<String>>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("");
+    let remote_target = format!("{}{}", remote_url.trim_end_matches('/'), path_and_query);
+    let headers = req.headers().clone();
+    handle_websocket_proxy(ws, remote_target, headers).await
+}
+
+/// Handler for proxying normal HTTP requests.
+async fn http_proxy_handler(
+    State(remote_url): State<Arc<String>>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_default();
+    let remote_target = format!("{}{}", remote_url.trim_end_matches('/'), path_and_query);
+
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+    let body = req.into_body();
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    let mut builder = client.request(method.clone(), &remote_target);
+
+    // Only attach body if the method expects one. Standard proxy gateways (Nginx, Cloudflare)
+    // will return 400 Bad Request if we send a chunked/empty body stream on GET/HEAD.
+    if method == axum::http::Method::POST
+        || method == axum::http::Method::PUT
+        || method == axum::http::Method::PATCH
+        || method == axum::http::Method::DELETE
+    {
+        let reqwest_body = reqwest::Body::wrap_stream(body.into_data_stream());
+        builder = builder.body(reqwest_body);
+    }
+
+    // Copy original headers (except Host, Sec-WebSocket-*, Origin, Referer, and Sec-Fetch-Site which might interfere)
+    for (key, value) in headers.iter() {
+        let key_str = key.as_str();
+        if !key_str.eq_ignore_ascii_case("host")
+            && !key_str.starts_with("sec-websocket-")
+            && !key_str.eq_ignore_ascii_case("origin")
+            && !key_str.eq_ignore_ascii_case("referer")
+            && !key_str.eq_ignore_ascii_case("sec-fetch-site")
+        {
+            builder = builder.header(key.clone(), value.clone());
+        }
+    }
+
+    // Rewrite Origin, Referer, and Sec-Fetch-Site to match the remote host to bypass CSRF guards
+    if let Ok(parsed_url) = url::Url::parse(&remote_target) {
+        if let Some(host) = parsed_url.host_str() {
+            let scheme = parsed_url.scheme();
+            let port_str = parsed_url
+                .port()
+                .map(|p| format!(":{}", p))
+                .unwrap_or_default();
+            let remote_origin = format!("{}://{}{}", scheme, host, port_str);
+            builder = builder.header("origin", &remote_origin);
+            builder = builder.header("referer", format!("{}/", remote_origin));
+            builder = builder.header("sec-fetch-site", "same-origin");
+        }
+    }
+
+    match builder.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let resp_headers = resp.headers().clone();
+
+            // Convert reqwest body to axum body
+            let body = axum::body::Body::from_stream(resp.bytes_stream());
+
+            let mut axum_resp = axum::response::Response::new(body);
+            *axum_resp.status_mut() = status;
+            *axum_resp.headers_mut() = resp_headers;
+            axum_resp
+        }
+        Err(e) => {
+            eprintln!("Proxy HTTP error to {}: {}", remote_target, e);
+            (StatusCode::BAD_GATEWAY, format!("Proxy error: {}", e)).into_response()
+        }
+    }
+}
+
+/// Upgrades the client connection and proxies WebSocket frames bi-directionally to the remote server.
+async fn handle_websocket_proxy(
+    ws_upgrade: axum::extract::ws::WebSocketUpgrade,
+    remote_target: String,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use futures::SinkExt;
+    use futures::StreamExt;
+
+    // Convert http(s) to ws(s) URL
+    let ws_url = if remote_target.starts_with("https://") {
+        remote_target.replacen("https://", "wss://", 1)
+    } else if remote_target.starts_with("http://") {
+        remote_target.replacen("http://", "ws://", 1)
+    } else {
+        remote_target
+    };
+
+    ws_upgrade.on_upgrade(move |client_ws| async move {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = match ws_url.as_str().into_client_request() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Failed to build WebSocket request for {}: {}", ws_url, e);
+                return;
+            }
+        };
+
+        // Copy relevant headers for authentication
+        if let Some(auth) = headers.get("authorization") {
+            request.headers_mut().insert("authorization", auth.clone());
+        }
+        if let Some(cookie) = headers.get("cookie") {
+            request.headers_mut().insert("cookie", cookie.clone());
+        }
+        if let Some(sec_ws_protocol) = headers.get("sec-websocket-protocol") {
+            request
+                .headers_mut()
+                .insert("sec-websocket-protocol", sec_ws_protocol.clone());
+        }
+
+        let remote_conn = match tokio_tungstenite::connect_async(request).await {
+            Ok((ws_stream, _)) => ws_stream,
+            Err(e) => {
+                eprintln!("Failed to connect to remote WebSocket {}: {}", ws_url, e);
+                return;
+            }
+        };
+
+        // Bi-directionally copy messages
+        let (mut client_write, mut client_read) = client_ws.split();
+        let (mut remote_write, mut remote_read) = remote_conn.split();
+
+        let client_to_remote = async {
+            while let Some(msg) = client_read.next().await {
+                match msg {
+                    Ok(m) => {
+                        let mapped = match m {
+                            axum::extract::ws::Message::Text(t) => {
+                                tokio_tungstenite::tungstenite::Message::Text(t.as_str().into())
+                            }
+                            axum::extract::ws::Message::Binary(b) => {
+                                tokio_tungstenite::tungstenite::Message::Binary(b)
+                            }
+                            axum::extract::ws::Message::Ping(p) => {
+                                tokio_tungstenite::tungstenite::Message::Ping(p)
+                            }
+                            axum::extract::ws::Message::Pong(p) => {
+                                tokio_tungstenite::tungstenite::Message::Pong(p)
+                            }
+                            axum::extract::ws::Message::Close(_) => {
+                                tokio_tungstenite::tungstenite::Message::Close(None)
+                            }
+                        };
+                        if let Err(e) = remote_write.send(mapped).await {
+                            eprintln!("Error sending to remote WS: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading from client WS: {}", e);
+                        break;
+                    }
+                }
+            }
+        };
+
+        let remote_to_client = async {
+            while let Some(msg) = remote_read.next().await {
+                match msg {
+                    Ok(m) => {
+                        let mapped = match m {
+                            tokio_tungstenite::tungstenite::Message::Text(t) => {
+                                axum::extract::ws::Message::Text(
+                                    axum::extract::ws::Utf8Bytes::from(t.as_str()),
+                                )
+                            }
+                            tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                                axum::extract::ws::Message::Binary(b)
+                            }
+                            tokio_tungstenite::tungstenite::Message::Ping(p) => {
+                                axum::extract::ws::Message::Ping(p)
+                            }
+                            tokio_tungstenite::tungstenite::Message::Pong(p) => {
+                                axum::extract::ws::Message::Pong(p)
+                            }
+                            tokio_tungstenite::tungstenite::Message::Close(_) => {
+                                axum::extract::ws::Message::Close(None)
+                            }
+                            tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
+                        };
+                        if let Err(e) = client_write.send(mapped).await {
+                            eprintln!("Error sending to client WS: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading from remote WS: {}", e);
+                        break;
+                    }
+                }
+            }
+        };
+
+        tokio::select! {
+            _ = client_to_remote => {}
+            _ = remote_to_client => {}
+        }
+    })
 }
 
 /// Find the grove-web dist directory
@@ -1090,7 +1372,7 @@ pub async fn start_server(
     crate::hooks::ensure_grove_app();
 
     let has_ui = static_dir.is_some() || has_embedded_assets();
-    let app = create_router(static_dir, auth.clone());
+    let app = create_router(static_dir, auth.clone(), None);
 
     let is_mobile = auth.secret_key.is_some();
 

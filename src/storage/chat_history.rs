@@ -708,6 +708,7 @@ mod tests {
                 start_ts: None,
                 end_ts: None,
                 stop_reason: "end".into(),
+                cost: None,
             },
         ];
         let result = compact_events(events);
@@ -732,6 +733,7 @@ mod tests {
                 start_ts: None,
                 end_ts: None,
                 stop_reason: "end".into(),
+                cost: None,
             },
         ];
         let result = compact_events(events);
@@ -771,6 +773,7 @@ mod tests {
                 start_ts: None,
                 end_ts: None,
                 stop_reason: "end".into(),
+                cost: None,
             },
         ];
         let result = compact_events(events);
@@ -825,6 +828,7 @@ mod tests {
                 start_ts: None,
                 end_ts: None,
                 stop_reason: "end".into(),
+                cost: None,
             },
         ];
         let result = compact_events(events);
@@ -859,6 +863,7 @@ mod tests {
                 start_ts: None,
                 end_ts: None,
                 stop_reason: "end".into(),
+                cost: None,
             },
         ];
         let result = compact_events(events);
@@ -902,6 +907,7 @@ mod tests {
                 start_ts: None,
                 end_ts: None,
                 stop_reason: "end".into(),
+                cost: None,
             },
         ];
         let result = compact_events(events);
@@ -949,6 +955,7 @@ mod tests {
                 start_ts: None,
                 end_ts: None,
                 stop_reason: "end".into(),
+                cost: None,
             },
         ];
         let result = compact_events(events);
@@ -1005,6 +1012,7 @@ mod tests {
                 start_ts: None,
                 end_ts: None,
                 stop_reason: "end".into(),
+                cost: None,
             },
         ];
         let result = compact_events(events);
@@ -1117,6 +1125,7 @@ mod tests {
                 start_ts: None,
                 end_ts: None,
                 stop_reason: "end".into(),
+                cost: None,
             },
         ];
         let result = compact_events(events);

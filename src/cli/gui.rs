@@ -254,7 +254,7 @@ async fn save_bytes_dialog(
 /// background child — the caller should exit.  Returns `false` if we are
 /// already the daemon child (or daemonize is not applicable) — proceed with
 /// the normal GUI startup.
-pub fn try_daemonize(port: u16) -> bool {
+pub fn try_daemonize(port: u16, remote_url: Option<&str>) -> bool {
     // Already the daemon child — run the GUI
     if std::env::var(DAEMON_ENV).as_deref() == Ok("1") {
         return false;
@@ -292,7 +292,12 @@ pub fn try_daemonize(port: u16) -> bool {
     };
 
     let mut cmd = std::process::Command::new(&exe);
-    cmd.args(["gui", "--port", &port.to_string()])
+    let mut args = vec!["gui".to_string(), "--port".to_string(), port.to_string()];
+    if let Some(url) = remote_url {
+        args.push("--remote-url".to_string());
+        args.push(url.to_string());
+    }
+    cmd.args(&args)
         .env(DAEMON_ENV, "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log_file))
@@ -380,10 +385,14 @@ fn expand_path_for_app_bundle() {
 }
 
 /// Execute the GUI desktop application
-pub async fn execute(port: u16) {
+pub async fn execute(port: u16, remote_url: Option<String>) {
     // Expand PATH before anything else so dependency checks work correctly (macOS only)
     #[cfg(target_os = "macos")]
     expand_path_for_app_bundle();
+
+    let is_remote = remote_url.is_some();
+    let remote_url_clone = remote_url.clone();
+
     // Check for embedded assets
     if !api::has_embedded_assets() {
         eprintln!("Error: No embedded frontend assets found.");
@@ -399,7 +408,7 @@ pub async fn execute(port: u16) {
     let server_ready_clone = server_ready.clone();
 
     // Bind to a port (with auto-fallback if in use)
-    let (listener, actual_port) = match api::bind_with_fallback("127.0.0.1", port, 10).await {
+    let (listener, bound_port) = match api::bind_with_fallback("127.0.0.1", port, 10).await {
         Ok(result) => result,
         Err(e) => {
             eprintln!("Failed to bind to port: {}", e);
@@ -407,36 +416,49 @@ pub async fn execute(port: u16) {
             std::process::exit(1);
         }
     };
+    let actual_port = bound_port;
 
-    println!(
-        "Grove GUI: Starting API server on http://localhost:{}",
-        actual_port
-    );
+    if let Some(ref base_url) = remote_url {
+        println!(
+            "Grove GUI (remote mode): starting local proxy on http://localhost:{}",
+            actual_port
+        );
+        println!(
+            "Grove GUI (remote mode): connecting to remote backend -> {}",
+            base_url
+        );
+    } else {
+        println!(
+            "Grove GUI: Starting API server on http://localhost:{}",
+            actual_port
+        );
+    }
 
     // Start HTTP server in a background task
-    let server_handle = tokio::spawn(async move {
-        // Initialize FileWatchers for all live tasks
-        api::init_file_watchers();
+    let handle = tokio::spawn(async move {
+        if !is_remote {
+            // Initialize FileWatchers for all live tasks
+            api::init_file_watchers();
 
-        // Start the agent_graph MCP listener (loopback-only). Non-fatal on failure.
-        match api::handlers::agent_graph_mcp::start_listener(
-            api::handlers::agent_graph_mcp::DEFAULT_BASE_PORT,
-            api::handlers::agent_graph_mcp::DEFAULT_MAX_ATTEMPTS,
-        )
-        .await
-        {
-            Ok(_port) => {
-                // Silent on success; failures still print since they disable
-                // agent_graph tools downstream.
+            // Start the agent_graph MCP listener (loopback-only). Non-fatal on failure.
+            match api::handlers::agent_graph_mcp::start_listener(
+                api::handlers::agent_graph_mcp::DEFAULT_BASE_PORT,
+                api::handlers::agent_graph_mcp::DEFAULT_MAX_ATTEMPTS,
+            )
+            .await
+            {
+                Ok(_port) => {
+                    // Silent on success
+                }
+                Err(e) => eprintln!(
+                    "[agent_graph_mcp] failed to bind listener: {} — agent_graph tools disabled",
+                    e
+                ),
             }
-            Err(e) => eprintln!(
-                "[agent_graph_mcp] failed to bind listener: {} — agent_graph tools disabled",
-                e
-            ),
         }
 
         let auth = std::sync::Arc::new(api::auth::ServerAuth::no_auth());
-        let app = api::create_router(None, auth);
+        let app = api::create_router(None, auth, remote_url_clone);
 
         // Signal that server is ready
         server_ready_clone.store(true, Ordering::SeqCst);
@@ -445,8 +467,11 @@ pub async fn execute(port: u16) {
             eprintln!("API server error: {}", e);
         }
 
-        api::shutdown_file_watchers();
+        if !is_remote {
+            api::shutdown_file_watchers();
+        }
     });
+    let server_handle = Some(handle);
 
     // Wait for server to be ready
     while !server_ready.load(Ordering::SeqCst) {
@@ -458,6 +483,8 @@ pub async fn execute(port: u16) {
 
     // Build and run Tauri application
     println!("Grove GUI: Launching desktop window...");
+
+    let target_url = format!("http://localhost:{}", actual_port);
 
     let tauri_app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -480,12 +507,10 @@ pub async fn execute(port: u16) {
         ])
         .setup(move |app| {
             let _ = TAURI_APP.set(app.handle().clone());
-            // Create a window pointing to our HTTP server
-            let url = format!("http://localhost:{}", actual_port);
             let builder = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
-                tauri::WebviewUrl::External(url.parse().unwrap()),
+                tauri::WebviewUrl::External(target_url.parse().unwrap()),
             )
             .title("Grove")
             .inner_size(1440.0, 900.0)
@@ -612,10 +637,12 @@ pub async fn execute(port: u16) {
             // Register menubar tray + popover. Gated by config so users who
             // dislike the menubar surface can opt out cleanly. Failure here
             // should not block the main window from launching — log only.
-            let cfg = crate::storage::config::load_config();
-            if cfg.notifications.tray_enabled {
-                if let Err(e) = crate::tray::init(&app.handle().clone(), actual_port) {
-                    eprintln!("[Grove] failed to initialize menubar tray: {}", e);
+            if !is_remote {
+                let cfg = crate::storage::config::load_config();
+                if cfg.notifications.tray_enabled {
+                    if let Err(e) = crate::tray::init(&app.handle().clone(), actual_port) {
+                        eprintln!("[Grove] failed to initialize menubar tray: {}", e);
+                    }
                 }
             }
             Ok(())
@@ -707,21 +734,23 @@ pub async fn execute(port: u16) {
     println!("Grove GUI closed.");
 
     // Abort the server task when Tauri exits and check for panic
-    server_handle.abort();
-    match server_handle.await {
-        Ok(()) => {}
-        Err(ref e) if e.is_cancelled() => {}
-        Err(e) if e.is_panic() => {
-            let panic = e.into_panic();
-            let msg = if let Some(s) = panic.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = panic.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-            eprintln!("[Grove] API server panicked: {}", msg);
+    if let Some(handle) = server_handle {
+        handle.abort();
+        match handle.await {
+            Ok(()) => {}
+            Err(ref e) if e.is_cancelled() => {}
+            Err(e) if e.is_panic() => {
+                let panic = e.into_panic();
+                let msg = if let Some(s) = panic.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                eprintln!("[Grove] API server panicked: {}", msg);
+            }
+            Err(e) => eprintln!("[Grove] API server error: {}", e),
         }
-        Err(e) => eprintln!("[Grove] API server error: {}", e),
     }
 }

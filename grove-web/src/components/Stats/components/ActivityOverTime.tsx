@@ -55,7 +55,13 @@ function bucketValue(b: TimeseriesBucket, m: MetricType, u: Unit, r: AverageRate
       cost_cached *= ratio;
       cost_out *= ratio;
     } else {
-      cost_in = b.cost_total;
+      // No token-derived split available — distribute evenly across the three
+      // segments so input/cached/output charts don't show the whole cost as
+      // "input only" (which was visually misleading).
+      const third = b.cost_total / 3;
+      cost_in = third;
+      cost_cached = third;
+      cost_out = third;
     }
   }
 
@@ -70,6 +76,7 @@ function bucketValue(b: TimeseriesBucket, m: MetricType, u: Unit, r: AverageRate
       case "output":
         return cost_out;
     }
+    return 0;
   } else {
     switch (m) {
       case "total":
@@ -81,6 +88,7 @@ function bucketValue(b: TimeseriesBucket, m: MetricType, u: Unit, r: AverageRate
       case "output":
         return b.tokens_out;
     }
+    return 0;
   }
 }
 
@@ -119,13 +127,30 @@ export function ActivityOverTime({
     if (isAgentStacked(metricType)) {
       return buckets.map((b) => {
         const map = new Map(b.per_agent.map((a) => [a.agent, a]));
-        
-        const total_tokens = b.tokens_in + b.tokens_cached + b.tokens_out;
+
+        // For cost mode, build avg_cost_per_token from ONLY the non-reporting
+        // agents' subset of total cost & tokens. Otherwise reporting agents'
+        // cost gets double-counted: their own cost shows directly AND their
+        // tokens contribute to the shared avg that non-reporting agents
+        // inherit, causing the stack to overshoot bucket.cost_total.
+        const reportingCost = b.per_agent
+          .filter((a) => (a.cost ?? 0) > 0)
+          .reduce((s, a) => s + (a.cost ?? 0), 0);
+        // Sum tokens DIRECTLY from the non-reporting subset rather than
+        // deriving via (bucket_total - reporting). The two domains don't
+        // necessarily share a denominator (backend can produce per_agent
+        // totals that drift from bucket.tokens_in/cached/out), and the
+        // subtraction-based approach mis-allocates avg_cost_per_token when
+        // they diverge.
+        const nonReportingTokens = b.per_agent
+          .filter((a) => (a.cost ?? 0) === 0)
+          .reduce((s, a) => s + a.tokens, 0);
         const cost_in = b.tokens_in * averageRates.input;
         const cost_cached = b.tokens_cached * averageRates.cached;
         const cost_out = b.tokens_out * averageRates.output;
         const total_cost = b.cost_total > 0 ? b.cost_total : cost_in + cost_cached + cost_out;
-        const avg_cost_per_token = total_tokens > 0 ? total_cost / total_tokens : 0;
+        const nonReportingCost = Math.max(0, total_cost - reportingCost);
+        const avg_cost_per_token = nonReportingTokens > 0 ? nonReportingCost / nonReportingTokens : 0;
 
         return {
           ts: b.bucket_start,
@@ -226,13 +251,21 @@ function getBezierPath(points: { x: number; y: number }[], maxY?: number): strin
   }
 
   let d = `M ${points[0].x.toFixed(1)},${clampY(points[0].y).toFixed(1)}`;
-  const t = 0.15; // tension factor for smoothing
+  const baseT = 0.15; // tension factor for smoothing
 
   for (let i = 0; i < points.length - 1; i++) {
     const p0 = points[i - 1] ?? points[i];
     const p1 = points[i];
     const p2 = points[i + 1];
     const p3 = points[i + 2] ?? p2;
+
+    // When an endpoint of this segment sits on the baseline (maxY in SVG y-down
+    // coords), degrade to a straight line for that segment. Per-coordinate
+    // clamping otherwise produces visible tangent discontinuities / kinks at
+    // the baseline because the entering and leaving derivatives disagree.
+    const onBaseline =
+      maxY !== undefined && (p1.y >= maxY - 0.5 || p2.y >= maxY - 0.5);
+    const t = onBaseline ? 0 : baseT;
 
     const cp1x = p1.x + (p2.x - p0.x) * t;
     const cp1y = clampY(p1.y + (p2.y - p0.y) * t);
@@ -335,7 +368,7 @@ function Chart({
     };
   });
 
-  const yTicks = makeTicks(yMax, 4);
+  const yTicks = makeTicks(yMax, 4, unit);
   const valueFmt = unit === "cost" ? formatCost : formatTokens;
 
   return (
@@ -343,7 +376,7 @@ function Chart({
       <svg
         viewBox={`0 0 ${W} ${H}`}
         preserveAspectRatio="none"
-        className="w-full h-full animate-fade-in"
+        className="w-full h-full"
         onMouseLeave={() => setHoverIdx(null)}
       >
         {yTicks.map((t, i) => (
@@ -514,11 +547,16 @@ function Tooltip({
   );
 }
 
-function makeTicks(max: number, count: number): number[] {
+function makeTicks(max: number, count: number, unit?: Unit): number[] {
   if (max <= 0) return [0];
   const step = max / count;
   const ticks: number[] = [];
-  for (let i = 0; i <= count; i++) ticks.push(step * i);
+  // Round to integers in token mode so the y-axis doesn't show "7.5 tokens".
+  // Cost mode keeps fractional steps for sub-dollar precision.
+  for (let i = 0; i <= count; i++) {
+    const v = step * i;
+    ticks.push(unit === "token" ? Math.round(v) : v);
+  }
   return ticks;
 }
 

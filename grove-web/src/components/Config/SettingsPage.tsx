@@ -58,7 +58,7 @@ import {
   setCustomAgentPersonas as setCustomAgentPersonasIconRegistry,
   loadCustomAgentPersonas as loadCustomAgentPersonasIcon,
 } from "../../utils/agentIcon";
-import { useExtensionConnection } from "../../hooks";
+import { getExtensionStatus } from "../../api/extension";
 import { formatShortcut } from "../AI/utils";
 
 interface SettingsPageProps {
@@ -317,8 +317,16 @@ export function SettingsPage({ config }: SettingsPageProps) {
   // Browser Control state
   const [browserControlEnabled, setBrowserControlEnabled] = useState(true);
   const [browserControlAutoGroups, setBrowserControlAutoGroups] = useState(true);
-  // Shared module-level poll — single fetch per 5s for the whole app.
-  const extensionConnected = useExtensionConnection();
+  // Extension connection state — fetched ONCE on mount; user must refresh the
+  // Settings page after plugging in / removing the extension to see the badge
+  // update. Polling was removed (it was the source of the GET /extension/tabs
+  // every 5s in DevTools).
+  const [extensionConnected, setExtensionConnected] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    getExtensionStatus().then((c) => { if (!cancelled) setExtensionConnected(c); });
+    return () => { cancelled = true; };
+  }, []);
   const [installDialogOpen, setInstallDialogOpen] = useState(false);
 
   // Anchor the language picker to the trigger button. Wrapped in
@@ -386,35 +394,10 @@ export function SettingsPage({ config }: SettingsPageProps) {
     setWorkspaceLayout(cfg.web.workspace_layout || "ide");
     setShowHideWindowShortcut(cfg.web.show_hide_window_shortcut || "");
 
-    // Load theme - sync with context
-    if (cfg.theme.mode) {
-      setAppearance({
-        mode: cfg.theme.mode as any,
-        lightThemeId: cfg.theme.light_theme,
-        darkThemeId: cfg.theme.dark_theme,
-        customThemes: cfg.theme.custom_themes?.map((ct: any) => ({
-          id: ct.id,
-          name: ct.name,
-          colors: {
-            bg: ct.colors.bg,
-            bgSecondary: ct.colors.bg_secondary,
-            bgTertiary: ct.colors.bg_tertiary,
-            border: ct.colors.border,
-            text: ct.colors.text,
-            textMuted: ct.colors.text_muted,
-            highlight: ct.colors.highlight,
-            accent: ct.colors.accent,
-            success: ct.colors.success,
-            warning: ct.colors.warning,
-            error: ct.colors.error,
-            info: ct.colors.info,
-          },
-          accentPalette: ct.accent_palette,
-          isLight: ct.is_light,
-          isCustom: true,
-        }))
-      });
-    }
+    // NOTE: theme/customThemes loading is owned by ThemeContext (it fetches
+    // /api/v1/config on mount + focus). Calling setAppearance here would echo
+    // the values back through patchConfig and trigger a redundant Radio
+    // ThemeChanged broadcast on every Settings-page mount.
 
     // Load custom layouts
     if (cfg.layout.custom_layouts) {
@@ -496,7 +479,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
     }
 
     setIsLoaded(true);
-  }, [config.agent.command, setAppearance]);
+  }, [config.agent.command]);
 
   // Load config from API
   const loadConfig = useCallback(async () => {
@@ -705,36 +688,93 @@ export function SettingsPage({ config }: SettingsPageProps) {
   const processThemeData = useCallback((text: string) => {
     try {
       const parsed = JSON.parse(text);
-      // Basic validation
-      if (!parsed.name || !parsed.colors || typeof parsed.isLight !== 'boolean') {
-        throw new Error("Invalid theme format.");
+      if (!parsed || typeof parsed !== 'object') throw new Error("Theme file is not a JSON object.");
+      if (!parsed.name || typeof parsed.name !== 'string') throw new Error("Missing 'name'.");
+      if (typeof parsed.isLight !== 'boolean') throw new Error("Missing 'isLight' boolean.");
+      const c = parsed.colors;
+      if (!c || typeof c !== 'object' || Array.isArray(c)) throw new Error("Missing 'colors' object.");
+      // Validate the 12 required color tokens are present and look like CSS colors.
+      // Anything that slips through here propagates to style.setProperty("--color-X", undefined)
+      // which silently sets the var to the string "undefined" and breaks the UI.
+      const requiredColors: (keyof Theme["colors"])[] = [
+        "bg", "bgSecondary", "bgTertiary", "border", "text", "textMuted",
+        "highlight", "accent", "success", "warning", "error", "info",
+      ];
+      // Browser CSS.supports parses the value the same way it'd parse it in a
+      // stylesheet — rejects "rgb(/*x*/)" and friends that the previous loose
+      // regex accepted. Also reject var(...) refs: those are accepted by
+      // CSS.supports but, when assigned to a --color-X var, create a self-
+      // referential cycle that silently breaks the palette.
+      const isValidColor = (v: string): boolean => {
+        // Reject var() anywhere (also blocks `/* */ var(--x)` since regex
+        // doesn't anchor to start). var() references would silently create
+        // a self-referential cycle when assigned to --color-X.
+        if (/var\s*\(/i.test(v)) return false;
+        // Reject CSS-wide keywords that CSS.supports accepts but are
+        // meaningless / fragile as concrete color values for our palette.
+        if (/^(inherit|currentcolor|transparent|initial|unset|revert|revert-layer)$/i.test(v)) return false;
+        if (typeof CSS !== 'undefined' && typeof CSS.supports === 'function') {
+          return CSS.supports("color", v);
+        }
+        return /^(#[0-9a-f]{3,8}|rgb[a]?\([\d\s,./%]+\)|hsl[a]?\([\d\s,./%deg]+\)|oklch\([\d\s,./%]+\)|[a-z]+)$/i.test(v);
+      };
+      for (const key of requiredColors) {
+        const v = (c as Record<string, unknown>)[key];
+        if (typeof v !== 'string' || !isValidColor(v.trim())) {
+          throw new Error(`Invalid color value for '${key}'.`);
+        }
+      }
+      // accentPalette is consumed via spread into newTheme; if user supplies
+      // a non-array or non-string entries, downstream consumers (getProjectStyle
+      // etc.) silently default away. Validate before propagating.
+      if (parsed.accentPalette !== undefined) {
+        if (!Array.isArray(parsed.accentPalette) || parsed.accentPalette.length === 0) {
+          throw new Error("'accentPalette' must be a non-empty array.");
+        }
+        for (const entry of parsed.accentPalette) {
+          if (typeof entry !== 'string' || !isValidColor(entry.trim())) {
+            throw new Error("'accentPalette' contains an invalid color.");
+          }
+        }
       }
       const newTheme: Theme = {
         ...parsed,
-        id: `custom-${Date.now()}`,
+        id: (typeof crypto !== "undefined" && "randomUUID" in crypto)
+          ? `custom-${crypto.randomUUID()}`
+          : `custom-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
         isCustom: true
       };
       setAppearance({ customThemes: [...customThemes, newTheme] });
       showBanner(`Theme "${newTheme.name}" imported successfully!`, "success");
-    } catch (e: any) {
-      showBanner(`Import failed: ${e.message}`, "error");
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      showBanner(`Import failed: ${message}`, "error");
     }
   }, [customThemes, setAppearance, showBanner]);
 
   const handleImportFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    // Reset the input's value so picking the same file twice (e.g. after a
+    // parse error → user edits file externally → re-tries) fires onChange again.
+    const inputEl = e.target;
     if (file) {
       const reader = new FileReader();
       reader.onload = (re) => {
         const text = re.target?.result as string;
         processThemeData(text);
+        inputEl.value = "";
       };
+      reader.onerror = () => { inputEl.value = ""; };
       reader.readAsText(file);
+    } else {
+      inputEl.value = "";
     }
   };
 
   const handleExportTheme = useCallback((themeToExport: Theme) => {
-    const { id, isCustom, ...rest } = themeToExport as any;
+    const { id: _id, isCustom: _isCustom, ...rest } = themeToExport;
+    void _id;
+    void _isCustom;
     const json = JSON.stringify(rest, null, 2);
     
     try {
@@ -1719,7 +1759,7 @@ env_vars = [
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
-                              const newCustoms = customThemes.filter((ct: any) => ct.id !== t.id);
+                              const newCustoms = customThemes.filter((ct: Theme) => ct.id !== t.id);
                               const nextLightThemeId = lightThemeId === t.id ? "light" : lightThemeId;
                               setAppearance({ customThemes: newCustoms, lightThemeId: nextLightThemeId });
                             }}
@@ -1781,7 +1821,7 @@ env_vars = [
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
-                              const newCustoms = customThemes.filter((ct: any) => ct.id !== t.id);
+                              const newCustoms = customThemes.filter((ct: Theme) => ct.id !== t.id);
                               const nextDarkThemeId = darkThemeId === t.id ? "dark" : darkThemeId;
                               setAppearance({ customThemes: newCustoms, darkThemeId: nextDarkThemeId });
                             }}
@@ -2603,12 +2643,16 @@ env_vars = [
         onSelectLayout={setSelectedCustomLayoutId}
       />
 
-      {/* Custom Theme Dialog */}
-      <CustomThemeDialog
-        isOpen={isCustomThemeDialogOpen}
-        onClose={() => setIsCustomThemeDialogOpen(false)}
-        onSave={handleSaveCustomTheme}
-      />
+      {/* Custom Theme Dialog — conditionally mounted so it picks up fresh
+          default state every time the user opens it (no stale name/colors
+          from a previous Cancel). */}
+      {isCustomThemeDialogOpen && (
+        <CustomThemeDialog
+          isOpen={isCustomThemeDialogOpen}
+          onClose={() => setIsCustomThemeDialogOpen(false)}
+          onSave={handleSaveCustomTheme}
+        />
+      )}
     </motion.div>
   );
 }

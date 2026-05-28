@@ -8,7 +8,6 @@ import { useEffect, useRef, useState, useMemo } from "react";
 import { Link as LinkIcon, Loader2, X, Globe } from "lucide-react";
 import { fetchUrlMetadata, type ApiError } from "../../api";
 import { listExtensionTabs, type ExtensionTab } from "../../api/extension";
-import { useExtensionConnection } from "../../hooks";
 import { hostnameOf } from "./linkFile";
 
 interface AddLinkDialogProps {
@@ -79,11 +78,13 @@ export function AddLinkDialog({ open, title = "Add Link", initial, submitLabel, 
   const [error, setError] = useState<string | null>(null);
   const urlInputRef = useRef<HTMLInputElement | null>(null);
 
-  // States for extension tabs integration. `extensionConnected` comes from
-  // the shared poll (one fetch per 5s across all components). `extensionTabs`
-  // is a per-dialog snapshot fetched on open.
-  const extensionConnected = useExtensionConnection();
+  // Tabs snapshot fetched on dialog open.
   const [extensionTabs, setExtensionTabs] = useState<ExtensionTab[]>([]);
+  // True ONLY when the tabs fetch succeeded (returned an array, even if
+  // empty). Lets the "Extension Connected" badge show when the extension
+  // is reachable but the user happens to have 0 open tabs — instead of
+  // false-negative-hiding the badge.
+  const [extensionConnected, setExtensionConnected] = useState(false);
   const [showDropdown, setShowDropdown] = useState(false);
 
   // Favicon is purely derived from `url` + `extensionTabs` — prefer the
@@ -121,6 +122,7 @@ export function AddLinkDialog({ open, title = "Add Link", initial, submitLabel, 
     // shows a clean state and doesn't leak the previous browser snapshot.
     setLastOpenKey({ open, initial });
     setExtensionTabs([]);
+    setExtensionConnected(false);
   }
   // Focus the URL field so users can immediately paste, after the reset above.
   useEffect(() => {
@@ -136,9 +138,11 @@ export function AddLinkDialog({ open, title = "Add Link", initial, submitLabel, 
         const tabs = await listExtensionTabs();
         if (cancelled) return;
         setExtensionTabs(tabs);
+        setExtensionConnected(true);
       } catch {
         if (cancelled) return;
         setExtensionTabs([]);
+        setExtensionConnected(false);
       }
     })();
     return () => {
@@ -335,7 +339,7 @@ export function AddLinkDialog({ open, title = "Add Link", initial, submitLabel, 
                 color: "var(--color-text)",
               }}
             />
-            {extensionConnected && showDropdown && filteredTabs.length > 0 && (
+            {showDropdown && filteredTabs.length > 0 && (
               <div
                 className="absolute left-0 right-0 mt-1 max-h-48 overflow-y-auto rounded-md shadow-lg border z-50 py-1"
                 style={{

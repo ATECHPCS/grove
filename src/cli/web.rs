@@ -92,8 +92,16 @@ fn find_project_dir() -> Option<PathBuf> {
 }
 
 /// Execute the web server
-pub async fn execute(port: u16, no_open: bool, dev: bool) {
-    if dev {
+///
+/// When `remote_url` is `Some`, no local API server is started. Instead a
+/// minimal HTTP server serves the static frontend with
+/// `window.__GROVE_API_BASE__` injected into `index.html`, so that
+/// `AuthGate` and `apiClient` direct every API call to the remote Grove
+/// server (typically `grove mobile`). The form appears as usual for password input.
+pub async fn execute(port: u16, no_open: bool, dev: bool, remote_url: Option<String>) {
+    if let Some(base_url) = remote_url {
+        execute_remote_mode(port, no_open, base_url).await;
+    } else if dev {
         // Development mode: run vite dev server + API server
         execute_dev_mode(port, no_open).await;
     } else {
@@ -391,6 +399,54 @@ async fn execute_prod_mode(port: u16, no_open: bool) {
     )
     .await
     {
+        eprintln!("Server error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+/// Execute the web server in remote mode.
+///
+/// Starts the unified Axum server with the reverse proxy router configured.
+/// Both Web and GUI modes now share the exact same reverse proxy logic, preventing
+/// duplication, port collision, and cross-origin CSRF/CORS issues!
+async fn execute_remote_mode(port: u16, no_open: bool, base_url: String) {
+    use std::sync::Arc;
+
+    let api_base = base_url.trim_end_matches('/').to_string();
+
+    let (listener, actual_port) = match api::bind_with_fallback("127.0.0.1", port, 10).await {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!(
+                "Failed to bind to 127.0.0.1 starting from port {}: {}",
+                port, e
+            );
+            std::process::exit(1);
+        }
+    };
+
+    println!(
+        "Grove web (remote mode): frontend on http://localhost:{}",
+        actual_port
+    );
+    println!("Grove web (remote mode): API target  -> {}", api_base);
+
+    // Create the same proxy router used by the GUI mode!
+    let auth = Arc::new(ServerAuth::no_auth());
+
+    // Check for embedded or external static assets
+    let static_dir = api::find_static_dir();
+    let app = api::create_router(static_dir, auth, Some(api_base));
+
+    if !no_open {
+        let url = format!("http://localhost:{}", actual_port);
+        println!("Opening browser: {}", url);
+        let _ = open::that(&url);
+    }
+
+    println!("\nPress Ctrl+C to stop");
+
+    if let Err(e) = axum::serve(listener, app).await {
         eprintln!("Server error: {}", e);
         std::process::exit(1);
     }

@@ -9,6 +9,9 @@ interface CustomThemeDialogProps {
   onSave: (theme: Theme) => void;
 }
 
+// Caller (SettingsPage) conditionally mounts this dialog only while isOpen,
+// so useState initializers run fresh every open — no leakage from a previous
+// Cancel.
 export function CustomThemeDialog({ isOpen, onClose, onSave }: CustomThemeDialogProps) {
   const [name, setName] = useState("");
   const [isLight, setIsLight] = useState(false);
@@ -22,6 +25,14 @@ export function CustomThemeDialog({ isOpen, onClose, onSave }: CustomThemeDialog
     }
   };
 
+  // Toggle between light/dark templates. Picking Light flips to the default
+  // light template; picking Dark flips to the default dark template. Otherwise
+  // the user could see "Light Theme" selected while the preview still shows
+  // dark colors.
+  const handleModeToggle = (nextIsLight: boolean) => {
+    handleBaseChange(nextIsLight ? "light" : "dark");
+  };
+
   const updateColor = (key: keyof ThemeColors, value: string) => {
     setColors(prev => ({ ...prev, [key]: value }));
   };
@@ -30,7 +41,11 @@ export function CustomThemeDialog({ isOpen, onClose, onSave }: CustomThemeDialog
     if (!name.trim()) return;
 
     const newTheme: Theme = {
-      id: `custom-${Date.now()}`,
+      // crypto.randomUUID avoids the same-millisecond Date.now() collision
+      // when several themes are created back-to-back (drag-and-drop batch import).
+      id: (typeof crypto !== "undefined" && "randomUUID" in crypto)
+        ? `custom-${crypto.randomUUID()}`
+        : `custom-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
       name: name.trim(),
       isLight,
       isCustom: true,
@@ -97,7 +112,7 @@ export function CustomThemeDialog({ isOpen, onClose, onSave }: CustomThemeDialog
                   ].map(opt => (
                     <button
                       key={opt.label}
-                      onClick={() => setIsLight(opt.value)}
+                      onClick={() => handleModeToggle(opt.value)}
                       className={`flex-1 py-1 px-2 rounded-md text-[10px] font-bold transition-all
                         ${isLight === opt.value
                           ? "bg-[var(--color-bg)] text-[var(--color-text)] shadow-sm border border-[var(--color-border)]"

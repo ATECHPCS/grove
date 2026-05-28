@@ -457,7 +457,9 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
   useEffect(() => {
     if (!monacoInstance) return;
 
-    const isLight = theme.id.includes('light') || theme.id.includes('latte') || theme.id.includes('dawn');
+    // Use theme.isLight (canonical), not id-substring sniffing — custom themes
+    // have ids like "custom-<uuid>" that don't contain any of these markers.
+    const isLight = theme.isLight;
     
     // For light mode comments, we use a darker gray to improve readability on light backgrounds.
     // Standard comments are often too faint.
@@ -606,6 +608,20 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
   const handleSelectFile = useCallback(async (path: string) => {
     if (path === selectedFile) return;
 
+    // Save any dirty content on the previously selected file BEFORE switching,
+    // otherwise the ref-sync effect would capture {modified:false, content:newFile}
+    // and the unmount auto-save would never save the old file's edits.
+    if (modified && selectedFile && getPreviewType(selectedFile) !== 'image') {
+      try {
+        await writeFileContent(projectId, taskId, selectedFile, editorContentRef.current);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message :
+          (err as { message?: string })?.message || 'Failed to save file before switch';
+        setError(msg);
+        return; // abort the switch so the user can resolve manually
+      }
+    }
+
     setSelectedFile(path);
     setLoading(true);
     setModified(false);
@@ -633,7 +649,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
       setFileContent('');
     }
     setLoading(false);
-  }, [projectId, taskId, selectedFile, isMobile]);
+  }, [projectId, taskId, selectedFile, isMobile, modified]);
 
   // After cross-file jumps, position the cursor once the new file's
   // content has rendered into Monaco. We watch fileContent (not just
@@ -708,6 +724,37 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [handleSave]);
+
+  // Auto-save on unmount when there are unsaved edits. TaskView force-remounts
+  // its child layouts on task switch (TaskView.tsx key={projectId-taskId}),
+  // which would otherwise silently discard typed content. Fire-and-forget
+  // because unmount can't await; failures are surfaced only in the console.
+  const unmountSaveRef = useRef<{ projectId: string; taskId: string; selectedFile: string | null; modified: boolean; content: string }>({
+    projectId,
+    taskId,
+    selectedFile,
+    modified: false,
+    content: '',
+  });
+  useEffect(() => {
+    unmountSaveRef.current = {
+      projectId,
+      taskId,
+      selectedFile,
+      modified,
+      content: editorContentRef.current,
+    };
+  });
+  useEffect(() => {
+    return () => {
+      const snap = unmountSaveRef.current;
+      if (!snap.modified || !snap.selectedFile) return;
+      if (getPreviewType(snap.selectedFile) === 'image') return;
+      writeFileContent(snap.projectId, snap.taskId, snap.selectedFile, snap.content).catch((err) => {
+        console.warn('TaskEditor: failed to auto-save on unmount', snap.selectedFile, err);
+      });
+    };
+  }, []);
 
   // Internal: used by create/delete handlers
   const reloadFiles = useCallback(async () => {

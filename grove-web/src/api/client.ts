@@ -1,7 +1,12 @@
 // API client base configuration
-// In dev mode, vite proxy forwards /api to backend
-// In prod mode (served by grove web), use relative path
-const API_BASE_URL = import.meta.env.VITE_API_URL || '';
+// Priority:
+//   1. window.__GROVE_API_BASE__ — injected by `grove web --remote-url` into index.html
+//   2. VITE_API_URL             — set by `grove web --dev` via vite proxy env
+//   3. '' (empty)               — production/GUI mode: use relative URLs
+const API_BASE_URL: string =
+  (typeof window !== 'undefined' && (window as unknown as Record<string, unknown>).__GROVE_API_BASE__ as string) ||
+  import.meta.env.VITE_API_URL ||
+  '';
 
 export interface ApiError {
   status: number;
@@ -307,11 +312,12 @@ class ApiClient {
     return response.text();
   }
 
-  async patch<T, R>(path: string, data: T): Promise<R> {
+  async patch<T, R>(path: string, data: T, signal?: AbortSignal): Promise<R> {
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: 'PATCH',
       headers: await getSignedHeaders('PATCH', path),
       body: JSON.stringify(data),
+      signal,
     });
 
     if (!response.ok) {
@@ -495,9 +501,18 @@ class ApiClient {
 export const apiClient = new ApiClient();
 
 /// Get the API host for WebSocket connections.
-/// In dev mode (VITE_API_URL set), extract host from that URL.
-/// In prod mode, use window.location.host.
+/// Priority: __GROVE_API_BASE__ > VITE_API_URL > window.location.host
 export function getApiHost(): string {
+  // Remote mode: injected by grove web --remote-url
+  const remoteBase = (typeof window !== 'undefined' && (window as unknown as Record<string, unknown>).__GROVE_API_BASE__) as string | undefined;
+  if (remoteBase) {
+    try {
+      const url = new URL(remoteBase);
+      return url.host;
+    } catch {
+      // fallback
+    }
+  }
   const envUrl = import.meta.env.VITE_API_URL;
   if (envUrl) {
     try {

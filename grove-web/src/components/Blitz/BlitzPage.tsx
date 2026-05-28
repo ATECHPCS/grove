@@ -328,12 +328,11 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
   }, [pageHandlers]);
 
   // Listen for Command key press for quick navigation.
-  // Cleanup is layered (keyup / blur / visibilitychange / mousemove / safety
-  // timeout) because the bare keyup-of-Meta path is unreliable on macOS:
-  // when Tauri Overlay title-bar mode is on, the OS occasionally swallows
-  // the meta keyup if a system shortcut intercepts it, leaving the body
-  // class stuck and chips visible. Any one of the fallback triggers clears
-  // the class as soon as the user does anything else.
+  // Cleanup is layered (keyup / blur / visibilitychange / 3s safety timer)
+  // because the bare keyup-of-Meta path is unreliable on macOS: when Tauri
+  // Overlay title-bar mode is on, the OS occasionally swallows the meta
+  // keyup if a system shortcut intercepts it, leaving the body class stuck
+  // and chips visible. Any one of the fallback triggers clears the class.
   useEffect(() => {
     let safetyTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -377,14 +376,6 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
       if (!e.metaKey) clearChips();
     };
 
-    // If the user moves the mouse after letting go of Meta but the keyup was
-    // missed, the mousemove will reliably carry the up-to-date metaKey state.
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!e.metaKey && document.body.classList.contains('blitz-command-pressed')) {
-        clearChips();
-      }
-    };
-
     // App lost focus (Cmd+Tab, switched window) — Meta keyup never arrives.
     const handleBlur = () => clearChips();
     const handleVisibilityChange = () => {
@@ -393,14 +384,12 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
 
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
-    window.addEventListener('mousemove', handleMouseMove);
     window.addEventListener('blur', handleBlur);
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
-      window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('blur', handleBlur);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       if (safetyTimer) clearTimeout(safetyTimer);
@@ -752,8 +741,11 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
       >
         {/* Logo + Mode Brand
            pt-8 clears macOS traffic lights when Tauri title bar is Overlay.
-           data-tauri-drag-region lets the user drag the window from here. */}
-        <div className="px-4 pt-8 pb-4 flex items-center justify-between" data-tauri-drag-region>
+           data-tauri-drag-region gives double-click-maximize; data-window-drag-strip
+           is what the App.tsx native mousedown listener uses to call startDragging()
+           (the bare data-tauri-drag-region silently fails after the first drag when
+           the webview is loaded from http://localhost). */}
+        <div className="px-4 pt-8 pb-4 flex items-center justify-between" data-tauri-drag-region data-window-drag-strip>
           <LogoBrand mode="blitz" onToggle={onSwitchToZen} />
           <button
             onClick={() => setShowRadioConnect(true)}
@@ -1159,9 +1151,9 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
          instead of `fixed` because BlitzPage's internal task-detail /
          workspace transitions rely on `absolute inset-0` motion divs —
          turning main into `fixed` breaks the containing-block chain for
-         those motion children and leaves the main area blank. ml-[300px]
-         clears the fixed sidebar (w-72 + left-3 + 12px buffer); mt/mr/mb
-         give the same 12px gap as the sidebar. Mobile keeps the original
+         those motion children and leaves the main area blank. ml-[312px]
+         clears the fixed sidebar (left-3 + w-72 + 12px buffer = 12+288+12);
+         mt/mr/mb give the same 12px gap as the sidebar. Mobile keeps the original
          flex layout since the sidebar there is full-screen, not floating. */}
       <main
         className={
@@ -1191,10 +1183,11 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
           </div>
         )}
         {/* Hairline inner padding so child content doesn't get clipped by
-           the main card's rounded-2xl corners. Matches Zen's workspace
-           p-2 (8px); Blitz uses the same padding across all states because
-           every Blitz inner view is a task-centric panel (no "breathing-
-           room dashboard" page like Zen has). */}
+           the main card's rounded-2xl corners. Matches Zen's workspace-mode
+           p-2 (8px); Zen's non-workspace pages use p-6 instead. Blitz uses
+           the same p-2 across all states because every Blitz inner view is
+           a task-centric panel (no "breathing-room dashboard" page like Zen
+           has). */}
         <div className="h-full relative p-2">
           <div className="h-full relative">
             {/* Task List Page */}
@@ -1240,7 +1233,7 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
                     exit={{ opacity: 0 }}
-                    className="h-full flex items-center justify-center rounded-2xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)]"
+                    className="h-full flex items-center justify-center"
                   >
                     <div className="text-center">
                       <p className="text-[var(--color-text-muted)] mb-2">

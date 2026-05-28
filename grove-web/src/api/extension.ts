@@ -25,14 +25,15 @@ export async function listExtensionTabs(): Promise<ExtensionTab[]> {
 }
 
 /**
- * Probe whether the Chrome companion extension is reachable. Used by the
- * Settings page status indicator. Implemented as a thin wrapper around
- * `listExtensionTabs` so we don't ping a separate health endpoint.
+ * Probe whether the Chrome companion extension is reachable. Hits a
+ * lightweight backend endpoint that only checks the in-process EXTENSION_SESSION
+ * — no WebSocket round-trip to the browser extension. Callers should fetch
+ * once on mount (or before opening a related UI flow); polling is wasted work.
  */
-export async function pingExtension(): Promise<boolean> {
+export async function getExtensionStatus(): Promise<boolean> {
   try {
-    await apiClient.get<ExtensionTab[]>('/api/v1/extension/tabs');
-    return true;
+    const resp = await apiClient.get<{ connected: boolean }>('/api/v1/extension/status');
+    return !!resp.connected;
   } catch {
     return false;
   }

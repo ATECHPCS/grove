@@ -739,7 +739,8 @@ fn query_top_tasks(project_key: &str, from_ts: i64, to_ts: i64) -> Vec<TopItem> 
 
 fn query_agent_split_for_project(key: &str, from_ts: i64, to_ts: i64) -> Vec<AgentBucket> {
     let conn = database::connection();
-    let sql = "SELECT agent, COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_amount), 0.0)
+    let sql =
+        "SELECT agent, COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_amount), 0.0)
                FROM chat_token_usage
                WHERE end_ts BETWEEN ?1 AND ?2 AND project_key = ?3
                GROUP BY agent
@@ -769,7 +770,8 @@ fn query_agent_split_for_task(
     to_ts: i64,
 ) -> Vec<AgentBucket> {
     let conn = database::connection();
-    let sql = "SELECT agent, COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_amount), 0.0)
+    let sql =
+        "SELECT agent, COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_amount), 0.0)
                FROM chat_token_usage
                WHERE end_ts BETWEEN ?1 AND ?2 AND project_key = ?3 AND task_id = ?4
                GROUP BY agent

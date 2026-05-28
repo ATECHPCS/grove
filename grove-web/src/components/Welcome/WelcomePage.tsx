@@ -17,6 +17,8 @@ export function WelcomePage({ onGetStarted }: WelcomePageProps) {
       .then((res) => setVersion(res.version))
       .catch(() => {});
   }, []);
+  const isRemote = typeof window !== "undefined" && !!(window as unknown as Record<string, unknown>).__GROVE_REMOTE__;
+
   return (
     <motion.div
       initial={{ opacity: 1 }}
@@ -48,33 +50,45 @@ export function WelcomePage({ onGetStarted }: WelcomePageProps) {
             repeat: Infinity,
             ease: "easeInOut",
           }}
-          className="absolute -bottom-1/2 -right-1/2 w-full h-full bg-gradient-to-tl from-[var(--color-accent)] via-transparent to-transparent rounded-full blur-3xl"
+          className="absolute -top-1/2 -right-1/2 w-full h-full bg-gradient-to-bl from-[var(--color-highlight)] via-transparent to-transparent rounded-full blur-3xl"
         />
       </div>
-
-      {/* Content */}
-      <div className="relative z-10 flex flex-col items-center text-center px-6">
-        {/* Logo - Tree icon with draw-in entrance */}
+      <div className="relative flex flex-col items-center text-center max-w-lg px-6">
+        {/* Main Icon with complex glow */}
         <motion.div
-          initial={{ scale: 0.3, opacity: 0 }}
+          initial={{ scale: 0.8, opacity: 0 }}
           animate={{ scale: 1, opacity: 1 }}
-          transition={{ type: "spring", stiffness: 260, damping: 20 }}
-          className="mb-8"
+          transition={{
+            type: "spring",
+            stiffness: 100,
+            damping: 15,
+            delay: 0.2,
+          }}
+          className="relative mb-8"
         >
-          {/* Glow behind icon */}
+          <div className="absolute -inset-4 bg-gradient-to-r from-emerald-500/20 to-teal-500/20 rounded-full blur-3xl opacity-75 animate-pulse" />
           <motion.div
-            className="relative"
-            initial={{ filter: "drop-shadow(0 0 0px transparent)" }}
-            animate={{ filter: "drop-shadow(0 0 24px var(--color-highlight))" }}
-            transition={{ delay: 1.2, duration: 1, ease: "easeOut" }}
+            animate={{
+              y: [0, -10, 0],
+            }}
+            transition={{
+              duration: 6,
+              repeat: Infinity,
+              ease: "easeInOut",
+            }}
           >
-            {/* Circle-reveal from bottom center — "tree growing" feel */}
             <motion.div
-              initial={{ clipPath: "circle(0% at 50% 100%)" }}
-              animate={{ clipPath: "circle(150% at 50% 100%)" }}
+              className="relative"
+              initial={{ rotate: -10 }}
+              animate={{ rotate: 0 }}
               transition={{ delay: 0.15, duration: 1.4, ease: [0.16, 1, 0.3, 1] }}
             >
               <GroveIcon size={160} background shimmer className="rounded-3xl" />
+              {isRemote && (
+                <span className="absolute bottom-2.5 right-2.5 px-2 py-0.75 text-[9px] font-black uppercase tracking-widest rounded-lg bg-[var(--color-highlight)]/10 text-[var(--color-highlight)] border border-[var(--color-highlight)]/20 backdrop-blur-md shadow-sm shadow-[var(--color-highlight)]/5 select-none">
+                  Remote
+                </span>
+              )}
             </motion.div>
           </motion.div>
         </motion.div>
