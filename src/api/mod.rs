@@ -759,6 +759,19 @@ pub fn create_api_router() -> Router {
     v1
 }
 
+/// Cache-Control header value for an embedded asset, or None for the default.
+///
+/// Service workers must revalidate on every request so updates propagate
+/// within one navigation; everything else (Vite content-hashed assets,
+/// index.html served as SPA fallback) uses the browser's default heuristics.
+fn cache_control_for(path: &str) -> Option<&'static str> {
+    if path == "sw.js" {
+        Some("no-cache")
+    } else {
+        None
+    }
+}
+
 /// Serve embedded static files
 async fn serve_embedded(uri: Uri) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
@@ -776,9 +789,13 @@ async fn serve_embedded(uri: Uri) -> impl IntoResponse {
     match file {
         Some(content) => {
             let mime = mime_guess::from_path(serve_path).first_or_octet_stream();
-            Response::builder()
+            let mut builder = Response::builder()
                 .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, mime.as_ref())
+                .header(header::CONTENT_TYPE, mime.as_ref());
+            if let Some(cc) = cache_control_for(serve_path) {
+                builder = builder.header(header::CACHE_CONTROL, cc);
+            }
+            builder
                 .body(Body::from(content.data.into_owned()))
                 .expect("build static file HTTP response")
         }
@@ -1512,4 +1529,22 @@ pub async fn start_server(
         })
         .await
         .map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_control_for_sw_js_is_no_cache() {
+        assert_eq!(cache_control_for("sw.js"), Some("no-cache"));
+    }
+
+    #[test]
+    fn cache_control_for_other_paths_is_none() {
+        assert_eq!(cache_control_for("index.html"), None);
+        assert_eq!(cache_control_for("assets/main.js"), None);
+        assert_eq!(cache_control_for("manifest.json"), None);
+        assert_eq!(cache_control_for("icon-512.png"), None);
+    }
 }
