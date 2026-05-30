@@ -1722,6 +1722,9 @@ export function TaskChat({
   // A ref so it never re-triggers a render; mount-time load is sufficient for v1.
   // Seeding (see session_ready handlers) only applies when the active chat's
   // agent matches the configured default agent.
+  // TODO: loaded once on mount — goes stale if the user changes defaults in
+  // Settings mid-session. Acceptable for v1 since it only affects newly-created
+  // chats; refresh this ref on a config-change signal if that becomes a problem.
   const chatDefaultsRef = useRef<{
     agent: string | undefined;
     model: string | null;
@@ -3438,11 +3441,17 @@ export function TaskChat({
     (chatId: string, agent: string | undefined, evt: any) => {
       // First-ready gate: never re-seed on reconnect/resume.
       if (seededChatsRef.current.has(chatId)) return;
-      seededChatsRef.current.add(chatId);
 
       const d = chatDefaultsRef.current;
-      // Agent gate: only seed when the chat's agent is the configured default.
+      // Config not loaded yet, or this chat isn't on the default agent: return
+      // WITHOUT marking seeded, so a later session_ready can still seed once
+      // config has loaded (avoids the cold-start race where the first new
+      // chat's session_ready fires before the mount-time getConfig resolves).
       if (!d.agent || agent !== d.agent) return;
+
+      // Passed all gates — mark seeded now (prevents re-seed on reconnect/resume
+      // which would clobber a manual change) and apply the validated defaults.
+      seededChatsRef.current.add(chatId);
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const has = (arr: any, value: string | null): boolean =>
