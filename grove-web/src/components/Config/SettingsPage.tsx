@@ -249,9 +249,11 @@ export function SettingsPage({ config }: SettingsPageProps) {
 
   // ACP / Custom agents state
   const [acpAgent, setAcpAgent] = useState("claude"); // Chat mode agent
-  const [defaultModel, setDefaultModel] = useState<string>("");
-  const [defaultMode, setDefaultMode] = useState<string>("");
-  const [defaultThinking, setDefaultThinking] = useState<string>("");
+  // Per-agent chat defaults, keyed by agent id. UI uses "" for unset; the
+  // backend stores null and tri-state-applies per agent (pruning all-empty).
+  const [chatDefaultsByAgent, setChatDefaultsByAgent] = useState<
+    Record<string, { model: string; mode: string; thinking: string }>
+  >({});
   const [agentCaps, setAgentCaps] = useState<AgentCapabilities | null>(null);
   const [customAgents, setCustomAgents] = useState<CustomAgentServer[]>([]);
   const [showCustomAgentModal, setShowCustomAgentModal] = useState(false);
@@ -451,9 +453,17 @@ export function SettingsPage({ config }: SettingsPageProps) {
     if (acp?.agent_command) {
       setAcpAgent(acp.agent_command);
     }
-    setDefaultModel(cfg.chat_defaults?.model ?? "");
-    setDefaultMode(cfg.chat_defaults?.mode ?? "");
-    setDefaultThinking(cfg.chat_defaults?.thinking ?? "");
+    // chat_defaults is a per-agent map (Record<agentId, {model,mode,thinking}>
+    // with null = unset). Normalize null → "" for the UI.
+    const hydrated: Record<string, { model: string; mode: string; thinking: string }> = {};
+    for (const [agentId, d] of Object.entries(cfg.chat_defaults ?? {})) {
+      hydrated[agentId] = {
+        model: d.model ?? "",
+        mode: d.mode ?? "",
+        thinking: d.thinking ?? "",
+      };
+    }
+    setChatDefaultsByAgent(hydrated);
     if (acp?.custom_agents) {
       setCustomAgents(acp.custom_agents);
     }
@@ -646,11 +656,9 @@ export function SettingsPage({ config }: SettingsPageProps) {
         render_window_limit: chatRenderWindowLimit,
         render_window_trigger: renderWindowTrigger,
       },
-      chat_defaults: {
-        model: defaultModel,
-        mode: defaultMode,
-        thinking: defaultThinking,
-      },
+      // Whole per-agent map; backend applies tri-state per agent ("" clears a
+      // field) and prunes all-empty entries.
+      chat_defaults: chatDefaultsByAgent,
       auto_link: {
         patterns: autoLinkPatterns,
       },
@@ -687,7 +695,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
     } catch {
       console.error("Failed to save config");
     }
-  }, [isLoaded, selectedLayout, agentCommand, acpAgent, defaultModel, defaultMode, defaultThinking, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, refreshGlobalConfig]);
+  }, [isLoaded, selectedLayout, agentCommand, acpAgent, chatDefaultsByAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, refreshGlobalConfig]);
 
   // Handle theme change with immediate save
   const handleModeChange = useCallback((newMode: "auto" | "light" | "dark") => {
@@ -823,7 +831,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
     }, 500); // 500ms debounce
 
     return () => clearTimeout(timer);
-  }, [selectedLayout, agentCommand, acpAgent, defaultModel, defaultMode, defaultThinking, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, isLoaded, saveConfig]);
+  }, [selectedLayout, agentCommand, acpAgent, chatDefaultsByAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, isLoaded, saveConfig]);
 
   useEffect(() => {
     if (!isRecordingWindowShortcut) return;
@@ -1058,21 +1066,22 @@ export function SettingsPage({ config }: SettingsPageProps) {
     return () => ctrl.abort();
   }, [acpAgent]);
 
-  // Clear stored defaults that are no longer valid for the current agent's
-  // capabilities. Uses the functional setState form so it never reads default*
-  // from closure — that makes [agentCaps] genuinely complete deps. setState is
-  // deferred to a microtask to satisfy react-hooks/set-state-in-effect.
-  useEffect(() => {
-    if (!agentCaps) return;
-    const caps = agentCaps;
-    void Promise.resolve().then(() => {
-      const has = (list: [string, string][], v: string) =>
-        v === "" || list.some(([id]) => id === v);
-      setDefaultModel((prev) => (has(caps.models, prev) ? prev : ""));
-      setDefaultMode((prev) => (has(caps.modes, prev) ? prev : ""));
-      setDefaultThinking((prev) => (has(caps.thought_levels, prev) ? prev : ""));
-    });
-  }, [agentCaps]);
+  // The current agent's stored defaults (derived, not separate state). Invalid
+  // values are NOT cleared here — render-time clamping (below) shows them as
+  // "Default" without persisting, so switching agents never clobbers others.
+  const cur = chatDefaultsByAgent[acpAgent] ?? { model: "", mode: "", thinking: "" };
+  const setChatDefaultField = useCallback(
+    (field: "model" | "mode" | "thinking", v: string) => {
+      setChatDefaultsByAgent((prev) => ({
+        ...prev,
+        [acpAgent]: {
+          ...(prev[acpAgent] ?? { model: "", mode: "", thinking: "" }),
+          [field]: v,
+        },
+      }));
+    },
+    [acpAgent],
+  );
 
   const suggestedChatRenderWindowTrigger = useCallback((limit: number) => {
     return Math.max(limit + 1, Math.ceil(limit * 1.5));
@@ -1313,18 +1322,24 @@ env_vars = [
                 Options come from the agent's cached capabilities (populated after
                 the agent first connects). Empty selection = use the agent's own default. */}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              {[
-                { label: "Default Model", value: defaultModel, set: setDefaultModel, opts: agentCaps?.models ?? [] },
-                { label: "Default Mode", value: defaultMode, set: setDefaultMode, opts: agentCaps?.modes ?? [] },
-                { label: "Default Thinking", value: defaultThinking, set: setDefaultThinking, opts: agentCaps?.thought_levels ?? [] },
-              ].map((f) => (
+              {([
+                { label: "Default Model", field: "model" as const, value: cur.model, opts: agentCaps?.models ?? [] },
+                { label: "Default Mode", field: "mode" as const, value: cur.mode, opts: agentCaps?.modes ?? [] },
+                { label: "Default Thinking", field: "thinking" as const, value: cur.thinking, opts: agentCaps?.thought_levels ?? [] },
+              ].map((f) => ({
+                ...f,
+                set: (v: string) => setChatDefaultField(f.field, v),
+                // Render-time clamp: a stored value not in the current agent's
+                // options shows as "Default" without ever persisting the clear.
+                displayValue: f.value && f.opts.some(([id]) => id === f.value) ? f.value : "",
+              }))).map((f) => (
                 <div key={f.label}>
                   <div className="text-xs font-medium text-[var(--color-text-muted)] mb-2 uppercase tracking-wider select-none">
                     {f.label}
                   </div>
                   {f.opts.length > 0 ? (
                     <Combobox
-                      value={f.value}
+                      value={f.displayValue}
                       onChange={f.set}
                       allowCustom={false}
                       options={[
