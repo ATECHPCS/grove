@@ -295,6 +295,77 @@ function renderPreviewCommentCard(env: GroveMetaEnvelope): ReactNode {
   );
 }
 
+function renderReviewCommentCard(env: GroveMetaEnvelope): ReactNode {
+  const data = env.data as unknown as {
+    id: number;
+    commentType?: string;
+    filePath?: string;
+    startLine?: number;
+    endLine?: number;
+    content: string;
+    agent?: string;
+    status?: string;
+    instructions?: string;
+  };
+  const filePath = data.filePath || "";
+  const fileName = filePath.split("/").pop() || "";
+  const dir = filePath.endsWith(fileName)
+    ? filePath.slice(0, Math.max(0, filePath.length - fileName.length - 1))
+    : "";
+  
+  const isProjectLevel = data.commentType === "project" || !filePath;
+  const isFileLevel = data.commentType === "file";
+
+  const typeLabel = isProjectLevel
+    ? "Project Discussion"
+    : isFileLevel
+      ? "File Comment"
+      : `Line Comment`;
+
+  const lineRange = data.startLine
+    ? data.startLine === data.endLine
+      ? `:L${data.startLine}`
+      : `:L${data.startLine}-L${data.endLine}`
+    : "";
+
+  return (
+    <div
+      className="my-2 overflow-hidden rounded-lg border border-[var(--color-border)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_78%,transparent)] text-[var(--color-text)]"
+      title={env.systemPrompt}
+    >
+      <div className="flex items-center justify-between gap-3 border-b border-[var(--color-border)] px-3 py-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="shrink-0 rounded-md bg-[color-mix(in_srgb,var(--color-warning)_14%,transparent)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--color-warning)]">
+            Comment #{data.id}
+          </span>
+          {!isProjectLevel ? (
+            <>
+              <span className="truncate text-[12px] font-semibold" title={filePath}>
+                {fileName}{lineRange}
+              </span>
+              {dir && (
+                <span className="truncate text-[10px] text-[var(--color-text-muted)]" title={filePath}>
+                  {dir}
+                </span>
+              )}
+            </>
+          ) : (
+            <span className="text-[12px] font-semibold">Project Discussion</span>
+          )}
+        </div>
+        <span className="shrink-0 text-[10px] uppercase tracking-wide text-[var(--color-text-muted)] font-medium">
+          {typeLabel}
+        </span>
+      </div>
+      <div className="space-y-1.5 px-3 py-2.5">
+        <div className="whitespace-pre-wrap break-words text-[12.5px] leading-snug">
+          {data.content}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export const GROVE_META_RENDERERS: Record<string, Renderer> = {
   mention_spawn: (env) => renderMentionSpawn(env),
   mention_send: (env) => renderMentionSend(env),
@@ -304,6 +375,7 @@ export const GROVE_META_RENDERERS: Record<string, Renderer> = {
   user_remind: (env) => renderUserRemindBadge(env),
   preview_comment: (env) => renderPreviewCommentCard(env),
   browser_tab: (env) => renderBrowserTab(env),
+  review_comment: (env) => renderReviewCommentCard(env),
 };
 
 /** Render an envelope, falling back to `systemPrompt` text on unknown type or

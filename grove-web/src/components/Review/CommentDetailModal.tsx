@@ -7,6 +7,8 @@ import { MarkdownRenderer, FileMentionDropdown } from '../ui';
 import { useFileMention } from '../../hooks';
 import type { MentionItem } from '../../utils/fileMention';
 import { useDefineCommand, useKeyboardScope } from '../../keyboard';
+import { useGlobalActiveChatId } from '../Tasks/TaskView/useActiveChatId';
+import { useBanner } from '../../context';
 
 /** Format ISO timestamp to human-readable local time, e.g. "2026-02-10 08:37:24" */
 function formatTime(ts: string): string {
@@ -48,6 +50,8 @@ export function CommentDetailModal({
   const [replyText, setReplyText] = useState('');
   const [showReplyForm, setShowReplyForm] = useState(false);
   const [editingComment, setEditingComment] = useState(false);
+  const activeChatId = useGlobalActiveChatId();
+  const { showBanner } = useBanner();
   const [editCommentText, setEditCommentText] = useState('');
   const [editingReplyId, setEditingReplyId] = useState<number | null>(null);
   const [editReplyText, setEditReplyText] = useState('');
@@ -572,6 +576,30 @@ export function CommentDetailModal({
             >
               <CheckCircle style={{ width: 14, height: 14 }} />
               Resolve
+            </button>
+          )}
+          {activeChatId && (
+            <button
+              onClick={() => {
+                window.dispatchEvent(new CustomEvent("grove-send-comment-to-chat", { detail: comment }));
+                showBanner("Comment sent to active Agent Chat Session", "success");
+                onClose();
+              }}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                padding: '6px 12px',
+                background: 'transparent',
+                border: '1px solid var(--color-border)',
+                borderRadius: 6,
+                color: 'var(--color-accent)',
+                cursor: 'pointer',
+                fontSize: 13,
+              }}
+            >
+              <Send style={{ width: 14, height: 14 }} />
+              Send to Chat
             </button>
           )}
           {onReopen && comment.status === 'resolved' && (

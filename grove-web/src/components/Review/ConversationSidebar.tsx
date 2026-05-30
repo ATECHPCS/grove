@@ -7,6 +7,8 @@ import { CommentDetailModal } from './CommentDetailModal';
 import { useFileMention } from '../../hooks';
 import { FileMentionDropdown } from '../ui';
 import type { MentionItem } from '../../utils/fileMention';
+import { useGlobalActiveChatId } from '../Tasks/TaskView/useActiveChatId';
+import { useBanner } from '../../context';
 
 type StatusFilter = 'all' | 'open' | 'resolved' | 'outdated';
 
@@ -396,6 +398,8 @@ function ConversationItem({
 }) {
   const [showReplyForm, setShowReplyForm] = useState(false);
   const [replyText, setReplyText] = useState('');
+  const activeChatId = useGlobalActiveChatId();
+  const { showBanner } = useBanner();
   const replyTextareaRef = useRef<HTMLTextAreaElement>(null);
   const replyMention = useFileMention({ mentionItems: mentionItems ?? null, textareaRef: replyTextareaRef });
 
@@ -512,6 +516,19 @@ function ConversationItem({
             title="Expand"
           >
             <Maximize2 style={{ width: 12, height: 12 }} />
+          </button>
+        )}
+        {activeChatId && (
+          <button
+            className="conv-item-resolve-btn"
+            onClick={(e) => {
+              e.stopPropagation();
+              window.dispatchEvent(new CustomEvent("grove-send-comment-to-chat", { detail: comment }));
+              showBanner("Comment sent to active Agent Chat Session", "success");
+            }}
+            title="Send to active Agent Chat Session"
+          >
+            <Send style={{ width: 12, height: 12 }} />
           </button>
         )}
         {onReply && (

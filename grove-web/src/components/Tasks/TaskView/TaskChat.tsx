@@ -3648,6 +3648,20 @@ export function TaskChat({
     };
   }, []);
 
+  // Synchronize activeChatId to window.__groveActiveChatId and listen to comment send event
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      (window as any).__groveActiveChatId = activeChatId;
+      window.dispatchEvent(new CustomEvent("grove-active-chat-changed", { detail: activeChatId }));
+    }
+    return () => {
+      if (typeof window !== "undefined") {
+        (window as any).__groveActiveChatId = null;
+        window.dispatchEvent(new CustomEvent("grove-active-chat-changed", { detail: null }));
+      }
+    };
+  }, [activeChatId]);
+
   // Save composer draft to localStorage on page unload / navigation /
   // tab hide. `beforeunload` is unreliable on mobile and on fast tab
   // close — `visibilitychange` (state="hidden") fires consistently
@@ -4742,6 +4756,69 @@ export function TaskChat({
     return Object.keys(cfg).length === 0 ? undefined : cfg;
   }, [selectedModel, permissionLevel, thoughtLevel, thoughtLevelConfigId]);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const handleSendComment = async (e: Event) => {
+      const customEvent = e as CustomEvent;
+      const comment = customEvent.detail;
+      if (!comment) return;
+
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        console.error("No active WebSocket connection to send comment.");
+        return;
+      }
+
+      // 1. Build line/location labels
+      const lineRange = comment.start_line
+        ? comment.start_line === comment.end_line
+          ? `L${comment.start_line}`
+          : `L${comment.start_line}-L${comment.end_line}`
+        : "";
+      const locLabel = comment.file_path
+        ? `${comment.file_path.split("/").pop() || comment.file_path}${lineRange ? ":" + lineRange : ""}`
+        : "Project-level";
+
+      // 2. Build grove-meta payload
+      const metaType = "review_comment";
+      const metaData = {
+        id: comment.id,
+        commentType: comment.comment_type || "inline",
+        filePath: comment.file_path || "",
+        startLine: comment.start_line,
+        endLine: comment.end_line,
+        content: comment.content,
+        agent: comment.agent || "",
+        status: comment.status || "open"
+      };
+      
+      const systemPrompt = `Please address Code Review Comment #${comment.id} on ${locLabel}. Comment: "${comment.content}". Use the grove_reply_review tool to reply and set resolve: true when addressed.`;
+
+      const text = buildGroveMetaTag(metaType, metaData, systemPrompt);
+
+      // 3. Send over WebSocket
+      enableAutoStickToBottom("auto");
+      const msgType = isBusy ? "queue_message" : "prompt";
+      ws.send(
+        JSON.stringify({
+          type: msgType,
+          text,
+          attachments: [],
+          config: buildPromptConfig(),
+        })
+      );
+      
+      // Let's scroll to bottom if needed
+      enableAutoStickToBottom("auto");
+    };
+
+    window.addEventListener("grove-send-comment-to-chat", handleSendComment);
+    return () => {
+      window.removeEventListener("grove-send-comment-to-chat", handleSendComment);
+    };
+  }, [activeChatId, isBusy, buildPromptConfig, enableAutoStickToBottom]);
+
   const handleSend = useCallback(async () => {
     const el = editableRef.current;
     if (!el) return;
@@ -5153,14 +5230,14 @@ export function TaskChat({
   useCommand(
     "chat.send",
     () => { void handleSend(); },
-    { enabled: () => !!activeChatId },
-    [activeChatId, handleSend],
+    { enabled: () => !!activeChatId && !showFileMenu && !showSlashMenu },
+    [activeChatId, showFileMenu, showSlashMenu, handleSend],
   );
   useCommand(
     "chat.send.alt",
     () => { void handleSend(); },
-    { enabled: () => !!activeChatId },
-    [activeChatId, handleSend],
+    { enabled: () => !!activeChatId && !showFileMenu && !showSlashMenu },
+    [activeChatId, showFileMenu, showSlashMenu, handleSend],
   );
   useCommand(
     "chat.permission.cycle",
@@ -6211,11 +6288,15 @@ export function TaskChat({
         }
         if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
           e.preventDefault();
+          e.stopPropagation();
+          e.nativeEvent.stopImmediatePropagation();
           insertCommandAtCursor(filteredSlashCommands[slashSelectedIdx].name);
           return;
         }
         if (e.key === "Escape") {
           e.preventDefault();
+          e.stopPropagation();
+          e.nativeEvent.stopImmediatePropagation();
           setShowSlashMenu(false);
           return;
         }
@@ -6224,11 +6305,15 @@ export function TaskChat({
       if (showFileMenu && filteredFiles.length > 0) {
         if (e.key === "ArrowDown") {
           e.preventDefault();
+          e.stopPropagation();
+          e.nativeEvent.stopImmediatePropagation();
           setFileSelectedIdx((prev) => (prev + 1) % filteredFiles.length);
           return;
         }
         if (e.key === "ArrowUp") {
           e.preventDefault();
+          e.stopPropagation();
+          e.nativeEvent.stopImmediatePropagation();
           setFileSelectedIdx(
             (prev) => (prev - 1 + filteredFiles.length) % filteredFiles.length,
           );
@@ -6236,6 +6321,8 @@ export function TaskChat({
         }
         if (e.key === "Tab") {
           e.preventDefault();
+          e.stopPropagation();
+          e.nativeEvent.stopImmediatePropagation();
           const sel_item = filteredFiles[fileSelectedIdx];
           if (
             sel_item.category === "category_selector" ||
@@ -6255,6 +6342,8 @@ export function TaskChat({
         }
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
+          e.stopPropagation();
+          e.nativeEvent.stopImmediatePropagation();
           const sel_item = filteredFiles[fileSelectedIdx];
           insertFileAtCursor(
             sel_item.path,
@@ -6266,6 +6355,8 @@ export function TaskChat({
         }
         if (e.key === "Escape") {
           e.preventDefault();
+          e.stopPropagation();
+          e.nativeEvent.stopImmediatePropagation();
           setShowFileMenu(false);
           setActiveCategory(null);
           return;
@@ -6500,6 +6591,7 @@ export function TaskChat({
   return (
     <motion.div
       ref={taskChatRootRef}
+      data-grove-chat-panel="true"
       tabIndex={-1}
       initial={{ opacity: 0, y: -10 }}
       animate={{ opacity: 1, y: 0 }}

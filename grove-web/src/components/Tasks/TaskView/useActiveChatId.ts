@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useRef, useState, useEffect } from "react";
 
 interface Result {
   activeChatId: string | null;
@@ -24,9 +24,68 @@ export function useActiveChatId(initial: string | null = null): Result {
   const setActiveChatId = useCallback((id: string | null) => {
     ref.current = id;
     setActiveChatIdState(id);
+    if (typeof window !== "undefined") {
+      (window as any).__groveActiveChatId = id;
+      window.dispatchEvent(new CustomEvent("grove-active-chat-changed", { detail: id }));
+    }
   }, []);
 
   const getActiveChatId = useCallback(() => ref.current, []);
 
   return { activeChatId, getActiveChatId, setActiveChatId };
+}
+
+export function useGlobalActiveChatId(): string | null {
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const checkActiveAndVisible = () => {
+      const globalActiveId = (window as any).__groveActiveChatId || null;
+      if (!globalActiveId) {
+        setActiveChatId(null);
+        return;
+      }
+
+      // Check if the chat panel is actually visible in the DOM (display !== none)
+      const panelEl = document.querySelector('[data-grove-chat-panel="true"]');
+      if (panelEl) {
+        const isVisible = (panelEl as HTMLElement).offsetParent !== null;
+        if (!isVisible) {
+          setActiveChatId(null);
+          return;
+        }
+      } else {
+        // If the component is not in DOM at all
+        setActiveChatId(null);
+        return;
+      }
+
+      setActiveChatId(globalActiveId);
+    };
+
+    const handleChanged = () => {
+      checkActiveAndVisible();
+    };
+
+    window.addEventListener("grove-active-chat-changed", handleChanged);
+    window.addEventListener("click", checkActiveAndVisible);
+    window.addEventListener("resize", checkActiveAndVisible);
+
+    // Initial check
+    checkActiveAndVisible();
+
+    // Check periodically in case layout changes without click/resize
+    const interval = setInterval(checkActiveAndVisible, 400);
+
+    return () => {
+      window.removeEventListener("grove-active-chat-changed", handleChanged);
+      window.removeEventListener("click", checkActiveAndVisible);
+      window.removeEventListener("resize", checkActiveAndVisible);
+      clearInterval(interval);
+    };
+  }, []);
+
+  return activeChatId;
 }

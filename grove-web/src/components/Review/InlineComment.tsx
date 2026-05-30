@@ -7,6 +7,9 @@ import { formatAgentDisplay } from './agentDisplay';
 import { MarkdownRenderer, FileMentionDropdown } from '../ui';
 import { useFileMention } from '../../hooks';
 import type { MentionItem } from '../../utils/fileMention';
+import { useGlobalActiveChatId } from '../Tasks/TaskView/useActiveChatId';
+import { useBanner } from '../../context';
+
 
 /** Format ISO timestamp to human-readable local time, e.g. "2026-02-10 08:37:24" */
 function formatTime(ts: string): string {
@@ -44,6 +47,8 @@ export function CommentCard({ comment, onDelete, onReply, onResolve, onReopen, o
   const [editCommentText, setEditCommentText] = useState('');
   const [editingReplyId, setEditingReplyId] = useState<number | null>(null);
   const [editReplyText, setEditReplyText] = useState('');
+  const activeChatId = useGlobalActiveChatId();
+  const { showBanner } = useBanner();
 
   const editCommentTextareaRef = useRef<HTMLTextAreaElement>(null);
   const editReplyTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -120,6 +125,18 @@ export function CommentCard({ comment, onDelete, onReply, onResolve, onReopen, o
               title="Resolve"
             >
               <CheckCircle style={{ width: 13, height: 13 }} />
+            </button>
+          )}
+          {activeChatId && (
+            <button
+              className="diff-comment-action-btn"
+              onClick={() => {
+                window.dispatchEvent(new CustomEvent("grove-send-comment-to-chat", { detail: comment }));
+                showBanner("Comment sent to active Agent Chat Session", "success");
+              }}
+              title="Send to active Agent Chat Session"
+            >
+              <Send style={{ width: 13, height: 13 }} />
             </button>
           )}
           {onReopen && comment.status === 'resolved' && (
