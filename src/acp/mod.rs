@@ -2574,6 +2574,46 @@ async fn drive_session(
         }
     }
 
+    // Cache this agent's declared capabilities so Settings can offer valid
+    // default model/mode/thinking choices without spawning a session.
+    //
+    // Key by the chat's stored `agent` column (the same identifier Settings
+    // persists as a default agent: "claude", "codex", or a custom-agent
+    // persona id like "ca-reviewer"). That value is NOT carried on
+    // `AcpStartConfig` — `config.agent_command` is the resolved binary
+    // ("npx"/path) and `config.agent_name` is the ACP display/logical name —
+    // so we read it back from the chat row via `handle.chat_id`. Headless
+    // paths with no chat (CLI/MCP) fall back to normalizing the declared
+    // display name to a canonical builtin id.
+    {
+        let agent_key = handle
+            .chat_id
+            .as_deref()
+            .and_then(|chat_id| {
+                crate::storage::tasks::get_chat_session(
+                    &handle.project_key,
+                    &handle.task_id,
+                    chat_id,
+                )
+                .ok()
+                .flatten()
+                .map(|chat| chat.agent)
+            })
+            .unwrap_or_else(|| {
+                canonical_builtin_acp_agent(&agent_name)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| agent_name.clone())
+            });
+        crate::storage::agent_capabilities::upsert(
+            &agent_key,
+            crate::storage::agent_capabilities::AgentCapabilities {
+                models: available_models.clone(),
+                modes: available_modes.clone(),
+                thought_levels: available_thought_levels.clone(),
+            },
+        );
+    }
+
     handle.emit(AcpUpdate::SessionReady {
         session_id,
         agent_name: agent_name.clone(),
