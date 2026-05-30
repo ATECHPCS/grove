@@ -129,12 +129,19 @@ export function XTerminal({
       getWs: () => WebSocket | null,
     ): ResizeObserver => {
       const observer = new ResizeObserver(() => {
+        // Fit locally immediately so the layout is snappy and correct
+        const { offsetWidth, offsetHeight } = mount;
+        if (offsetWidth === 0 || offsetHeight === 0) return;
+        try {
+          fitAddon.fit();
+        } catch (e) {
+          console.warn("xterm fit failed", e);
+        }
+        terminal.scrollToBottom();
+
+        // Debounce sending the resize event to the backend PTY
         if (resizeTimer) clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
-          const { offsetWidth, offsetHeight } = mount;
-          if (offsetWidth === 0 || offsetHeight === 0) return;
-          fitAddon.fit();
-          terminal.scrollToBottom();
           const ws = getWs();
           if (ws?.readyState === WebSocket.OPEN) {
             ws.send(
@@ -145,7 +152,7 @@ export function XTerminal({
               }),
             );
           }
-        }, 250);
+        }, 100); // Snappier 100ms debounce for PTY resize
       });
       observer.observe(mount);
       return observer;
@@ -273,7 +280,7 @@ export function XTerminal({
       cursorBlink: true,
       fontSize: 13,
       fontFamily:
-        '"SF Mono", "Monaco", "Inconsolata", "Fira Code", "Fira Mono", "Droid Sans Mono", "Source Code Pro", Consolas, "Liberation Mono", Menlo, Courier, monospace',
+        '"SF Mono", "Monaco", "Inconsolata", "Fira Code", "Fira Mono", "Droid Sans Mono", "Source Code Pro", Consolas, "Liberation Mono", Menlo, Courier, "PingFang SC", "Microsoft YaHei", monospace',
       theme: terminalThemeRef.current.colors,
       allowProposedApi: true,
     });

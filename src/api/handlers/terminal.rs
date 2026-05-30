@@ -269,84 +269,140 @@ async fn handle_mux_terminal(socket: WebSocket, params: MuxTerminalParams) {
     }
 }
 
+/// A stateful UTF-8 lossy decoder that buffers incomplete UTF-8 byte sequences
+/// at the end of input chunks. This prevents multibyte characters (like Chinese characters)
+/// from being garbled when split across streaming PTY read boundaries.
+pub(crate) struct Utf8LossyDecoder {
+    buffer: Vec<u8>,
+}
+
+impl Utf8LossyDecoder {
+    pub(crate) fn new() -> Self {
+        Self { buffer: Vec::new() }
+    }
+
+    pub(crate) fn feed(&mut self, input: &[u8]) -> String {
+        self.buffer.extend_from_slice(input);
+        
+        let mut processed_len = 0;
+        let mut result = String::new();
+        
+        loop {
+            let remaining = &self.buffer[processed_len..];
+            if remaining.is_empty() {
+                break;
+            }
+            match std::str::from_utf8(remaining) {
+                Ok(s) => {
+                    result.push_str(s);
+                    processed_len += remaining.len();
+                    break;
+                }
+                Err(err) => {
+                    let valid_up_to = err.valid_up_to();
+                    if valid_up_to > 0 {
+                        let valid_str = std::str::from_utf8(&remaining[..valid_up_to]).unwrap();
+                        result.push_str(valid_str);
+                        processed_len += valid_up_to;
+                    }
+                    
+                    if let Some(error_len) = err.error_len() {
+                        // Replace the invalid sequence with U+FFFD (replacement character)
+                        result.push('\u{FFFD}');
+                        processed_len += error_len;
+                    } else {
+                        // Incomplete UTF-8 sequence at the end of the buffer.
+                        // We stop processing and keep the remainder in the buffer.
+                        break;
+                    }
+                }
+            }
+        }
+        
+        self.buffer.drain(..processed_len);
+        result
+    }
+}
+
 /// Common PTY terminal handler
 pub(crate) async fn handle_pty_terminal(
     socket: WebSocket,
     cmd: CommandBuilder,
     cols: u16,
     rows: u16,
-) {
-    // Create PTY in blocking context
-    let pty_result = tokio::task::spawn_blocking(move || {
-        let pty_system = native_pty_system();
-        let pair = pty_system.openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-
-        // Spawn the command
-        let child = pair.slave.spawn_command(cmd)?;
-
-        // Get reader from PTY master
-        let reader = pair.master.try_clone_reader()?;
-
-        // Get writer from PTY master
-        let writer = pair.master.take_writer()?;
-
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((pair.master, reader, writer, child))
-    })
-    .await;
-
-    let (master, reader, writer, child) = match pty_result {
-        Ok(Ok(result)) => result,
-        Ok(Err(e)) => {
-            eprintln!("Failed to setup PTY: {}", e);
-            return;
-        }
-        Err(e) => {
-            eprintln!("Task failed: {}", e);
-            return;
-        }
-    };
-
-    // Wrap in Arc for sharing
-    let master = Arc::new(std::sync::Mutex::new(master));
-    let reader = Arc::new(std::sync::Mutex::new(reader));
-    let writer = Arc::new(std::sync::Mutex::new(writer));
-    let child = Arc::new(std::sync::Mutex::new(child));
-
-    // Create channels for communication
-    let (pty_tx, mut pty_rx) = mpsc::channel::<String>(100);
-    let (ws_tx, mut ws_rx) = mpsc::channel::<Vec<u8>>(100);
-
-    // Split WebSocket
-    let (mut ws_sender, mut ws_receiver) = socket.split();
-
-    // Task: Read from PTY (blocking) and send to channel
-    let reader_clone = reader.clone();
-    let mut pty_reader_task = tokio::task::spawn_blocking(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = {
-                let mut reader = reader_clone.lock().expect("PTY reader mutex poisoned");
-                match reader.read(&mut buf) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => n,
-                    Err(e) => {
-                        eprintln!("PTY read error: {}", e);
-                        break;
-                    }
-                }
-            };
-
-            let data = String::from_utf8_lossy(&buf[..n]).to_string();
-            if pty_tx.blocking_send(data).is_err() {
-                break;
-            }
-        }
-    });
+ ) {
+     // Create PTY in blocking context
+     let pty_result = tokio::task::spawn_blocking(move || {
+         let pty_system = native_pty_system();
+         let pair = pty_system.openpty(PtySize {
+             rows,
+             cols,
+             pixel_width: 0,
+             pixel_height: 0,
+         })?;
+ 
+         // Spawn the command
+         let child = pair.slave.spawn_command(cmd)?;
+ 
+         // Get reader from PTY master
+         let reader = pair.master.try_clone_reader()?;
+ 
+         // Get writer from PTY master
+         let writer = pair.master.take_writer()?;
+ 
+         Ok::<_, Box<dyn std::error::Error + Send + Sync>>((pair.master, reader, writer, child))
+     })
+     .await;
+ 
+     let (master, reader, writer, child) = match pty_result {
+         Ok(Ok(result)) => result,
+         Ok(Err(e)) => {
+             eprintln!("Failed to setup PTY: {}", e);
+             return;
+         }
+         Err(e) => {
+             eprintln!("Task failed: {}", e);
+             return;
+         }
+     };
+ 
+     // Wrap in Arc for sharing
+     let master = Arc::new(std::sync::Mutex::new(master));
+     let reader = Arc::new(std::sync::Mutex::new(reader));
+     let writer = Arc::new(std::sync::Mutex::new(writer));
+     let child = Arc::new(std::sync::Mutex::new(child));
+ 
+     // Create channels for communication
+     let (pty_tx, mut pty_rx) = mpsc::channel::<String>(100);
+     let (ws_tx, mut ws_rx) = mpsc::channel::<Vec<u8>>(100);
+ 
+     // Split WebSocket
+     let (mut ws_sender, mut ws_receiver) = socket.split();
+ 
+     // Task: Read from PTY (blocking) and send to channel
+     let reader_clone = reader.clone();
+     let mut pty_reader_task = tokio::task::spawn_blocking(move || {
+         let mut buf = [0u8; 4096];
+         let mut decoder = Utf8LossyDecoder::new();
+         loop {
+             let n = {
+                 let mut reader = reader_clone.lock().expect("PTY reader mutex poisoned");
+                 match reader.read(&mut buf) {
+                     Ok(0) => break, // EOF
+                     Ok(n) => n,
+                     Err(e) => {
+                         eprintln!("PTY read error: {}", e);
+                         break;
+                     }
+                 }
+             };
+ 
+             let data = decoder.feed(&buf[..n]);
+             if !data.is_empty() && pty_tx.blocking_send(data).is_err() {
+                 break;
+             }
+         }
+     });
 
     // Task: Send PTY output to WebSocket
     let mut pty_to_ws = tokio::spawn(async move {

@@ -2210,7 +2210,7 @@ async fn drive_session(
         }
     }
 
-    let agent_name = init_resp
+    let mut agent_name = init_resp
         .agent_info
         .as_ref()
         .map(|i| i.name.clone())
@@ -2221,9 +2221,14 @@ async fn drive_session(
         .map(|i| i.version.clone())
         .unwrap_or_else(|| "0.0.0".to_string());
 
-    // Trae 错误地标识了不支持 load_session 且不返回 agent_info,但实际可以调用
+    // 如果是 Trae 但其未返回 agent_info (导致被识别为 "unknown")，则修正为 "traecli"
     let is_trae = config.agent_command.contains("trae");
-    let supports_load = init_resp.agent_capabilities.load_session || is_trae;
+    if agent_name == "unknown" && is_trae {
+        agent_name = "traecli".to_string();
+    }
+
+    // Trae 目前已在新版中正确声明支持 load_session，此处可直接使用其实际能力声明
+    let supports_load = init_resp.agent_capabilities.load_session;
 
     // Fork 能力(`unstable_session_fork`):agent 在 capabilities 里声明 fork=Some(_)
     // 表示支持 `session/fork`。同时 grove 的 fork 实现依赖 load_session — 派生
@@ -3891,6 +3896,8 @@ impl AcpSessionHandle {
             let mut stderr_buf = [0u8; 4096];
             let mut stdout_done = false;
             let mut stderr_done = false;
+            let mut stdout_decoder = crate::api::handlers::terminal::Utf8LossyDecoder::new();
+            let mut stderr_decoder = crate::api::handlers::terminal::Utf8LossyDecoder::new();
 
             loop {
                 tokio::select! {
@@ -3898,8 +3905,10 @@ impl AcpSessionHandle {
                         match result {
                             Ok(0) | Err(_) => stdout_done = true,
                             Ok(n) => {
-                                let text = String::from_utf8_lossy(&stdout_buf[..n]).to_string();
-                                handle.emit(AcpUpdate::TerminalChunk { output: text });
+                                let text = stdout_decoder.feed(&stdout_buf[..n]);
+                                if !text.is_empty() {
+                                    handle.emit(AcpUpdate::TerminalChunk { output: text });
+                                }
                             }
                         }
                     }
@@ -3907,8 +3916,10 @@ impl AcpSessionHandle {
                         match result {
                             Ok(0) | Err(_) => stderr_done = true,
                             Ok(n) => {
-                                let text = String::from_utf8_lossy(&stderr_buf[..n]).to_string();
-                                handle.emit(AcpUpdate::TerminalChunk { output: text });
+                                let text = stderr_decoder.feed(&stderr_buf[..n]);
+                                if !text.is_empty() {
+                                    handle.emit(AcpUpdate::TerminalChunk { output: text });
+                                }
                             }
                         }
                     }
