@@ -1,9 +1,11 @@
 // Grove PWA service worker.
-// Hand-rolled (no Workbox, no vite-plugin-pwa) to satisfy Chrome's
-// install-prompt criteria. Strategy: instant takeover on update,
-// network-first navigations to avoid stale HTML, pass-through for
-// everything else (Vite content-hashes assets, so the browser cache
-// handles them correctly).
+// Hand-rolled (no Workbox, no vite-plugin-pwa). Sole job: satisfy
+// Chrome's install-prompt criteria, which require an active SW with a
+// `fetch` listener. The listener body is intentionally empty — Chrome
+// only checks that a listener exists; without `respondWith` the browser
+// handles every request normally (Vite's content-hashed assets cache
+// correctly; the backend sets Cache-Control: no-cache on /sw.js itself).
+// Plus instant takeover on update so SW updates land within one nav.
 
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting());
@@ -13,10 +15,6 @@ self.addEventListener("activate", (event) => {
   event.waitUntil(self.clients.claim());
 });
 
-self.addEventListener("fetch", (event) => {
-  const { request } = event;
-  if (request.mode === "navigate") {
-    event.respondWith(fetch(request, { cache: "no-cache" }));
-  }
-  // else: pass through (let the browser handle)
+self.addEventListener("fetch", () => {
+  // Intentionally empty — see comment at top.
 });
