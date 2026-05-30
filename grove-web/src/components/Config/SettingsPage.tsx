@@ -1045,12 +1045,12 @@ export function SettingsPage({ config }: SettingsPageProps) {
   // Fetch the selected default agent's cached capabilities so the
   // model/mode/thinking dropdowns below can offer its known options.
   useEffect(() => {
-    if (!acpAgent) {
-      // Defer to a microtask to avoid a synchronous setState in the effect
-      // body (react-hooks/set-state-in-effect), matching the pattern above.
-      void Promise.resolve().then(() => setAgentCaps(null));
-      return;
-    }
+    // Clear stale options immediately so the dropdowns collapse to the
+    // empty/"Default" state while the new agent's capabilities load — otherwise
+    // the previous agent's options stay selectable for the wrong agent. setState
+    // is deferred to a microtask to satisfy react-hooks/set-state-in-effect.
+    void Promise.resolve().then(() => setAgentCaps(null));
+    if (!acpAgent) return;
     const ctrl = new AbortController();
     getAgentCapabilities(acpAgent, ctrl.signal)
       .then(setAgentCaps)
@@ -1059,20 +1059,20 @@ export function SettingsPage({ config }: SettingsPageProps) {
   }, [acpAgent]);
 
   // Clear stored defaults that are no longer valid for the current agent's
-  // capabilities. We only react to agentCaps changing (not the default* values)
-  // to avoid a save-loop; the disable below is intentional. setState is deferred
-  // to a microtask to satisfy react-hooks/set-state-in-effect.
+  // capabilities. Uses the functional setState form so it never reads default*
+  // from closure — that makes [agentCaps] genuinely complete deps. setState is
+  // deferred to a microtask to satisfy react-hooks/set-state-in-effect.
   useEffect(() => {
     if (!agentCaps) return;
     const caps = agentCaps;
     void Promise.resolve().then(() => {
       const has = (list: [string, string][], v: string) =>
         v === "" || list.some(([id]) => id === v);
-      if (!has(caps.models, defaultModel)) setDefaultModel("");
-      if (!has(caps.modes, defaultMode)) setDefaultMode("");
-      if (!has(caps.thought_levels, defaultThinking)) setDefaultThinking("");
+      setDefaultModel((prev) => (has(caps.models, prev) ? prev : ""));
+      setDefaultMode((prev) => (has(caps.modes, prev) ? prev : ""));
+      setDefaultThinking((prev) => (has(caps.thought_levels, prev) ? prev : ""));
     });
-  }, [agentCaps]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [agentCaps]);
 
   const suggestedChatRenderWindowTrigger = useCallback((limit: number) => {
     return Math.max(limit + 1, Math.ceil(limit * 1.5));
@@ -1328,6 +1328,8 @@ env_vars = [
                       onChange={f.set}
                       allowCustom={false}
                       options={[
+                        // No-selection sentinel; must not collide with a real
+                        // capability id (extremely unlikely).
                         { id: "__default__", label: "Default", value: "" },
                         ...f.opts.map(([id, name]) => ({ id, label: name, value: id })),
                       ]}
