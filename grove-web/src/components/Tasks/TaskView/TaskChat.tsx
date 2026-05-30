@@ -1718,19 +1718,15 @@ export function TaskChat({
 
   // Per-chat state cache (preserved across chat switches)
   const perChatStateRef = useRef<Map<string, PerChatState>>(new Map());
-  // Cached chat-defaults from config (acp.agent_command + chat_defaults).
+  // Cached per-agent chat-defaults from config (chat_defaults), keyed by agent id.
   // A ref so it never re-triggers a render; mount-time load is sufficient for v1.
-  // Seeding (see session_ready handlers) only applies when the active chat's
-  // agent matches the configured default agent.
+  // Seeding (see session_ready handlers) applies each chat's own agent's defaults.
   // TODO: loaded once on mount — goes stale if the user changes defaults in
   // Settings mid-session. Acceptable for v1 since it only affects newly-created
   // chats; refresh this ref on a config-change signal if that becomes a problem.
-  const chatDefaultsRef = useRef<{
-    agent: string | undefined;
-    model: string | null;
-    mode: string | null;
-    thinking: string | null;
-  }>({ agent: undefined, model: null, mode: null, thinking: null });
+  const chatDefaultsRef = useRef<
+    Record<string, { model: string | null; mode: string | null; thinking: string | null }>
+  >({});
   // Chats whose selectors have already been seeded from chat_defaults. Gates
   // on the FIRST session_ready per chat id so a later reconnect/resume never
   // re-seeds and clobbers a user's manual model/mode/thinking change.
@@ -3410,44 +3406,39 @@ export function TaskChat({
 
   // activeChatIdRef is owned by useActiveChatId — no separate declaration here.
 
-  // Load chat-defaults (default agent + model/mode/thinking) from config once
-  // on mount into a ref. Used by the session_ready seeding below. A mount-time
-  // load is sufficient for v1; if config is re-fetched elsewhere this ref can
-  // be refreshed there.
+  // Load per-agent chat-defaults from config once on mount into a ref. Used by
+  // the session_ready seeding below. A mount-time load is sufficient for v1; if
+  // config is re-fetched elsewhere this ref can be refreshed there.
   useEffect(() => {
     void getConfig()
       .then((cfg) => {
-        chatDefaultsRef.current = {
-          agent: cfg.acp?.agent_command,
-          model: cfg.chat_defaults?.model ?? null,
-          mode: cfg.chat_defaults?.mode ?? null,
-          thinking: cfg.chat_defaults?.thinking ?? null,
-        };
+        chatDefaultsRef.current = cfg.chat_defaults ?? {};
       })
       .catch(() => {
         /* leave defaults empty — seeding becomes a no-op */
       });
   }, []);
 
-  // Seed the model/mode/thinking selectors from the user's configured
-  // chat_defaults on the FIRST session_ready for a chat, when that chat uses
-  // the configured default agent. Validates each default against the event's
-  // own available_* option arrays (objects shaped `{ id, name }`) — using the
-  // event payload, not component state, avoids async-state staleness. Bare
-  // setters are correct here: the values reach the agent via the next prompt's
+  // Seed the model/mode/thinking selectors from the user's configured per-agent
+  // chat_defaults on the FIRST session_ready for a chat, using THIS chat's own
+  // agent's stored defaults. Validates each default against the event's own
+  // available_* option arrays (objects shaped `{ id, name }`) — using the event
+  // payload, not component state, avoids async-state staleness. Bare setters are
+  // correct here: the values reach the agent via the next prompt's
   // buildPromptConfig() bundle, exactly like the dropdown onSelect handlers.
   const seedChatDefaults = useCallback(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (chatId: string, agent: string | undefined, evt: any) => {
       // First-ready gate: never re-seed on reconnect/resume.
       if (seededChatsRef.current.has(chatId)) return;
+      if (!agent) return;
 
-      const d = chatDefaultsRef.current;
-      // Config not loaded yet, or this chat isn't on the default agent: return
+      const d = chatDefaultsRef.current[agent];
+      // Config not loaded yet, or this agent has no configured defaults: return
       // WITHOUT marking seeded, so a later session_ready can still seed once
       // config has loaded (avoids the cold-start race where the first new
       // chat's session_ready fires before the mount-time getConfig resolves).
-      if (!d.agent || agent !== d.agent) return;
+      if (!d) return;
 
       // Passed all gates — mark seeded now (prevents re-seed on reconnect/resume
       // which would clobber a manual change) and apply the validated defaults.
@@ -3560,7 +3551,7 @@ export function TaskChat({
               // Seed chat_defaults for this freshly-opened chat: a brand-new
               // chat's session_ready can land during the HTTP history load and
               // be replayed here rather than via the live path above. Same
-              // first-ready + default-agent gating; seededChatsRef dedupes so
+              // first-ready + per-agent gating; seededChatsRef dedupes so
               // it never double-seeds with the live path.
               {
                 const chat = chatsRef.current.find((c) => c.id === chatId);
@@ -3842,7 +3833,7 @@ export function TaskChat({
           if (msg.thought_level_config_id)
             setThoughtLevelConfigId(msg.thought_level_config_id);
           // Override the agent's own defaults with the user's configured
-          // chat_defaults (first session_ready only, default agent only).
+          // chat_defaults (first session_ready only, this chat's own agent).
           {
             const id = getActiveChatId();
             const chat = chatsRef.current.find((c) => c.id === id);
