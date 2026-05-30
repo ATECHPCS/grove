@@ -18,71 +18,81 @@ A Settings panel where the user picks one default "stack": agent + that agent's 
 - **Remember-last-used / auto-sticky** behavior — explicitly rejected in favor of explicit settings.
 - **Hard-pinning** — defaults only *seed* new chats; they never lock a chat's selectors.
 
-## Decisions locked during brainstorming
+## Decisions locked during brainstorming + planning investigation
 
 1. **Explicit global defaults in Settings** (not remember-last-used).
 2. **One default stack**: a single `{ agent, model, mode, thinking }` tuple. When a chat's agent matches the default agent, all four seed; when the user manually switches a chat to a *different* agent, that agent's built-in defaults apply (the stored model wouldn't be valid for it).
 3. **Capability source = cache-on-connect**: agent model/mode/thinking option lists are declared by the agent at ACP session init. Persist that capability set keyed by agent id whenever a session initializes; the Settings panel reads the cache to populate dropdowns. No subprocess spawn on Settings open, no hardcoded lists that rot.
+
+### Grounded decisions (from planning-phase code investigation)
+
+The "first planning task" (verify capability sourcing) is resolved. Findings:
+
+- **The default *agent* already exists** as `config.acp.agent_command` — the Settings "Default Coding Agent" picker writes here, and the backend `create_chat` handler (`src/api/handlers/acp.rs:1060`) already falls back to it. **Decision: reuse `acp.agent_command` as the default agent.** The new config struct stores only `{ model, mode, thinking }` — no separate agent field — to avoid two competing "default agent" sources.
+- **The frontend new-chat path ignores the configured default agent.** `handleNewChatWithAgent`'s no-pick fallback is `chats[chats.length-1]?.agent || "claude"` (last-used), not `acp.agent_command` (TaskChat.tsx:4331). **Decision: fix this fallback to honor `acp.agent_command`**, so the configured default agent is actually applied to new chats. This directly addresses the original complaint.
+- **No per-agent capability cache or endpoint exists.** Capabilities arrive only via the per-session ACP `session_ready` event (TaskChat.tsx:4073) and are persisted per-chat in `session.json` (not per-agent). **Decision: add a small per-agent capability cache** written when `session_ready` is emitted, read by a new endpoint.
+- **Model/mode/thinking are never sent at chat creation** — they're applied by the agent's own `session_ready`. **Decision: seed them frontend-side right after `session_ready`** (validated against the agent's declared option lists), not via a backend `CreateChatRequest` change.
 
 ## Architecture
 
 ### Backend — config field
 
 `src/storage/config.rs`:
-- New struct `ChatDefaultsConfig { agent: Option<String>, model: Option<String>, mode: Option<String>, thinking: Option<String> }` (all `Option`, `#[serde(default)]`).
-- Add `pub chat_defaults: ChatDefaultsConfig` to the top-level `Config` struct (line ~262).
-- All fields optional → existing `config.toml` files deserialize unchanged; unset = today's hardcoded fallbacks.
-- **No new HTTP route**: the existing `GET /config` and `PATCH /config` serialize/patch the whole `Config`, so `chat_defaults` rides along automatically. Verify the PATCH handler does a deep/partial merge (not whole-object replace) so a partial `{ chat_defaults: {...} }` patch doesn't wipe sibling config.
+- New struct `ChatDefaultsConfig { model: Option<String>, mode: Option<String>, thinking: Option<String> }` (all `Option`, `#[serde(default)]`). **No `agent` field** — the default agent is `acp.agent_command`.
+- Add `#[serde(default)] pub chat_defaults: ChatDefaultsConfig` to the top-level `Config` struct (line ~262).
+- All fields optional → existing `config.toml` files deserialize unchanged; unset = today's fallbacks.
+- **No new HTTP route for config**: extend `ConfigResponse` (serialize), `ConfigPatchRequest` (a `chat_defaults: Option<ChatDefaultsConfigPatch>`), and the `patch_config` partial-merge body — following the exact per-section pattern already used for `acp`, `notifications`, etc. (`src/api/handlers/config.rs:323`). The merge is hand-written per field, so `chat_defaults` must be added to it explicitly; `Some("")` clears a field, `Some(value)` sets it.
 
-### Backend — capability cache
+### Backend — capability cache (confirmed: none exists, build it)
 
-**First planning task: determine whether a capability cache already exists.** The in-chat model/mode/thinking dropdowns are populated today, so the data is sourced somewhere (likely the ACP `initialize` response surfaced to the frontend, possibly already persisted). Two outcomes:
-- **If an existing cache/endpoint exists** → the Settings panel reads it; no backend cache work needed.
-- **If not** → add a small per-agent capability cache: on ACP session init, persist the agent's declared `{ models, modes, thinking_levels }` keyed by agent id (SQLite table or a `config`-adjacent store). Expose via a read endpoint (e.g. `GET /agents/{id}/capabilities`) or fold into the existing `/agents/base` response.
-
-This is the highest-uncertainty piece and is deliberately left for planning to pin down against the live code.
+Investigation confirmed **no per-agent capability cache or endpoint exists**. Capabilities live only in per-chat `session.json` and the transient `session_ready` event. Build a small per-agent cache:
+- **Store**: a JSON file `~/.grove/agent_capabilities.json` mapping `agent_id -> { models, modes, thought_levels }` (each a `Vec<(String, String)>` of `(id, label)`), written atomically (tmp → rename), mirroring `write_session_metadata` (`src/acp/mod.rs:4158`). New module `src/storage/agent_capabilities.rs`.
+- **Write hook**: where `AcpUpdate::SessionReady` is emitted (`src/acp/mod.rs:~2577`), also upsert the agent's `{ available_models, available_modes, available_thought_levels }` into the cache keyed by the session's agent id. Last-writer-wins; cheap.
+- **Read endpoint**: `GET /api/v1/agents/{id}/capabilities` in `src/api/handlers/agents.rs`, returning the cached set or empty arrays for an agent that has never connected. Register in `src/api/mod.rs` next to `/agents/base`.
 
 ### Frontend — Settings panel
 
-New panel under the AI / Settings section (follow the existing Settings panel pattern, e.g. `ShortcutSettingsPanel`):
-- **Agent** dropdown — from `/agents/base` (built-in + custom agents).
-- **Model / Mode / Thinking** dropdowns — populated from the selected agent's cached capabilities. Empty-state when the agent has never connected: show just "Default" + hint *"Options populate after you first run this agent."*
-- Save → `PATCH /config` with `{ chat_defaults: { agent, model, mode, thinking } }`.
-- A "Reset to built-in defaults" affordance that clears the fields (PATCH with nulls).
+Extend the **existing "Agent" Settings section** (`SettingsPage.tsx`, `<Section id="chat">` at line 1237), directly under the "Default Coding Agent" picker — not a brand-new top-level panel. The default agent is the existing `acpAgent` state (`acp.agent_command`).
+- **Model / Mode / Thinking** dropdowns (`Combobox`) — populated by fetching `GET /agents/{acpAgent}/capabilities`. Re-fetch whenever `acpAgent` changes.
+- Empty-state when the agent has never connected: show just a "Default" option + hint *"Options populate after you first run this agent."*
+- When `acpAgent` changes, clear any stored model/mode/thinking that aren't valid for the new agent's capability set.
+- Save → `PATCH /config` with `{ chat_defaults: { model, mode, thinking } }`, folded into the existing `saveConfig` debounced PATCH that already persists `acpAgent`.
 
 ### Frontend — chat-creation resolution
 
-In `TaskChat` (and the new-chat/new-task creation flow):
-- New task/chat creation pre-selects `chat_defaults.agent` when set (instead of no/most-recent agent).
-- When a chat's active agent === `chat_defaults.agent`, seed `selectedModel` / mode / thinking from the defaults instead of `""` / "Auto" / "Default".
-- When the agent differs (user switched), fall back to that agent's built-in defaults — unchanged behavior.
-- Any per-chat selector change overrides locally and does not write back to the global default.
+In `TaskChat`:
+- **Honor the default agent**: `handleNewChatWithAgent`'s no-explicit-pick fallback (TaskChat.tsx:4331) changes from `chats[chats.length-1]?.agent || "claude"` to consult `config.acp.agent_command` first, then fall back to last-used, then `"claude"`.
+- **Seed model/mode/thinking**: in the `session_ready` handler (TaskChat.tsx:4073), when the chat is brand-new (no prior `current_model_id` from the agent) AND its agent === `config.acp.agent_command`, override `selectedModel`/`permissionLevel`/`thoughtLevel` with `chat_defaults.{model,mode,thinking}` — but only for values that exist in the event's `available_*` option lists (validate; skip invalid). Apply via the same setters the dropdowns use so the choice is pushed to the agent.
+- When the chat's agent differs from the default agent, seed nothing — the agent's own `session_ready` defaults stand (unchanged behavior).
+- Any per-chat selector change overrides locally and never writes back to the global default.
 
 ## Data flow
 
 ```
-Settings:
-  user picks agent A + model M + mode D + thinking T
-    → PATCH /config { chat_defaults: { agent: A, model: M, mode: D, thinking: T } }
+Settings (Agent section):
+  user picks default agent A  → PATCH /config { acp: { agent_command: A } }   (existing)
+  user picks model M / mode D / thinking T for A
+    → PATCH /config { chat_defaults: { model: M, mode: D, thinking: T } }
     → persisted to ~/.grove/config.toml
 
-New chat created:
-  resolve agent:
-    chat.agent = chat_defaults.agent ?? (existing fallback)
-  resolve selectors:
-    if chat.agent === chat_defaults.agent:
-       selectedModel    = chat_defaults.model    ?? agent built-in
-       selectedMode     = chat_defaults.mode     ?? agent built-in
-       selectedThinking = chat_defaults.thinking ?? agent built-in
-    else:
-       use agent built-in defaults (unchanged)
+New chat created (no explicit agent pick):
+  chat.agent = config.acp.agent_command ?? last-used ?? "claude"
+
+On session_ready for that new chat:
+  if chat.agent === config.acp.agent_command AND chat is brand-new:
+     selectedModel    = chat_defaults.model    if in available_models     else agent default
+     permissionLevel  = chat_defaults.mode     if in available_modes      else agent default
+     thoughtLevel     = chat_defaults.thinking if in available_thought... else agent default
+  else:
+     use agent's own session_ready defaults (unchanged)
 
 Per-chat override:
   user changes a selector → local chat state only; global default untouched
 
 Capability population (Settings dropdowns):
-  agent session init → cache { models, modes, thinking } keyed by agentId
-  Settings reads cache for the selected agent → populates dropdowns
+  any session reaches session_ready → upsert { models, modes, thought_levels } keyed by agentId
+    into ~/.grove/agent_capabilities.json
+  Settings fetches GET /agents/{A}/capabilities → populates dropdowns
   no cache yet → "Default" only + hint
 ```
 
@@ -91,10 +101,10 @@ Capability population (Settings dropdowns):
 | Failure | Behavior |
 |---|---|
 | `config.toml` has no `chat_defaults` (pre-feature config) | `#[serde(default)]` → all `None` → today's fallbacks. No migration needed. |
-| `chat_defaults.agent` references an agent no longer installed | New-chat resolution falls back to the existing agent-selection logic; Settings shows the stale value with a "not currently available" hint. |
-| `chat_defaults.model` invalid for the agent (agent updated, model removed) | Chat seeds the agent's built-in default instead; no error. Treat the stored value as a hint, not a guarantee. |
-| Capability cache empty for the chosen default agent | Settings dropdowns show "Default" + hint; saving "Default" is always valid. |
-| `PATCH /config` partial-merge bug wipes siblings | Guarded by the planning-phase verification that PATCH deep-merges. Add a test if the merge path is non-obvious. |
+| `acp.agent_command` references an agent no longer installed | Backend `create_chat` already falls back to `"claude"`; Settings picker already surfaces availability. Unchanged behavior. |
+| `chat_defaults.model` invalid for the agent (agent updated, model removed) | `session_ready` seeding validates against `available_models` and skips invalid values → agent's own default stands; no error. |
+| Capability cache empty for the chosen default agent | Settings dropdowns show "Default" + hint; saving nothing (all `None`) is always valid. |
+| `PATCH /config` merge must include `chat_defaults` | The merge is hand-written per section; the new field must be added explicitly. Covered by a merge-preserves-siblings unit test. |
 
 ## Testing
 
@@ -111,12 +121,14 @@ Capability population (Settings dropdowns):
 
 | File | Change |
 |---|---|
-| `src/storage/config.rs` | new `ChatDefaultsConfig` struct + field on `Config` |
-| `src/api/handlers/config.rs` | verify PATCH deep-merge covers the new field (likely no change) |
-| (capability cache) | TBD by planning — new cache + read path *only if* none exists |
-| `grove-web/src/api/` config types | add `chat_defaults` to the TS config type |
-| `grove-web/src/components/Config/` | new ChatDefaultsSettingsPanel |
-| `grove-web/src/components/Tasks/TaskView/TaskChat.tsx` | seed selectors from defaults when agent matches |
-| new-chat / new-task creation flow | pre-select default agent |
+| `src/storage/config.rs` | new `ChatDefaultsConfig { model, mode, thinking }` struct + `chat_defaults` field on `Config` |
+| `src/api/handlers/config.rs` | add `chat_defaults` to `ConfigResponse`, `ConfigPatchRequest`, and the `patch_config` per-section merge |
+| `src/storage/agent_capabilities.rs` | NEW — per-agent capability cache (atomic JSON read/write keyed by agent id) |
+| `src/acp/mod.rs` | on `SessionReady` emit, upsert agent capabilities into the cache |
+| `src/api/handlers/agents.rs` + `src/api/mod.rs` | NEW `GET /agents/{id}/capabilities` endpoint + route registration |
+| `grove-web/src/api/config.ts` | add `chat_defaults` to `Config` + `ConfigPatch` types |
+| `grove-web/src/api/agents.ts` | add `getAgentCapabilities(id)` client + types |
+| `grove-web/src/components/Config/SettingsPage.tsx` | model/mode/thinking dropdowns in the existing Agent section + save wiring |
+| `grove-web/src/components/Tasks/TaskView/TaskChat.tsx` | honor default agent in new-chat fallback; seed selectors on `session_ready` when agent matches |
 
-Backend change is small; the capability-cache question is the main scoping unknown for the plan phase.
+Reuses the existing default agent (`acp.agent_command`); the capability cache is the only net-new backend subsystem.
