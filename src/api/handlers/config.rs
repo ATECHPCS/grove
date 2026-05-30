@@ -341,6 +341,30 @@ pub async fn get_config() -> Json<ConfigResponse> {
     Json(ConfigResponse::from(&config))
 }
 
+/// Apply a chat_defaults patch with tri-state semantics:
+/// absent (`None`) leaves the field unchanged, `Some("")` (or whitespace)
+/// clears it, and `Some(v)` sets it to the trimmed value. Pure so the merge
+/// logic is unit-testable without touching the filesystem.
+fn apply_chat_defaults_patch(config: &mut Config, patch: ChatDefaultsConfigPatch) {
+    fn norm(v: String) -> Option<String> {
+        let t = v.trim().to_string();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t)
+        }
+    }
+    if let Some(model) = patch.model {
+        config.chat_defaults.model = norm(model);
+    }
+    if let Some(mode) = patch.mode {
+        config.chat_defaults.mode = norm(mode);
+    }
+    if let Some(thinking) = patch.thinking {
+        config.chat_defaults.thinking = norm(thinking);
+    }
+}
+
 /// PATCH /api/v1/config
 pub async fn patch_config(
     Json(patch): Json<ConfigPatchRequest>,
@@ -557,23 +581,7 @@ pub async fn patch_config(
 
     // Apply chat_defaults patch
     if let Some(cd) = patch.chat_defaults {
-        fn norm(v: String) -> Option<String> {
-            let t = v.trim().to_string();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t)
-            }
-        }
-        if let Some(model) = cd.model {
-            config.chat_defaults.model = norm(model);
-        }
-        if let Some(mode) = cd.mode {
-            config.chat_defaults.mode = norm(mode);
-        }
-        if let Some(thinking) = cd.thinking {
-            config.chat_defaults.thinking = norm(thinking);
-        }
+        apply_chat_defaults_patch(&mut config, cd);
     }
 
     // Save config
@@ -916,15 +924,85 @@ fn extract_app_icon_to_file(app_path: &Path, output_path: &Path) -> Option<Vec<u
 
 #[cfg(test)]
 mod chat_defaults_patch_tests {
+    use super::{apply_chat_defaults_patch, ChatDefaultsConfigPatch, ConfigResponse};
     use crate::storage::config::Config;
 
+    /// Tri-state merge: `None` leaves a field unchanged, `Some("")` clears it,
+    /// `Some(v)` sets the trimmed value. All three behaviours in one patch.
     #[test]
-    fn setting_chat_defaults_preserves_siblings() {
+    fn tri_state_merge_unchanged_cleared_and_set() {
+        let mut cfg = Config::default();
+        cfg.chat_defaults.model = Some("opus".to_string());
+        cfg.chat_defaults.mode = Some("plan".to_string());
+        cfg.chat_defaults.thinking = Some("low".to_string());
+
+        apply_chat_defaults_patch(
+            &mut cfg,
+            ChatDefaultsConfigPatch {
+                model: None,                            // unchanged
+                mode: Some(String::new()),              // cleared
+                thinking: Some("  high  ".to_string()), // set (trimmed)
+            },
+        );
+
+        assert_eq!(
+            cfg.chat_defaults.model.as_deref(),
+            Some("opus"),
+            "absent field must be left unchanged"
+        );
+        assert_eq!(
+            cfg.chat_defaults.mode, None,
+            "Some(\"\") must clear the field"
+        );
+        assert_eq!(
+            cfg.chat_defaults.thinking.as_deref(),
+            Some("high"),
+            "Some(v) must set the trimmed value"
+        );
+    }
+
+    /// A chat_defaults patch must not touch sibling config sections.
+    #[test]
+    fn patch_preserves_siblings() {
         let mut cfg = Config::default();
         cfg.acp.agent_command = Some("claude".to_string());
+        cfg.acp.render_window_limit = 42;
+
+        apply_chat_defaults_patch(
+            &mut cfg,
+            ChatDefaultsConfigPatch {
+                model: Some("sonnet".to_string()),
+                mode: None,
+                thinking: None,
+            },
+        );
+
+        assert_eq!(
+            cfg.acp.agent_command.as_deref(),
+            Some("claude"),
+            "acp.agent_command must be untouched by a chat_defaults patch"
+        );
+        assert_eq!(
+            cfg.acp.render_window_limit, 42,
+            "acp.render_window_limit must be untouched by a chat_defaults patch"
+        );
+        // sanity: the patch itself applied
+        assert_eq!(cfg.chat_defaults.model.as_deref(), Some("sonnet"));
+    }
+
+    /// GET round-trip: chat_defaults values must survive into the response DTO.
+    #[test]
+    fn get_round_trip_carries_chat_defaults() {
+        let mut cfg = Config::default();
         cfg.chat_defaults.model = Some("opus".to_string());
-        assert_eq!(cfg.acp.agent_command.as_deref(), Some("claude"));
-        assert_eq!(cfg.chat_defaults.model.as_deref(), Some("opus"));
+        cfg.chat_defaults.mode = Some("plan".to_string());
+        cfg.chat_defaults.thinking = Some("high".to_string());
+
+        let response = ConfigResponse::from(&cfg);
+
+        assert_eq!(response.chat_defaults.model.as_deref(), Some("opus"));
+        assert_eq!(response.chat_defaults.mode.as_deref(), Some("plan"));
+        assert_eq!(response.chat_defaults.thinking.as_deref(), Some("high"));
     }
 }
 
