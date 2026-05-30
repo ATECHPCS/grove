@@ -120,9 +120,9 @@ export interface BrowserControlConfig {
 }
 
 export interface ChatDefaultsConfig {
-  model?: string | null;
-  mode?: string | null;
-  thinking?: string | null;
+  model: string | null;
+  mode: string | null;
+  thinking: string | null;
 }
 
 export interface Config {
