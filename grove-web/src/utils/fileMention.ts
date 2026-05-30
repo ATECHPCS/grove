@@ -105,7 +105,7 @@ function fuzzyMatch(
     const nextChar = q[qIdx];
     let ti = t.indexOf(nextChar, tIdx);
     while (ti !== -1) {
-      let currentMatchScore = ti === lastMatchIdx + 1 ? 2 : 1;
+      let currentMatchScore = ti === lastMatchIdx + 1 ? 5 : 1;
       
       // Bonus for matching after a slash or start of path
       if (ti === 0 || t[ti - 1] === "/") {
@@ -186,7 +186,16 @@ export function filterMentionItems(
       return { ...item, score, indices, match };
     })
     .filter((r) => r.match)
-    .sort((a, b) => b.score - a.score)
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      // Tie-breaker 1: Shorter path length first
+      const lenDiff = a.path.length - b.path.length;
+      if (lenDiff !== 0) return lenDiff;
+      // Tie-breaker 2: Match starts earlier in the string
+      const aStart = a.indices[0] ?? Infinity;
+      const bStart = b.indices[0] ?? Infinity;
+      return aStart - bStart;
+    })
     .slice(0, limit);
 }
 
