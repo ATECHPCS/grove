@@ -3,6 +3,7 @@ import { motion } from "framer-motion";
 import { X, Plus, FolderOpen, GitBranch, Sparkles, Code2, Globe } from "lucide-react";
 import { Button } from "../ui";
 import { DialogShell } from "../ui/DialogShell";
+import { FolderTreePickerDialog } from "./FolderTreePickerDialog";
 import { useIsMobile } from "../../hooks";
 import { apiClient } from "../../api/client";
 
@@ -55,6 +56,8 @@ export function AddProjectDialog({
   const [error, setError] = useState("");
   const { isMobile } = useIsMobile();
 
+  const [pickerOpen, setPickerOpen] = useState<null | "existing" | "parent">(null);
+
   const prevIsOpenRef = useRef(isOpen);
 
   /* eslint-disable react-hooks/set-state-in-effect */
@@ -73,6 +76,7 @@ export function AddProjectDialog({
       setGitName("");
       setGitNameTouched(false);
       setError("");
+      setPickerOpen(null);
     }
     prevIsOpenRef.current = isOpen;
   }, [isOpen, initialMode]);
@@ -130,30 +134,55 @@ export function AddProjectDialog({
   const displayedExistingName = existingNameTouched ? existingName : deriveNameFromPath(path);
   const displayedGitName = gitNameTouched ? gitName : deriveNameFromGitUrl(gitUrl);
 
+  // In remote/mobile mode the native dialog would open on the server's
+  // physical screen (invisible to the remote user) and `Command::output()`
+  // blocks until someone dismisses it on that screen — so the request hangs
+  // and our "fallback when null/throw" path never triggers. Skip the native
+  // call entirely in that mode and go straight to the web picker.
+  // `window.__GROVE_REMOTE__` is set by AuthGate when `/api/v1/auth/info`
+  // reports either `remote: true` or `required: true`.
+  const isRemoteMode = (): boolean =>
+    (window as unknown as Record<string, unknown>).__GROVE_REMOTE__ === true;
+
   // Use apiClient (not raw fetch) so HMAC headers are attached in mobile mode.
   const handleBrowseExisting = async () => {
+    if (isRemoteMode()) {
+      setPickerOpen("existing");
+      return;
+    }
     try {
       const data = await apiClient.get<{ path: string | null }>("/api/v1/browse-folder");
       if (data.path) {
         setPath(data.path);
+        if (!existingNameTouched) setExistingName(data.path.split("/").pop() || "");
         setError("");
+      } else {
+        // Native dialog unavailable (headless host) — open web picker.
+        setPickerOpen("existing");
       }
     } catch (err) {
       console.error("Failed to browse folder:", err);
-      setError("Failed to open folder picker");
+      // Network/API failure — fall back to web picker rather than dead-ending.
+      setPickerOpen("existing");
     }
   };
 
   const handleBrowseParent = async () => {
+    if (isRemoteMode()) {
+      setPickerOpen("parent");
+      return;
+    }
     try {
       const data = await apiClient.get<{ path: string | null }>("/api/v1/browse-folder");
       if (data.path) {
         setParentDir(data.path);
         setError("");
+      } else {
+        setPickerOpen("parent");
       }
     } catch (err) {
       console.error("Failed to browse folder:", err);
-      setError("Failed to open folder picker");
+      setPickerOpen("parent");
     }
   };
 
@@ -244,6 +273,7 @@ export function AddProjectDialog({
   };
 
   return (
+    <>
     <DialogShell isOpen={isOpen} onClose={resetAndClose}>
       <div
         onKeyDown={handleKeyDown}
@@ -532,6 +562,22 @@ export function AddProjectDialog({
         </div>
       </div>
     </DialogShell>
+    <FolderTreePickerDialog
+      isOpen={pickerOpen !== null}
+      onClose={() => setPickerOpen(null)}
+      onSelect={(p) => {
+        if (pickerOpen === "existing") {
+          setPath(p);
+          if (!existingNameTouched) setExistingName(p.split("/").pop() || "");
+        } else if (pickerOpen === "parent") {
+          setParentDir(p);
+        }
+        setError("");
+        setPickerOpen(null);
+      }}
+      title={pickerOpen === "parent" ? "Select Parent Directory" : "Select Project Folder"}
+    />
+    </>
   );
 }
 
