@@ -33,6 +33,17 @@ The "first planning task" (verify capability sourcing) is resolved. Findings:
 - **No per-agent capability cache or endpoint exists.** Capabilities arrive only via the per-session ACP `session_ready` event (TaskChat.tsx:4073) and are persisted per-chat in `session.json` (not per-agent). **Decision: add a small per-agent capability cache** written when `session_ready` is emitted, read by a new endpoint.
 - **Model/mode/thinking are never sent at chat creation** — they're applied by the agent's own `session_ready`. **Decision: seed them frontend-side right after `session_ready`** (validated against the agent's declared option lists), not via a backend `CreateChatRequest` change.
 
+## Revision 2026-05-30b — per-agent defaults (post-deploy test feedback)
+
+The v1 "one flat stack" stored a single `{model, mode, thinking}` tuple. Live testing exposed three bugs rooted in that single tuple being shown under a multi-agent picker:
+1. **Leak** — the one tuple displayed under whichever agent was selected (Claude's values showed under Codex).
+2. **Reset** — switching agents ran a "clear-invalid" effect whose cleared values were autosaved, destroying the previous agent's stored defaults; switching back didn't restore them (config was read only on mount).
+3. **Free-typing** — `Combobox` (`Combobox.tsx:42`) flips into a text-input "custom mode" whenever `value ∉ options`; the leaked stale value triggered it. The control must be a strict dropdown.
+
+**Resolution: defaults are now PER-AGENT.** Storage changes from a single tuple to a map keyed by agent id: `chat_defaults: { [agentId]: { model, mode, thinking } }`. Each agent remembers its own; switching the Settings picker shows that agent's saved values (or empty) and never clobbers another. New chats seed from **their own agent's** stored defaults (any agent, not only the default agent). `Combobox` gets `allowCustom={false}` AND its `isCustomMode` init is guarded by `allowCustom` so it can never become typeable.
+
+The sections below are superseded where they describe a single flat `{model,mode,thinking}`; read them as per-agent map entries.
+
 ## Architecture
 
 ### Backend — config field
