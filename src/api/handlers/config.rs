@@ -34,7 +34,8 @@ pub struct ConfigResponse {
     /// without doing a separate `listApplications` round-trip.
     pub platform: &'static str,
     pub browser_control: BrowserControlConfigDto,
-    pub chat_defaults: ChatDefaultsConfigDto,
+    /// Per-agent chat defaults, keyed by agent id.
+    pub chat_defaults: std::collections::HashMap<String, ChatDefaultsConfigDto>,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,11 +226,20 @@ impl From<&Config> for ConfigResponse {
                 enabled: config.browser_control.enabled,
                 auto_groups: config.browser_control.auto_groups,
             },
-            chat_defaults: ChatDefaultsConfigDto {
-                model: config.chat_defaults.model.clone(),
-                mode: config.chat_defaults.mode.clone(),
-                thinking: config.chat_defaults.thinking.clone(),
-            },
+            chat_defaults: config
+                .chat_defaults
+                .iter()
+                .map(|(agent_id, entry)| {
+                    (
+                        agent_id.clone(),
+                        ChatDefaultsConfigDto {
+                            model: entry.model.clone(),
+                            mode: entry.mode.clone(),
+                            thinking: entry.thinking.clone(),
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -246,7 +256,8 @@ pub struct ConfigPatchRequest {
     pub notifications: Option<NotificationsConfigPatch>,
     pub indexing: Option<IndexingConfigPatch>,
     pub browser_control: Option<BrowserControlConfigPatch>,
-    pub chat_defaults: Option<ChatDefaultsConfigPatch>,
+    /// Per-agent chat defaults patch, keyed by agent id.
+    pub chat_defaults: Option<std::collections::HashMap<String, ChatDefaultsConfigPatch>>,
     /// Terminal 模式使用的复用器 ("tmux" | "zellij")
     pub terminal_multiplexer: Option<String>,
 }
@@ -341,11 +352,16 @@ pub async fn get_config() -> Json<ConfigResponse> {
     Json(ConfigResponse::from(&config))
 }
 
-/// Apply a chat_defaults patch with tri-state semantics:
-/// absent (`None`) leaves the field unchanged, `Some("")` (or whitespace)
-/// clears it, and `Some(v)` sets it to the trimmed value. Pure so the merge
-/// logic is unit-testable without touching the filesystem.
-fn apply_chat_defaults_patch(config: &mut Config, patch: ChatDefaultsConfigPatch) {
+/// Apply a per-agent chat_defaults patch. The patch is keyed by agent id; each
+/// entry uses tri-state semantics per field: absent (`None`) leaves the field
+/// unchanged, `Some("")` (or whitespace) clears it, and `Some(v)` sets it to
+/// the trimmed value. Patching one agent never affects another. After applying,
+/// any agent whose fields are all `None` is pruned so config.toml stays clean.
+/// Pure so the merge logic is unit-testable without touching the filesystem.
+fn apply_chat_defaults_patch(
+    config: &mut Config,
+    patch: std::collections::HashMap<String, ChatDefaultsConfigPatch>,
+) {
     fn norm(v: String) -> Option<String> {
         let t = v.trim().to_string();
         if t.is_empty() {
@@ -354,14 +370,21 @@ fn apply_chat_defaults_patch(config: &mut Config, patch: ChatDefaultsConfigPatch
             Some(t)
         }
     }
-    if let Some(model) = patch.model {
-        config.chat_defaults.model = norm(model);
-    }
-    if let Some(mode) = patch.mode {
-        config.chat_defaults.mode = norm(mode);
-    }
-    if let Some(thinking) = patch.thinking {
-        config.chat_defaults.thinking = norm(thinking);
+    for (agent_id, entry_patch) in patch {
+        let entry = config.chat_defaults.entry(agent_id.clone()).or_default();
+        if let Some(model) = entry_patch.model {
+            entry.model = norm(model);
+        }
+        if let Some(mode) = entry_patch.mode {
+            entry.mode = norm(mode);
+        }
+        if let Some(thinking) = entry_patch.thinking {
+            entry.thinking = norm(thinking);
+        }
+        // Prune an entry that no longer holds any defaults.
+        if entry.model.is_none() && entry.mode.is_none() && entry.thinking.is_none() {
+            config.chat_defaults.remove(&agent_id);
+        }
     }
 }
 
@@ -925,56 +948,87 @@ fn extract_app_icon_to_file(app_path: &Path, output_path: &Path) -> Option<Vec<u
 #[cfg(test)]
 mod chat_defaults_patch_tests {
     use super::{apply_chat_defaults_patch, ChatDefaultsConfigPatch, ConfigResponse};
-    use crate::storage::config::Config;
+    use crate::storage::config::{ChatDefaultsConfig, Config};
+    use std::collections::HashMap;
 
-    /// Tri-state merge: `None` leaves a field unchanged, `Some("")` clears it,
-    /// `Some(v)` sets the trimmed value. All three behaviours in one patch.
+    /// Build a single-agent patch map.
+    fn patch_for(
+        agent: &str,
+        p: ChatDefaultsConfigPatch,
+    ) -> HashMap<String, ChatDefaultsConfigPatch> {
+        let mut m = HashMap::new();
+        m.insert(agent.to_string(), p);
+        m
+    }
+
+    /// Tri-state merge on one agent's entry: `None` leaves a field unchanged,
+    /// `Some("")` clears it, `Some(v)` sets the trimmed value.
     #[test]
     fn tri_state_merge_unchanged_cleared_and_set() {
         let mut cfg = Config::default();
-        cfg.chat_defaults.model = Some("opus".to_string());
-        cfg.chat_defaults.mode = Some("plan".to_string());
-        cfg.chat_defaults.thinking = Some("low".to_string());
-
-        apply_chat_defaults_patch(
-            &mut cfg,
-            ChatDefaultsConfigPatch {
-                model: None,                            // unchanged
-                mode: Some(String::new()),              // cleared
-                thinking: Some("  high  ".to_string()), // set (trimmed)
+        cfg.chat_defaults.insert(
+            "claude".to_string(),
+            ChatDefaultsConfig {
+                model: Some("opus".to_string()),
+                mode: Some("auto".to_string()),
+                thinking: Some("high".to_string()),
             },
         );
 
+        apply_chat_defaults_patch(
+            &mut cfg,
+            patch_for(
+                "claude",
+                ChatDefaultsConfigPatch {
+                    model: None,                            // unchanged
+                    mode: Some(String::new()),              // cleared
+                    thinking: Some("  high  ".to_string()), // set (trimmed)
+                },
+            ),
+        );
+
+        let entry = cfg
+            .chat_defaults
+            .get("claude")
+            .expect("claude entry exists");
         assert_eq!(
-            cfg.chat_defaults.model.as_deref(),
+            entry.model.as_deref(),
             Some("opus"),
             "absent field must be left unchanged"
         );
+        assert_eq!(entry.mode, None, "Some(\"\") must clear the field");
         assert_eq!(
-            cfg.chat_defaults.mode, None,
-            "Some(\"\") must clear the field"
-        );
-        assert_eq!(
-            cfg.chat_defaults.thinking.as_deref(),
+            entry.thinking.as_deref(),
             Some("high"),
             "Some(v) must set the trimmed value"
         );
     }
 
-    /// A chat_defaults patch must not touch sibling config sections.
+    /// Patching one agent must not touch sibling config sections OR other agents.
     #[test]
     fn patch_preserves_siblings() {
         let mut cfg = Config::default();
         cfg.acp.agent_command = Some("claude".to_string());
         cfg.acp.render_window_limit = 42;
+        cfg.chat_defaults.insert(
+            "codex".to_string(),
+            ChatDefaultsConfig {
+                model: Some("gpt-5".to_string()),
+                mode: Some("plan".to_string()),
+                thinking: None,
+            },
+        );
 
         apply_chat_defaults_patch(
             &mut cfg,
-            ChatDefaultsConfigPatch {
-                model: Some("sonnet".to_string()),
-                mode: None,
-                thinking: None,
-            },
+            patch_for(
+                "claude",
+                ChatDefaultsConfigPatch {
+                    model: Some("sonnet".to_string()),
+                    mode: None,
+                    thinking: None,
+                },
+            ),
         );
 
         assert_eq!(
@@ -986,23 +1040,77 @@ mod chat_defaults_patch_tests {
             cfg.acp.render_window_limit, 42,
             "acp.render_window_limit must be untouched by a chat_defaults patch"
         );
-        // sanity: the patch itself applied
-        assert_eq!(cfg.chat_defaults.model.as_deref(), Some("sonnet"));
+        // The unrelated "codex" agent entry must be fully preserved.
+        let codex = cfg
+            .chat_defaults
+            .get("codex")
+            .expect("codex entry preserved");
+        assert_eq!(codex.model.as_deref(), Some("gpt-5"));
+        assert_eq!(codex.mode.as_deref(), Some("plan"));
+        assert_eq!(codex.thinking, None);
+        // sanity: the patch itself applied to "claude"
+        assert_eq!(
+            cfg.chat_defaults
+                .get("claude")
+                .and_then(|e| e.model.as_deref()),
+            Some("sonnet")
+        );
     }
 
-    /// GET round-trip: chat_defaults values must survive into the response DTO.
+    /// GET round-trip: per-agent chat_defaults values must survive into the DTO.
     #[test]
     fn get_round_trip_carries_chat_defaults() {
         let mut cfg = Config::default();
-        cfg.chat_defaults.model = Some("opus".to_string());
-        cfg.chat_defaults.mode = Some("plan".to_string());
-        cfg.chat_defaults.thinking = Some("high".to_string());
+        cfg.chat_defaults.insert(
+            "claude".to_string(),
+            ChatDefaultsConfig {
+                model: Some("opus".to_string()),
+                mode: Some("plan".to_string()),
+                thinking: Some("high".to_string()),
+            },
+        );
 
         let response = ConfigResponse::from(&cfg);
 
-        assert_eq!(response.chat_defaults.model.as_deref(), Some("opus"));
-        assert_eq!(response.chat_defaults.mode.as_deref(), Some("plan"));
-        assert_eq!(response.chat_defaults.thinking.as_deref(), Some("high"));
+        let entry = response
+            .chat_defaults
+            .get("claude")
+            .expect("claude entry carried into DTO");
+        assert_eq!(entry.model.as_deref(), Some("opus"));
+        assert_eq!(entry.mode.as_deref(), Some("plan"));
+        assert_eq!(entry.thinking.as_deref(), Some("high"));
+    }
+
+    /// Clearing all three fields of an agent prunes its entry from the map so
+    /// config.toml doesn't accumulate empty `[chat_defaults.<agent>]` tables.
+    #[test]
+    fn clearing_all_fields_prunes_entry() {
+        let mut cfg = Config::default();
+        cfg.chat_defaults.insert(
+            "claude".to_string(),
+            ChatDefaultsConfig {
+                model: Some("opus".to_string()),
+                mode: Some("auto".to_string()),
+                thinking: Some("high".to_string()),
+            },
+        );
+
+        apply_chat_defaults_patch(
+            &mut cfg,
+            patch_for(
+                "claude",
+                ChatDefaultsConfigPatch {
+                    model: Some(String::new()),
+                    mode: Some(String::new()),
+                    thinking: Some(String::new()),
+                },
+            ),
+        );
+
+        assert!(
+            !cfg.chat_defaults.contains_key("claude"),
+            "an agent whose fields are all cleared must be pruned from the map"
+        );
     }
 }
 

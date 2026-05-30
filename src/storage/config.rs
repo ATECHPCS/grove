@@ -282,8 +282,6 @@ pub struct Config {
     pub indexing: IndexingConfig,
     #[serde(default)]
     pub browser_control: BrowserControlConfig,
-    #[serde(default)]
-    pub chat_defaults: ChatDefaultsConfig,
 
     /// Storage layout version (None = legacy, "1.0" = task-centric layout)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,6 +303,13 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_launch: Option<LastLaunch>,
 
+    /// Per-agent chat defaults, keyed by agent id. Each agent remembers its
+    /// own `{model, mode, thinking}` tuple. Serialized last because a
+    /// map-of-tables (`[chat_defaults.<agent>]`) must come after all scalar
+    /// fields in TOML.
+    #[serde(default)]
+    pub chat_defaults: std::collections::HashMap<String, ChatDefaultsConfig>,
+
     // ===== 向后兼容字段（反序列化时使用，序列化时跳过） =====
     #[serde(skip_serializing, default)]
     multiplexer: Option<LegacyMultiplexer>,
@@ -313,10 +318,9 @@ pub struct Config {
     enabled_modes: Vec<String>,
 }
 
-/// Global default model/mode/thinking applied to new chats whose agent
-/// matches the default agent (`acp.agent_command`). All optional: `None`
-/// means "use the agent's own default". The default *agent* is NOT stored
-/// here — it is `acp.agent_command`.
+/// Per-agent default model/mode/thinking applied to new chats for one agent.
+/// Stored as the value of `Config::chat_defaults`, keyed by agent id. All
+/// optional: `None` means "use the agent's own default".
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatDefaultsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -753,26 +757,36 @@ mod chat_defaults_tests {
     use super::*;
 
     #[test]
-    fn chat_defaults_absent_deserializes_to_none() {
+    fn chat_defaults_absent_deserializes_to_empty_map() {
         let toml_str = r#"
             terminal_multiplexer = "tmux"
         "#;
         let cfg: Config = toml::from_str(toml_str).expect("parse legacy config");
-        assert!(cfg.chat_defaults.model.is_none());
-        assert!(cfg.chat_defaults.mode.is_none());
-        assert!(cfg.chat_defaults.thinking.is_none());
+        assert!(
+            cfg.chat_defaults.is_empty(),
+            "a legacy config without [chat_defaults] must deserialize to an empty map"
+        );
     }
 
     #[test]
     fn chat_defaults_round_trips() {
         let mut cfg = Config::default();
-        cfg.chat_defaults.model = Some("opus".to_string());
-        cfg.chat_defaults.mode = Some("auto".to_string());
-        cfg.chat_defaults.thinking = Some("high".to_string());
+        cfg.chat_defaults.insert(
+            "claude".to_string(),
+            ChatDefaultsConfig {
+                model: Some("opus".to_string()),
+                mode: Some("auto".to_string()),
+                thinking: Some("high".to_string()),
+            },
+        );
         let serialized = toml::to_string(&cfg).expect("serialize");
         let parsed: Config = toml::from_str(&serialized).expect("parse");
-        assert_eq!(parsed.chat_defaults.model.as_deref(), Some("opus"));
-        assert_eq!(parsed.chat_defaults.mode.as_deref(), Some("auto"));
-        assert_eq!(parsed.chat_defaults.thinking.as_deref(), Some("high"));
+        let entry = parsed
+            .chat_defaults
+            .get("claude")
+            .expect("claude entry round-trips");
+        assert_eq!(entry.model.as_deref(), Some("opus"));
+        assert_eq!(entry.mode.as_deref(), Some("auto"));
+        assert_eq!(entry.thinking.as_deref(), Some("high"));
     }
 }
