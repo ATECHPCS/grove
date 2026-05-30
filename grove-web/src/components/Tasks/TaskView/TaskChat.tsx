@@ -234,6 +234,30 @@ function gcChatDraftsOnce(): void {
   }
 }
 
+// ─── WebSocket diagnostics (TEMPORARY — Blitz grid connection-drop bug #3) ───
+// Captures the lifecycle of every per-chat WebSocket so we can tell, after a
+// repro on the pilot, WHY a grid slot dropped: the close `code`/`reason`,
+// whether the close was clean, and which side initiated it. Records land in
+// the console (prefixed `[grove-ws]`) AND a capped `window.__groveWsDiag` ring
+// buffer — on mobile/relay where devtools are awkward, run
+// `copy(JSON.stringify(window.__groveWsDiag, null, 2))` to grab the timeline.
+// Remove once root cause is confirmed.
+export interface WsCloseInfo {
+  code: number;
+  reason: string;
+  wasClean: boolean;
+  clientInitiated: boolean;
+}
+function wsDiag(event: string, chatId: string, extra?: Record<string, unknown>) {
+  const rec = { t: new Date().toISOString(), event, chatId: chatId.slice(0, 8), ...extra };
+  console.warn("[grove-ws]", rec);
+  if (typeof window !== "undefined") {
+    const w = window as Window & { __groveWsDiag?: Record<string, unknown>[] };
+    (w.__groveWsDiag ??= []).push(rec);
+    if (w.__groveWsDiag.length > 300) w.__groveWsDiag.shift();
+  }
+}
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 interface TaskChatProps {
@@ -249,7 +273,7 @@ interface TaskChatProps {
   onExpand?: () => void;
   onCollapse?: () => void;
   onConnected?: () => void;
-  onDisconnected?: () => void;
+  onDisconnected?: (info?: WsCloseInfo) => void;
   fullscreen?: boolean;
   onToggleFullscreen?: () => void;
   hideHeader?: boolean;
@@ -3303,6 +3327,7 @@ export function TaskChat({
       wsMapRef.current.set(chatId, ws);
 
       ws.onopen = () => {
+        wsDiag("open", chatId, { isActive: chatId === getActiveChatId() });
         // Successful connect — reset backoff so the next disconnect retries fast.
         reconnectAttemptRef.current.delete(chatId);
       };
@@ -3343,11 +3368,18 @@ export function TaskChat({
         }
       };
 
-      ws.onclose = () => {
+      ws.onclose = (ev) => {
+        const closeInfo: WsCloseInfo = {
+          code: ev.code,
+          reason: ev.reason,
+          wasClean: ev.wasClean,
+          clientInitiated: intentionalCloseRef.current.has(chatId),
+        };
+        wsDiag("close", chatId, { ...closeInfo, isActive: chatId === getActiveChatId() });
         wsMapRef.current.delete(chatId);
         if (chatId === getActiveChatId()) {
           setIsConnected(false);
-          onDisconnectedPropRef.current?.();
+          onDisconnectedPropRef.current?.(closeInfo);
         } else {
           const cached = perChatStateRef.current.get(chatId);
           if (cached) cached.isConnected = false;
@@ -3364,6 +3396,7 @@ export function TaskChat({
           const attempt = reconnectAttemptRef.current.get(chatId) ?? 0;
           const WS_MAX_RECONNECT_ATTEMPTS = 5;
           if (attempt >= WS_MAX_RECONNECT_ATTEMPTS) {
+            wsDiag("reconnect-giveup", chatId, { attempts: attempt });
             if (chatId === getActiveChatId()) {
               setMessages((prev) =>
                 appendSystemMessage(
@@ -3376,6 +3409,7 @@ export function TaskChat({
             return;
           }
           const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
+          wsDiag("reconnect-schedule", chatId, { attempt, delayMs: delay });
           reconnectAttemptRef.current.set(chatId, attempt + 1);
           const timer = setTimeout(() => {
             reconnectTimerRef.current.delete(chatId);
@@ -3392,6 +3426,7 @@ export function TaskChat({
       };
 
       ws.onerror = () => {
+        wsDiag("error", chatId, { readyState: ws.readyState });
         if (chatId === getActiveChatId()) {
           setMessages((prev) => appendSystemMessage(prev, "Connection error."));
         }
