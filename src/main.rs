@@ -292,6 +292,27 @@ fn main() -> io::Result<()> {
         Commands::Tui | Commands::Web { .. } | Commands::Mobile { .. } | Commands::Gui { .. }
     );
     if needs_storage {
+        // Check for updates at CLI startup and prompt user to auto-update
+        let config = storage::config::load_config();
+        let update_info = update::check_for_updates(
+            config.update.latest_version.as_deref(),
+            config.update.last_check.as_deref(),
+        );
+
+        // If a new check was performed, save the results to the config cache
+        if update::should_check(config.update.last_check.as_deref()) {
+            if let Some(ref check_time) = update_info.check_time {
+                let mut new_config = config.clone();
+                new_config.update.last_check = Some(check_time.to_rfc3339());
+                new_config.update.latest_version = update_info.latest_version.clone();
+                let _ = storage::config::save_config(&new_config);
+            }
+        }
+
+        if update_info.has_update() {
+            update::prompt_and_execute_update(&update_info);
+        }
+
         ensure_storage_version();
         // 一次性地把当前工作目录(若为 git 仓库)登记成 project。
         // 旧逻辑放在 GET /projects handler 里,每次请求要 80ms+,纯属浪费。

@@ -203,6 +203,71 @@ pub fn check_for_updates(cached_version: Option<&str>, last_check: Option<&str>)
     }
 }
 
+/// Prompt the user in the CLI to update if a new version is available.
+/// If they choose to update, execute the installation command and exit.
+/// Otherwise, continue starting the application.
+pub fn prompt_and_execute_update(update_info: &UpdateInfo) {
+    use std::io::{self, IsTerminal, Write};
+    use std::process::Command;
+
+    // Check if stdin is a terminal to avoid hanging in non-interactive/AppBundle environments
+    if !io::stdin().is_terminal() {
+        return;
+    }
+
+    let Some(latest) = &update_info.latest_version else {
+        return;
+    };
+
+    let command_str = update_info.update_command();
+    if command_str.is_empty() {
+        return; // AppBundle updates are handled in-app via the web UI/Tauri
+    }
+
+    println!("\n🔔 检测到有新版本可用: {}", latest);
+    println!("建议更新。更新指令为:\n  {}", command_str);
+    print!("是否现在自动更新？ [y/N]: ");
+    let _ = io::stdout().flush();
+
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_ok() {
+        let trimmed = input.trim().to_lowercase();
+        if trimmed == "y" || trimmed == "yes" {
+            println!("正在执行更新指令: {}\n", command_str);
+
+            // Execute the command using the system shell
+            let status = if cfg!(windows) {
+                Command::new("powershell")
+                    .args(["-Command", command_str])
+                    .status()
+            } else {
+                Command::new("sh").args(["-c", command_str]).status()
+            };
+
+            match status {
+                Ok(s) if s.success() => {
+                    println!("\n✨ 更新完成！请重新启动 Grove。");
+                    std::process::exit(0);
+                }
+                Ok(s) => {
+                    eprintln!("\n❌ 更新失败，退出代码: {:?}", s.code());
+                    print!("按回车键继续启动 Grove...");
+                    let _ = io::stdout().flush();
+                    let mut dummy = String::new();
+                    let _ = io::stdin().read_line(&mut dummy);
+                }
+                Err(e) => {
+                    eprintln!("\n❌ 无法执行更新指令: {}", e);
+                    print!("按回车键继续启动 Grove...");
+                    let _ = io::stdout().flush();
+                    let mut dummy = String::new();
+                    let _ = io::stdin().read_line(&mut dummy);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
