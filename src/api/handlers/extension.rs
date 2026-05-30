@@ -834,10 +834,10 @@ fn open_url_with_default_browser(url: &str) -> Result<String, String> {
                 // sensible binary name in 90% of cases (firefox, brave-browser,
                 // google-chrome, microsoft-edge, opera, vivaldi, chromium).
                 let binary = desktop.trim_end_matches(".desktop").to_string();
-                if !binary.is_empty() {
-                    if std::process::Command::new(&binary).arg(url).spawn().is_ok() {
-                        return Ok(binary);
-                    }
+                if !binary.is_empty()
+                    && std::process::Command::new(&binary).arg(url).spawn().is_ok()
+                {
+                    return Ok(binary);
                 }
             }
         }
