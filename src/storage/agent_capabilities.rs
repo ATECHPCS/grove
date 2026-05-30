@@ -3,9 +3,6 @@
 //! same id used by `acp.agent_command` and a chat's stored `agent`), so the
 //! Settings UI can offer valid choices without spawning a session.
 
-// Public API consumed by later tasks (acp session_ready handler, REST endpoint).
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

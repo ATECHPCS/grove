@@ -76,6 +76,10 @@ pub fn create_api_router() -> Router {
         )
         // Agent discovery API
         .route("/agents/base", get(handlers::agents::list_base_agents))
+        .route(
+            "/agents/{id}/capabilities",
+            get(handlers::agents::get_agent_capabilities),
+        )
         // Custom Agent (Persona) API
         .route(
             "/custom-agents",
