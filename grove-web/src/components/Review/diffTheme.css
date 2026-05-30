@@ -250,6 +250,7 @@
   min-height: 0;
   overflow-y: auto;
   overflow-x: auto;
+  padding-bottom: 75vh; /* Scroll past end + prevent viewport jump on collapse */
 }
 
 /* When a preview drawer is open, make diff-content a flex column so the file section
@@ -787,12 +788,7 @@ td.diff-code.diff-line-highlighted::before {
   border-bottom: 1px solid var(--color-border);
   flex-shrink: 0;
   gap: 12px;
-  overflow-x: auto;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
-}
-.diff-toolbar::-webkit-scrollbar {
-  display: none;
+  overflow: visible;
 }
 
 .diff-toolbar-left {

@@ -731,30 +731,19 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       return hashes;
     }
 
-    // In Changes mode, compute hash based on cached diff content
+    // In Changes mode, compute hash based on stable diff properties (path, status, additions, deletions)
     if (!diffData) return hashes;
     for (const f of diffData.files) {
-      const cached = fileDiffCache.get(f.path);
       let hash = 5381;
-      if (cached && typeof cached !== 'string' && cached.hunks) {
-        for (const h of cached.hunks) {
-          for (const l of h.lines) {
-            for (let i = 0; i < l.content.length; i++) {
-              hash = ((hash << 5) + hash) + l.content.charCodeAt(i);
-              hash = hash & hash;
-            }
-          }
-        }
-      } else {
-        for (let i = 0; i < f.path.length; i++) {
-          hash = ((hash << 5) + hash) + f.path.charCodeAt(i);
-          hash = hash & hash;
-        }
+      const hashStr = `${f.path}:${f.status}:${f.additions}:${f.deletions}`;
+      for (let i = 0; i < hashStr.length; i++) {
+        hash = ((hash << 5) + hash) + hashStr.charCodeAt(i);
+        hash = hash & hash;
       }
       hashes.set(f.path, hash.toString(36));
     }
     return hashes;
-  }, [diffData, viewMode, displayFiles, fileDiffCache]);
+  }, [diffData, viewMode, displayFiles]);
 
   // Compute viewed status per file: 'none' | 'viewed' | 'updated'
   const getFileViewedStatus = useCallback((path: string): 'none' | 'viewed' | 'updated' => {
@@ -1478,12 +1467,17 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   const handleToggleViewed = useCallback((path: string) => {
     setViewedFiles((prev) => {
       const next = new Map(prev);
-      if (next.has(path)) {
+      const savedHash = prev.get(path);
+      const currentHash = fileHashes.get(path) || '';
+
+      // If already viewed and the hash matches, toggle it off (unviewed)
+      if (savedHash && savedHash === currentHash) {
         next.delete(path);
         // When unmarking as viewed, keep current collapsed state
       } else {
-        const hash = fileHashes.get(path) || '';
-        next.set(path, hash);
+        // If unviewed (no savedHash) OR updated (savedHash !== currentHash),
+        // mark it as viewed (store the new current hash) and clear the Updated status
+        next.set(path, currentHash);
         // Auto-collapse when marking as viewed
         setCollapsedFiles((prevCollapsed) => new Set(prevCollapsed).add(path));
       }

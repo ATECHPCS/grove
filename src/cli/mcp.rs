@@ -497,6 +497,15 @@ pub struct SingleReply {
     pub resolve: Option<bool>,
 }
 
+/// Parameters for reading review comments
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ReadReviewParams {
+    /// Optional file path/name query for fuzzy matching. Only comments in files with matching paths are returned.
+    pub file_search: Option<String>,
+    /// Optional comment ID for precise retrieval of a single comment and its replies.
+    pub comment_id: Option<u32>,
+}
+
 /// Batch reply parameters - reply to multiple comments at once
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ReplyReviewParams {
@@ -1467,7 +1476,10 @@ impl GroveMcpServer {
         name = "read_review",
         description = "Read code review comments for the current Grove task. Returns comments with IDs, locations, content, and status (open/resolved/outdated). Use grove_reply_review to respond to comments. Call grove_status first to ensure you are in a Grove task."
     )]
-    async fn grove_read_review(&self) -> Result<CallToolResult, McpError> {
+    async fn grove_read_review(
+        &self,
+        params: Parameters<ReadReviewParams>,
+    ) -> Result<CallToolResult, McpError> {
         let (task_id, project_path) = get_task_context()
             .ok_or_else(|| McpError::invalid_request("Not in a Grove task", None))?;
 
@@ -1478,6 +1490,22 @@ impl GroveMcpServer {
                 "No code review comments yet.",
             )])),
             Ok(mut data) => {
+                // Apply filters if provided
+                if let Some(ref query) = params.0.file_search {
+                    let query_lower = query.to_lowercase();
+                    data.comments.retain(|c| {
+                        if let Some(ref path) = c.file_path {
+                            path.to_lowercase().contains(&query_lower)
+                        } else {
+                            false
+                        }
+                    });
+                }
+
+                if let Some(id) = params.0.comment_id {
+                    data.comments.retain(|c| c.id == id);
+                }
+
                 // 动态检测 outdated
                 let worktree = env::var("GROVE_WORKTREE").unwrap_or_default();
                 let target = env::var("GROVE_TARGET").unwrap_or_default();

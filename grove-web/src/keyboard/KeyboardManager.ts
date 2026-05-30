@@ -59,8 +59,23 @@ function detectSuppression(): Suppression {
   return false;
 }
 
+const TEXT_INPUT_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "Home",
+  "End",
+  "PageUp",
+  "PageDown",
+  "Backspace",
+  "Delete",
+  "Insert",
+]);
+
 function isAlphaKey(e: KeyboardEvent): boolean {
-  return e.key.length === 1 && !e.altKey && !e.ctrlKey && !e.metaKey;
+  if (e.altKey || e.ctrlKey || e.metaKey) return false;
+  return e.key.length === 1 || TEXT_INPUT_KEYS.has(e.key);
 }
 
 export class KeyboardManagerImpl {

@@ -443,6 +443,41 @@ describe("KeyboardManager — text input suppression", () => {
     expect(handler).toHaveBeenCalledOnce();
   });
 
+  it("unmodified navigation and editing control keys (ArrowUp, ArrowDown, Backspace, Delete) are suppressed in textarea", () => {
+    const arrowUpHandler = vi.fn();
+    const arrowDownHandler = vi.fn();
+    const backspaceHandler = vi.fn();
+    const deleteHandler = vi.fn();
+
+    commandRegistry.contribute(
+      { id: "arrowUp", name: "arrowUp", category: "t", defaultBindings: [{ key: "ArrowUp" }] },
+      arrowUpHandler,
+    );
+    commandRegistry.contribute(
+      { id: "arrowDown", name: "arrowDown", category: "t", defaultBindings: [{ key: "ArrowDown" }] },
+      arrowDownHandler,
+    );
+    commandRegistry.contribute(
+      { id: "backspace", name: "backspace", category: "t", defaultBindings: [{ key: "Backspace" }] },
+      backspaceHandler,
+    );
+    commandRegistry.contribute(
+      { id: "delete", name: "delete", category: "t", defaultBindings: [{ key: "Delete" }] },
+      deleteHandler,
+    );
+
+    textarea.focus();
+    dispatchKey("ArrowUp");
+    dispatchKey("ArrowDown");
+    dispatchKey("Backspace");
+    dispatchKey("Delete");
+
+    expect(arrowUpHandler).not.toHaveBeenCalled();
+    expect(arrowDownHandler).not.toHaveBeenCalled();
+    expect(backspaceHandler).not.toHaveBeenCalled();
+    expect(deleteHandler).not.toHaveBeenCalled();
+  });
+
   it("passThroughTextInput overrides suppression", () => {
     const handler = vi.fn();
     commandRegistry.contribute(
