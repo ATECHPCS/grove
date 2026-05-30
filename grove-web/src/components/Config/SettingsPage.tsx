@@ -44,8 +44,10 @@ import {
   listBaseAgents,
   listApplications,
   listCustomAgents,
+  getAgentCapabilities,
   type AppInfo,
   type BaseAgent,
+  type AgentCapabilities,
   type CustomAgentServer,
   type CustomAgentPersona,
 } from "../../api";
@@ -247,6 +249,10 @@ export function SettingsPage({ config }: SettingsPageProps) {
 
   // ACP / Custom agents state
   const [acpAgent, setAcpAgent] = useState("claude"); // Chat mode agent
+  const [defaultModel, setDefaultModel] = useState<string>("");
+  const [defaultMode, setDefaultMode] = useState<string>("");
+  const [defaultThinking, setDefaultThinking] = useState<string>("");
+  const [agentCaps, setAgentCaps] = useState<AgentCapabilities | null>(null);
   const [customAgents, setCustomAgents] = useState<CustomAgentServer[]>([]);
   const [showCustomAgentModal, setShowCustomAgentModal] = useState(false);
   const [showCustomAgentsModal, setShowCustomAgentsModal] = useState(false);
@@ -445,6 +451,9 @@ export function SettingsPage({ config }: SettingsPageProps) {
     if (acp?.agent_command) {
       setAcpAgent(acp.agent_command);
     }
+    setDefaultModel(cfg.chat_defaults?.model ?? "");
+    setDefaultMode(cfg.chat_defaults?.mode ?? "");
+    setDefaultThinking(cfg.chat_defaults?.thinking ?? "");
     if (acp?.custom_agents) {
       setCustomAgents(acp.custom_agents);
     }
@@ -637,6 +646,11 @@ export function SettingsPage({ config }: SettingsPageProps) {
         render_window_limit: chatRenderWindowLimit,
         render_window_trigger: renderWindowTrigger,
       },
+      chat_defaults: {
+        model: defaultModel,
+        mode: defaultMode,
+        thinking: defaultThinking,
+      },
       auto_link: {
         patterns: autoLinkPatterns,
       },
@@ -673,7 +687,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
     } catch {
       console.error("Failed to save config");
     }
-  }, [isLoaded, selectedLayout, agentCommand, acpAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, refreshGlobalConfig]);
+  }, [isLoaded, selectedLayout, agentCommand, acpAgent, defaultModel, defaultMode, defaultThinking, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, refreshGlobalConfig]);
 
   // Handle theme change with immediate save
   const handleModeChange = useCallback((newMode: "auto" | "light" | "dark") => {
@@ -809,7 +823,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
     }, 500); // 500ms debounce
 
     return () => clearTimeout(timer);
-  }, [selectedLayout, agentCommand, acpAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, isLoaded, saveConfig]);
+  }, [selectedLayout, agentCommand, acpAgent, defaultModel, defaultMode, defaultThinking, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, isLoaded, saveConfig]);
 
   useEffect(() => {
     if (!isRecordingWindowShortcut) return;
@@ -1027,6 +1041,38 @@ export function SettingsPage({ config }: SettingsPageProps) {
       });
     }
   }, [isLoaded, commandAvailability, agentCommand, acpAgent, terminalAgentOptions, chatAgentOptions, baseAgentStatusById, baseAgents.length]);
+
+  // Fetch the selected default agent's cached capabilities so the
+  // model/mode/thinking dropdowns below can offer its known options.
+  useEffect(() => {
+    if (!acpAgent) {
+      // Defer to a microtask to avoid a synchronous setState in the effect
+      // body (react-hooks/set-state-in-effect), matching the pattern above.
+      void Promise.resolve().then(() => setAgentCaps(null));
+      return;
+    }
+    const ctrl = new AbortController();
+    getAgentCapabilities(acpAgent, ctrl.signal)
+      .then(setAgentCaps)
+      .catch(() => setAgentCaps(null));
+    return () => ctrl.abort();
+  }, [acpAgent]);
+
+  // Clear stored defaults that are no longer valid for the current agent's
+  // capabilities. We only react to agentCaps changing (not the default* values)
+  // to avoid a save-loop; the disable below is intentional. setState is deferred
+  // to a microtask to satisfy react-hooks/set-state-in-effect.
+  useEffect(() => {
+    if (!agentCaps) return;
+    const caps = agentCaps;
+    void Promise.resolve().then(() => {
+      const has = (list: [string, string][], v: string) =>
+        v === "" || list.some(([id]) => id === v);
+      if (!has(caps.models, defaultModel)) setDefaultModel("");
+      if (!has(caps.modes, defaultMode)) setDefaultMode("");
+      if (!has(caps.thought_levels, defaultThinking)) setDefaultThinking("");
+    });
+  }, [agentCaps]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const suggestedChatRenderWindowTrigger = useCallback((limit: number) => {
     return Math.max(limit + 1, Math.ceil(limit * 1.5));
@@ -1261,6 +1307,39 @@ env_vars = [
                   customAgents={customAgents}
                 />
               )}
+            </div>
+
+            {/* Default model / mode / thinking — paired with the default agent.
+                Options come from the agent's cached capabilities (populated after
+                the agent first connects). Empty selection = use the agent's own default. */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              {[
+                { label: "Default Model", value: defaultModel, set: setDefaultModel, opts: agentCaps?.models ?? [] },
+                { label: "Default Mode", value: defaultMode, set: setDefaultMode, opts: agentCaps?.modes ?? [] },
+                { label: "Default Thinking", value: defaultThinking, set: setDefaultThinking, opts: agentCaps?.thought_levels ?? [] },
+              ].map((f) => (
+                <div key={f.label}>
+                  <div className="text-xs font-medium text-[var(--color-text-muted)] mb-2 uppercase tracking-wider select-none">
+                    {f.label}
+                  </div>
+                  {f.opts.length > 0 ? (
+                    <Combobox
+                      value={f.value}
+                      onChange={f.set}
+                      allowCustom={false}
+                      options={[
+                        { id: "__default__", label: "Default", value: "" },
+                        ...f.opts.map(([id, name]) => ({ id, label: name, value: id })),
+                      ]}
+                      placeholder="Default"
+                    />
+                  ) : (
+                    <div className="h-10 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-3 flex items-center text-xs text-[var(--color-text-muted)]">
+                      Options populate after you first run this agent.
+                    </div>
+                  )}
+                </div>
+              ))}
             </div>
 
             {/* Hub entry list — full-width rows so an odd entry count never
