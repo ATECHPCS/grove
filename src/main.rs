@@ -19,6 +19,7 @@ mod error;
 mod event;
 mod fs_link;
 mod git;
+mod groove_dashboard;
 mod hooks;
 mod model;
 #[cfg(not(windows))]
