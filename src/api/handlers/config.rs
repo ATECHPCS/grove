@@ -34,6 +34,14 @@ pub struct ConfigResponse {
     /// without doing a separate `listApplications` round-trip.
     pub platform: &'static str,
     pub browser_control: BrowserControlConfigDto,
+    pub chat_defaults: ChatDefaultsConfigDto,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatDefaultsConfigDto {
+    pub model: Option<String>,
+    pub mode: Option<String>,
+    pub thinking: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -217,6 +225,11 @@ impl From<&Config> for ConfigResponse {
                 enabled: config.browser_control.enabled,
                 auto_groups: config.browser_control.auto_groups,
             },
+            chat_defaults: ChatDefaultsConfigDto {
+                model: config.chat_defaults.model.clone(),
+                mode: config.chat_defaults.mode.clone(),
+                thinking: config.chat_defaults.thinking.clone(),
+            },
         }
     }
 }
@@ -233,8 +246,17 @@ pub struct ConfigPatchRequest {
     pub notifications: Option<NotificationsConfigPatch>,
     pub indexing: Option<IndexingConfigPatch>,
     pub browser_control: Option<BrowserControlConfigPatch>,
+    pub chat_defaults: Option<ChatDefaultsConfigPatch>,
     /// Terminal 模式使用的复用器 ("tmux" | "zellij")
     pub terminal_multiplexer: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatDefaultsConfigPatch {
+    /// `Some("")` clears the field, `Some("opus")` sets it, `None` leaves unchanged.
+    pub model: Option<String>,
+    pub mode: Option<String>,
+    pub thinking: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -530,6 +552,27 @@ pub async fn patch_config(
         }
         if let Some(v) = bc_patch.auto_groups {
             config.browser_control.auto_groups = v;
+        }
+    }
+
+    // Apply chat_defaults patch
+    if let Some(cd) = patch.chat_defaults {
+        fn norm(v: String) -> Option<String> {
+            let t = v.trim().to_string();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        }
+        if let Some(model) = cd.model {
+            config.chat_defaults.model = norm(model);
+        }
+        if let Some(mode) = cd.mode {
+            config.chat_defaults.mode = norm(mode);
+        }
+        if let Some(thinking) = cd.thinking {
+            config.chat_defaults.thinking = norm(thinking);
         }
     }
 
@@ -869,6 +912,20 @@ fn extract_app_icon_to_file(app_path: &Path, output_path: &Path) -> Option<Vec<u
     }
 
     None
+}
+
+#[cfg(test)]
+mod chat_defaults_patch_tests {
+    use crate::storage::config::Config;
+
+    #[test]
+    fn setting_chat_defaults_preserves_siblings() {
+        let mut cfg = Config::default();
+        cfg.acp.agent_command = Some("claude".to_string());
+        cfg.chat_defaults.model = Some("opus".to_string());
+        assert_eq!(cfg.acp.agent_command.as_deref(), Some("claude"));
+        assert_eq!(cfg.chat_defaults.model.as_deref(), Some("opus"));
+    }
 }
 
 /// Convert icns to PNG using a temporary file based on output_path
