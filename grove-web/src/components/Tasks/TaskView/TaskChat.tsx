@@ -1718,6 +1718,20 @@ export function TaskChat({
 
   // Per-chat state cache (preserved across chat switches)
   const perChatStateRef = useRef<Map<string, PerChatState>>(new Map());
+  // Cached chat-defaults from config (acp.agent_command + chat_defaults).
+  // A ref so it never re-triggers a render; mount-time load is sufficient for v1.
+  // Seeding (see session_ready handlers) only applies when the active chat's
+  // agent matches the configured default agent.
+  const chatDefaultsRef = useRef<{
+    agent: string | undefined;
+    model: string | null;
+    mode: string | null;
+    thinking: string | null;
+  }>({ agent: undefined, model: null, mode: null, thinking: null });
+  // Chats whose selectors have already been seeded from chat_defaults. Gates
+  // on the FIRST session_ready per chat id so a later reconnect/resume never
+  // re-seeds and clobbers a user's manual model/mode/thinking change.
+  const seededChatsRef = useRef<Set<string>>(new Set());
   // Per-chat WebSocket connections
   const wsMapRef = useRef<Map<string, WebSocket>>(new Map());
   // Track intentionally closed WebSockets (don't auto-reconnect these)
@@ -3393,6 +3407,62 @@ export function TaskChat({
 
   // activeChatIdRef is owned by useActiveChatId — no separate declaration here.
 
+  // Load chat-defaults (default agent + model/mode/thinking) from config once
+  // on mount into a ref. Used by the session_ready seeding below. A mount-time
+  // load is sufficient for v1; if config is re-fetched elsewhere this ref can
+  // be refreshed there.
+  useEffect(() => {
+    void getConfig()
+      .then((cfg) => {
+        chatDefaultsRef.current = {
+          agent: cfg.acp?.agent_command,
+          model: cfg.chat_defaults?.model ?? null,
+          mode: cfg.chat_defaults?.mode ?? null,
+          thinking: cfg.chat_defaults?.thinking ?? null,
+        };
+      })
+      .catch(() => {
+        /* leave defaults empty — seeding becomes a no-op */
+      });
+  }, []);
+
+  // Seed the model/mode/thinking selectors from the user's configured
+  // chat_defaults on the FIRST session_ready for a chat, when that chat uses
+  // the configured default agent. Validates each default against the event's
+  // own available_* option arrays (objects shaped `{ id, name }`) — using the
+  // event payload, not component state, avoids async-state staleness. Bare
+  // setters are correct here: the values reach the agent via the next prompt's
+  // buildPromptConfig() bundle, exactly like the dropdown onSelect handlers.
+  const seedChatDefaults = useCallback(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (chatId: string, agent: string | undefined, evt: any) => {
+      // First-ready gate: never re-seed on reconnect/resume.
+      if (seededChatsRef.current.has(chatId)) return;
+      seededChatsRef.current.add(chatId);
+
+      const d = chatDefaultsRef.current;
+      // Agent gate: only seed when the chat's agent is the configured default.
+      if (!d.agent || agent !== d.agent) return;
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const has = (arr: any, value: string | null): boolean =>
+        !!value &&
+        Array.isArray(arr) &&
+        arr.some((o: { id: string }) => o.id === value);
+
+      if (d.model && has(evt.available_models, d.model)) {
+        setSelectedModel(d.model);
+      }
+      if (d.mode && has(evt.available_modes, d.mode)) {
+        setPermissionLevel(d.mode);
+      }
+      if (d.thinking && has(evt.available_thought_levels, d.thinking)) {
+        setThoughtLevel(d.thinking);
+      }
+    },
+    [],
+  );
+
   // Connect WS first (for real-time events + SessionReady), then load history via HTTP
   useEffect(() => {
     if (!activeChatId) return;
@@ -3478,6 +3548,15 @@ export function TaskChat({
                 setThoughtLevel(evt.current_thought_level_id);
               if (evt.thought_level_config_id)
                 setThoughtLevelConfigId(evt.thought_level_config_id);
+              // Seed chat_defaults for this freshly-opened chat: a brand-new
+              // chat's session_ready can land during the HTTP history load and
+              // be replayed here rather than via the live path above. Same
+              // first-ready + default-agent gating; seededChatsRef dedupes so
+              // it never double-seeds with the live path.
+              {
+                const chat = chatsRef.current.find((c) => c.id === chatId);
+                seedChatDefaults(chatId, chat?.agent, evt);
+              }
               if (evt.prompt_capabilities) {
                 setPromptCaps({
                   image: evt.prompt_capabilities.image ?? false,
@@ -3629,7 +3708,7 @@ export function TaskChat({
     // loading after this effect's first run (when launch_mode was still
     // undefined → connectChatWs bailed), the effect re-fires with the
     // resolved mode and routes the chat correctly (ACP WS vs PTY-only).
-  }, [activeChatId, activeChat?.launch_mode, connectChatWs, projectId, task.id, updateBusy, chatRenderWindowSettings, updateHiddenMessageCount, getActiveChatId]);
+  }, [activeChatId, activeChat?.launch_mode, connectChatWs, projectId, task.id, updateBusy, chatRenderWindowSettings, updateHiddenMessageCount, getActiveChatId, seedChatDefaults]);
 
   // Cleanup all WebSockets on unmount, plus any pending reconnect timers —
   // otherwise an in-flight backoff timer fires after unmount and creates a
@@ -3753,6 +3832,13 @@ export function TaskChat({
             setThoughtLevel(msg.current_thought_level_id);
           if (msg.thought_level_config_id)
             setThoughtLevelConfigId(msg.thought_level_config_id);
+          // Override the agent's own defaults with the user's configured
+          // chat_defaults (first session_ready only, default agent only).
+          {
+            const id = getActiveChatId();
+            const chat = chatsRef.current.find((c) => c.id === id);
+            if (id) seedChatDefaults(id, chat?.agent, msg);
+          }
           // Extract prompt capabilities
           if (msg.prompt_capabilities) {
             setPromptCaps({
@@ -4060,7 +4146,7 @@ export function TaskChat({
           break;
       }
     },
-    [onConnectedProp, enableAutoStickToBottom, onChatBecameIdle, updateBusy, pruneActiveChatMessages, setAutoExpandSectionId],
+    [onConnectedProp, enableAutoStickToBottom, onChatBecameIdle, updateBusy, pruneActiveChatMessages, setAutoExpandSectionId, getActiveChatId, seedChatDefaults],
   );
 
   /** Buffer a server message into the per-chat cache (for non-active chats) */
