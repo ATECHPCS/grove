@@ -39,7 +39,7 @@ export function Combobox({
 }: ComboboxProps) {
   const [isOpen, setIsOpen] = useState(false);
   // Initialize custom mode from initial props (lazy state initializer)
-  const [isCustomMode, setIsCustomMode] = useState(() => !!(value && !options.find((opt) => opt.value === value)));
+  const [isCustomMode, setIsCustomMode] = useState(() => allowCustom && !!(value && !options.find((opt) => opt.value === value)));
   const [customValue, setCustomValue] = useState(() => (value && !options.find((opt) => opt.value === value)) ? value : "");
   const [dropdownPosition, setDropdownPosition] = useState<DropdownPosition | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);

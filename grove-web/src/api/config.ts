@@ -137,7 +137,7 @@ export interface Config {
   indexing: IndexingConfig;
   browser_control: BrowserControlConfig;
   platform: string; // "macos" | "windows" | "linux"
-  chat_defaults: ChatDefaultsConfig;
+  chat_defaults: Record<string, ChatDefaultsConfig>;
 }
 
 interface IndexingConfigPatch {
@@ -156,7 +156,7 @@ interface ConfigPatch {
   notifications?: Partial<NotificationsConfig>;
   indexing?: IndexingConfigPatch;
   browser_control?: Partial<BrowserControlConfig>;
-  chat_defaults?: Partial<ChatDefaultsConfig>;
+  chat_defaults?: Record<string, Partial<ChatDefaultsConfig>>;
 }
 
 // Application info for picker
