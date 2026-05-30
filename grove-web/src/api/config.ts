@@ -119,6 +119,12 @@ export interface BrowserControlConfig {
   auto_groups?: boolean;
 }
 
+export interface ChatDefaultsConfig {
+  model?: string | null;
+  mode?: string | null;
+  thinking?: string | null;
+}
+
 export interface Config {
   theme: ThemeConfig;
   layout: LayoutConfig;
@@ -131,6 +137,7 @@ export interface Config {
   indexing: IndexingConfig;
   browser_control: BrowserControlConfig;
   platform: string; // "macos" | "windows" | "linux"
+  chat_defaults: ChatDefaultsConfig;
 }
 
 interface IndexingConfigPatch {
@@ -149,6 +156,7 @@ interface ConfigPatch {
   notifications?: Partial<NotificationsConfig>;
   indexing?: IndexingConfigPatch;
   browser_control?: Partial<BrowserControlConfig>;
+  chat_defaults?: Partial<ChatDefaultsConfig>;
 }
 
 // Application info for picker
