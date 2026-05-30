@@ -35,7 +35,7 @@ pub struct ConfigResponse {
     pub platform: &'static str,
     pub browser_control: BrowserControlConfigDto,
     /// Per-agent chat defaults, keyed by agent id.
-    pub chat_defaults: std::collections::HashMap<String, ChatDefaultsConfigDto>,
+    pub chat_defaults: std::collections::BTreeMap<String, ChatDefaultsConfigDto>,
 }
 
 #[derive(Debug, Serialize)]
@@ -257,7 +257,7 @@ pub struct ConfigPatchRequest {
     pub indexing: Option<IndexingConfigPatch>,
     pub browser_control: Option<BrowserControlConfigPatch>,
     /// Per-agent chat defaults patch, keyed by agent id.
-    pub chat_defaults: Option<std::collections::HashMap<String, ChatDefaultsConfigPatch>>,
+    pub chat_defaults: Option<std::collections::BTreeMap<String, ChatDefaultsConfigPatch>>,
     /// Terminal 模式使用的复用器 ("tmux" | "zellij")
     pub terminal_multiplexer: Option<String>,
 }
@@ -360,7 +360,7 @@ pub async fn get_config() -> Json<ConfigResponse> {
 /// Pure so the merge logic is unit-testable without touching the filesystem.
 fn apply_chat_defaults_patch(
     config: &mut Config,
-    patch: std::collections::HashMap<String, ChatDefaultsConfigPatch>,
+    patch: std::collections::BTreeMap<String, ChatDefaultsConfigPatch>,
 ) {
     fn norm(v: String) -> Option<String> {
         let t = v.trim().to_string();
@@ -949,14 +949,14 @@ fn extract_app_icon_to_file(app_path: &Path, output_path: &Path) -> Option<Vec<u
 mod chat_defaults_patch_tests {
     use super::{apply_chat_defaults_patch, ChatDefaultsConfigPatch, ConfigResponse};
     use crate::storage::config::{ChatDefaultsConfig, Config};
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     /// Build a single-agent patch map.
     fn patch_for(
         agent: &str,
         p: ChatDefaultsConfigPatch,
-    ) -> HashMap<String, ChatDefaultsConfigPatch> {
-        let mut m = HashMap::new();
+    ) -> BTreeMap<String, ChatDefaultsConfigPatch> {
+        let mut m = BTreeMap::new();
         m.insert(agent.to_string(), p);
         m
     }

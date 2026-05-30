@@ -308,7 +308,7 @@ pub struct Config {
     /// map-of-tables (`[chat_defaults.<agent>]`) must come after all scalar
     /// fields in TOML.
     #[serde(default)]
-    pub chat_defaults: std::collections::HashMap<String, ChatDefaultsConfig>,
+    pub chat_defaults: std::collections::BTreeMap<String, ChatDefaultsConfig>,
 
     // ===== 向后兼容字段（反序列化时使用，序列化时跳过） =====
     #[serde(skip_serializing, default)]
