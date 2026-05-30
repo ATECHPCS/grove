@@ -4327,9 +4327,16 @@ export function TaskChat({
   //   agent.picker.show    → just open the picker, user chooses.
   useEffect(() => {
     const onDefault = () => {
-      const fallback =
-        chats[chats.length - 1]?.agent || "claude";
-      void handleNewChatWithAgent(fallback);
+      void (async () => {
+        // Prefer the configured default agent (acp.agent_command); fall back
+        // to the last-used agent, then "claude".
+        const cfg = await getConfig().catch(() => null);
+        const agent =
+          cfg?.acp?.agent_command ||
+          chats[chats.length - 1]?.agent ||
+          "claude";
+        await handleNewChatWithAgent(agent);
+      })();
     };
     const onPicker = () => {
       // Prefer the header button as anchor; fall back to the sidebar
