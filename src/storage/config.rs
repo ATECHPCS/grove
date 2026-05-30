@@ -282,6 +282,8 @@ pub struct Config {
     pub indexing: IndexingConfig,
     #[serde(default)]
     pub browser_control: BrowserControlConfig,
+    #[serde(default)]
+    pub chat_defaults: ChatDefaultsConfig,
 
     /// Storage layout version (None = legacy, "1.0" = task-centric layout)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,6 +311,20 @@ pub struct Config {
 
     #[serde(skip_serializing, default)]
     enabled_modes: Vec<String>,
+}
+
+/// Global default model/mode/thinking applied to new chats whose agent
+/// matches the default agent (`acp.agent_command`). All optional: `None`
+/// means "use the agent's own default". The default *agent* is NOT stored
+/// here — it is `acp.agent_command`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChatDefaultsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 /// Menubar tray + macOS notifications config. The two surfaces are
@@ -729,5 +745,34 @@ impl Config {
         } else {
             self.terminal_multiplexer.to_string()
         }
+    }
+}
+
+#[cfg(test)]
+mod chat_defaults_tests {
+    use super::*;
+
+    #[test]
+    fn chat_defaults_absent_deserializes_to_none() {
+        let toml_str = r#"
+            terminal_multiplexer = "tmux"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).expect("parse legacy config");
+        assert!(cfg.chat_defaults.model.is_none());
+        assert!(cfg.chat_defaults.mode.is_none());
+        assert!(cfg.chat_defaults.thinking.is_none());
+    }
+
+    #[test]
+    fn chat_defaults_round_trips() {
+        let mut cfg = Config::default();
+        cfg.chat_defaults.model = Some("opus".to_string());
+        cfg.chat_defaults.mode = Some("auto".to_string());
+        cfg.chat_defaults.thinking = Some("high".to_string());
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        let parsed: Config = toml::from_str(&serialized).expect("parse");
+        assert_eq!(parsed.chat_defaults.model.as_deref(), Some("opus"));
+        assert_eq!(parsed.chat_defaults.mode.as_deref(), Some("auto"));
+        assert_eq!(parsed.chat_defaults.thinking.as_deref(), Some("high"));
     }
 }
