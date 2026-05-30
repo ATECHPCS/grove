@@ -975,7 +975,7 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
               type="button"
               onClick={() => setGridMode((v) => !v)}
               aria-pressed={gridMode}
-              className={`relative flex items-center gap-1.5 px-2.5 py-1.5 text-xs border rounded-lg transition-colors ${
+              className={`relative flex items-center gap-1.5 px-2.5 py-1.5 text-xs border rounded-lg transition-colors whitespace-nowrap ${
                 gridMode
                   ? "text-[var(--color-highlight)] border-[var(--color-highlight)]/30 bg-[var(--color-highlight)]/10 hover:bg-[var(--color-highlight)]/20"
                   : "text-[var(--color-text-muted)] hover:text-[var(--color-text)] bg-[var(--color-bg-secondary)] hover:bg-[var(--color-bg-tertiary)] border-[var(--color-border)]"

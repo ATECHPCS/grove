@@ -29,6 +29,17 @@ export function GridSlot({ slotIdx, assignment, blitzTasks, onAssign, onClear }:
     setStale(false);
   }
 
+  // Track whether onConnected has ever fired for the current assignment.
+  // onDisconnected fires during initial WebSocket setup (before onConnected),
+  // so without this guard every fresh slot mount would flash "Connection lost".
+  // This ref is reset inside onConnected/onDisconnected by comparing against
+  // the stable assignment?.chatId captured at render time — no render-time
+  // ref writes needed, keeping the react-hooks/refs lint rule happy.
+  const wasConnectedRef = useRef<{ chatId: string | undefined; value: boolean }>({
+    chatId: assignment?.chatId,
+    value: false,
+  });
+
   const liveTask = useMemo(() => {
     if (!assignment) return null;
     return blitzTasks.find(
@@ -64,7 +75,7 @@ export function GridSlot({ slotIdx, assignment, blitzTasks, onAssign, onClear }:
 
   if (!liveTask) {
     return (
-      <div className="flex flex-col h-full border border-[var(--color-border)] rounded-md overflow-hidden opacity-60">
+      <div className="flex flex-col h-full min-h-0 min-w-0 border border-[var(--color-border)] rounded-md overflow-hidden opacity-60">
         {titleBar}
         <div className="flex-1 flex items-center justify-center text-sm text-[var(--color-text-muted)] bg-[var(--color-bg)]">
           Chat unavailable
@@ -74,7 +85,7 @@ export function GridSlot({ slotIdx, assignment, blitzTasks, onAssign, onClear }:
   }
 
   return (
-    <div className="flex flex-col h-full border border-[var(--color-border)] rounded-md overflow-hidden">
+    <div className="flex flex-col h-full min-h-0 min-w-0 border border-[var(--color-border)] rounded-md overflow-hidden">
       {titleBar}
       <div className="flex-1 overflow-hidden">
         {stale ? (
@@ -87,8 +98,21 @@ export function GridSlot({ slotIdx, assignment, blitzTasks, onAssign, onClear }:
             task={liveTask.task}
             pinnedChatId={assignment.chatId}
             hideHeader={true}
-            onDisconnected={() => setStale(true)}
-            onConnected={() => setStale(false)}
+            onConnected={() => {
+              wasConnectedRef.current = { chatId: assignment.chatId, value: true };
+              setStale(false);
+            }}
+            onDisconnected={() => {
+              // Only show stale if we've previously connected for *this* chat.
+              // If the chatId has changed since wasConnectedRef was last set,
+              // this is a stale closure and we ignore it.
+              if (
+                wasConnectedRef.current.chatId === assignment.chatId &&
+                wasConnectedRef.current.value
+              ) {
+                setStale(true);
+              }
+            }}
           />
         )}
       </div>

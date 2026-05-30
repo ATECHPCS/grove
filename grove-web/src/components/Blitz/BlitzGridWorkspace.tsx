@@ -53,7 +53,7 @@ export function BlitzGridWorkspace({ blitzTasks }: BlitzGridWorkspaceProps) {
     <div className="flex flex-col h-full bg-[var(--color-bg)]">
       <GridLayoutToolbar current={layout} onChange={requestLayoutChange} />
       <div
-        className="flex-1 grid gap-2 p-2 min-h-0"
+        className="flex-1 grid gap-2 p-2 min-h-0 min-w-0"
         style={{ gridTemplateColumns: tpl.columns, gridTemplateRows: tpl.rows }}
       >
         {assignments.map((assignment, i) => (
