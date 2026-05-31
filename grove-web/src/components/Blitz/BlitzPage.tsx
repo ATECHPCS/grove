@@ -1,6 +1,6 @@
 import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Search, ArrowLeft, ChevronRight, Laptop, Radio, Plus, Folder, LayoutGrid } from "lucide-react";
+import { Search, ArrowLeft, ChevronRight, ChevronLeft, Laptop, Radio, Plus, Folder, LayoutGrid } from "lucide-react";
 import { TaskInfoPanel } from "../Tasks/TaskInfoPanel";
 import { TaskView, type TaskViewHandle } from "../Tasks/TaskView";
 import { CommitDialog, ConfirmDialog, DirtyBranchDialog, MergeDialog } from "../Dialogs";
@@ -73,6 +73,10 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
   const [selectedBlitzTask, setSelectedBlitzTask] = useState<BlitzTask | null>(null);
   const [mobileShowDetail, setMobileShowDetail] = useState(false);
   const [gridMode, setGridMode] = useState(false);
+  // Desktop-only: collapse the Blitz task-list sidebar to a slim rail so the
+  // grid quadrants get the full width. Mirrors Zen's sidebar minimize; like
+  // Zen it's in-memory (resets on reload), not persisted.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   // ── Unified drag-and-drop state ──────────────────────────────────────────
   // Single ref tracks the drag source; render state tracks visual feedback
@@ -959,9 +963,34 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
         className={
           isMobile
             ? `${mobileShowDetail ? "hidden" : "w-full h-full"} bg-[var(--color-bg)] flex flex-col flex-shrink-0`
-            : "blitz-area glass-panel fixed top-3 bottom-3 left-3 w-72 z-40 rounded-2xl flex flex-col"
+            : `blitz-area glass-panel fixed top-3 bottom-3 left-3 z-40 rounded-2xl flex flex-col transition-[width] duration-200 ease-in-out ${
+                sidebarCollapsed ? "w-[72px]" : "w-72"
+              }`
         }
       >
+        {/* Collapsed rail (desktop): mirrors Zen's collapsed sidebar — the
+           drag strip up top, then the same bottom-pinned expand toggle (just a
+           ChevronRight, styled identically to Zen's Collapse button). Full
+           content is hidden while collapsed. */}
+        {!isMobile && sidebarCollapsed && (
+          <>
+            <div className="pt-8" data-tauri-drag-region data-window-drag-strip />
+            <div className="mt-auto px-2 pb-3">
+              <motion.button
+                whileHover={{ scale: 1.02 }}
+                whileTap={{ scale: 0.98 }}
+                onClick={() => setSidebarCollapsed(false)}
+                aria-label="Expand sidebar"
+                title="Expand sidebar"
+                className="w-full flex items-center justify-center gap-3 px-3 py-2.5 mt-1 rounded-xl text-sm font-medium text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-border)] transition-colors"
+              >
+                <ChevronRight className="w-4 h-4" />
+              </motion.button>
+            </div>
+          </>
+        )}
+        {(isMobile || !sidebarCollapsed) && (
+        <>
         {/* Logo + Mode Brand
            pt-8 clears macOS traffic lights when Tauri title bar is Overlay.
            data-tauri-drag-region gives double-click-maximize; data-window-drag-strip
@@ -1383,6 +1412,24 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
             Press <kbd className="px-1 py-0.5 text-[10px] font-mono rounded border bg-[var(--color-bg-secondary)] border-[var(--color-border)]">{helpKey}</kbd> for shortcuts
           </button>
         </div>
+
+        {/* Collapse toggle — same affordance as the Zen sidebar (bottom-pinned
+           "‹ Collapse" button) so the two modes feel continuous. Desktop only. */}
+        {!isMobile && (
+          <div className="px-2 pb-3">
+            <motion.button
+              whileHover={{ scale: 1.02 }}
+              whileTap={{ scale: 0.98 }}
+              onClick={() => setSidebarCollapsed(true)}
+              className="w-full flex items-center justify-center gap-3 px-3 py-2.5 mt-1 rounded-xl text-sm font-medium text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-border)] transition-colors"
+            >
+              <ChevronLeft className="w-4 h-4" />
+              <span className="flex-1 text-left">Collapse</span>
+            </motion.button>
+          </div>
+        )}
+        </>
+        )}
       </aside>
 
       {/* Main Content
@@ -1398,7 +1445,9 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
         className={
           isMobile
             ? `flex-1 overflow-hidden relative ${!mobileShowDetail ? "hidden" : ""}`
-            : "blitz-area flex-1 ml-[312px] mt-3 mr-3 mb-3 rounded-2xl bg-[var(--color-bg)] overflow-hidden relative"
+            : `blitz-area flex-1 mt-3 mr-3 mb-3 rounded-2xl bg-[var(--color-bg)] overflow-hidden relative transition-[margin] duration-200 ease-in-out ${
+                sidebarCollapsed ? "ml-[96px]" : "ml-[312px]"
+              }`
         }
         style={
           isMobile
