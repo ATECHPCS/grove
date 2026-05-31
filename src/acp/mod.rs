@@ -2549,11 +2549,36 @@ async fn drive_session(
                 saved_id
             }
             Err(load_err) => {
-                // Don't emit AcpUpdate::Error here — run_acp_session's caller
-                // already emits a single error message when this function returns
-                // Err(...). Double-emitting shows the user the same banner twice.
-                return Err(acp::Error::internal_error()
-                    .data(format!("Resume session failed: {}", load_err)));
+                let load_err_msg = format!("{}", load_err);
+                if is_definitive_resume_failure(&load_err_msg) {
+                    // Saved session is genuinely gone. Recover in place by starting
+                    // a fresh session instead of dead-ending the client (which would
+                    // force a full page refresh — Blitz Findings #3). Flag the handle
+                    // so the WS handler sends a one-time "reconnected" notice.
+                    eprintln!(
+                        "[ACP] resume failed for key {} ({}); recovering with a fresh session",
+                        handle.key, load_err_msg
+                    );
+                    handle
+                        .recovered
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    let new_id = create_new_session!(false);
+                    // Persist the fresh id so future reconnects resume IT, not the
+                    // dead one. Idempotent if the fresh path already wrote it.
+                    if let Some(ref cid) = handle.chat_id {
+                        let _ = crate::storage::tasks::update_chat_acp_session_id(
+                            &handle.project_key,
+                            &handle.task_id,
+                            cid,
+                            &new_id,
+                        );
+                    }
+                    new_id
+                } else {
+                    // Transient/transport/auth failure — keep existing behavior.
+                    return Err(acp::Error::internal_error()
+                        .data(format!("Resume session failed: {}", load_err)));
+                }
             }
         }
     } else {
