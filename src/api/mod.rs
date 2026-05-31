@@ -324,6 +324,7 @@ pub fn create_api_router() -> Router {
             "/projects/{id}/memory",
             get(handlers::projects::get_memory).put(handlers::projects::update_memory),
         )
+        .route("/dashboard", get(handlers::dashboard::get_dashboard))
         .route(
             "/statistics/global",
             get(handlers::statistics::get_global_statistics),
