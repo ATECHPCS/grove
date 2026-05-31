@@ -50,6 +50,14 @@ function BlitzChatPane({
 }) {
   const [stale, setStale] = useState(false);
   const hasConnectedRef = useRef(false);
+  // Locally-picked session, so the pane swaps to the chat the instant the user
+  // picks — flexlayout's Tab is memoized and won't re-invoke the factory on a
+  // config-only change (updateNodeAttributes), so we can't wait for cfg.chatId
+  // to propagate. onPickSession still persists it to the node config.
+  const [pickedChat, setPickedChat] = useState<{ id: string; name: string } | null>(null);
+
+  const chatId = cfg.chatId ?? pickedChat?.id;
+  const chatName = cfg.chatName ?? pickedChat?.name;
 
   const live = useMemo(
     () => blitzTasks.find((bt) => bt.projectId === cfg.projectId && bt.task.id === cfg.taskId),
@@ -57,7 +65,7 @@ function BlitzChatPane({
   );
 
   // A task dropped from the left list awaits a session pick.
-  if (cfg.needsSession || !cfg.chatId) {
+  if (!chatId) {
     if (!cfg.projectId || !cfg.taskId) {
       // Transient frame between tab creation and onDrop filling in the task.
       return (
@@ -71,7 +79,10 @@ function BlitzChatPane({
         projectId={cfg.projectId}
         taskId={cfg.taskId}
         taskName={cfg.taskName}
-        onPick={onPickSession}
+        onPick={(chat) => {
+          setPickedChat(chat); // instant local swap
+          onPickSession(chat); // persist to node config
+        }}
         onCancel={onCancel}
       />
     );
@@ -94,13 +105,13 @@ function BlitzChatPane({
         <span className="shrink-0 text-[var(--color-text-muted)]">·</span>
         <span className="truncate min-w-0 text-[var(--color-text)]">{cfg.taskName}</span>
         <span className="shrink-0 text-[var(--color-text-muted)]">·</span>
-        <span className="truncate min-w-0 text-[var(--color-highlight)]">{cfg.chatName}</span>
+        <span className="truncate min-w-0 text-[var(--color-highlight)]">{chatName}</span>
       </div>
       <div className="relative flex flex-1 min-h-0 min-w-0 overflow-hidden">
         <TaskChat
           projectId={live.projectId}
           task={live.task}
-          pinnedChatId={cfg.chatId}
+          pinnedChatId={chatId}
           hideHeader={true}
           onConnected={() => {
             hasConnectedRef.current = true;
