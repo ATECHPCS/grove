@@ -61,27 +61,38 @@ function BlitzChatPane({ cfg, blitzTasks }: { cfg: BlitzTabConfig; blitzTasks: B
   }
 
   return (
-    <div className="relative flex h-full w-full min-h-0 min-w-0 overflow-hidden">
-      <TaskChat
-        projectId={live.projectId}
-        task={live.task}
-        pinnedChatId={cfg.chatId}
-        hideHeader={true}
-        onConnected={() => {
-          hasConnectedRef.current = true;
-          setStale(false);
-        }}
-        onDisconnected={() => {
-          // Only flag stale after a successful connect — the initial WS setup
-          // fires onDisconnected before onConnected.
-          if (hasConnectedRef.current) setStale(true);
-        }}
-      />
-      {stale && (
-        <div className="absolute inset-0 z-10 flex items-center justify-center bg-[var(--color-bg)]/80 text-sm text-[var(--color-text-muted)] pointer-events-none">
-          Connection lost — reconnecting automatically…
-        </div>
-      )}
+    <div className="flex flex-col h-full w-full min-h-0 min-w-0 overflow-hidden">
+      {/* Context breadcrumb — which project · task · chat this panel is, since
+          the tab only shows the chat name and several panels coexist. */}
+      <div className="flex items-center gap-1 shrink-0 px-2.5 py-1 text-[11px] leading-none border-b border-[var(--color-border)] bg-[var(--color-bg-secondary)] overflow-hidden">
+        <span className="shrink-0 text-[var(--color-text-muted)]">{cfg.projectName}</span>
+        <span className="shrink-0 text-[var(--color-text-muted)]">·</span>
+        <span className="truncate min-w-0 text-[var(--color-text)]">{cfg.taskName}</span>
+        <span className="shrink-0 text-[var(--color-text-muted)]">·</span>
+        <span className="truncate min-w-0 text-[var(--color-highlight)]">{cfg.chatName}</span>
+      </div>
+      <div className="relative flex flex-1 min-h-0 min-w-0 overflow-hidden">
+        <TaskChat
+          projectId={live.projectId}
+          task={live.task}
+          pinnedChatId={cfg.chatId}
+          hideHeader={true}
+          onConnected={() => {
+            hasConnectedRef.current = true;
+            setStale(false);
+          }}
+          onDisconnected={() => {
+            // Only flag stale after a successful connect — the initial WS setup
+            // fires onDisconnected before onConnected.
+            if (hasConnectedRef.current) setStale(true);
+          }}
+        />
+        {stale && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center bg-[var(--color-bg)]/80 text-sm text-[var(--color-text-muted)] pointer-events-none">
+            Connection lost — reconnecting automatically…
+          </div>
+        )}
+      </div>
     </div>
   );
 }
