@@ -21,7 +21,7 @@ import {
 import { useCommand, useDefineCommand, useKeyboardScope, useContextKey, useHelpKeyDisplay } from "../../keyboard";
 import { RadioConnectDialog } from "./RadioConnectDialog";
 import { useBlitzTasks } from "./useBlitzTasks";
-import { BlitzGridWorkspace } from "./BlitzGridWorkspace";
+import { BlitzFlexWorkspace } from "./BlitzFlexWorkspace";
 import { BlitzTaskListItem } from "./BlitzTaskListItem";
 import type { BlitzTask } from "../../data/types";
 import { MAIN_GROUP_ID, LOCAL_GROUP_ID } from "../../data/types";
@@ -1478,7 +1478,7 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
            has). */}
         <div className="h-full relative p-2">
           {gridMode ? (
-            <BlitzGridWorkspace blitzTasks={blitzTasks} />
+            <BlitzFlexWorkspace blitzTasks={blitzTasks} />
           ) : (
           <div className="h-full relative">
             {/* Task List Page */}
