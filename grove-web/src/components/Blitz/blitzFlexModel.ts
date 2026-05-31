@@ -69,6 +69,51 @@ function tabSetWith(cfg: BlitzTabConfig): IJsonTabSetNode {
   return { type: "tabset", weight: 100, children: [tabNodeFor(cfg)] };
 }
 
+/** Like tabNodeFor but preserves an existing tab id (used when re-tiling so
+ *  panels keep their identity and chats don't remount/reconnect). */
+function tabNodeWithId(id: string, cfg: BlitzTabConfig): IJsonTabNode {
+  return {
+    type: "tab",
+    id,
+    name: cfg.chatName || cfg.taskName,
+    component: BLITZ_TAB_COMPONENT,
+    config: cfg,
+    enableClose: true,
+  };
+}
+
+/** A currently-open tab: its FlexLayout-generated id + pinned-chat config. */
+export interface OpenTab {
+  id: string;
+  config: BlitzTabConfig;
+}
+
+/**
+ * Rebuild the model laying the given tabs into `cols` balanced columns
+ * (round-robin so columns stay even), equal weights throughout. Each tab keeps
+ * its existing id, so swapping to this model reconciles the panels rather than
+ * remounting them — pinned chats stay connected across a re-tile.
+ */
+export function buildColumnsModelJson(tabs: OpenTab[], cols: number): IJsonModel {
+  if (tabs.length === 0) return emptyModel();
+  const colCount = Math.max(1, Math.min(cols, tabs.length));
+  const columns: OpenTab[][] = Array.from({ length: colCount }, () => []);
+  tabs.forEach((t, i) => columns[i % colCount].push(t));
+  const children = columns
+    .filter((col) => col.length > 0)
+    .map((col) => {
+      const tabsets: IJsonTabSetNode[] = col.map((t) => ({
+        type: "tabset",
+        weight: 100,
+        children: [tabNodeWithId(t.id, t.config)],
+      }));
+      return tabsets.length === 1
+        ? tabsets[0]
+        : ({ type: "row", weight: 100, children: tabsets } as IJsonRowNode);
+    });
+  return { global: GLOBAL, borders: [], layout: { type: "row", weight: 100, children } };
+}
+
 /** Columns × rows for each legacy preset. */
 function shapeFor(layout: GridLayout): { cols: number; rows: number } {
   switch (layout) {

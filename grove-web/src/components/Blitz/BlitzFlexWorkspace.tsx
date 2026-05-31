@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { Layout, Model, Actions, DockLocation, TabNode } from "flexlayout-react";
-import { Plus } from "lucide-react";
+import { Plus, AlignHorizontalSpaceAround } from "lucide-react";
 import "flexlayout-react/style/light.css";
 import "../Tasks/PanelSystem/flexlayout-theme.css";
 import { TaskChat } from "../Tasks/TaskView/TaskChat";
@@ -9,10 +9,20 @@ import type { BlitzTask } from "../../data/types";
 import type { SlotAssignment } from "./useBlitzGrid";
 import {
   type BlitzTabConfig,
+  type OpenTab,
+  buildColumnsModelJson,
   createInitialModel,
   persistModelJson,
   tabNodeFor,
 } from "./blitzFlexModel";
+
+/** Grid presets: label → number of columns to tile open chats into. */
+const GRID_PRESETS: ReadonlyArray<{ label: string; cols: number; title: string }> = [
+  { label: "1", cols: 1, title: "Single column" },
+  { label: "2", cols: 2, title: "Two columns" },
+  { label: "2×2", cols: 2, title: "Two columns (2×2 with four chats)" },
+  { label: "3×2", cols: 3, title: "Three columns (3×2 with six chats)" },
+];
 
 interface BlitzFlexWorkspaceProps {
   blitzTasks: BlitzTask[];
@@ -91,9 +101,50 @@ function countTabs(m: Model): number {
  * localStorage; existing preset grids migrate in on first load.
  */
 export function BlitzFlexWorkspace({ blitzTasks }: BlitzFlexWorkspaceProps) {
-  const [model] = useState(() => createInitialModel());
+  const [model, setModel] = useState(() => createInitialModel());
   const [isEmpty, setIsEmpty] = useState(() => countTabs(model) === 0);
   const [pickerOpen, setPickerOpen] = useState(false);
+
+  const collectTabs = useCallback((): OpenTab[] => {
+    const tabs: OpenTab[] = [];
+    model.visitNodes((node) => {
+      if (node.getType() === "tab") {
+        tabs.push({ id: node.getId(), config: (node as TabNode).getConfig() as BlitzTabConfig });
+      }
+    });
+    return tabs;
+  }, [model]);
+
+  // Reset every panel to equal size in place (no reshape, no remount → chats
+  // stay connected). adjustWeights on each multi-child row evens columns and,
+  // via nested rows, the stacked panels within them.
+  const equalize = useCallback(() => {
+    const rows: Array<{ id: string; count: number }> = [];
+    model.visitNodes((node) => {
+      if (node.getType() === "row") {
+        const count = node.getChildren().length;
+        if (count > 1) rows.push({ id: node.getId(), count });
+      }
+    });
+    rows.forEach(({ id, count }) =>
+      model.doAction(Actions.adjustWeights(id, new Array(count).fill(100))),
+    );
+  }, [model]);
+
+  // Snap open chats into an even grid of `cols` columns (the optional
+  // "auto grid"). Tab ids are preserved so panels reconcile instead of
+  // remounting — connections survive the re-tile.
+  const tileColumns = useCallback(
+    (cols: number) => {
+      const tabs = collectTabs();
+      if (tabs.length === 0) return;
+      const json = buildColumnsModelJson(tabs, cols);
+      setModel(Model.fromJson(json));
+      persistModelJson(json);
+      setIsEmpty(false);
+    },
+    [collectTabs],
+  );
 
   const factory = useCallback(
     (node: TabNode) => <BlitzChatPane cfg={node.getConfig() as BlitzTabConfig} blitzTasks={blitzTasks} />,
@@ -138,10 +189,36 @@ export function BlitzFlexWorkspace({ blitzTasks }: BlitzFlexWorkspaceProps) {
 
   return (
     <div className="flex flex-col h-full bg-[var(--color-bg)]">
-      <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--color-border)]">
-        <span className="text-xs text-[var(--color-text-muted)]">
-          Workspace · drag tabs to rearrange, drag edges to resize
-        </span>
+      <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-[var(--color-border)]">
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={equalize}
+            disabled={isEmpty}
+            title="Reset all panel sizes to equal"
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-lg border border-[var(--color-border)] text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] disabled:opacity-40 disabled:pointer-events-none transition-colors"
+          >
+            <AlignHorizontalSpaceAround className="w-3.5 h-3.5" />
+            Equalize
+          </button>
+          <div className="flex items-center rounded-lg border border-[var(--color-border)] overflow-hidden text-xs">
+            <span className="px-2 py-1.5 text-[var(--color-text-muted)] border-r border-[var(--color-border)]">
+              Grid
+            </span>
+            {GRID_PRESETS.map((p) => (
+              <button
+                key={p.label}
+                type="button"
+                onClick={() => tileColumns(p.cols)}
+                disabled={isEmpty}
+                title={p.title}
+                className="px-2.5 py-1.5 text-[var(--color-text-muted)] hover:text-[var(--color-highlight)] hover:bg-[var(--color-highlight)]/10 disabled:opacity-40 disabled:pointer-events-none transition-colors border-l border-[var(--color-border)] first:border-l-0"
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+        </div>
         <div className="relative">
           <button
             type="button"
