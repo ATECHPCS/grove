@@ -3813,6 +3813,17 @@ export function TaskChat({
           }
           setForkCapable(!!msg.fork_capable);
           break;
+        case "session_recovered":
+          // Server auto-started a fresh agent after the saved session was gone
+          // (Blitz Findings #3). Surface a subtle, non-blocking system notice.
+          setMessages((prev) =>
+            appendSystemMessage(
+              prev,
+              msg.reason ||
+                "Previous session expired — reconnected with a fresh agent.",
+            ),
+          );
+          break;
         case "message_chunk":
           // Auto-close the current tool section (one-time)
           setAutoExpandSectionId((prev) => {
