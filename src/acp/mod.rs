@@ -58,6 +58,10 @@ pub struct AcpSessionHandle {
     chat_id: Option<String>,
     /// load_session 期间抑制 emit（只恢复 agent 内部状态，不转发回放通知）
     suppress_emit: std::sync::atomic::AtomicBool,
+    /// Set true when this session was auto-started after a saved-session resume
+    /// failed (the saved id was dead). The WS handler reads-and-clears it on
+    /// connect to send a one-time `SessionRecovered` notice. (Blitz Findings #3)
+    pub recovered: std::sync::atomic::AtomicBool,
     /// 待执行消息队列（agent 完成当前任务后自动发送下一条）
     pending_queue: Mutex<Vec<QueuedMessage>>,
     /// 队列暂停标志（用户正在编辑队列消息时暂停 auto-send）
@@ -1614,6 +1618,7 @@ pub async fn get_or_start_session(
                     task_id: config.task_id.clone(),
                     chat_id: config.chat_id.clone(),
                     suppress_emit: std::sync::atomic::AtomicBool::new(false),
+                    recovered: std::sync::atomic::AtomicBool::new(false),
                     pending_queue: Mutex::new(Vec::new()),
                     queue_paused: std::sync::atomic::AtomicBool::new(false),
                     current_mode_id: Mutex::new(None),
@@ -4021,6 +4026,7 @@ pub fn new_handle_for_test(
         task_id: task_id.to_string(),
         chat_id: Some(chat_id.to_string()),
         suppress_emit: std::sync::atomic::AtomicBool::new(false),
+        recovered: std::sync::atomic::AtomicBool::new(false),
         pending_queue: Mutex::new(Vec::new()),
         queue_paused: std::sync::atomic::AtomicBool::new(false),
         current_mode_id: Mutex::new(None),
