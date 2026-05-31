@@ -2,7 +2,7 @@ import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { MessageSquare, CheckCircle, RotateCcw, Reply, Send, FileCode, ChevronDown, ChevronRight, Trash2, Maximize2 } from 'lucide-react';
 import type { ReviewCommentEntry } from '../../api/tasks';
 import { AgentAvatar } from './AgentAvatar';
-import { formatAgentDisplay } from './agentDisplay';
+import { AgentDisplay } from './agentDisplay';
 import { CommentDetailModal } from './CommentDetailModal';
 import { useFileMention } from '../../hooks';
 import { FileMentionDropdown } from '../ui';
@@ -464,7 +464,7 @@ function ConversationItem({
     <div className="conv-item" onClick={onClick}>
       <div className="conv-item-header">
         <AgentAvatar agent={comment.agent} size={18} className="conv-item-avatar" />
-        <span className="conv-item-author">{formatAgentDisplay(comment.agent, comment.role, comment.model)}</span>
+        <span className="conv-item-author"><AgentDisplay agent={comment.agent} role={comment.role} model={comment.model} /></span>
         <span className="conv-item-meta" style={{ opacity: 0.6 }}>#{comment.id}</span>
         {locationLabel && <span className="conv-item-meta">{locationLabel}</span>}
         <span
@@ -497,7 +497,7 @@ function ConversationItem({
             return (
               <div key={reply.id} className="conv-item-reply">
                 <AgentAvatar agent={reply.agent} size={14} />
-                <span className="conv-item-reply-author">{formatAgentDisplay(reply.agent, reply.role, reply.model)}</span>
+                <span className="conv-item-reply-author"><AgentDisplay agent={reply.agent} role={reply.role} model={reply.model} /></span>
                 <span className="conv-item-reply-text">{truncatedReply}</span>
               </div>
             );
