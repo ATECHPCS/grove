@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Folder, GitBranch, ChevronUp, Home as HomeIcon, Check, X } from "lucide-react";
+import { Folder, GitBranch, ChevronUp, ChevronRight, Home as HomeIcon, Check, X } from "lucide-react";
 import { Button, DialogShell } from "../ui";
 import { listFolder, type ListFolderResponse } from "../../api/projects";
 
@@ -112,9 +112,11 @@ export function FolderTreePickerDialog({
     });
   }
 
+  const currentName = crumbs.length ? crumbs[crumbs.length - 1].label : "";
+
   return (
     <DialogShell isOpen={isOpen} onClose={onClose} maxWidth="max-w-2xl">
-      <div className="bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-xl shadow-xl overflow-hidden w-full max-w-[95vw]">
+      <div className="glass-overlay rounded-2xl overflow-hidden w-full max-w-[95vw]">
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-[var(--color-border)]">
           <h2 className="text-lg font-semibold text-[var(--color-text)]">{title}</h2>
@@ -150,15 +152,16 @@ export function FolderTreePickerDialog({
             >
               <HomeIcon className="w-4 h-4 mr-1" /> Home
             </Button>
-            <div className="flex-1 overflow-x-auto text-xs text-[var(--color-text-muted)] whitespace-nowrap">
+            <div className="flex-1 flex items-center gap-0.5 overflow-x-auto text-xs text-[var(--color-text-muted)] whitespace-nowrap">
               {crumbs.map((c, i) => (
-                <span key={c.path || sep}>
-                  {i > 0 && <span className="mx-1">{sep}</span>}
+                <span key={c.path || sep} className="flex items-center gap-0.5 shrink-0">
+                  {i > 0 && <ChevronRight className="w-3 h-3 opacity-40 shrink-0" />}
                   <button
                     type="button"
-                    className="hover:underline hover:text-[var(--color-text)] disabled:opacity-50"
+                    className="px-1.5 py-0.5 rounded-md hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)] disabled:opacity-50 transition-colors"
                     onClick={() => void load(c.path || sep)}
                     disabled={loading}
+                    title={c.path}
                   >
                     {c.label}
                   </button>
@@ -168,7 +171,10 @@ export function FolderTreePickerDialog({
           </div>
 
           {/* List */}
-          <div className="border border-[var(--color-border)] rounded-md max-h-80 overflow-y-auto bg-[var(--color-bg)]">
+          <div
+            className="rounded-lg max-h-80 overflow-y-auto border border-[var(--color-border)] p-1"
+            style={{ background: "color-mix(in oklab, var(--color-bg) 55%, transparent)" }}
+          >
             {loading && (
               <div className="p-4 text-sm text-[var(--color-text-muted)]">Loading…</div>
             )}
@@ -189,22 +195,25 @@ export function FolderTreePickerDialog({
                   type="button"
                   onClick={() => void load(e.path)}
                   disabled={loading}
-                  className="w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-[var(--color-bg-tertiary)] border-b border-[var(--color-border)] last:border-b-0 text-sm text-[var(--color-text)] disabled:opacity-50"
+                  className="group w-full text-left px-2.5 py-2 flex items-center gap-2.5 rounded-md hover:bg-[var(--color-bg-tertiary)] text-sm text-[var(--color-text)] disabled:opacity-50 transition-colors"
                 >
-                  <Folder className="w-4 h-4 text-[var(--color-text-muted)] shrink-0" />
+                  <Folder
+                    className={`w-4 h-4 shrink-0 ${e.is_git_repo ? "text-[var(--color-highlight)]" : "text-[var(--color-text-muted)]"}`}
+                  />
                   <span className="flex-1 truncate">{e.name}</span>
                   {e.is_git_repo && (
-                    <span className="text-xs text-[var(--color-highlight)] flex items-center gap-1 shrink-0">
+                    <span className="text-[10px] font-medium uppercase tracking-wide text-[var(--color-highlight)] flex items-center gap-1 shrink-0">
                       <GitBranch className="w-3 h-3" /> git
                     </span>
                   )}
+                  <ChevronRight className="w-4 h-4 text-[var(--color-text-muted)] opacity-0 group-hover:opacity-60 shrink-0 transition-opacity" />
                 </button>
               ))}
           </div>
         </div>
 
         {/* Footer */}
-        <div className="flex justify-end gap-2 px-5 py-4 bg-[var(--color-bg)] border-t border-[var(--color-border)]">
+        <div className="flex justify-end gap-2 px-5 py-4 border-t border-[var(--color-border)]">
           <Button variant="secondary" onClick={onClose} type="button">
             Cancel
           </Button>
@@ -215,7 +224,7 @@ export function FolderTreePickerDialog({
             type="button"
           >
             <Check className="w-4 h-4 mr-1" />
-            Select this folder
+            {currentName ? `Select “${currentName}”` : "Select this folder"}
           </Button>
         </div>
       </div>
