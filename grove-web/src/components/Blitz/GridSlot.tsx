@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { X } from "lucide-react";
-import { TaskChat, type WsCloseInfo } from "../Tasks/TaskView/TaskChat";
+import { TaskChat } from "../Tasks/TaskView/TaskChat";
 import type { BlitzTask } from "../../data/types";
 import { EmptyGridSlot } from "./EmptyGridSlot";
 import type { SlotAssignment } from "./useBlitzGrid";
@@ -15,10 +15,6 @@ interface GridSlotProps {
 
 export function GridSlot({ slotIdx, assignment, blitzTasks, onAssign, onClear }: GridSlotProps) {
   const [stale, setStale] = useState(false);
-  // TEMPORARY (bug #3 instrumentation): last WS close details for this slot,
-  // shown in the stale overlay so the close code/reason is visible on the
-  // pilot without devtools. Remove with the rest of the WS diagnostics.
-  const [staleInfo, setStaleInfo] = useState<WsCloseInfo | null>(null);
 
   // Reset stale when the slot's chat identity changes (clear → reassign).
   // Without this, the prior chat's disconnect would leak into the new one's
@@ -31,7 +27,6 @@ export function GridSlot({ slotIdx, assignment, blitzTasks, onAssign, onClear }:
   if (prevChatIdRef.current !== assignment?.chatId) {
     prevChatIdRef.current = assignment?.chatId;
     setStale(false);
-    setStaleInfo(null);
   }
 
   // Track whether onConnected has ever fired for the current assignment.
@@ -97,19 +92,8 @@ export function GridSlot({ slotIdx, assignment, blitzTasks, onAssign, onClear }:
           only the title bar + composer are visible. */}
       <div className="flex-1 flex min-h-0 min-w-0 overflow-hidden">
         {stale ? (
-          <div className="h-full flex flex-col gap-2 items-center justify-center text-sm text-[var(--color-text-muted)] px-3 text-center">
-            <div>Connection lost — click the slot's clear button and reassign to retry.</div>
-            {staleInfo && (
-              // TEMPORARY (bug #3): close diagnostics. `code` is the decisive
-              // signal — 1006=abnormal/proxy-or-network, 1011=server error,
-              // 1001=going-away/idle, 1000=clean app close.
-              <div className="text-xs font-mono text-[var(--color-text-muted)] opacity-80">
-                close code {staleInfo.code}
-                {staleInfo.reason ? ` · "${staleInfo.reason}"` : ""}
-                {` · ${staleInfo.wasClean ? "clean" : "unclean"}`}
-                {` · ${staleInfo.clientInitiated ? "client-initiated" : "server/network"}`}
-              </div>
-            )}
+          <div className="h-full flex items-center justify-center text-sm text-[var(--color-text-muted)]">
+            Connection lost — click the slot's clear button and reassign to retry.
           </div>
         ) : (
           <TaskChat
@@ -120,9 +104,8 @@ export function GridSlot({ slotIdx, assignment, blitzTasks, onAssign, onClear }:
             onConnected={() => {
               wasConnectedRef.current = { chatId: assignment.chatId, value: true };
               setStale(false);
-              setStaleInfo(null);
             }}
-            onDisconnected={(info) => {
+            onDisconnected={() => {
               // Only show stale if we've previously connected for *this* chat.
               // If the chatId has changed since wasConnectedRef was last set,
               // this is a stale closure and we ignore it.
@@ -131,7 +114,6 @@ export function GridSlot({ slotIdx, assignment, blitzTasks, onAssign, onClear }:
                 wasConnectedRef.current.value
               ) {
                 setStale(true);
-                setStaleInfo(info ?? null);
               }
             }}
           />
