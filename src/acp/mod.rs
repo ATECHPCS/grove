@@ -1509,6 +1509,20 @@ fn append_terminal_output(
     }
 }
 
+/// True when a `LoadSession` (resume) error means the saved session is
+/// genuinely, permanently gone — vs a transient/transport failure. Substring
+/// match mirrors the frontend detection in `TaskChat.tsx` ("Resume session
+/// failed"). Used to decide whether to auto-recover with a fresh session
+/// (Blitz Findings #3).
+pub fn is_definitive_resume_failure(msg: &str) -> bool {
+    const MARKERS: [&str; 3] = [
+        "Resume session failed",
+        "No previous sessions found",
+        "Resource not found",
+    ];
+    MARKERS.iter().any(|m| msg.contains(m))
+}
+
 /// 获取已存在的 ACP 会话，或启动一个新的
 ///
 /// 如果 session key 已存在，复用现有会话（返回新的 broadcast subscriber）。
@@ -5237,5 +5251,26 @@ mod tests {
             "nonexistent:key",
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn definitive_resume_failures_are_recognized() {
+        assert!(is_definitive_resume_failure(
+            "Resume session failed: whatever"
+        ));
+        assert!(is_definitive_resume_failure(
+            "Internal error: { \"details\": \"No previous sessions found for this project.\" }"
+        ));
+        assert!(is_definitive_resume_failure(
+            "Resource not found: 62514d49-7b46-476c-ba27-17572a68e7e6"
+        ));
+    }
+
+    #[test]
+    fn transient_failures_are_not_definitive() {
+        assert!(!is_definitive_resume_failure("connection reset by peer"));
+        assert!(!is_definitive_resume_failure("Authentication required"));
+        assert!(!is_definitive_resume_failure("timed out waiting for agent"));
+        assert!(!is_definitive_resume_failure(""));
     }
 }
