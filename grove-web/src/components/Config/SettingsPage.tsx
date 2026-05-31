@@ -1344,11 +1344,13 @@ env_vars = [
                       allowCustom={false}
                       options={[
                         // No-selection sentinel; must not collide with a real
-                        // capability id (extremely unlikely).
-                        { id: "__default__", label: "Default", value: "" },
+                        // capability id (extremely unlikely). Labeled distinctly
+                        // from the agent's own "Default (recommended)" model so the
+                        // two don't read as duplicate "Default" rows.
+                        { id: "__default__", label: "Use agent default", value: "" },
                         ...f.opts.map(([id, name]) => ({ id, label: name, value: id })),
                       ]}
-                      placeholder="Default"
+                      placeholder="Use agent default"
                     />
                   ) : (
                     <div className="h-10 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-3 flex items-center text-xs text-[var(--color-text-muted)]">
