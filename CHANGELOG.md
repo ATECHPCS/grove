@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.2] - 2026-05-31
+
+### Added
+
+- **Web-based folder picker with native fallback** — New `FolderTreePickerDialog` lets you browse and pick a folder from the web/GUI surface when the native OS picker is unavailable, backed by a `/api/v1/folders/list` endpoint and a `listFolder` API client. Mode-based dispatch chooses native vs in-app picker, with cross-platform path handling. The dialog is restyled with the liquid-glass chrome to match the rest of the window.
+- **Configurable keyboard shortcut system** — A scoped command registry powers a configurable, context-aware shortcut system: commands are gated by scope (palette, editor, file preview, etc.), the ⌘K palette toggle and exclusivity are formalized, and a help overlay surfaces the active shortcut hints. Includes a file-preview proof-of-concept consumer of the registry.
+- **Code Review: hide viewed files + auto-saving reviewed state** — File-tree sidebar can hide files you've already viewed; reviewed state auto-saves statelessly and the view jumps to the first unviewed file on open. You can also send a Code Review comment straight into the active agent's chat session. Each agent's model now renders as a dimmed subtitle.
+- **Interactive CLI auto-update prompt at startup** — CLI installs prompt to self-update at startup instead of silently lagging behind the latest release.
+
+### Improved
+
+- **ACP upgraded to 0.12 with resume / delete / close** — Session lifecycle gains explicit resume, delete, and close operations; fixes a double-replay on `traecli` history load.
+- **Fuzzy matching prioritizes consecutive matches and shorter paths** — File/command fuzzy search ranks consecutive character matches and shorter path lengths higher, surfacing the intended target sooner.
+- **Zoom controls, responsive toolbar, and autocomplete key handling** — Refined zoom controls, a toolbar that adapts to width, and corrected autocomplete key-event propagation.
+
+### Fixed
+
+- **Unmodified navigation/editing keys no longer leak out of focused inputs** — Keys like j/k and editing keystrokes are suppressed from global navigation handlers while an input is focused, so typing in a field doesn't trigger task navigation.
+- **Terminal streaming UTF-8 splits and resize lag** — Multi-byte UTF-8 characters split across stream chunks no longer corrupt terminal output, and layout resize lag on the terminal is resolved.
+- **Combined review feedback addressed** — Folds in fixes from loop-review, superpowers, and codex review passes, including folder-picker review feedback.
+- **Non-macOS build warning silenced** — Unused `main_window` warning on non-macOS GUI builds removed.
+
 ## [0.11.1] - 2026-05-28
 
 ### Added
