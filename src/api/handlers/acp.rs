@@ -601,6 +601,21 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
         }
     };
 
+    // Blitz Findings #3: if the session was auto-recovered from a dead saved id,
+    // tell the client exactly once so it can show a "reconnected" notice. swap()
+    // clears the flag so a later reattach by another client doesn't re-notify.
+    if handle
+        .recovered
+        .swap(false, std::sync::atomic::Ordering::Relaxed)
+    {
+        let msg = ServerMessage::SessionRecovered {
+            reason: "Previous session expired — reconnected with a fresh agent.".to_string(),
+        };
+        if let Ok(json) = serde_json::to_string(&msg) {
+            let _ = ws_sender.send(Message::Text(json.into())).await;
+        }
+    }
+
     // For existing sessions, construct SessionReady from metadata so frontend can interact.
     // History is already loaded via HTTP.
     if is_existing {
