@@ -58,6 +58,10 @@ pub struct AcpSessionHandle {
     chat_id: Option<String>,
     /// load_session 期间抑制 emit（只恢复 agent 内部状态，不转发回放通知）
     suppress_emit: std::sync::atomic::AtomicBool,
+    /// Set true when this session was auto-started after a saved-session resume
+    /// failed (the saved id was dead). The WS handler reads-and-clears it on
+    /// connect to send a one-time `SessionRecovered` notice. (Blitz Findings #3)
+    pub recovered: std::sync::atomic::AtomicBool,
     /// 待执行消息队列（agent 完成当前任务后自动发送下一条）
     pending_queue: Mutex<Vec<QueuedMessage>>,
     /// 队列暂停标志（用户正在编辑队列消息时暂停 auto-send）
@@ -1509,6 +1513,20 @@ fn append_terminal_output(
     }
 }
 
+/// True when a `LoadSession` (resume) error means the saved session is
+/// genuinely, permanently gone — vs a transient/transport failure. Substring
+/// match mirrors the frontend detection in `TaskChat.tsx` ("Resume session
+/// failed"). Used to decide whether to auto-recover with a fresh session
+/// (Blitz Findings #3).
+pub fn is_definitive_resume_failure(msg: &str) -> bool {
+    const MARKERS: [&str; 3] = [
+        "Resume session failed",
+        "No previous sessions found",
+        "Resource not found",
+    ];
+    MARKERS.iter().any(|m| msg.contains(m))
+}
+
 /// 获取已存在的 ACP 会话，或启动一个新的
 ///
 /// 如果 session key 已存在，复用现有会话（返回新的 broadcast subscriber）。
@@ -1600,6 +1618,7 @@ pub async fn get_or_start_session(
                     task_id: config.task_id.clone(),
                     chat_id: config.chat_id.clone(),
                     suppress_emit: std::sync::atomic::AtomicBool::new(false),
+                    recovered: std::sync::atomic::AtomicBool::new(false),
                     pending_queue: Mutex::new(Vec::new()),
                     queue_paused: std::sync::atomic::AtomicBool::new(false),
                     current_mode_id: Mutex::new(None),
@@ -2530,11 +2549,36 @@ async fn drive_session(
                 saved_id
             }
             Err(load_err) => {
-                // Don't emit AcpUpdate::Error here — run_acp_session's caller
-                // already emits a single error message when this function returns
-                // Err(...). Double-emitting shows the user the same banner twice.
-                return Err(acp::Error::internal_error()
-                    .data(format!("Resume session failed: {}", load_err)));
+                let load_err_msg = format!("{}", load_err);
+                if is_definitive_resume_failure(&load_err_msg) {
+                    // Saved session is genuinely gone. Recover in place by starting
+                    // a fresh session instead of dead-ending the client (which would
+                    // force a full page refresh — Blitz Findings #3). Flag the handle
+                    // so the WS handler sends a one-time "reconnected" notice.
+                    eprintln!(
+                        "[ACP] resume failed for key {} ({}); recovering with a fresh session",
+                        handle.key, load_err_msg
+                    );
+                    handle
+                        .recovered
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    let new_id = create_new_session!(false);
+                    // Persist the fresh id so future reconnects resume IT, not the
+                    // dead one. Idempotent if the fresh path already wrote it.
+                    if let Some(ref cid) = handle.chat_id {
+                        let _ = crate::storage::tasks::update_chat_acp_session_id(
+                            &handle.project_key,
+                            &handle.task_id,
+                            cid,
+                            &new_id,
+                        );
+                    }
+                    new_id
+                } else {
+                    // Transient/transport/auth failure — keep existing behavior.
+                    return Err(acp::Error::internal_error()
+                        .data(format!("Resume session failed: {}", load_err)));
+                }
             }
         }
     } else {
@@ -4047,6 +4091,7 @@ pub fn new_handle_for_test(
         task_id: task_id.to_string(),
         chat_id: Some(chat_id.to_string()),
         suppress_emit: std::sync::atomic::AtomicBool::new(false),
+        recovered: std::sync::atomic::AtomicBool::new(false),
         pending_queue: Mutex::new(Vec::new()),
         queue_paused: std::sync::atomic::AtomicBool::new(false),
         current_mode_id: Mutex::new(None),
@@ -5277,5 +5322,26 @@ mod tests {
             "nonexistent:key",
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn definitive_resume_failures_are_recognized() {
+        assert!(is_definitive_resume_failure(
+            "Resume session failed: whatever"
+        ));
+        assert!(is_definitive_resume_failure(
+            "Internal error: { \"details\": \"No previous sessions found for this project.\" }"
+        ));
+        assert!(is_definitive_resume_failure(
+            "Resource not found: 62514d49-7b46-476c-ba27-17572a68e7e6"
+        ));
+    }
+
+    #[test]
+    fn transient_failures_are_not_definitive() {
+        assert!(!is_definitive_resume_failure("connection reset by peer"));
+        assert!(!is_definitive_resume_failure("Authentication required"));
+        assert!(!is_definitive_resume_failure("timed out waiting for agent"));
+        assert!(!is_definitive_resume_failure(""));
     }
 }
