@@ -34,6 +34,9 @@ export interface BlitzTabConfig {
 
 export const BLITZ_TAB_COMPONENT = "blitz-chat";
 
+/** dataTransfer MIME a dragged task carries so the canvas can accept it. */
+export const GROVE_TASK_MIME = "application/x-grove-task";
+
 const GLOBAL: IJsonModel["global"] = {
   tabEnableClose: true,
   tabEnableRename: false,

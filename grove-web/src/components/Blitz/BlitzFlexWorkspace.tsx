@@ -1,15 +1,18 @@
 import { useCallback, useMemo, useRef, useState } from "react";
-import { Layout, Model, Actions, DockLocation, TabNode } from "flexlayout-react";
+import { Layout, Model, Actions, DockLocation, TabNode, Node as FlexNode } from "flexlayout-react";
 import { Plus, AlignHorizontalSpaceAround } from "lucide-react";
 import "flexlayout-react/style/light.css";
 import "../Tasks/PanelSystem/flexlayout-theme.css";
 import { TaskChat } from "../Tasks/TaskView/TaskChat";
 import { ChatPickerDropdown } from "./ChatPickerDropdown";
+import { SessionPickerPane } from "./SessionPickerPane";
 import type { BlitzTask } from "../../data/types";
 import type { SlotAssignment } from "./useBlitzGrid";
 import {
   type BlitzTabConfig,
   type OpenTab,
+  BLITZ_TAB_COMPONENT,
+  GROVE_TASK_MIME,
   buildColumnsModelJson,
   createInitialModel,
   persistModelJson,
@@ -34,7 +37,17 @@ interface BlitzFlexWorkspaceProps {
  * "reconnecting" state is a non-blocking overlay, not an unmount (same fix as
  * the old GridSlot).
  */
-function BlitzChatPane({ cfg, blitzTasks }: { cfg: BlitzTabConfig; blitzTasks: BlitzTask[] }) {
+function BlitzChatPane({
+  cfg,
+  blitzTasks,
+  onPickSession,
+  onCancel,
+}: {
+  cfg: BlitzTabConfig;
+  blitzTasks: BlitzTask[];
+  onPickSession: (chat: { id: string; name: string }) => void;
+  onCancel: () => void;
+}) {
   const [stale, setStale] = useState(false);
   const hasConnectedRef = useRef(false);
 
@@ -43,12 +56,24 @@ function BlitzChatPane({ cfg, blitzTasks }: { cfg: BlitzTabConfig; blitzTasks: B
     [blitzTasks, cfg.projectId, cfg.taskId],
   );
 
-  if (!cfg.chatId) {
-    // needsSession placeholder — the drag-to-add session picker lands in Phase 2.
+  // A task dropped from the left list awaits a session pick.
+  if (cfg.needsSession || !cfg.chatId) {
+    if (!cfg.projectId || !cfg.taskId) {
+      // Transient frame between tab creation and onDrop filling in the task.
+      return (
+        <div className="flex h-full items-center justify-center text-sm text-[var(--color-text-muted)]">
+          Loading…
+        </div>
+      );
+    }
     return (
-      <div className="flex h-full items-center justify-center text-sm text-[var(--color-text-muted)]">
-        Pick a session…
-      </div>
+      <SessionPickerPane
+        projectId={cfg.projectId}
+        taskId={cfg.taskId}
+        taskName={cfg.taskName}
+        onPick={onPickSession}
+        onCancel={onCancel}
+      />
     );
   }
 
@@ -157,9 +182,103 @@ export function BlitzFlexWorkspace({ blitzTasks }: BlitzFlexWorkspaceProps) {
     [collectTabs],
   );
 
+  // Fill a needs-session placeholder tab (dropped task) with the chosen chat.
+  const assignSession = useCallback(
+    (nodeId: string, chat: { id: string; name: string }) => {
+      const node = model.getNodeById(nodeId);
+      if (!(node instanceof TabNode)) return;
+      // If this chat is already pinned in another panel, select it and drop the
+      // placeholder rather than duplicating (mirrors the Add chat path).
+      const tabs: TabNode[] = [];
+      model.visitNodes((n) => {
+        if (n.getType() === "tab") tabs.push(n as TabNode);
+      });
+      const existing = tabs.find(
+        (t) => t.getId() !== nodeId && (t.getConfig() as BlitzTabConfig | undefined)?.chatId === chat.id,
+      );
+      if (existing) {
+        model.doAction(Actions.selectTab(existing.getId()));
+        model.doAction(Actions.deleteTab(nodeId));
+        return;
+      }
+      const cfg = (node.getConfig() as BlitzTabConfig | undefined) ?? ({} as BlitzTabConfig);
+      model.doAction(
+        Actions.updateNodeAttributes(nodeId, {
+          name: chat.name,
+          config: { ...cfg, chatId: chat.id, chatName: chat.name, needsSession: false },
+        }),
+      );
+    },
+    [model],
+  );
+
   const factory = useCallback(
-    (node: TabNode) => <BlitzChatPane cfg={node.getConfig() as BlitzTabConfig} blitzTasks={blitzTasks} />,
-    [blitzTasks],
+    (node: TabNode) => (
+      <BlitzChatPane
+        cfg={node.getConfig() as BlitzTabConfig}
+        blitzTasks={blitzTasks}
+        onPickSession={(chat) => assignSession(node.getId(), chat)}
+        onCancel={() => model.doAction(Actions.deleteTab(node.getId()))}
+      />
+    ),
+    [blitzTasks, assignSession, model],
+  );
+
+  // Accept a task dragged from the left list: drop a placeholder tab where the
+  // user aims, then fill in the task (onDrop) so its SessionPickerPane renders.
+  // dataTransfer values can't be read during dragenter, only on drop — so the
+  // placeholder carries no task until onDrop.
+  const onExternalDrag = useCallback(
+    (e: React.DragEvent<HTMLElement>) => {
+      if (!Array.from(e.dataTransfer.types).includes(GROVE_TASK_MIME)) return undefined;
+      return {
+        json: {
+          type: "tab",
+          name: "New chat",
+          component: BLITZ_TAB_COMPONENT,
+          enableClose: true,
+          config: {
+            projectId: "",
+            projectName: "",
+            taskId: "",
+            taskName: "",
+            needsSession: true,
+          } as BlitzTabConfig,
+        },
+        onDrop: (node?: FlexNode, event?: React.DragEvent<HTMLElement>) => {
+          // Act on the dropped node's OWN model, not a captured one: flexlayout
+          // keeps a static external-drag state that isn't cleared on cancel, so
+          // a closed-over model could be stale after a re-tile (setModel).
+          if (!(node instanceof TabNode) || !event) return;
+          const targetModel = node.getModel();
+          try {
+            const data = JSON.parse(event.dataTransfer.getData(GROVE_TASK_MIME)) as {
+              projectId: string;
+              projectName: string;
+              taskId: string;
+              taskName: string;
+            };
+            targetModel.doAction(
+              Actions.updateNodeAttributes(node.getId(), {
+                name: data.taskName,
+                config: {
+                  projectId: data.projectId,
+                  projectName: data.projectName,
+                  taskId: data.taskId,
+                  taskName: data.taskName,
+                  needsSession: true,
+                } as BlitzTabConfig,
+              }),
+            );
+            setIsEmpty(false);
+          } catch (err) {
+            console.warn("[blitzFlex] invalid task drop", err);
+            targetModel.doAction(Actions.deleteTab(node.getId()));
+          }
+        },
+      };
+    },
+    [],
   );
 
   const handleModelChange = useCallback((m: Model) => {
@@ -253,13 +372,18 @@ export function BlitzFlexWorkspace({ blitzTasks }: BlitzFlexWorkspaceProps) {
 
       <div className="relative flex-1 min-h-0">
         <div className="absolute inset-0">
-          <Layout model={model} factory={factory} onModelChange={handleModelChange} />
+          <Layout
+            model={model}
+            factory={factory}
+            onModelChange={handleModelChange}
+            onExternalDrag={onExternalDrag}
+          />
         </div>
         {isEmpty && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 pointer-events-none text-[var(--color-text-muted)]">
             <span className="text-sm">No chats pinned yet</span>
             <span className="text-xs text-[var(--color-text-faint,var(--color-text-muted))]">
-              Use “Add chat” to pin a session as a panel
+              Drag a task from the list onto the canvas, or use “Add chat”
             </span>
           </div>
         )}
