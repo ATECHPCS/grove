@@ -362,33 +362,10 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
         safetyTimer = setTimeout(clearChips, 3000);
       }
 
-      // Handle Cmd+G (macOS) or Ctrl+G (Linux/Windows) to toggle grid
-      // workspace. Outside the metaKey block above so Ctrl+G works on
-      // platforms where Cmd+0-9 navigation doesn't make sense.
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'g') {
-        const target = e.target as HTMLElement | null;
-        if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
-          return;
-        }
-        e.preventDefault();
-        // Skip auto-repeats — holding the key would otherwise toggle
-        // gridMode on every native keydown event.
-        if (e.repeat) return;
-        setGridMode((v) => !v);
-      }
-
-      // Escape exits grid view back to the task list (per design spec).
-      // Skip when input/textarea/contenteditable is focused — the active
-      // picker dropdown / shrink-confirm modal handle their own Escape
-      // before this fires (their listeners attach later, so they receive
-      // the event first via standard DOM ordering).
-      if (gridMode && e.key === 'Escape') {
-        const target = e.target as HTMLElement | null;
-        if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
-          return;
-        }
-        setGridMode(false);
-      }
+      // Grid toggle (Cmd/Ctrl+G) and grid Escape are catalog commands now —
+      // `blitz.grid.toggle` / `blitz.grid.exit` registered below — so they're
+      // rebindable, show in ⌘/ help, and respect scopes (no double-fire with
+      // tasks.escape).
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
@@ -416,7 +393,7 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
       // Clean up class on unmount
       document.body.classList.remove('blitz-command-pressed');
     };
-  }, [gridMode]);
+  }, []);
 
   // ── Unified drag handlers ───────────────────────────────────────────────
 
@@ -642,6 +619,8 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
   // same key TasksPage publishes; last-write wins, both reflect the same
   // semantic "user has a task highlighted somewhere".
   useContextKey("taskSelected", hasTask);
+  // Gates blitz.grid.exit (Escape) so it only fires while the grid is showing.
+  useContextKey("blitzGridActive", gridMode);
 
   const enabledTask = useCallback(() => hasTask, [hasTask]);
   const enabledOpenWorkspace = useCallback(
@@ -668,6 +647,17 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
     [navHandlers, enabledTask],
   );
   useCommand("task.search", () => searchInputRef.current?.focus(), []);
+
+  // Grid workspace toggle + exit (replaces the old raw window keydown listener).
+  // Both skip while a text surface is focused so the keyboard doesn't toggle the
+  // grid mid-typing or steal Escape from a composer/picker (its own blur/close
+  // handling runs instead) — matching the old raw handler's input skip.
+  const notTypingEnabled = useCallback(() => {
+    const a = document.activeElement as HTMLElement | null;
+    return !(a && (a.tagName === "INPUT" || a.tagName === "TEXTAREA" || a.isContentEditable));
+  }, []);
+  useCommand("blitz.grid.toggle", () => setGridMode((v) => !v), { enabled: notTypingEnabled }, [notTypingEnabled]);
+  useCommand("blitz.grid.exit", () => setGridMode(false), { enabled: notTypingEnabled }, [notTypingEnabled]);
 
   // Task lifecycle commands (catalog: workspace scope) — Blitz doesn't show
   // archived tasks so task.unarchive isn't wired here; Zen owns it. Studio
@@ -771,8 +761,10 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
     scope: "tasks",
     hidden: true,
     handler: handleCloseTask,
-    enabled: () => pageState.inWorkspace || hasTask,
-  }, [handleCloseTask, pageState.inWorkspace, hasTask]);
+    // In grid mode, blitz.grid.exit owns Escape — keep these mutually exclusive
+    // so they never both fire when a task is also selected.
+    enabled: () => !gridMode && (pageState.inWorkspace || hasTask),
+  }, [handleCloseTask, pageState.inWorkspace, hasTask, gridMode]);
 
   // --- Workspace tab switching (Cmd+1-9, Cmd+W).
   const inWorkspace = pageState.inWorkspace;
