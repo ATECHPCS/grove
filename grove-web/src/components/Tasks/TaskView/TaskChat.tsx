@@ -5422,16 +5422,27 @@ export function TaskChat({
   // keybindings in onKeyDown still own composer-local semantics (Enter vs
   // Shift+Enter inside contenteditable) — these registry entries only
   // surface for catalog binding overrides + palette discovery.
+  // Multiple TaskChats coexist in the Blitz grid, and each registers
+  // `chat.send`. The command registry now keeps every handler and dispatches
+  // to the first whose `enabled()` passes, so we gate on "is focus inside THIS
+  // panel?" (same guard as chat.search.toggle) to route Enter to the focused
+  // pane. Without it, Enter sent to whichever chat mounted last. In single-pane
+  // Zen the only instance is the focused one, so behaviour is unchanged.
+  const sendFocusInPanel = () => {
+    const root = taskChatRootRef.current;
+    const active = document.activeElement;
+    return !!(root && active && root.contains(active));
+  };
   useCommand(
     "chat.send",
     () => { void handleSend(); },
-    { enabled: () => !!activeChatId && !showFileMenu && !showSlashMenu && !isInputExpanded },
+    { enabled: () => sendFocusInPanel() && !!activeChatId && !showFileMenu && !showSlashMenu && !isInputExpanded },
     [activeChatId, showFileMenu, showSlashMenu, isInputExpanded, handleSend],
   );
   useCommand(
     "chat.send.alt",
     () => { void handleSend(); },
-    { enabled: () => !!activeChatId && !showFileMenu && !showSlashMenu },
+    { enabled: () => sendFocusInPanel() && !!activeChatId && !showFileMenu && !showSlashMenu },
     [activeChatId, showFileMenu, showSlashMenu, handleSend],
   );
   useCommand(
@@ -6571,11 +6582,31 @@ export function TaskChat({
         }
         return;
       }
-      // Enter / Cmd+Enter → send moved to the catalog (chat.send /
-      // chat.send.alt) so the binding is rebindable in Settings.
-      // KeyboardManager handles them via passThroughTextInput.
+      // Enter / Cmd+Enter → send. In single-pane (Zen) this rides the
+      // `chat.send` / `chat.send.alt` catalog commands (scope "workspace",
+      // rebindable in Settings). The Blitz grid mounts TaskChat directly and
+      // never activates the "workspace" scope — and its `chatFocus` /
+      // `messageNotEmpty` context keys are clobbered across the 4 panes — so
+      // the catalog binding can't fire there. When pinned (grid only) we handle
+      // Enter locally on the focused composer instead. Gating on pinnedChatId
+      // keeps single-pane on the catalog path (no double-send).
+      if (pinnedChatId && !isTerminalMode && !showFileMenu && !showSlashMenu && e.key === "Enter") {
+        const withMod = e.metaKey || e.ctrlKey;
+        // Plain Enter sends unless the input is expanded (then Enter = newline);
+        // Cmd/Ctrl+Enter always sends (mirrors chat.send.alt). Shift+Enter is
+        // always a newline.
+        if (!e.shiftKey && (withMod || !isInputExpanded)) {
+          e.preventDefault();
+          e.stopPropagation();
+          e.nativeEvent.stopImmediatePropagation();
+          void handleSend();
+          return;
+        }
+      }
     },
     [
+      pinnedChatId,
+      handleSend,
       isTerminalMode,
       isInputExpanded,
       showSlashMenu,
