@@ -167,6 +167,12 @@ enum ServerMessage {
     Error {
         message: String,
     },
+    /// Sent once, on connect, when the server auto-started a fresh session
+    /// because the chat's saved session could not be resumed (Blitz Findings #3).
+    /// Serializes (snake_case tag) as `{ "type": "session_recovered", "reason": "…" }`.
+    SessionRecovered {
+        reason: String,
+    },
     UserMessage {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
