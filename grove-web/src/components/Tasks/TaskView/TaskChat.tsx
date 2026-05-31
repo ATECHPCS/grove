@@ -3777,6 +3777,49 @@ export function TaskChat({
     };
   }, [getActiveChatId]);
 
+  // Reconnect on wake / regained connectivity. Sleeping or suspending the
+  // machine kills every WebSocket at once; on resume the onclose backoff ladder
+  // can burn through its 5 attempts before the network is actually back, then
+  // give up — leaving "Connection lost" until a manual refresh (exactly what a
+  // laptop-sleep produces). When the tab becomes visible again, or the browser
+  // fires `online`, proactively re-open any chat this view owns whose socket is
+  // dead, resetting its backoff so recovery is immediate and no refresh needed.
+  useEffect(() => {
+    const reviveDeadSockets = () => {
+      if (document.visibilityState !== "visible") return;
+      const activeId = getActiveChatId();
+      const candidates = new Set<string>(wsMapRef.current.keys());
+      if (activeId) candidates.add(activeId);
+      for (const chatId of candidates) {
+        if (intentionalCloseRef.current.has(chatId)) continue;
+        if (connectingRef.current.has(chatId)) continue;
+        const ws = wsMapRef.current.get(chatId);
+        // Healthy or still negotiating → leave it alone.
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+          continue;
+        }
+        // A dead socket lingering in the map makes connectChatWs bail on its
+        // `wsMapRef.has` guard — drop it first.
+        if (ws) wsMapRef.current.delete(chatId);
+        // Reset the backoff (clears any pending timer + attempt count) so the
+        // reconnect fires now instead of being blocked by the exhausted ladder.
+        cancelPendingReconnectRef.current(chatId);
+        connectChatWsRef.current(chatId).then(() => {
+          if (chatId === getActiveChatId()) {
+            wsRef.current = wsMapRef.current.get(chatId) ?? null;
+          }
+        });
+      }
+    };
+    const onVisibility = () => reviveDeadSockets();
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("online", reviveDeadSockets);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("online", reviveDeadSockets);
+    };
+  }, [getActiveChatId]);
+
   // GC stale chat drafts from prior sessions on first mount of any
   // TaskChat. Idempotent across mounts thanks to a module-level guard.
   useEffect(() => {
