@@ -1,3 +1,8 @@
+//! Groove dashboard snapshot (WIP). The types and cache below aren't wired to
+//! a route yet, so allow dead_code until the dashboard handler lands — keeps
+//! `cargo clippy -D warnings` (the pre-commit hook) green meanwhile.
+#![allow(dead_code)]
+
 use chrono::Utc;
 use once_cell::sync::Lazy;
 use serde::Serialize;
