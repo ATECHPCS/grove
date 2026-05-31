@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import type { DiffFile } from '../../api/review';
 import type { DirEntry } from '../../api/tasks';
-import { FolderOpen, Folder, Search, MessageSquare, FilePlus, FolderPlus, Copy, FileText } from 'lucide-react';
+import { FolderOpen, Folder, Search, MessageSquare, FilePlus, FolderPlus, Copy, FileText, Eye, EyeOff } from 'lucide-react';
 import { VSCodeIcon } from '../ui';
 
 interface FileCommentCount {
@@ -66,6 +66,11 @@ export function FileTreeSidebar({
     isDirectory: boolean;
   } | null>(null);
 
+  // Hide Viewed Files state
+  const [hideViewed, setHideViewed] = useState<boolean>(() => {
+    return localStorage.getItem('grove:review.hideViewed') === 'true';
+  });
+
   // Inline input state for creating virtual files
   const [creatingVirtual, setCreatingVirtual] = useState<{
     type: 'file' | 'directory';
@@ -74,10 +79,21 @@ export function FileTreeSidebar({
   } | null>(null);
   const virtualInputRef = useRef<HTMLInputElement>(null);
 
-  // Filter files by search query
-  const filteredFiles = searchQuery
-    ? files.filter((f) => f.new_path.toLowerCase().includes(searchQuery.toLowerCase()))
-    : files;
+  // Filter files by search query and viewed status
+  const filteredFiles = files.filter((f) => {
+    // 1. Search Query Filter
+    if (searchQuery && !f.new_path.toLowerCase().includes(searchQuery.toLowerCase())) {
+      return false;
+    }
+    // 2. Hide Viewed Filter (always show the active/selected file so user doesn't lose context)
+    if (hideViewed && getFileViewedStatus && f.new_path !== selectedFile) {
+      const viewedStatus = getFileViewedStatus(f.new_path);
+      if (viewedStatus === 'viewed') {
+        return false;
+      }
+    }
+    return true;
+  });
 
   const tree = buildTree(filteredFiles);
 
@@ -158,6 +174,23 @@ export function FileTreeSidebar({
             value={searchQuery}
             onChange={(e) => onSearchChange(e.target.value)}
           />
+          {getFileViewedStatus && (
+            <button
+              className={`diff-sidebar-hide-viewed-btn ${hideViewed ? 'active' : ''}`}
+              onClick={() => {
+                const next = !hideViewed;
+                setHideViewed(next);
+                localStorage.setItem('grove:review.hideViewed', String(next));
+              }}
+              title={hideViewed ? "Show viewed files" : "Hide viewed files"}
+            >
+              {hideViewed ? (
+                <EyeOff style={{ width: 14, height: 14 }} />
+              ) : (
+                <Eye style={{ width: 14, height: 14 }} />
+              )}
+            </button>
+          )}
         </div>
       )}
 

@@ -882,6 +882,33 @@ td.diff-code.diff-line-highlighted::before {
   border-color: var(--color-highlight);
 }
 
+.diff-sidebar-hide-viewed-btn {
+  background: transparent;
+  border: none;
+  padding: 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-muted);
+  opacity: 0.8;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.diff-sidebar-hide-viewed-btn:hover {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text);
+  opacity: 1;
+}
+
+.diff-sidebar-hide-viewed-btn.active {
+  color: var(--color-highlight);
+  background: color-mix(in srgb, var(--color-highlight) 15%, var(--color-bg-secondary));
+  opacity: 1;
+}
+
 /* Sidebar viewed/updated badges */
 .diff-sidebar-file-viewed {
   text-decoration: line-through;
