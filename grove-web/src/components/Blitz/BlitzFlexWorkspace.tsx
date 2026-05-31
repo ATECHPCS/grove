@@ -19,12 +19,12 @@ import {
   tabNodeFor,
 } from "./blitzFlexModel";
 
-/** Grid presets: label → number of columns to tile open chats into. */
+/** Column presets: label → number of columns to tile open chats into evenly.
+ *  (2 columns with four chats = a 2×2; 3 columns with six = a 3×2.) */
 const GRID_PRESETS: ReadonlyArray<{ label: string; cols: number; title: string }> = [
   { label: "1", cols: 1, title: "Single column" },
-  { label: "2", cols: 2, title: "Two columns" },
-  { label: "2×2", cols: 2, title: "Two columns (2×2 with four chats)" },
-  { label: "3×2", cols: 3, title: "Three columns (3×2 with six chats)" },
+  { label: "2", cols: 2, title: "Two columns (2×2 with four chats)" },
+  { label: "3", cols: 3, title: "Three columns (3×2 with six chats)" },
 ];
 
 interface BlitzFlexWorkspaceProps {
@@ -344,7 +344,7 @@ export function BlitzFlexWorkspace({ blitzTasks }: BlitzFlexWorkspaceProps) {
           </button>
           <div className="flex items-center rounded-lg border border-[var(--color-border)] overflow-hidden text-xs">
             <span className="px-2 py-1.5 text-[var(--color-text-muted)] border-r border-[var(--color-border)]">
-              Grid
+              Columns
             </span>
             {GRID_PRESETS.map((p) => (
               <button
