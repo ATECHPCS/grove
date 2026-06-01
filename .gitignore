@@ -74,3 +74,6 @@ examples/test_autolink.rs
 
 # LimeZu Modern Office assets — licensed to the user, do NOT commit/redistribute
 grove-web/public/office/
+
+# Arc Relay MCP config — contains bearer tokens, never commit
+.mcp.json
