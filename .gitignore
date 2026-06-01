@@ -71,3 +71,6 @@ examples/test_autolink.rs
 # Superpowers brainstorm cache
 .superpowers/
 .agentic-team
+
+# LimeZu Modern Office assets — licensed to the user, do NOT commit/redistribute
+grove-web/public/office/
