@@ -107,6 +107,18 @@ pub async fn agent_pty_handler(
     // laptop slept) the agent keeps running and re-attaches cleanly on the
     // next connect — which is the whole point of routing through tmux.
     let session_name = crate::tmux::agent_session_name(&chat_id);
+
+    // Serialise the create-vs-attach decision per chat. Two near-simultaneous
+    // first connects (e.g. the same chat pinned into two Blitz slots) could
+    // otherwise both observe `session_exists() == false` and both run the
+    // one-time setup — generating two acp_session_ids (last write wins, leaving
+    // the DB id out of sync with the agent the tmux winner actually launched)
+    // and registering two tokens (one orphaned until delete_chat). Holding the
+    // chat's lock across the existence check + create closes that window; the
+    // loser re-reads `session_exists()` inside the lock and falls through to
+    // attach. Released before the WS upgrade — concurrent attaches are safe.
+    let create_lock = session_create_lock(&session_name);
+    let create_guard = create_lock.lock().await;
     let session_existed = crate::tmux::session_exists(&session_name);
 
     // Build + launch the agent only when no live tmux session exists. On a
@@ -234,6 +246,10 @@ pub async fn agent_pty_handler(
             .map_err(|e| AgentPtyError::Internal(format!("create agent tmux session: {}", e)))?;
     }
 
+    // Session now exists (we created it or it was already live). Concurrent
+    // attaches don't race, so release the per-chat lock before upgrading.
+    drop(create_guard);
+
     // Attach the WebSocket PTY to the (now guaranteed-live) tmux session.
     // Detaching this client on WS close leaves the session — and the agent
     // running inside it — alive for the next connect.
@@ -246,6 +262,24 @@ pub async fn agent_pty_handler(
     Ok(ws.on_upgrade(move |socket: WebSocket| async move {
         handle_pty_terminal(socket, cmd, cols, rows).await;
     }))
+}
+
+/// Per-chat async locks serialising the create-vs-attach decision in
+/// `agent_pty_handler`. The map grows by one `Arc<Mutex<()>>` per chat ever
+/// opened in terminal mode — bounded by chat count and negligible in size, so
+/// entries are intentionally not reaped.
+fn session_create_lock(session_name: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::Mutex as AsyncMutex;
+
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().expect("agent_pty session lock map poisoned");
+    guard
+        .entry(session_name.to_string())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
 }
 
 /// Inject locale + PATH defaults into the env handed to a tmux-backed agent
