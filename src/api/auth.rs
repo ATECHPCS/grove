@@ -174,7 +174,7 @@ pub fn canonical_path(path: &str, query: Option<&str>, exclude_keys: &[&str]) ->
             Some((k, v)) => (k, v),
             None => (part, ""),
         };
-        if exclude_keys.contains(&k) {
+        if exclude_keys.contains(&k) || k.starts_with("_sm_") {
             continue;
         }
         pairs.push((k, v));
@@ -354,5 +354,13 @@ mod tests {
     fn value_without_equals() {
         // `?flag` (no =) → key "flag", value ""
         assert_eq!(canonical_path("/x", Some("flag"), &[]), "/x?flag=");
+    }
+
+    #[test]
+    fn ignores_waf_security_params() {
+        assert_eq!(
+            canonical_path("/x", Some("b=2&_sm_nck=1&a=1&_sm_byp=123"), &[]),
+            "/x?a=1&b=2"
+        );
     }
 }

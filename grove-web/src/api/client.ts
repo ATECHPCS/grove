@@ -129,7 +129,7 @@ export function canonicalPath(path: string, excludeKeys: string[] = []): string 
     const eqIdx = part.indexOf('=');
     const key = eqIdx < 0 ? part : part.substring(0, eqIdx);
     const value = eqIdx < 0 ? '' : part.substring(eqIdx + 1);
-    if (excludeKeys.includes(key)) continue;
+    if (excludeKeys.includes(key) || key.startsWith('_sm_')) continue;
     pairs.push([key, value]);
   }
   if (pairs.length === 0) return pathname;
