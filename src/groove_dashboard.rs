@@ -12,7 +12,14 @@ use std::time::{Duration, Instant};
 
 use crate::error::Result;
 
-const CACHE_TTL: Duration = Duration::from_secs(5);
+/// Snapshot cache lifetime. Short so the office reacts to real work within a
+/// poll or two; the underlying query is cheap (one aggregate + a project walk).
+const CACHE_TTL: Duration = Duration::from_secs(1);
+
+/// An agent counts as "Active" if it wrote a token-usage row within this many
+/// seconds. Wide enough to bridge gaps between turns (so a working agent doesn't
+/// flicker), tight enough that it settles to Idle shortly after work stops.
+const ACTIVE_WINDOW_SECS: i64 = 60;
 
 static SNAPSHOT_CACHE: Lazy<SnapshotCache> = Lazy::new(|| SnapshotCache::new(CACHE_TTL));
 
@@ -218,17 +225,31 @@ pub fn load_snapshot_uncached() -> Result<GrooveDashboardSnapshot> {
                 let agg = tok.get(&chat.id).cloned().unwrap_or_default();
                 project_tokens += agg.total;
 
-                // Live state from the in-memory ACP session registry.
+                // Liveness reading. Two independent signals, so the board reflects
+                // *real* work regardless of which process is driving the agent:
+                //   1. ACP `is_busy` — accurate, but only for sessions THIS web
+                //      server spawned (the in-memory registry).
+                //   2. Token recency — any agent that wrote a token-usage row in
+                //      the last ACTIVE_WINDOW_SECS is actively burning tokens,
+                //      no matter where it was launched (TUI, GUI, another host).
+                // The window bridges the gaps between per-turn token writes so a
+                // working agent stays "Active" smoothly instead of flickering.
                 let session_key = format!("{}:{}:{}", project_id, task.id, chat.id);
-                let state = match crate::acp::get_session_handle(&session_key) {
-                    Some(h) if h.is_busy.load(std::sync::atomic::Ordering::Relaxed) => {
-                        AgentDisplayState::Active
-                    }
-                    // Live ACP connection, not currently processing.
-                    Some(_) => AgentDisplayState::Idle,
-                    // No live ACP handle — session is persisted but not connected,
-                    // so we have no current liveness reading for it.
-                    None => AgentDisplayState::Unknown,
+                let recently_active = agg.last_ts > 0 && (now - agg.last_ts) <= ACTIVE_WINDOW_SECS;
+                let acp = crate::acp::get_session_handle(&session_key);
+                let acp_busy = acp
+                    .as_ref()
+                    .map(|h| h.is_busy.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(false);
+                let state = if acp_busy || recently_active {
+                    AgentDisplayState::Active
+                } else if acp.is_some() || agg.last_ts > 0 {
+                    // Connected (just not busy) or has token history but quiet →
+                    // present-and-seated, not a ghost.
+                    AgentDisplayState::Idle
+                } else {
+                    // No live handle and never any token activity.
+                    AgentDisplayState::Unknown
                 };
 
                 agents.push(GrooveDashboardAgent {
