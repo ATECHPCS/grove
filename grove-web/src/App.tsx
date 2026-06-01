@@ -18,6 +18,7 @@ import { AddProjectDialog } from "./components/Projects/AddProjectDialog";
 import { WelcomePage } from "./components/Welcome";
 import { DiffReviewPage } from "./components/Review";
 import { StatusBoard } from "./components/StatusBoard/StatusBoard";
+import { OfficeFloor } from "./components/GrooveOffice/OfficeFloor";
 import { HelpOverlay } from "./components/Tasks/HelpOverlay";
 import { SkillsPage } from "./components/Skills";
 import { AIPage, GlobalAudioRecorder } from "./components/AI";
@@ -1392,10 +1393,20 @@ function AppContent() {
 }
 
 function App() {
-  // Standalone status board (kiosk / shared screen / public relay) — full
+  // Standalone status surfaces (kiosk / shared screen / public relay) — full
   // screen, auto-refreshing, no app chrome or auth gate (the relay's access
   // control fronts it). Privacy-safe data only.
-  if (window.location.pathname.replace(/\/+$/, "") === "/dashboard") {
+  //   /groove-dashboard — animated office-floor TV wall display
+  //   /dashboard        — the compact data board
+  const standalonePath = window.location.pathname.replace(/\/+$/, "");
+  if (standalonePath === "/groove-dashboard") {
+    return (
+      <ThemeProvider>
+        <OfficeFloor />
+      </ThemeProvider>
+    );
+  }
+  if (standalonePath === "/dashboard") {
     return (
       <ThemeProvider>
         <StatusBoard />
