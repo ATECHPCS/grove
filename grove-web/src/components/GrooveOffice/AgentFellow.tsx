@@ -1,7 +1,9 @@
 import { resolveAgentIcon } from "../../utils/agentIcon";
 import type { DashboardAgent } from "../../api/dashboard";
+import { PixelBody } from "./PixelBody";
 
-/** Brand torso tint per agent (falls back to the Blitz highlight). */
+/** Brand shirt colour per agent (concrete hex so the SVG body + color-mix
+ *  render reliably). Falls back to the Blitz orange. */
 const BRAND: Record<string, string> = {
   claude: "#d97757",
   codex: "#10a37f",
@@ -32,7 +34,7 @@ const PIP: Record<DashboardAgent["state"], string> = {
 export function AgentFellow({ agent }: { agent: DashboardAgent }) {
   const info = resolveAgentIcon(agent.agent);
   const Icon = info.Component;
-  const brand = BRAND[agent.agent] ?? "var(--color-highlight)";
+  const brand = BRAND[agent.agent] ?? "#f0883e";
 
   return (
     <div
@@ -44,10 +46,7 @@ export function AgentFellow({ agent }: { agent: DashboardAgent }) {
       <div className="office-fellow__head">
         <Icon size={22} />
       </div>
-      <div
-        className="office-fellow__body"
-        style={{ background: `linear-gradient(${brand}, color-mix(in srgb, ${brand} 65%, #000))` }}
-      />
+      <PixelBody shirt={brand} />
       <div className="office-fellow__desk">
         <div className="office-fellow__screen" />
       </div>
