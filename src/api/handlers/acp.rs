@@ -1212,6 +1212,13 @@ pub async fn delete_chat(
     let session_key = format!("{}:{}:{}", project_key, task_id, chat_id);
     let _ = acp::kill_session(&session_key);
 
+    // Kill the tmux-backed terminal session if this chat was ever launched in
+    // terminal mode (no-op otherwise), and release its session-scoped
+    // agent_graph token. Terminal-mode agents live in tmux beyond any single
+    // WebSocket, so chat deletion is where they get reaped.
+    let _ = crate::tmux::kill_session(&crate::tmux::agent_session_name(&chat_id));
+    crate::api::handlers::agent_graph_mcp::unregister_chat(&chat_id);
+
     // Remove chat entry from chats.toml
     tasks::delete_chat_session(&project_key, &task_id, &chat_id)
         .map_err(|e| AcpError::Internal(e.to_string()))?;
