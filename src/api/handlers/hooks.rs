@@ -155,3 +155,72 @@ fn level_to_string(level: NotificationLevel) -> String {
         NotificationLevel::Critical => "critical".to_string(),
     }
 }
+
+use axum::extract::Query;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuiOpenTaskQuery {
+    pub project_id: String,
+    pub task_id: String,
+    pub chat_id: Option<String>,
+}
+
+pub async fn handle_gui_open_task(
+    Query(q): Query<GuiOpenTaskQuery>,
+) -> StatusCode {
+
+    // 广播 RadioEvent 焦点切换事件，使得所有连接的 Grove Web 网页端以及移动端客户端都能自动完成跳转！
+    let target = q.chat_id.clone().filter(|s| !s.is_empty()).map(|chat_id| {
+        super::walkie_talkie::TargetMode::Chat { chat_id }
+    });
+    super::walkie_talkie::broadcast_radio_event(
+        super::walkie_talkie::RadioEvent::FocusTask {
+            project_id: q.project_id.clone(),
+            task_id: q.task_id.clone(),
+            target,
+        }
+    );
+
+    #[cfg(feature = "gui")]
+    if let Some(app) = crate::cli::gui::TAURI_APP.get() {
+        let _ = crate::tray::tray_open_task(
+            app.clone(),
+            q.project_id,
+            q.task_id,
+            q.chat_id,
+        );
+    }
+
+    StatusCode::OK
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuiResolvePermissionQuery {
+    pub project_id: String,
+    pub task_id: String,
+    pub chat_id: String,
+    pub option_id: String,
+}
+
+/// POST /gui/resolve-permission — handle permission response from native macOS action button
+pub async fn handle_gui_resolve_permission(
+    Query(q): Query<GuiResolvePermissionQuery>,
+) -> StatusCode {
+    #[cfg(feature = "gui")]
+    {
+        let _ = crate::tray::tray_resolve_permission(
+            q.project_id,
+            q.task_id,
+            q.chat_id,
+            q.option_id,
+        );
+        return StatusCode::OK;
+    }
+    #[cfg(not(feature = "gui"))]
+    {
+        let _ = q;
+        StatusCode::NOT_IMPLEMENTED
+    }
+}

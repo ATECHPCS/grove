@@ -866,10 +866,28 @@ pub fn create_router(
         // /auth/verify can't be probed cross-origin. Sec-Fetch-Site / Origin /
         // Referer are checked for non-safe methods; safe methods (GET/HEAD/OPTIONS,
         // including WebSocket upgrades and CORS preflight) pass through.
-        Router::new()
+        let base = Router::new()
             .nest("/api/v1", protected_api)
             .nest("/api/v1", auth_router)
-            .layer(middleware::from_fn(csrf::csrf_middleware))
+            .layer(middleware::from_fn(csrf::csrf_middleware));
+
+        // GUI-only loopback endpoints: only registered in gui builds (server binds
+        // 127.0.0.1 there). Non-gui builds (web, mobile) simply don't expose these routes.
+        #[cfg(feature = "gui")]
+        let base = {
+            let gui_router = Router::new()
+                .route(
+                    "/gui/open-task",
+                    post(handlers::hooks::handle_gui_open_task),
+                )
+                .route(
+                    "/gui/resolve-permission",
+                    post(handlers::hooks::handle_gui_resolve_permission),
+                );
+            base.nest("/api/v1", gui_router)
+        };
+
+        base
     };
 
     // Priority: external static_dir > embedded assets

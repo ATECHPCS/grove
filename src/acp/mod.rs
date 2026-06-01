@@ -861,7 +861,7 @@ async fn handle_request_permission(
     state.handle.emit(AcpUpdate::PermissionRequest {
         id: request_id,
         description: desc.clone(),
-        options,
+        options: options.clone(),
     });
 
     notify_acp_event(
@@ -871,6 +871,7 @@ async fn handle_request_permission(
         "Permission Required",
         &desc,
         AcpNotificationEvent::PermissionRequired,
+        Some(&options),
     );
 
     match rx.await {
@@ -2969,6 +2970,7 @@ async fn drive_session(
                             "Task Complete",
                             &summary,
                             AcpNotificationEvent::TurnComplete,
+                            None,
                         );
                         handle.emit(AcpUpdate::Busy { value: false });
                         let turn_end_ts = chrono::Utc::now().timestamp();
@@ -5007,6 +5009,7 @@ fn notify_acp_event(
     title_suffix: &str,
     message: &str,
     event: AcpNotificationEvent,
+    options: Option<&[PermOptionData]>,
 ) {
     use crate::hooks::{self, NotificationLevel};
     use crate::storage::{config, tasks as task_storage};
@@ -5084,7 +5087,34 @@ fn notify_acp_event(
 
         let title = format!("{} - {}", project_name, title_suffix);
         let banner_msg = format!("{} — {}", task_name, message);
-        hooks::send_banner(&title, &banner_msg);
+        let is_permission = event == AcpNotificationEvent::PermissionRequired;
+
+        let mut approve_opt = None;
+        let mut deny_opt = None;
+        if let Some(opts) = options {
+            // 只匹配明确的 allow 类型，找不到就不设按钮（不猜测）
+            approve_opt = opts.iter().find(|o| o.kind == "allow_once")
+                .or_else(|| opts.iter().find(|o| o.kind == "allow_always"))
+                .or_else(|| opts.iter().find(|o| o.kind.contains("allow")))
+                .map(|o| o.option_id.as_str());
+
+            // 只匹配明确的 reject/deny 类型，找不到就不设按钮（不猜测）
+            deny_opt = opts.iter().find(|o| o.kind == "reject_once")
+                .or_else(|| opts.iter().find(|o| o.kind == "reject_always"))
+                .or_else(|| opts.iter().find(|o| o.kind.contains("reject") || o.kind.contains("deny")))
+                .map(|o| o.option_id.as_str());
+        }
+
+        hooks::send_banner(
+            &title,
+            &banner_msg,
+            project_key,
+            task_id,
+            chat_id,
+            is_permission,
+            approve_opt,
+            deny_opt,
+        );
     }
 
     let level = if title_suffix.contains("Permission") {

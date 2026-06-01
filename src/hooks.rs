@@ -302,6 +302,32 @@ pub fn load_hooks_with_cleanup(project_path: &str) -> HooksFile {
 
 // === Notification utilities (shared by CLI hooks and ACP) ===
 
+pub static ACTIVE_BASE_URL: once_cell::sync::OnceCell<String> = once_cell::sync::OnceCell::new();
+
+pub fn set_active_base_url(url: String) {
+    let _ = ACTIVE_BASE_URL.set(url.clone());
+    let grove_dir = crate::storage::grove_dir();
+    if std::fs::create_dir_all(&grove_dir).is_ok() {
+        let endpoint_file = grove_dir.join("gui_endpoint");
+        let _ = std::fs::write(&endpoint_file, url);
+    }
+}
+
+pub fn get_active_base_url() -> String {
+    if let Some(url) = ACTIVE_BASE_URL.get() {
+        return url.clone();
+    }
+    let grove_dir = crate::storage::grove_dir();
+    let endpoint_file = grove_dir.join("gui_endpoint");
+    if let Ok(content) = std::fs::read_to_string(&endpoint_file) {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "http://127.0.0.1:3001".to_string()
+}
+
 /// Play a system sound.
 #[cfg(target_os = "macos")]
 pub fn play_sound(sound: &str) {
@@ -317,7 +343,16 @@ pub fn play_sound(_sound: &str) {
 
 /// Send a desktop notification banner.
 #[cfg(target_os = "macos")]
-pub fn send_banner(title: &str, message: &str) {
+pub fn send_banner(
+    title: &str,
+    message: &str,
+    project_id: &str,
+    task_id: &str,
+    chat_id: Option<&str>,
+    is_permission: bool,
+    approve_opt: Option<&str>,
+    deny_opt: Option<&str>,
+) {
     let notify_bin = ensure_grove_app();
     if notify_bin.exists() {
         let app_path = notify_bin
@@ -325,6 +360,7 @@ pub fn send_banner(title: &str, message: &str) {
             .and_then(|p| p.parent()) // Contents/
             .and_then(|p| p.parent()); // Grove.app/
         if let Some(app) = app_path {
+            let base_url = get_active_base_url();
             Command::new("open")
                 .args([
                     "-n", // new instance each time
@@ -333,6 +369,13 @@ pub fn send_banner(title: &str, message: &str) {
                     "--args",
                     title,
                     message,
+                    project_id,
+                    task_id,
+                    chat_id.unwrap_or(""),
+                    if is_permission { "true" } else { "false" },
+                    approve_opt.unwrap_or(""),
+                    deny_opt.unwrap_or(""),
+                    &base_url,
                 ])
                 .spawn()
                 .ok();
@@ -349,7 +392,16 @@ pub fn send_banner(title: &str, message: &str) {
 }
 
 #[cfg(target_os = "windows")]
-pub fn send_banner(title: &str, message: &str) {
+pub fn send_banner(
+    title: &str,
+    message: &str,
+    _project_id: &str,
+    _task_id: &str,
+    _chat_id: Option<&str>,
+    _is_permission: bool,
+    _approve_opt: Option<&str>,
+    _deny_opt: Option<&str>,
+) {
     // Windows 10+ toast notification via PowerShell
     let icon_attr = ensure_notification_icon()
         .map(|p| {
@@ -437,7 +489,16 @@ fn log_notify_error(msg: &str) {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub fn send_banner(title: &str, message: &str) {
+pub fn send_banner(
+    title: &str,
+    message: &str,
+    _project_id: &str,
+    _task_id: &str,
+    _chat_id: Option<&str>,
+    _is_permission: bool,
+    _approve_opt: Option<&str>,
+    _deny_opt: Option<&str>,
+) {
     // Linux: use notify-send if available, with custom icon when present.
     // Use `--` so a title/message starting with `-` is not parsed as an option flag.
     let mut cmd = Command::new("notify-send");
@@ -520,24 +581,74 @@ import UserNotifications
 class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let args = CommandLine.arguments
-        let title = args.count > 1 ? args[1] : "Grove"
-        let body  = args.count > 2 ? args[2] : ""
-
         let center = UNUserNotificationCenter.current()
         center.delegate = self
 
-        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
-            guard granted else {
-                DispatchQueue.main.async { NSApp.terminate(nil) }
-                return
+        if args.count > 1 {
+            // ─── Trigger Mode: Send Banner ───
+            let title = args[1]
+            let body = args.count > 2 ? args[2] : ""
+            let projectId = args.count > 3 ? args[3] : ""
+            let taskId = args.count > 4 ? args[4] : ""
+            let chatId = args.count > 5 ? args[5] : ""
+            let isPermission = args.count > 6 ? (args[6] == "true") : false
+            let approveRaw = args.count > 7 ? args[7] : "allow"
+            let denyRaw = args.count > 8 ? args[8] : "deny"
+            let baseUrl = args.count > 9 ? args[9] : "http://127.0.0.1:3001"
+
+            var categories: Set<UNNotificationCategory> = []
+            let categoryId = "PERMISSION_CATEGORY_" + UUID().uuidString
+            if isPermission {
+                let approveAction = UNNotificationAction(
+                    identifier: "APPROVE_ACTION",
+                    title: "Allow once",
+                    options: []
+                )
+                let denyAction = UNNotificationAction(
+                    identifier: "DENY_ACTION",
+                    title: "Reject",
+                    options: []
+                )
+                let category = UNNotificationCategory(
+                    identifier: categoryId,
+                    actions: [approveAction, denyAction],
+                    intentIdentifiers: [],
+                    options: []
+                )
+                categories.insert(category)
             }
-            let content = UNMutableNotificationContent()
-            content.title = title
-            content.body  = body
-            let req = UNNotificationRequest(
-                identifier: UUID().uuidString, content: content, trigger: nil)
-            center.add(req) { _ in
-                DispatchQueue.main.async { NSApp.terminate(nil) }
+            center.setNotificationCategories(categories)
+
+            center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+                guard granted else {
+                    DispatchQueue.main.async { NSApp.terminate(nil) }
+                    return
+                }
+                let content = UNMutableNotificationContent()
+                content.title = title
+                content.body = body
+                if isPermission {
+                    content.categoryIdentifier = categoryId
+                }
+                content.userInfo = [
+                    "projectId": projectId,
+                    "taskId": taskId,
+                    "chatId": chatId,
+                    "approveOpt": approveRaw,
+                    "denyOpt": denyRaw,
+                    "baseUrl": baseUrl
+                ]
+
+                let req = UNNotificationRequest(
+                    identifier: UUID().uuidString, content: content, trigger: nil)
+                center.add(req) { _ in
+                    DispatchQueue.main.async { NSApp.terminate(nil) }
+                }
+            }
+        } else {
+            // ─── Activation Mode: macOS launched us on banner click ───
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
+                NSApp.terminate(nil)
             }
         }
     }
@@ -548,6 +659,55 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         withCompletionHandler handler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
         handler([.banner, .sound])
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let userInfo = response.notification.request.content.userInfo
+        let projectId = userInfo["projectId"] as? String ?? ""
+        let taskId = userInfo["taskId"] as? String ?? ""
+        let chatId = userInfo["chatId"] as? String ?? ""
+        let approveOpt = userInfo["approveOpt"] as? String ?? "allow"
+        let denyOpt = userInfo["denyOpt"] as? String ?? "deny"
+        var baseUrl = userInfo["baseUrl"] as? String ?? "http://127.0.0.1:3001"
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser
+        let endpointFile = homeDir.appendingPathComponent(".grove").appendingPathComponent("gui_endpoint")
+        if let savedEndpoint = try? String(contentsOf: endpointFile, encoding: .utf8) {
+            let trimmed = savedEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                baseUrl = trimmed
+            }
+        }
+
+        func encode(_ s: String) -> String {
+            s.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? s
+        }
+
+        var urlString = ""
+        if response.actionIdentifier == "APPROVE_ACTION" {
+            urlString = "\(baseUrl)/api/v1/gui/resolve-permission?projectId=\(encode(projectId))&taskId=\(encode(taskId))&chatId=\(encode(chatId))&optionId=\(encode(approveOpt))"
+        } else if response.actionIdentifier == "DENY_ACTION" {
+            urlString = "\(baseUrl)/api/v1/gui/resolve-permission?projectId=\(encode(projectId))&taskId=\(encode(taskId))&chatId=\(encode(chatId))&optionId=\(encode(denyOpt))"
+        } else {
+            urlString = "\(baseUrl)/api/v1/gui/open-task?projectId=\(encode(projectId))&taskId=\(encode(taskId))&chatId=\(encode(chatId))"
+        }
+
+        if let url = URL(string: urlString) {
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            let semaphore = DispatchSemaphore(value: 0)
+            let task = URLSession.shared.dataTask(with: request) { _, _, _ in
+                semaphore.signal()
+            }
+            task.resume()
+            _ = semaphore.wait(timeout: .now() + 2.0)
+        }
+
+        completionHandler()
+        NSApp.terminate(nil)
     }
 }
 
@@ -561,14 +721,33 @@ app.run()
 /// Returns the path to the `grove-notify` binary.
 #[cfg(target_os = "macos")]
 pub fn ensure_grove_app() -> PathBuf {
+    use sha2::{Digest, Sha256};
+
     let grove_dir = crate::storage::grove_dir();
     let app_dir = grove_dir.join("Grove.app").join("Contents");
     let macos_dir = app_dir.join("MacOS");
     let res_dir = app_dir.join("Resources");
     let notify_bin = macos_dir.join("grove-notify");
+    let sentinel_path = res_dir.join("swift_src.sha256");
 
-    // Already built — fast path
-    if notify_bin.exists() {
+    let expected_hash = {
+        let mut h = Sha256::new();
+        h.update(NOTIFY_SWIFT_SRC.as_bytes());
+        hex::encode(h.finalize())
+    };
+
+    let needs_rebuild = !notify_bin.exists()
+        || !sentinel_path.exists()
+        || fs::read_to_string(&sentinel_path)
+            .map(|s| s.trim() != expected_hash)
+            .unwrap_or(true);
+
+    if needs_rebuild {
+        let app_bundle = grove_dir.join("Grove.app");
+        if app_bundle.exists() {
+            let _ = fs::remove_dir_all(&app_bundle);
+        }
+    } else {
         return notify_bin;
     }
 
@@ -618,6 +797,9 @@ pub fn ensure_grove_app() -> PathBuf {
     fs::remove_file(&swift_src).ok();
 
     if status.is_ok_and(|s| s.success()) {
+        // Write the sentinel file
+        let _ = fs::write(&sentinel_path, &expected_hash);
+
         // Ad-hoc sign so UNUserNotificationCenter works without developer account
         let app_bundle = grove_dir.join("Grove.app");
         Command::new("codesign")
