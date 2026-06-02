@@ -440,6 +440,26 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
   const sortedDiffFiles = useMemo(() => {
     if (viewMode === 'full') {
+      // Comment-based virtual files: files that have a review comment but
+      // don't appear in any of the in-repo file lists. Only surfaced in
+      // "All Files" mode so they don't pollute the Changes (vN..latest) range.
+      const realPaths = new Set(allFiles);
+      const commentVirtualFiles: DiffFile[] = [];
+      const seenVirtual = new Set<string>();
+      for (const c of comments) {
+        if (!c.file_path || realPaths.has(c.file_path) || seenVirtual.has(c.file_path)) continue;
+        seenVirtual.add(c.file_path);
+        commentVirtualFiles.push({
+          old_path: '',
+          new_path: c.file_path,
+          change_type: 'added' as const,
+          hunks: [],
+          is_binary: false,
+          additions: 0,
+          deletions: 0,
+          is_virtual: true,
+        });
+      }
       const temporaryVirtualFiles: DiffFile[] = Array.from(temporaryVirtualPaths).map(path => ({
         old_path: '',
         new_path: path,
@@ -459,9 +479,8 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
         additions: 0,
         deletions: 0,
       }));
-      const existingPaths = new Set(allFiles);
-      const uniqueVirtualFiles = temporaryVirtualFiles.filter(vf => !existingPaths.has(vf.new_path));
-      return sortTreeOrder([...allFileDiffFiles, ...uniqueVirtualFiles]);
+      const virtualFiles = [...commentVirtualFiles, ...temporaryVirtualFiles];
+      return sortTreeOrder([...allFileDiffFiles, ...virtualFiles]);
     }
     if (!diffData) return [];
     const statFiles: DiffFile[] = diffData.files.map(e => ({
@@ -475,7 +494,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       is_untracked: e.status === 'U',
     }));
     return sortTreeOrder(statFiles);
-  }, [viewMode, allFiles, diffData, temporaryVirtualPaths, sortTreeOrder]);
+  }, [viewMode, allFiles, diffData, temporaryVirtualPaths, comments, sortTreeOrder]);
 
   const baseFiles = (viewMode === 'full' && focusMode) ? focusFiles : sortedDiffFiles;
 
@@ -1222,26 +1241,11 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
         }
 
         if (!cancelled) {
-          // Detect virtual files (files with comments but not in diff)
-          // Include all comment types (file, inline) - any comment with a file_path
-          const existingFilePaths = new Set(data.files.map(f => f.path));
-          const virtualFilePaths = reviewComments
-            .filter(c => c.file_path && !existingFilePaths.has(c.file_path))
-            .map(c => c.file_path!)
-            .filter((path, idx, arr) => arr.indexOf(path) === idx);
-
-          if (virtualFilePaths.length > 0) {
-            const virtualEntries = virtualFilePaths.map(path => ({
-              path,
-              status: 'A' as const,
-              additions: 0,
-              deletions: 0,
-              is_binary: false,
-            }));
-            setDiffData({ ...data, files: [...data.files, ...virtualEntries] });
-          } else {
-            setDiffData(data);
-          }
+          // Store pure diff data. Virtual files (files with comments that aren't
+          // in the diff range) are computed in sortedDiffFiles for "All Files"
+          // mode only — adding them to diffData would leak them into "Changes"
+          // mode and inflate the file count for the selected vN..latest range.
+          setDiffData(data);
           if (filesData) {
             setAllFiles(filesData.files);
           }
