@@ -3,6 +3,31 @@ set -euo pipefail
 
 echo "=== Pre-commit checks ==="
 
+# 0. Protected paths — bespoke local features (the GrooveOffice/StatusBoard
+#    monitoring dashboard) that must never be deleted by accident: a stray
+#    `git rm`, an unintended merge of the dashboard-free export branch, etc.
+#    Skipped on the export branches (production / fork/* / export/*), which
+#    legitimately omit them. Override deliberately with `git commit --no-verify`.
+_pp_branch=$(git rev-parse --abbrev-ref HEAD)
+case "$_pp_branch" in
+    production|fork/*|export/*) : ;;
+    *)
+        echo ">> protected paths (GrooveOffice / StatusBoard)"
+        for _pp in \
+            src/groove_dashboard.rs \
+            grove-web/src/components/GrooveOffice \
+            grove-web/src/components/StatusBoard; do
+            if [ ! -e "$_pp" ]; then
+                echo "   ✘ protected path missing: $_pp"
+                echo "     GrooveOffice/StatusBoard must not be removed on '$_pp_branch'."
+                echo "     Intentional? Use an export branch or 'git commit --no-verify'."
+                exit 1
+            fi
+        done
+        echo "   ✔ protected paths present"
+        ;;
+esac
+
 # 1. Format check
 echo ">> cargo fmt --check"
 cargo fmt --all -- --check
