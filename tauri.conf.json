@@ -31,6 +31,9 @@
       "endpoints": [
         "https://raw.githubusercontent.com/GarrickZ2/grove/master/updater.json"
       ]
+    },
+    "deep-link": {
+      "schemes": ["grove"]
     }
   }
 }

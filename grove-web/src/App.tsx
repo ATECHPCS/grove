@@ -673,6 +673,7 @@ function AppContent() {
   useCommand("nav.dashboard", () => setActiveItem("dashboard"), []);
   useCommand("nav.work", () => setActiveItem("work"), []);
   useCommand("nav.tasks", () => setActiveItem("tasks"), []);
+  useCommand("nav.tasks.studio", () => setActiveItem("tasks"), []);
   useCommand("nav.resource", () => setActiveItem("resource"), []);
   useCommand("nav.automation", () => setActiveItem("automation"), []);
   useCommand("nav.skills", () => setActiveItem("skills"), []);
