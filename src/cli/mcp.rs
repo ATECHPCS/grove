@@ -2747,6 +2747,7 @@ async fn start_chat_impl(p: StartChatParams) -> Result<CallToolResult, McpError>
     let working_dir = std::path::PathBuf::from(&task.worktree_path);
 
     let acp_config = acp::AcpStartConfig {
+        auto_approve_permissions: false,
         agent_command: resolved.command,
         agent_name: resolved.agent_name,
         agent_args: resolved.args,
@@ -2802,6 +2803,7 @@ async fn resolve_session_access(
     let working_dir = std::path::PathBuf::from(&task.worktree_path);
 
     let config = acp::AcpStartConfig {
+        auto_approve_permissions: false,
         agent_command: resolved.command,
         agent_name: resolved.agent_name,
         agent_args: resolved.args,

@@ -1524,6 +1524,9 @@ pub async fn chat_ws_handler(
     };
 
     let config = AcpStartConfig {
+        // Interactive chat driven by a human in the UI — keep prompting for
+        // permission so the user stays in control.
+        auto_approve_permissions: false,
         agent_command: final_command,
         agent_name: resolved.agent_name,
         agent_args: final_args,

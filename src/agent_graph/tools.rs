@@ -610,6 +610,10 @@ pub async fn grove_agent_spawn(
     let working_dir = std::path::PathBuf::from(&task.worktree_path);
     let session_key = format!("{}:{}:{}", project_key, task_id, new_chat_id);
     let config = AcpStartConfig {
+        // Graph-spawned ally: no human watches its sub-session, so auto-approve
+        // permission requests or it would hang on the first tool call (e.g. its
+        // grove_agent_graph_reply) and never reply to the orchestrator.
+        auto_approve_permissions: true,
         agent_command: resolved.command,
         agent_name: resolved.agent_name,
         agent_args: resolved.args,
@@ -1029,6 +1033,10 @@ pub(crate) async fn ensure_target_handle(
     );
     let working_dir = std::path::PathBuf::from(&task.worktree_path);
     let config = AcpStartConfig {
+        // Graph-spawned ally: no human watches its sub-session, so auto-approve
+        // permission requests or it would hang on the first tool call (e.g. its
+        // grove_agent_graph_reply) and never reply to the orchestrator.
+        auto_approve_permissions: true,
         agent_command: resolved.command,
         agent_name: resolved.agent_name,
         agent_args: resolved.args,

@@ -25,6 +25,8 @@ pub async fn execute(agent: String, cwd: String) {
     eprintln!("Working directory: {}", working_dir.display());
 
     let config = AcpStartConfig {
+        // Standalone `grove acp` bridge — preserve default prompting behavior.
+        auto_approve_permissions: false,
         agent_command: resolved.command,
         agent_name: resolved.agent_name,
         agent_args: resolved.args,

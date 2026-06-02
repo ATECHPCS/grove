@@ -120,6 +120,9 @@ pub async fn user_spawn_node(
     );
     let session_key = format!("{}:{}:{}", project_key, task_id, new_chat_id);
     let config = AcpStartConfig {
+        // Graph ally spawned from the UI — headless sub-session, auto-approve
+        // permissions so it doesn't stall on a prompt nobody is watching.
+        auto_approve_permissions: true,
         agent_command: resolved.command,
         agent_name: resolved.agent_name,
         agent_args: resolved.args,

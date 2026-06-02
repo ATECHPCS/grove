@@ -647,6 +647,15 @@ pub struct AcpStartConfig {
     /// already in chat history. Wrapped in a `<grove-meta>` envelope of type
     /// `custom_agent_init` (see `agent_graph::inject::build_custom_agent_init_prompt`).
     pub persona_injection: Option<PersonaInjection>,
+    /// Auto-approve the agent's `session/request_permission` tool requests
+    /// instead of blocking on a human decision. Set for orchestrator/graph-
+    /// spawned allies: nobody is watching their sub-session UI, so a permission
+    /// prompt would hang forever and the ally would never reply (notably the
+    /// `grove_agent_graph_reply` MCP call). Claude allies already bypass via
+    /// their CLI `--allow-dangerously-skip-permissions`; this gives Gemini/Codex
+    /// (and any ACP agent that routes permission through the client) parity.
+    /// Left false for user-driven interactive chats, which keep prompting.
+    pub auto_approve_permissions: bool,
 }
 
 /// Custom Agent (persona) identity bundle injected once per fresh session.
@@ -757,6 +766,9 @@ struct AcpClientState {
     /// 前端这条 tool_call 会永远显示 running。我们在收到 Plan 时把它们合成
     /// 为 completed。
     pending_plan_tool_ids: Mutex<Vec<String>>,
+    /// Auto-approve permission requests (orchestrator/graph-spawned allies).
+    /// See `AcpStartConfig::auto_approve_permissions`.
+    auto_approve_permissions: bool,
 }
 
 /// Build a richer permission description by extracting the most useful
@@ -817,6 +829,30 @@ async fn handle_request_permission(
     args: acp::RequestPermissionRequest,
 ) -> acp::Result<acp::RequestPermissionResponse> {
     let _guard = state.handle.permission_lock.lock().await;
+
+    // Orchestrator/graph-spawned allies have no human watching their sub-session
+    // UI, so a permission prompt would block forever (the ally would never reach
+    // its reply tool call). Auto-approve instead: prefer a persistent "allow
+    // always", else "allow once", else the first offered option.
+    if state.auto_approve_permissions {
+        let pick = args
+            .options
+            .iter()
+            .find(|o| matches!(o.kind, acp::PermissionOptionKind::AllowAlways))
+            .or_else(|| {
+                args.options
+                    .iter()
+                    .find(|o| matches!(o.kind, acp::PermissionOptionKind::AllowOnce))
+            })
+            .or_else(|| args.options.first());
+        if let Some(opt) = pick {
+            return Ok(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
+                    opt.option_id.clone(),
+                )),
+            ));
+        }
+    }
 
     let request_id = args.tool_call.tool_call_id.to_string();
     let title = args.tool_call.fields.title.clone().unwrap_or_default();
@@ -1984,6 +2020,7 @@ async fn run_acp_session(
         file_snapshots: Mutex::new(HashMap::new()),
         write_tool_paths: Mutex::new(HashMap::new()),
         pending_plan_tool_ids: Mutex::new(Vec::new()),
+        auto_approve_permissions: config.auto_approve_permissions,
     });
 
     let transport = acp::ByteStreams::new(writer, reader);
