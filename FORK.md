@@ -9,7 +9,7 @@ that are being contributed back as PRs. This file is the source of truth for
 > tables below. Lives only on the fork (upstream never touches `FORK.md`), so it
 > never causes a merge conflict on upstream sync.
 
-_Last updated: 2026-06-02_
+_Last updated: 2026-06-02 (PR #18 superseded by #23)_
 
 ## Branches
 
@@ -22,17 +22,19 @@ _Last updated: 2026-06-02_
 | `pr/ios-pwa-fixes` | `origin/...` | Backs PR #20 |
 | `pr/agent-graph-ally-reliability` | `origin/...` | Backs PR #21 |
 | `pr/agent-named-sessions` | `origin/...` | Backs PR #22 |
-| `pr-blitz-grid` | `origin/feat/blitz-grid-workspace` | Backs PR #18 (+ local-only docs) |
+| `pr/blitz-flexlayout` | `origin/...` | Backs PR #23 (flexlayout grid rewrite) |
+| `pr-blitz-grid` | `origin/feat/blitz-grid-workspace` | Backed PR #18 (closed, superseded by #23). Keeps the local-only design docs; stale otherwise. |
 
 ## Open PRs → upstream (GarrickZ2/grove)
 
 | PR | Status | Title |
 |---|---|---|
-| [#18](https://github.com/GarrickZ2/grove/pull/18) | 🟢 Open | feat(blitz): grid workspace for viewing multiple chats simultaneously |
 | [#19](https://github.com/GarrickZ2/grove/pull/19) | 🟢 Open | tmux-backed agent terminal + per-chat launch picker |
 | [#20](https://github.com/GarrickZ2/grove/pull/20) | 🟢 Open | Fix iOS standalone-PWA layout: safe-area, input zoom, full-screen fill |
 | [#21](https://github.com/GarrickZ2/grove/pull/21) | 🟢 Open | Agent-graph: make orchestrator-spawned allies reliably reply |
 | [#22](https://github.com/GarrickZ2/grove/pull/22) | 🟢 Open | feat(chat): name new sessions after their agent instead of a timestamp |
+| [#23](https://github.com/GarrickZ2/grove/pull/23) | 🟢 Open | feat(blitz): grid workspace on flexlayout-react (supersedes #18) |
+| [#18](https://github.com/GarrickZ2/grove/pull/18) | 🔴 Closed | feat(blitz): grid workspace — preset version, superseded by #23 |
 
 Legend: 🟢 Open · 🟣 Merged · 🔴 Closed · ⚪ Draft
 
