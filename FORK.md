@@ -9,7 +9,7 @@ that are being contributed back as PRs. This file is the source of truth for
 > tables below. Lives only on the fork (upstream never touches `FORK.md`), so it
 > never causes a merge conflict on upstream sync.
 
-_Last updated: 2026-06-02 (PR #18 superseded by #23)_
+_Last updated: 2026-06-02 (PR #18 superseded by #23; pr-blitz-grid retired, docs → docs/legacy/)_
 
 ## Branches
 
@@ -23,7 +23,9 @@ _Last updated: 2026-06-02 (PR #18 superseded by #23)_
 | `pr/agent-graph-ally-reliability` | `origin/...` | Backs PR #21 |
 | `pr/agent-named-sessions` | `origin/...` | Backs PR #22 |
 | `pr/blitz-flexlayout` | `origin/...` | Backs PR #23 (flexlayout grid rewrite) |
-| `pr-blitz-grid` | `origin/feat/blitz-grid-workspace` | Backed PR #18 (closed, superseded by #23). Keeps the local-only design docs; stale otherwise. |
+
+> `pr-blitz-grid` (backed the closed PR #18) was deleted after #23 superseded it.
+> Its local-only design/plan docs are preserved under [`docs/legacy/`](docs/legacy/).
 
 ## Open PRs → upstream (GarrickZ2/grove)
 
