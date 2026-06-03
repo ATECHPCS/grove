@@ -1,5 +1,7 @@
 # Grove
 
+> **ATECHPCS fork** — see [`FORK.md`](FORK.md) for branch topology, in-flight PRs, and fork-only features.
+
 **The multi-agent IDE.**
 *Run every coding agent you use in one workspace, working in parallel as a team.*
 
