@@ -341,6 +341,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
   // Code search state (Ctrl+F)
   const [codeSearchVisible, setCodeSearchVisible] = useState(false);
+  const [codeSearchFocusTrigger, setCodeSearchFocusTrigger] = useState(0);
   const [codeSearchQuery, setCodeSearchQuery] = useState('');
   const [codeSearchCaseSensitive, setCodeSearchCaseSensitive] = useState(false);
   const [codeSearchCurrentIndex, setCodeSearchCurrentIndex] = useState(0);
@@ -1345,7 +1346,10 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
   const lightboxNotOpen = useCallback(() => !document.querySelector('[data-lightbox-active]'), []);
 
-  useCommand('diffReview.openSearch', () => setCodeSearchVisible(true), []);
+  useCommand('diffReview.openSearch', () => {
+    setCodeSearchVisible(true);
+    setCodeSearchFocusTrigger((n) => n + 1);
+  }, []);
 
   useCommand(
     'diffReview.closeSearch',
@@ -2228,6 +2232,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       {/* Code Search Bar (Ctrl+F) */}
       <CodeSearchBar
         visible={codeSearchVisible}
+        focusTrigger={codeSearchFocusTrigger}
         query={codeSearchQuery}
         caseSensitive={codeSearchCaseSensitive}
         currentIndex={codeSearchQuery ? codeSearchCurrentIndex : 0}

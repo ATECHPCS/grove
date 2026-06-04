@@ -259,6 +259,10 @@
   overflow-y: hidden;
   display: flex;
   flex-direction: column;
+  /* The base rule's `padding-bottom: 75vh` (scroll-past-end space) would, in
+     this flex-column layout, eat the entire content height and collapse the
+     file section/body/preview drawer to 0. Only needed in scroll mode. */
+  padding-bottom: 0;
 }
 
 .diff-content:has(.diff-file-body.with-preview) .diff-file-section {
