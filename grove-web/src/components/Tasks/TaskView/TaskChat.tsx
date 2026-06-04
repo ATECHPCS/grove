@@ -2613,8 +2613,9 @@ export function TaskChat({
     // Sibling chats in the same task (excluding the active one) — feed
     // `Read History` mentions so the AI can inspect another chat's
     // history.jsonl by absolute path.
-    const siblingChats = chats
+    const siblingChats = [...chats]
       .filter((c) => c.id !== activeChatId)
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
       .map((c) => ({
         chat_id: c.id,
         name: c.title,
