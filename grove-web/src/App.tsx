@@ -3,6 +3,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { Sidebar } from "./components/Layout/Sidebar";
+import { PluginFrame } from "./components/Plugins/PluginFrame";
+import { listPlugins, type Plugin } from "./api/plugins";
 import { MobileHeader } from "./components/Layout/MobileHeader";
 import { MobileDrawer } from "./components/Layout/MobileDrawer";
 import { NotificationPopover } from "./components/Layout/NotificationPopover";
@@ -136,6 +138,24 @@ function AppContent() {
   const effectiveSidebarCollapsed = sidebarCollapsed || viewportTooNarrowForSidebar;
   const [hasExitedWelcome, setHasExitedWelcome] = useState(false);
   const [navigationData, setNavigationData] = useState<Record<string, unknown> | null>(null);
+
+  // Installed plugins that contribute a top-level sidebar page. Loaded once;
+  // the sidebar renders a nav entry per plugin (id `plugin:<id>`) and
+  // renderContent renders the plugin full-page when one is active.
+  const [sidebarPlugins, setSidebarPlugins] = useState<Plugin[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    listPlugins()
+      .then((ps) => {
+        if (!cancelled) setSidebarPlugins(ps.filter((p) => p.contributes?.sidebar));
+      })
+      .catch(() => {
+        if (!cancelled) setSidebarPlugins([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const { selectedProject, currentProjectId, isLoading, selectProject, projects, addProject, createNewProject, cloneProject, refreshProjects, refreshSelectedProject } = useProject();
   useReportDebugId("projectId", selectedProject?.id ?? null);
   const [showAddProject, setShowAddProject] = useState(false);
@@ -1028,7 +1048,15 @@ function AppContent() {
         return <ProjectStatsPage projectId={selectedProject?.id} />;
       case "settings":
         return <SettingsPage config={mockConfig} />;
-      default:
+      default: {
+        // Plugin sidebar page (`contributes.sidebar`) — app-scoped full page.
+        if (activeItem.startsWith("plugin:")) {
+          const pluginId = activeItem.slice("plugin:".length);
+          const plugin = sidebarPlugins.find((p) => p.id === pluginId);
+          if (plugin) {
+            return <PluginFrame plugin={plugin} projectId={selectedProject?.id ?? null} />;
+          }
+        }
         return (
           <div className="flex items-center justify-center h-full min-h-[60vh]">
             <div className="text-center">
@@ -1041,6 +1069,7 @@ function AppContent() {
             </div>
           </div>
         );
+      }
     }
   };
 
@@ -1053,7 +1082,8 @@ function AppContent() {
     activeItem === "ai" ||
     activeItem === "resource" ||
     activeItem === "automation" ||
-    activeItem === "statistics";
+    activeItem === "statistics" ||
+    activeItem.startsWith("plugin:");
 
   const sidebarProps = {
     activeItem,
@@ -1073,6 +1103,7 @@ function AppContent() {
     tasks: selectedProject?.tasks ?? [],
     onTaskSelect: handleTaskSelectFromPalette,
     inWorkspace,
+    sidebarPlugins,
   };
 
   // Add-library dialog — surfaces both the install confirmation and any

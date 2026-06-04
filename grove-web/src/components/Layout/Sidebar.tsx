@@ -16,6 +16,8 @@ import {
   Layers,
   Repeat,
 } from "lucide-react";
+import type { Plugin } from "../../api/plugins";
+import { PluginIcon } from "../Plugins/PluginIcon";
 import { ProjectSelector } from "./ProjectSelector";
 import { NotificationPopover } from "./NotificationPopover";
 import { LogoBrand } from "./LogoBrand";
@@ -73,9 +75,11 @@ interface SidebarProps {
   onTaskSelect?: (task: Task) => void;
   /** Whether a task workspace is currently active */
   inWorkspace?: boolean;
+  /** Installed plugins contributing a top-level page (`contributes.sidebar`). */
+  sidebarPlugins?: Plugin[];
 }
 
-export function Sidebar({ activeItem, onItemClick, collapsed, onToggleCollapse, onManageProjects, onAddProject, onNavigate, tasksMode, onTasksModeChange, onProjectSwitch, onSearch, drawerMode, onDrawerClose, tasks, onTaskSelect, inWorkspace }: SidebarProps) {
+export function Sidebar({ activeItem, onItemClick, collapsed, onToggleCollapse, onManageProjects, onAddProject, onNavigate, tasksMode, onTasksModeChange, onProjectSwitch, onSearch, drawerMode, onDrawerClose, tasks, onTaskSelect, inWorkspace, sidebarPlugins }: SidebarProps) {
   const [notifOpen, setNotifOpen] = useState(false);
   const { unreadCount } = useNotifications();
   const { selectedProject } = useProject();
@@ -159,6 +163,28 @@ export function Sidebar({ activeItem, onItemClick, collapsed, onToggleCollapse, 
             );
           })}
         </div>
+
+        {/* Plugin pages (`contributes.sidebar`) — id namespaced `plugin:<id>`. */}
+        {sidebarPlugins && sidebarPlugins.length > 0 && (
+          <div className="mt-2 space-y-1 border-t border-[var(--color-border)] pt-2">
+            {sidebarPlugins.map((p) => {
+              const navId = `plugin:${p.id}`;
+              // The plugin's own icon (manifest `icon`), falling back to Puzzle.
+              const Icon = (props: { className?: string }) => (
+                <PluginIcon plugin={p} className={props.className} size={20} />
+              );
+              return (
+                <NavButton
+                  key={navId}
+                  item={{ id: navId, label: p.contributes?.sidebar?.title || p.name, icon: Icon }}
+                  isActive={activeItem === navId}
+                  onClick={() => handleItemClick(navId)}
+                  collapsed={isCollapsed}
+                />
+              );
+            })}
+          </div>
+        )}
       </nav>
 
       {/* Footer */}

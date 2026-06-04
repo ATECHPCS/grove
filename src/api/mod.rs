@@ -189,6 +189,81 @@ pub fn create_api_router() -> Router {
             "/extension/open-chrome",
             post(handlers::extension::open_chrome_extensions),
         )
+        // Plugin development API (scaffold a starter into a chosen folder)
+        .route(
+            "/plugins/browse-folder",
+            get(handlers::plugins::browse_plugin_folder),
+        )
+        .route(
+            "/plugins/scaffold",
+            post(handlers::plugins::scaffold_plugin),
+        )
+        .route(
+            "/plugins/install-local",
+            post(handlers::plugins::install_local),
+        )
+        .route("/plugins/install-git", post(handlers::plugins::install_git))
+        .route(
+            "/plugins/install-zip",
+            post(handlers::plugins::install_zip).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/plugins",
+            get(handlers::plugins::list_plugins).post(handlers::plugins::register_plugin),
+        )
+        .route("/plugins/{id}", delete(handlers::plugins::delete_plugin))
+        .route(
+            "/plugins/{id}/reveal",
+            post(handlers::plugins::reveal_plugin_folder),
+        )
+        .route(
+            "/plugins/{id}/data-dir",
+            get(handlers::plugins::list_plugin_data),
+        )
+        .route(
+            "/plugins/{id}/data/{*path}",
+            get(handlers::plugins::read_plugin_data)
+                .put(handlers::plugins::write_plugin_data)
+                .delete(handlers::plugins::delete_plugin_data),
+        )
+        .route(
+            "/plugins/{id}/data-bytes/{*path}",
+            get(handlers::plugins::read_plugin_bytes).put(handlers::plugins::write_plugin_bytes),
+        )
+        .route(
+            "/plugins/{id}/asset/{*path}",
+            get(handlers::plugins::serve_plugin_asset),
+        )
+        .route(
+            "/plugins/{id}/project-file",
+            get(handlers::plugins::read_project_file),
+        )
+        .route(
+            "/plugins/{id}/project-dir",
+            get(handlers::plugins::list_project_dir),
+        )
+        .route(
+            "/plugins/{id}/backend/invoke",
+            post(handlers::plugins::backend_invoke),
+        )
+        .route("/plugins/{id}/exec", post(handlers::plugins::exec_command))
+        .route(
+            "/plugins/{id}/events",
+            post(handlers::plugins::emit_event),
+        )
+        .route(
+            "/plugins/{id}/events/subscribe",
+            get(handlers::plugins::subscribe_events),
+        )
+        .route(
+            "/plugins/{id}/update-sdk",
+            post(handlers::plugins::update_plugin_sdk),
+        )
+        .route(
+            "/plugins/{id}/chat/list",
+            get(handlers::plugins::chat_list),
+        )
+        .route("/plugins/{id}/chat/send", post(handlers::plugins::chat_send))
         // Folder selection API
         .route("/browse-folder", get(handlers::folder::browse_folder))
         .route("/folders/list", get(handlers::folder::list_folder))
@@ -1377,6 +1452,16 @@ pub async fn start_server(
     auth: Arc<ServerAuth>,
     tls_mode: crate::cli::web::TlsMode,
 ) -> std::io::Result<()> {
+    // Record our loopback base so a plugin's MCP server (a node child process,
+    // not an authenticated Grove client) knows where to POST events. Always
+    // loopback — the MCP server runs on this same machine regardless of bind.
+    crate::plugins::events::set_server_base(format!("http://127.0.0.1:{}", port));
+
+    // Relay the aggregated radio event stream into plugin panels (holding
+    // `chat:read`) as `grove:radio` events. No-op on the wire until a panel
+    // subscribes; safe to start unconditionally.
+    crate::plugins::radio_bridge::spawn();
+
     // Auto-correct agent defaults based on what's actually installed on PATH.
     // Runs every server start because the user's environment can change between
     // sessions (e.g. they install a new CLI).

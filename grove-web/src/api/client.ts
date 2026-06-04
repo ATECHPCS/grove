@@ -361,6 +361,27 @@ class ApiClient {
     return undefined as R;
   }
 
+  /**
+   * POST that returns the raw (signed) Response so the caller can read a
+   * streaming body — e.g. the plugin exec NDJSON stream. Throws on non-2xx.
+   */
+  async postStream<T>(path: string, data?: T): Promise<Response> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: 'POST',
+      headers: await getSignedHeaders('POST', path),
+      body: data ? JSON.stringify(data) : undefined,
+    });
+    if (!response.ok) {
+      const payload = await extractErrorPayload(response);
+      throw {
+        status: response.status,
+        message: payload.message,
+        data: payload.data,
+      } as ApiError;
+    }
+    return response;
+  }
+
   async postNoContent(path: string): Promise<void> {
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: 'POST',

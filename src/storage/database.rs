@@ -387,6 +387,26 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             updated_at    TEXT NOT NULL
         );
 
+        -- Plugins registry. One row per installed/registered plugin (a folder
+        -- containing plugin.json). `source` decides where local_path points and
+        -- whether delete removes files:
+        --   'dev'   → local_path is the user's own folder (referenced, not
+        --             copied; edits hot-reload; delete only drops the row).
+        --   'local' → copied into ~/.grove/plugins/<id> (delete removes files).
+        --   'git'   → cloned into ~/.grove/plugins/<id> from git_url[/subpath]
+        --             (delete removes files).
+        CREATE TABLE IF NOT EXISTS plugins (
+            id            TEXT PRIMARY KEY,
+            name          TEXT NOT NULL,
+            version       TEXT NOT NULL DEFAULT '0.0.0',
+            source        TEXT NOT NULL,
+            local_path    TEXT NOT NULL UNIQUE,
+            git_url       TEXT,
+            subpath       TEXT,
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        );
+
         -- Marketplace-managed agent installs. Auto-detected (user has the CLI
         -- on PATH already) is NOT tracked here — that comes from runtime probe.
         -- `hidden` lets a user suppress an auto-detected agent from the picker

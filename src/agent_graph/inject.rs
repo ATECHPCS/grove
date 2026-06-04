@@ -187,6 +187,33 @@ pub fn build_injected_prompt(
     }
 }
 
+/// Build a prompt injected into an ACP session on behalf of a Grove **plugin**
+/// (via `grove.chat.sendPrompt`). Uses the same `<grove-meta>` envelope as the
+/// agent-to-agent injects so the chat UI can render a "from plugin X" pill;
+/// frontends that don't recognise the `plugin_inject` type fall back to
+/// rendering the `system-prompt` text (per the envelope contract), so the
+/// origin is visible either way.
+pub fn build_plugin_inject_prompt(plugin_id: &str, plugin_name: &str, body: &str) -> String {
+    let system_prompt = format!(
+        "The following message was injected by the Grove plugin \"{name}\" \
+         (id={id}) on the user's behalf. Treat it as a user instruction.",
+        name = plugin_name,
+        id = plugin_id,
+    );
+    let payload = json!({
+        "v": 1,
+        "type": "plugin_inject",
+        "data": { "plugin_id": plugin_id, "plugin_name": plugin_name },
+        "system-prompt": system_prompt,
+    });
+    let envelope = serde_json::to_string(&payload).expect("envelope serializes");
+    if body.is_empty() {
+        format!("<grove-meta>{envelope}</grove-meta>")
+    } else {
+        format!("<grove-meta>{envelope}</grove-meta>\n\n{body}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

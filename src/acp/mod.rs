@@ -81,6 +81,10 @@ pub struct AcpSessionHandle {
     /// Config option id for thought-level（agent 自定义，例如 "effort_level"）。
     /// 前端在下一条 `Prompt.config.thought_level_config_id` 里 echo 回来。
     thought_level_config_id: Mutex<Option<String>>,
+    /// Config option id for the model selector（claude-agent-acp ≥0.40 moves
+    /// model into configOptions; older agents expose session/set_model instead）.
+    /// None = use legacy SetSessionModelRequest; Some(id) = use SetSessionConfigOptionRequest.
+    model_config_id: Mutex<Option<String>>,
     /// Task 工作目录（用于用户直接执行 terminal 命令）
     pub working_dir: String,
     /// 用户终端命令的 kill channel（Shell 模式）
@@ -559,6 +563,8 @@ pub struct SessionMetadata {
     pub available_models: Vec<(String, String)>,
     pub current_model_id: Option<String>,
     #[serde(default)]
+    pub model_config_id: Option<String>,
+    #[serde(default)]
     pub available_thought_levels: Vec<(String, String)>,
     #[serde(default)]
     pub current_thought_level_id: Option<String>,
@@ -723,7 +729,204 @@ fn build_mcp_servers(
             )));
         }
     }
+    // Inject stdio MCP servers contributed by installed plugins, forwarding the
+    // task/project context env (so a plugin's MCP server has the same "current
+    // context" the panel gets from host.getInfo).
+    servers.extend(load_plugin_mcp_servers(env_vars));
     Ok(servers)
+}
+
+/// Build stdio MCP servers contributed by installed plugins. A plugin whose
+/// manifest has `contributes.mcp = { command, args?, env? }` gets one stdio
+/// server. Relative file paths in command/args are resolved against the plugin
+/// folder; `GROVE_PLUGIN_DIR` / `GROVE_PLUGIN_DATA_DIR` plus the allowlisted
+/// task/project context (`PLUGIN_MCP_CONTEXT_ENV`, e.g. `GROVE_WORKTREE`) are
+/// injected so the server has the same context the panel gets from
+/// host.getInfo. Best-effort: a missing / malformed manifest is skipped, never
+/// fails the session.
+fn load_plugin_mcp_servers(base_env: &HashMap<String, String>) -> Vec<acp::McpServer> {
+    let plugins = match crate::storage::plugins::list() {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let mut servers = Vec::new();
+    for plugin in plugins {
+        let manifest_path = std::path::Path::new(&plugin.local_path).join("plugin.json");
+        let manifest: serde_json::Value = match std::fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+        {
+            Some(m) => m,
+            None => continue,
+        };
+        let mcp = match manifest.get("contributes").and_then(|c| c.get("mcp")) {
+            Some(m) => m,
+            None => continue,
+        };
+        let plugin_dir = std::path::Path::new(&plugin.local_path);
+        // Resolve a value to an absolute path when it names a file inside the
+        // plugin folder. McpServerStdio has no cwd, so a relative entry like
+        // `dist/server.js` would otherwise resolve against Grove's cwd. Bare
+        // commands (`node`) and flags (`--foo`) don't match a file and pass
+        // through unchanged (PATH resolution handles `node`).
+        let resolve = |s: &str| -> String {
+            let candidate = plugin_dir.join(s);
+            if candidate.is_file() {
+                candidate.display().to_string()
+            } else {
+                s.to_string()
+            }
+        };
+        let command = match mcp.get("command").and_then(|v| v.as_str()) {
+            Some(c) if !c.is_empty() => resolve(c),
+            _ => continue,
+        };
+        let mut args: Vec<String> = mcp
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).map(resolve).collect())
+            .unwrap_or_default();
+        // Declared permissions → Node Permission Model flags. A node-based MCP
+        // server runs under `node --permission` with fs/exec grants matching
+        // exactly what the manifest declares; Grove requires node >= 24 and
+        // refuses (skips) the server otherwise, so a permission is never left
+        // silently unenforced.
+        let perms: std::collections::HashSet<String> = manifest
+            .get("permissions")
+            .and_then(|p| p.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let storage_root = crate::storage::plugin_data::data_dir(&plugin.id);
+        let _ = std::fs::create_dir_all(&storage_root);
+        if crate::plugins::runtime::is_node_command(&command) {
+            if !crate::plugins::runtime::node_supports_permissions(&command) {
+                eprintln!(
+                    "grove: skipping MCP server for plugin '{}': node >= {} is required \
+                     for enforced permissions (check `node --version`)",
+                    plugin.name,
+                    crate::plugins::runtime::MIN_NODE_MAJOR
+                );
+                continue;
+            }
+            let mut flags = crate::plugins::runtime::node_permission_flags(
+                &perms,
+                &plugin.local_path,
+                &storage_root.display().to_string(),
+                base_env.get("GROVE_WORKTREE").map(|s| s.as_str()),
+            );
+            flags.extend(args);
+            args = flags;
+        }
+        let mut env: Vec<acp::EnvVariable> = mcp
+            .get("env")
+            .and_then(|v| v.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, v)| {
+                        v.as_str()
+                            .map(|s| acp::EnvVariable::new(k.clone(), s.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Hand the server a single structured context blob — the SDK's
+        // `getGroveContext()` parses this; plugin authors never read env
+        // directly. Secrets (e.g. Grove's MCP token) are never included.
+        // The three storage scope dirs the MCP server can use directly (it runs
+        // with `--allow-fs-*` on the data root). project/task are present only
+        // when the session carries those ids.
+        use crate::storage::plugin_data::{scope_dir, Scope};
+        let dir_str = |s: Scope| scope_dir(&plugin.id, &s).ok().map(|p| p.display().to_string());
+        let pid = base_env.get("GROVE_PROJECT_KEY").cloned();
+        let tid = base_env.get("GROVE_TASK_ID").cloned();
+        let storage = serde_json::json!({
+            "global": dir_str(Scope::Global),
+            "project": pid.clone().and_then(|p| dir_str(Scope::Project(p))),
+            "task": pid.clone().zip(tid.clone()).and_then(|(p, t)| dir_str(Scope::Task(p, t))),
+        });
+        // Studio task worktrees live under ~/.grove/studios; everything else is
+        // a coding repo. Mirrors the panel's host.getInfo().projectType.
+        let project_type = base_env.get("GROVE_WORKTREE").map(|w| {
+            if w.contains("studios") {
+                "studio"
+            } else {
+                "repo"
+            }
+        });
+        let context = serde_json::json!({
+            "projectDir": base_env.get("GROVE_WORKTREE"),   // current task's working dir
+            "projectPath": base_env.get("GROVE_PROJECT"),   // project root
+            "projectName": base_env.get("GROVE_PROJECT_NAME"),
+            "projectId": base_env.get("GROVE_PROJECT_KEY"),
+            "projectType": project_type,
+            "taskId": base_env.get("GROVE_TASK_ID"),
+            "taskName": base_env.get("GROVE_TASK_NAME"),
+            "branch": base_env.get("GROVE_BRANCH"),
+            "target": base_env.get("GROVE_TARGET"),
+            "chatId": base_env.get("GROVE_CHAT_ID"),
+            "pluginDir": plugin.local_path,
+            "dataDir": storage_root.display().to_string(),  // data root (all scopes)
+            "storage": storage,
+        });
+        env.push(acp::EnvVariable::new(
+            "GROVE_CONTEXT".to_string(),
+            context.to_string(),
+        ));
+        // Event bus: the MCP server's stdio talks to the agent, not Grove, so
+        // grove.events.emit posts back over HTTP (loopback) with the token.
+        if let Some(url) = crate::plugins::events::events_url(&plugin.id) {
+            env.push(acp::EnvVariable::new(
+                "GROVE_EVENTS_TRANSPORT".to_string(),
+                "http".to_string(),
+            ));
+            env.push(acp::EnvVariable::new("GROVE_EVENTS_URL".to_string(), url));
+            env.push(acp::EnvVariable::new(
+                "GROVE_EVENTS_TOKEN".to_string(),
+                crate::plugins::events::token().to_string(),
+            ));
+        }
+        servers.push(acp::McpServer::Stdio(
+            acp::McpServerStdio::new(
+                plugin_mcp_server_name(&plugin),
+                std::path::PathBuf::from(command),
+            )
+            .args(args)
+            .env(env),
+        ));
+    }
+    servers
+}
+
+/// A readable, tool-safe MCP server name for a plugin — the agent prefixes the
+/// plugin's tools with this, so it must not be the opaque `pl-<uuid>`. Uses the
+/// plugin's folder name (sanitized to `[A-Za-z0-9_-]`), falling back to the id.
+fn plugin_mcp_server_name(plugin: &crate::storage::plugins::Plugin) -> String {
+    let raw = std::path::Path::new(&plugin.local_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&plugin.name);
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            slug.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        format!("plugin-{}", plugin.id)
+    } else {
+        slug.to_string()
+    }
 }
 
 /// 单个 terminal 实例的状态
@@ -1621,6 +1824,7 @@ pub async fn get_or_start_session(
                     current_usage: Mutex::new(None),
                     current_thought_level_id: Mutex::new(None),
                     thought_level_config_id: Mutex::new(None),
+                    model_config_id: Mutex::new(None),
                     working_dir: config.working_dir.to_string_lossy().to_string(),
                     terminal_kill_tx: Mutex::new(None),
                     is_busy: std::sync::atomic::AtomicBool::new(false),
@@ -2156,19 +2360,46 @@ async fn drive_session(
 
     fn extract_models(
         models: &Option<acp::SessionModelState>,
-    ) -> (Vec<(String, String)>, Option<String>) {
-        match models {
-            Some(state) => {
-                let available: Vec<(String, String)> = state
-                    .available_models
-                    .iter()
-                    .map(|m| (m.model_id.to_string(), m.name.clone()))
-                    .collect();
-                let current = Some(state.current_model_id.to_string());
-                (available, current)
-            }
-            None => (vec![], None),
+        config_options: &[acp::SessionConfigOption],
+    ) -> (Vec<(String, String)>, Option<String>, Option<String>) {
+        if let Some(state) = models {
+            let available: Vec<(String, String)> = state
+                .available_models
+                .iter()
+                .map(|m| (m.model_id.to_string(), m.name.clone()))
+                .collect();
+            let current = Some(state.current_model_id.to_string());
+            return (available, current, None);
         }
+        // claude-agent-acp ≥0.40 no longer returns a separate `models` field;
+        // model info is embedded in `configOptions` with category "model".
+        for opt in config_options {
+            let is_model = matches!(opt.category, Some(acp::SessionConfigOptionCategory::Model));
+            let is_model_other = matches!(
+                &opt.category,
+                Some(acp::SessionConfigOptionCategory::Other(s))
+                    if s.eq_ignore_ascii_case("model")
+            );
+            if !is_model && !is_model_other {
+                continue;
+            }
+            let acp::SessionConfigKind::Select(select) = &opt.kind else {
+                continue;
+            };
+            let acp::SessionConfigSelectOptions::Ungrouped(entries) = &select.options else {
+                continue;
+            };
+            let available: Vec<(String, String)> = entries
+                .iter()
+                .map(|e| (e.value.to_string(), e.name.clone()))
+                .collect();
+            return (
+                available,
+                Some(select.current_value.to_string()),
+                Some(opt.id.to_string()),
+            );
+        }
+        (vec![], None, None)
     }
 
     // Grove 内部错误 → acp::Error
@@ -2315,6 +2546,7 @@ async fn drive_session(
     let current_mode_id;
     let available_models;
     let current_model_id;
+    let model_config_id;
     let available_thought_levels;
     let current_thought_level_id;
     let thought_level_config_id;
@@ -2469,7 +2701,10 @@ async fn drive_session(
             let sid = resp.session_id.to_string();
             persist_session_id(&sid);
             (available_modes, current_mode_id) = extract_modes(&resp.modes);
-            (available_models, current_model_id) = extract_models(&resp.models);
+            (available_models, current_model_id, model_config_id) = extract_models(
+                &resp.models,
+                resp.config_options.as_deref().unwrap_or(&[]),
+            );
             (
                 available_thought_levels,
                 current_thought_level_id,
@@ -2565,7 +2800,8 @@ async fn drive_session(
             match resume_result {
                 Ok(resp) => {
                     (available_modes, current_mode_id) = extract_modes(&resp.modes);
-                    (available_models, current_model_id) = extract_models(&resp.models);
+                    (available_models, current_model_id, model_config_id) =
+                        extract_models(&resp.models, resp.config_options.as_deref().unwrap_or(&[]));
                     (
                         available_thought_levels,
                         current_thought_level_id,
@@ -2607,7 +2843,8 @@ async fn drive_session(
             match load_result {
                 Ok(resp) => {
                     (available_modes, current_mode_id) = extract_modes(&resp.modes);
-                    (available_models, current_model_id) = extract_models(&resp.models);
+                    (available_models, current_model_id, model_config_id) =
+                        extract_models(&resp.models, resp.config_options.as_deref().unwrap_or(&[]));
                     (
                         available_thought_levels,
                         current_thought_level_id,
@@ -2652,6 +2889,7 @@ async fn drive_session(
     *handle.current_model_id.lock().unwrap() = current_model_id.clone();
     *handle.current_thought_level_id.lock().unwrap() = current_thought_level_id.clone();
     *handle.thought_level_config_id.lock().unwrap() = thought_level_config_id.clone();
+    *handle.model_config_id.lock().unwrap() = model_config_id.clone();
 
     if let Some(ref chat_id) = handle.chat_id {
         if let Some(existing) = read_session_metadata(&handle.project_key, &handle.task_id, chat_id)
@@ -2752,13 +2990,28 @@ async fn drive_session(
                         if let Some(ref model_id) = cfg.model {
                             let current = handle.current_model_id.lock().unwrap().clone();
                             if current.as_deref() != Some(model_id.as_str()) {
-                                let resp = conn
-                                    .send_request(acp::SetSessionModelRequest::new(
+                                let model_cfg_id = handle.model_config_id.lock().unwrap().clone();
+                                let resp: Result<(), _> = if let Some(ref config_id) = model_cfg_id
+                                {
+                                    // claude-agent-acp ≥0.40: model via generic config option
+                                    conn.send_request(acp::SetSessionConfigOptionRequest::new(
+                                        session_id_arc.clone(),
+                                        acp::SessionConfigId::new(config_id.clone()),
+                                        acp::SessionConfigValueId::new(model_id.clone()),
+                                    ))
+                                    .block_task()
+                                    .await
+                                    .map(|_| ())
+                                } else {
+                                    // Legacy: dedicated session/set_model method
+                                    conn.send_request(acp::SetSessionModelRequest::new(
                                         session_id_arc.clone(),
                                         acp::ModelId::new(model_id.clone()),
                                     ))
                                     .block_task()
-                                    .await;
+                                    .await
+                                    .map(|_| ())
+                                };
                                 match resp {
                                     Ok(_) => {
                                         *handle.current_model_id.lock().unwrap() =
@@ -3423,6 +3676,7 @@ impl AcpSessionHandle {
                     *self.current_thought_level_id.lock().unwrap() =
                         current_thought_level_id.clone();
                     *self.thought_level_config_id.lock().unwrap() = thought_level_config_id.clone();
+                    let model_cfg_id = self.model_config_id.lock().unwrap().clone();
 
                     write_session_metadata(
                         &self.project_key,
@@ -3436,6 +3690,7 @@ impl AcpSessionHandle {
                             current_mode_id: current_mode_id.clone(),
                             available_models: available_models.clone(),
                             current_model_id: current_model_id.clone(),
+                            model_config_id: model_cfg_id,
                             available_thought_levels: available_thought_levels.clone(),
                             current_thought_level_id: current_thought_level_id.clone(),
                             thought_level_config_id: thought_level_config_id.clone(),
@@ -3485,6 +3740,7 @@ impl AcpSessionHandle {
                             current_mode_id: None,
                             available_models: Vec::new(),
                             current_model_id: None,
+                            model_config_id: None,
                             available_thought_levels: Vec::new(),
                             current_thought_level_id: None,
                             thought_level_config_id: None,
@@ -4167,6 +4423,7 @@ pub fn new_handle_for_test(
         current_usage: Mutex::new(None),
         current_thought_level_id: Mutex::new(None),
         thought_level_config_id: Mutex::new(None),
+        model_config_id: Mutex::new(None),
         working_dir: "/tmp".to_string(),
         terminal_kill_tx: Mutex::new(None),
         is_busy: std::sync::atomic::AtomicBool::new(false),
@@ -5093,15 +5350,22 @@ fn notify_acp_event(
         let mut deny_opt = None;
         if let Some(opts) = options {
             // 只匹配明确的 allow 类型，找不到就不设按钮（不猜测）
-            approve_opt = opts.iter().find(|o| o.kind == "allow_once")
+            approve_opt = opts
+                .iter()
+                .find(|o| o.kind == "allow_once")
                 .or_else(|| opts.iter().find(|o| o.kind == "allow_always"))
                 .or_else(|| opts.iter().find(|o| o.kind.contains("allow")))
                 .map(|o| o.option_id.as_str());
 
             // 只匹配明确的 reject/deny 类型，找不到就不设按钮（不猜测）
-            deny_opt = opts.iter().find(|o| o.kind == "reject_once")
+            deny_opt = opts
+                .iter()
+                .find(|o| o.kind == "reject_once")
                 .or_else(|| opts.iter().find(|o| o.kind == "reject_always"))
-                .or_else(|| opts.iter().find(|o| o.kind.contains("reject") || o.kind.contains("deny")))
+                .or_else(|| {
+                    opts.iter()
+                        .find(|o| o.kind.contains("reject") || o.kind.contains("deny"))
+                })
                 .map(|o| o.option_id.as_str());
         }
 
@@ -5395,6 +5659,7 @@ mod tests {
             current_mode_id: Some("code".into()),
             available_models: vec![("opus".into(), "Opus".into())],
             current_model_id: Some("opus".into()),
+            model_config_id: None,
             available_thought_levels: vec![],
             current_thought_level_id: None,
             thought_level_config_id: None,
