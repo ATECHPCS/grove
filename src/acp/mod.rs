@@ -840,7 +840,11 @@ fn load_plugin_mcp_servers(base_env: &HashMap<String, String>) -> Vec<acp::McpSe
         // with `--allow-fs-*` on the data root). project/task are present only
         // when the session carries those ids.
         use crate::storage::plugin_data::{scope_dir, Scope};
-        let dir_str = |s: Scope| scope_dir(&plugin.id, &s).ok().map(|p| p.display().to_string());
+        let dir_str = |s: Scope| {
+            scope_dir(&plugin.id, &s)
+                .ok()
+                .map(|p| p.display().to_string())
+        };
         let pid = base_env.get("GROVE_PROJECT_KEY").cloned();
         let tid = base_env.get("GROVE_TASK_ID").cloned();
         let storage = serde_json::json!({

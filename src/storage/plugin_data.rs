@@ -38,7 +38,9 @@ impl Scope {
         Ok(match self {
             Scope::Global => std::path::PathBuf::from("global"),
             Scope::Project(p) => std::path::Path::new("project").join(safe_id(p)?),
-            Scope::Task(p, t) => std::path::Path::new("task").join(safe_id(p)?).join(safe_id(t)?),
+            Scope::Task(p, t) => std::path::Path::new("task")
+                .join(safe_id(p)?)
+                .join(safe_id(t)?),
         })
     }
 }
@@ -179,7 +181,10 @@ mod tests {
 
     #[test]
     fn scope_segments() {
-        assert_eq!(Scope::Global.seg().unwrap(), std::path::PathBuf::from("global"));
+        assert_eq!(
+            Scope::Global.seg().unwrap(),
+            std::path::PathBuf::from("global")
+        );
         assert_eq!(
             Scope::Project("pid".into()).seg().unwrap(),
             std::path::Path::new("project").join("pid")

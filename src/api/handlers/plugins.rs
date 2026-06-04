@@ -1094,7 +1094,11 @@ pub async fn scaffold_plugin(
             }
         }
         let s = s.trim_matches('-').to_string();
-        if s.is_empty() { "example".to_string() } else { s }
+        if s.is_empty() {
+            "example".to_string()
+        } else {
+            s
+        }
     };
     let skill_name = format!("{skill_slug}-hello");
     let skill_md = format!(
@@ -1631,9 +1635,10 @@ fn unbuilt_entries(local_path: &str) -> Vec<String> {
             .and_then(|m| m.get("args"))
             .and_then(|a| a.as_array())
         {
-            let entry = args.iter().filter_map(|a| a.as_str()).find(|s| {
-                s.ends_with(".js") || s.ends_with(".cjs") || s.ends_with(".mjs")
-            });
+            let entry = args
+                .iter()
+                .filter_map(|a| a.as_str())
+                .find(|s| s.ends_with(".js") || s.ends_with(".cjs") || s.ends_with(".mjs"));
             if let Some(entry) = entry {
                 if !dir.join(entry).is_file() {
                     missing.push(key.to_string());
@@ -2107,9 +2112,10 @@ pub async fn backend_invoke(
         (Some(p), Some(t)) => Some((p, t)),
         _ => None,
     };
-    let result = crate::plugins::backend::invoke(&id, task, &req.method, req.params, req.timeout_ms)
-        .await
-        .map_err(|e| ApiError::bad_request(format!("backend invoke failed: {}", e)))?;
+    let result =
+        crate::plugins::backend::invoke(&id, task, &req.method, req.params, req.timeout_ms)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("backend invoke failed: {}", e)))?;
     Ok(Json(json!({ "result": result })))
 }
 
@@ -2138,11 +2144,7 @@ pub async fn exec_command(
     let rx = crate::plugins::exec::run(req.command, req.args, cwd);
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = axum::body::Body::from_stream(stream);
-    Ok((
-        [(header::CONTENT_TYPE, "application/x-ndjson")],
-        body,
-    )
-        .into_response())
+    Ok(([(header::CONTENT_TYPE, "application/x-ndjson")], body).into_response())
 }
 
 // ─── events (plugin event bus: MCP/backend → panel) ──────────────────────────
@@ -2221,11 +2223,7 @@ pub async fn emit_event(
         return Err(ApiError::forbidden("invalid events token".to_string()));
     }
     let task = req.task_id.unwrap_or_else(|| "global".to_string());
-    crate::plugins::events::publish(
-        &id,
-        &task,
-        &json!({ "name": req.name, "data": req.data }),
-    );
+    crate::plugins::events::publish(&id, &task, &json!({ "name": req.name, "data": req.data }));
     Ok(Json(json!({ "ok": true })))
 }
 

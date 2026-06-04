@@ -183,7 +183,9 @@ async fn spawn(
     let decl = manifest
         .get("contributes")
         .and_then(|c| c.get("backend"))
-        .ok_or_else(|| GroveError::not_found("plugin declares no contributes.backend".to_string()))?;
+        .ok_or_else(|| {
+            GroveError::not_found("plugin declares no contributes.backend".to_string())
+        })?;
 
     // Resolve command/args files relative to the plugin folder (like the MCP path).
     let plugin_dir = std::path::Path::new(&plugin.local_path);
@@ -197,7 +199,11 @@ async fn spawn(
     };
     let command = match decl.get("command").and_then(|v| v.as_str()) {
         Some(c) if !c.is_empty() => resolve(c),
-        _ => return Err(GroveError::not_found("contributes.backend has no command".to_string())),
+        _ => {
+            return Err(GroveError::not_found(
+                "contributes.backend has no command".to_string(),
+            ))
+        }
     };
     let user_args: Vec<String> = decl
         .get("args")
@@ -207,7 +213,11 @@ async fn spawn(
     let perms: std::collections::HashSet<String> = manifest
         .get("permissions")
         .and_then(|p| p.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let task_info = match task {
@@ -301,7 +311,11 @@ fn build_context(
     storage_root: &std::path::Path,
 ) -> Value {
     use crate::storage::plugin_data::{scope_dir, Scope};
-    let dir_str = |s: Scope| scope_dir(&plugin.id, &s).ok().map(|p| p.display().to_string());
+    let dir_str = |s: Scope| {
+        scope_dir(&plugin.id, &s)
+            .ok()
+            .map(|p| p.display().to_string())
+    };
     let project_id = task.map(|(p, _)| p.to_string());
     let task_id = task.map(|(_, t)| t.to_string());
     let project_type = info.map(|i| {

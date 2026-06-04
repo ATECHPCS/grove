@@ -247,10 +247,7 @@ pub fn create_api_router() -> Router {
             post(handlers::plugins::backend_invoke),
         )
         .route("/plugins/{id}/exec", post(handlers::plugins::exec_command))
-        .route(
-            "/plugins/{id}/events",
-            post(handlers::plugins::emit_event),
-        )
+        .route("/plugins/{id}/events", post(handlers::plugins::emit_event))
         .route(
             "/plugins/{id}/events/subscribe",
             get(handlers::plugins::subscribe_events),
@@ -259,11 +256,11 @@ pub fn create_api_router() -> Router {
             "/plugins/{id}/update-sdk",
             post(handlers::plugins::update_plugin_sdk),
         )
+        .route("/plugins/{id}/chat/list", get(handlers::plugins::chat_list))
         .route(
-            "/plugins/{id}/chat/list",
-            get(handlers::plugins::chat_list),
+            "/plugins/{id}/chat/send",
+            post(handlers::plugins::chat_send),
         )
-        .route("/plugins/{id}/chat/send", post(handlers::plugins::chat_send))
         // Folder selection API
         .route("/browse-folder", get(handlers::folder::browse_folder))
         .route("/folders/list", get(handlers::folder::list_folder))
