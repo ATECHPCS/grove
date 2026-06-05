@@ -728,6 +728,10 @@ pub fn create_api_router() -> Router {
         // AI Settings API — Audio
         .route("/ai/transcribe", post(handlers::ai::transcribe))
         .route(
+            "/ai/transcribe-stream",
+            get(handlers::ai_stream::transcribe_stream_ws_handler),
+        )
+        .route(
             "/ai/audio",
             get(handlers::ai::get_audio).put(handlers::ai::save_audio_global),
         )
@@ -1032,6 +1036,7 @@ pub fn create_proxy_router(remote: String) -> Router {
         .route("/api/v1/extension/ws", any(ws_proxy_handler))
         .route("/api/v1/walkie-talkie/ws", any(ws_proxy_handler))
         .route("/api/v1/radio/events/ws", any(ws_proxy_handler))
+        .route("/api/v1/ai/transcribe-stream", any(ws_proxy_handler))
         .route(
             "/api/v1/projects/{id}/tasks/{taskId}/terminal",
             any(ws_proxy_handler),

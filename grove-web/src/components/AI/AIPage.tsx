@@ -19,6 +19,8 @@ import type { AudioSettings, ProviderProfile, TabId } from "./types";
 
 const defaultAudio: AudioSettings = {
   enabled: false,
+  transcribeMode: "batch",
+  globalModeEnabled: false,
   transcribeProvider: "",
   preferredLanguages: [],
   toggleShortcut: "",

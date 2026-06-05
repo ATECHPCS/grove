@@ -567,6 +567,13 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch("ALTER TABLE hook_notifications ADD COLUMN chat_id TEXT;");
     let _ = conn.execute_batch("ALTER TABLE chat_token_usage ADD COLUMN cost_amount REAL;");
     let _ = conn.execute_batch("ALTER TABLE chat_token_usage ADD COLUMN cost_currency TEXT;");
+    // Streaming transcription mode + OS-wide global voice mode (added later).
+    let _ = conn.execute_batch(
+        "ALTER TABLE audio_config ADD COLUMN transcribe_mode TEXT NOT NULL DEFAULT 'batch';",
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE audio_config ADD COLUMN global_mode_enabled INTEGER NOT NULL DEFAULT 0;",
+    );
     let _ =
         conn.execute_batch("ALTER TABLE agent_edge ADD COLUMN project TEXT NOT NULL DEFAULT '';");
     let _ = conn.execute_batch(

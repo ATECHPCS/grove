@@ -114,6 +114,12 @@ pub struct AudioSettingsGlobal {
     pub forbidden_terms: Vec<String>,
     #[serde(default)]
     pub replacements: Vec<ReplacementRule>,
+    /// Transcription mode: "batch" (record then transcribe) or "streaming" (live).
+    #[serde(default = "default_transcribe_mode")]
+    pub transcribe_mode: String,
+    /// OS-wide global voice mode (global shortcut + floating widget).
+    #[serde(default)]
+    pub global_mode_enabled: bool,
 }
 
 fn default_max_duration() -> u32 {
@@ -122,6 +128,10 @@ fn default_max_duration() -> u32 {
 
 fn default_min_duration() -> u32 {
     2
+}
+
+fn default_transcribe_mode() -> String {
+    "batch".to_string()
 }
 
 impl Default for AudioSettingsGlobal {
@@ -140,6 +150,8 @@ impl Default for AudioSettingsGlobal {
             preferred_terms: Vec::new(),
             forbidden_terms: Vec::new(),
             replacements: Vec::new(),
+            transcribe_mode: default_transcribe_mode(),
+            global_mode_enabled: false,
         }
     }
 }
@@ -166,7 +178,7 @@ pub fn load_audio_global() -> AudioSettingsGlobal {
     let config_result = conn.query_row(
         "SELECT enabled, transcribe_provider, toggle_shortcut, push_to_talk_key, \
          max_duration, min_duration, revise_enabled, revise_provider, revise_prompt, \
-         preferred_languages FROM audio_config WHERE id = 1",
+         preferred_languages, transcribe_mode, global_mode_enabled FROM audio_config WHERE id = 1",
         [],
         |row| {
             let enabled: i32 = row.get(0)?;
@@ -179,6 +191,8 @@ pub fn load_audio_global() -> AudioSettingsGlobal {
             let revise_provider: String = row.get(7)?;
             let revise_prompt: String = row.get(8)?;
             let preferred_languages_json: String = row.get(9)?;
+            let transcribe_mode: String = row.get(10)?;
+            let global_mode_enabled: i32 = row.get(11)?;
             Ok((
                 enabled != 0,
                 transcribe_provider,
@@ -190,6 +204,8 @@ pub fn load_audio_global() -> AudioSettingsGlobal {
                 revise_provider,
                 revise_prompt,
                 preferred_languages_json,
+                transcribe_mode,
+                global_mode_enabled != 0,
             ))
         },
     );
@@ -205,6 +221,8 @@ pub fn load_audio_global() -> AudioSettingsGlobal {
         revise_provider,
         revise_prompt,
         preferred_languages_json,
+        transcribe_mode,
+        global_mode_enabled,
     ) = match config_result {
         Ok(row) => row,
         Err(rusqlite::Error::QueryReturnedNoRows) => return AudioSettingsGlobal::default(),
@@ -256,6 +274,8 @@ pub fn load_audio_global() -> AudioSettingsGlobal {
         preferred_terms,
         forbidden_terms,
         replacements,
+        transcribe_mode,
+        global_mode_enabled,
     }
 }
 
@@ -269,8 +289,8 @@ pub fn save_audio_global(data: &AudioSettingsGlobal) -> Result<()> {
         "INSERT OR REPLACE INTO audio_config \
          (id, enabled, transcribe_provider, toggle_shortcut, push_to_talk_key, \
           max_duration, min_duration, revise_enabled, revise_provider, revise_prompt, \
-          preferred_languages) \
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+          preferred_languages, transcribe_mode, global_mode_enabled) \
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             data.enabled as i32,
             data.transcribe_provider,
@@ -282,6 +302,8 @@ pub fn save_audio_global(data: &AudioSettingsGlobal) -> Result<()> {
             data.revise_provider,
             data.revise_prompt,
             preferred_languages_json,
+            data.transcribe_mode,
+            data.global_mode_enabled as i32,
         ],
     )?;
 
