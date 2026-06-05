@@ -6514,28 +6514,26 @@ export function TaskChat({
     [chatSearchOpen],
   );
 
-  // followOutput callback. Always use "smooth" — Virtuoso coalesces
-  // successive smooth scrolls into one continuous animation, which makes
-  // streaming tokens feel like flowing text rather than chunk-by-chunk
-  // jumps. (The old DOM-based scroll used "auto" during streaming because
-  // smooth scrollTo() couldn't keep up with rapid setState; that
-  // limitation doesn't apply to Virtuoso's internal scroll scheduler.)
+  // followOutput callback. Use "auto" during streaming because smooth
+  // scrollToIndex can fail to keep up with rapid height changes and cause
+  // React-Virtuoso to glitch and render a blank white page.
   const handleFollowOutput = useCallback((isAtBottom: boolean) => {
-    return isAtBottom ? ("smooth" as const) : (false as const);
+    return isAtBottom ? ("auto" as const) : (false as const);
   }, []);
 
   // Typewriter reveals text via setState INSIDE MessageItem — the
   // `messages` array reference doesn't change, so Virtuoso's
   // followOutput never fires. We watch totalListHeightChanged
   // (which DOES fire when the streaming row grows) and re-anchor to
-  // bottom while auto-stick is on.
+  // bottom while auto-stick is on. Use behavior: "auto" to prevent
+  // blank viewport rendering glitches during rapid streaming.
   const handleTotalListHeightChanged = useCallback(() => {
     if (!autoStickToBottomRef.current) return;
     if (isUserScrollingRef.current) return;
     virtuosoRef.current?.scrollToIndex({
       index: "LAST",
       align: "end",
-      behavior: "smooth",
+      behavior: "auto",
     });
   }, []);
 
