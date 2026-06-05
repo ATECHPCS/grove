@@ -497,7 +497,8 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     return sortTreeOrder(statFiles);
   }, [viewMode, allFiles, diffData, temporaryVirtualPaths, comments, sortTreeOrder]);
 
-  const baseFiles = (viewMode === 'full' && focusMode) ? focusFiles : sortedDiffFiles;
+  const baseFiles = (viewMode === 'full' && focusMode) ? (sidebarSearch ? sortedDiffFiles : focusFiles) : sortedDiffFiles;
+
 
   const displayFiles = useMemo(() => {
     if (viewMode !== 'diff' || baseFiles.length === 0) return baseFiles;
@@ -910,6 +911,10 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       }).catch(console.error).finally(() => {
         if (fetchGenRef.current === gen) setLoading(false);
       });
+      getTaskFiles(projectId, taskId).then((result) => {
+        if (fetchGenRef.current !== gen) return;
+        setAllFiles(result.files);
+      }).catch(() => null);
     } else if (viewMode === 'full' && !focusMode) {
       getTaskFiles(projectId, taskId).then((result) => {
         if (fetchGenRef.current !== gen) return;

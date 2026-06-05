@@ -126,50 +126,105 @@ function highlightSearchInHTML(
   const flags = caseSensitive ? 'g' : 'gi';
   const regex = new RegExp(searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
 
-  // Function to process text nodes
-  function processTextNode(node: Node) {
-    if (node.nodeType === Node.TEXT_NODE && node.textContent) {
-      const text = node.textContent;
-      const matches = [...text.matchAll(regex)];
-
-      if (matches.length > 0) {
-        const fragment = document.createDocumentFragment();
-        let lastIndex = 0;
-
-        matches.forEach((match) => {
-          // Add text before match
-          if (match.index! > lastIndex) {
-            fragment.appendChild(document.createTextNode(text.substring(lastIndex, match.index)));
-          }
-
-          // Add highlighted match
-          const mark = document.createElement('mark');
-          mark.className = 'code-search-match';
-          mark.setAttribute('data-match-index', String(_matchCounter.current++));
-          mark.style.background = 'rgba(255, 215, 0, 0.4)';
-          mark.style.color = 'inherit';
-          mark.style.padding = '0';
-          mark.style.borderRadius = '2px';
-          mark.textContent = match[0];
-          fragment.appendChild(mark);
-
-          lastIndex = match.index! + match[0].length;
-        });
-
-        // Add remaining text
-        if (lastIndex < text.length) {
-          fragment.appendChild(document.createTextNode(text.substring(lastIndex)));
-        }
-
-        node.parentNode?.replaceChild(fragment, node);
+  // Collect all text nodes depth-first
+  const textNodes: Text[] = [];
+  function collectTextNodes(node: Node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      if (node.textContent) {
+        textNodes.push(node as Text);
       }
     } else if (node.nodeType === Node.ELEMENT_NODE) {
-      // Recursively process child nodes
-      Array.from(node.childNodes).forEach(processTextNode);
+      Array.from(node.childNodes).forEach(collectTextNodes);
+    }
+  }
+  collectTextNodes(tempDiv);
+
+  // Concatenate all text content
+  let fullText = '';
+  const nodeRanges = textNodes.map((node) => {
+    const start = fullText.length;
+    fullText += node.textContent || '';
+    const end = fullText.length;
+    return { node, start, end };
+  });
+
+  // Find all matches in full text
+  const matches: { start: number; end: number }[] = [];
+  let match;
+  while ((match = regex.exec(fullText)) !== null) {
+    matches.push({
+      start: match.index,
+      end: match.index + match[0].length,
+    });
+    // Avoid infinite loop for empty matches
+    if (match[0].length === 0) {
+      regex.lastIndex++;
     }
   }
 
-  processTextNode(tempDiv);
+  // If no matches, return early
+  if (matches.length === 0) return html;
+
+  // Highlight matches by replacing text nodes
+  nodeRanges.forEach(({ node, start, end }) => {
+    const nodeContent = node.textContent || '';
+    const overlapping: { mStart: number; mEnd: number }[] = [];
+
+    matches.forEach((m) => {
+      const iStart = Math.max(start, m.start);
+      const iEnd = Math.min(end, m.end);
+      if (iStart < iEnd) {
+        overlapping.push({
+          mStart: iStart - start,
+          mEnd: iEnd - start,
+        });
+      }
+    });
+
+    if (overlapping.length > 0) {
+      // Sort overlapping matches by start offset
+      overlapping.sort((a, b) => a.mStart - b.mStart);
+
+      const fragment = document.createDocumentFragment();
+      let lastIdx = 0;
+
+      overlapping.forEach((overlap) => {
+        // Skip segments already consumed by a previous (overlapping) match
+        if (overlap.mEnd <= lastIdx) return;
+        const segStart = Math.max(overlap.mStart, lastIdx);
+
+        // Text before the match
+        if (segStart > lastIdx) {
+          fragment.appendChild(
+            document.createTextNode(nodeContent.substring(lastIdx, segStart))
+          );
+        }
+
+        // The match segment
+        const mark = document.createElement('mark');
+        mark.className = 'code-search-match';
+        mark.setAttribute('data-match-index', String(_matchCounter.current++));
+        mark.style.background = 'rgba(255, 215, 0, 0.4)';
+        mark.style.color = 'inherit';
+        mark.style.padding = '0';
+        mark.style.borderRadius = '2px';
+        mark.textContent = nodeContent.substring(segStart, overlap.mEnd);
+        fragment.appendChild(mark);
+
+        lastIdx = overlap.mEnd;
+      });
+
+      // Remaining text after last match
+      if (lastIdx < nodeContent.length) {
+        fragment.appendChild(
+          document.createTextNode(nodeContent.substring(lastIdx))
+        );
+      }
+
+      node.parentNode?.replaceChild(fragment, node);
+    }
+  });
+
   return tempDiv.innerHTML;
 }
 
