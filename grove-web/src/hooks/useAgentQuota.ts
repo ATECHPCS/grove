@@ -14,6 +14,7 @@ const SUPPORTED_AGENTS = new Set([
   'kimi',
   'opencode',
   'minimax',
+  'hermes',
 ]);
 
 /**
@@ -23,7 +24,7 @@ const SUPPORTED_AGENTS = new Set([
  * models share one pool, so we intentionally ignore `model` here to avoid
  * re-fetching on every model switch.
  */
-const MODEL_AWARE_AGENTS = new Set<string>(['opencode']);
+const MODEL_AWARE_AGENTS = new Set<string>(['opencode', 'hermes']);
 
 export interface UseAgentQuotaResult {
   usage: AgentUsage | null;

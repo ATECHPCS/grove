@@ -6,11 +6,13 @@
 //! `{limit, requests, renewsAt}` where `requests` is the count consumed so
 //! far in the window. We expose all three as usage windows.
 
-use super::{clamp_percent, AgentUsage, ExtraInfo, UsageWindow, HTTP_TIMEOUT_SYNTHETIC};
+use super::super::{
+    clamp_percent, iso_to_seconds_remaining, AgentUsage, ExtraInfo, UsageWindow,
+    HTTP_TIMEOUT_SYNTHETIC,
+};
 use serde::Deserialize;
 
 const USAGE_URL: &str = "https://api.synthetic.new/v2/quotas";
-pub(super) const OPENCODE_KEY: &str = "synthetic";
 
 #[derive(Debug, Deserialize)]
 struct Bucket {
@@ -33,7 +35,7 @@ struct SyntheticResponse {
     free_tool_calls: Option<Bucket>,
 }
 
-pub(super) fn fetch_with_token(token: &str) -> Result<AgentUsage, String> {
+pub(crate) fn fetch_with_token(token: &str) -> Result<AgentUsage, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(HTTP_TIMEOUT_SYNTHETIC)
         .build();
@@ -79,10 +81,7 @@ fn push_bucket(usage: &mut AgentUsage, label: &str, b: &Bucket, total_window_sec
         label: label.to_string(),
         percentage_remaining: pct,
         resets_at: b.renews_at.clone(),
-        resets_in_seconds: b
-            .renews_at
-            .as_deref()
-            .and_then(super::iso_to_seconds_remaining),
+        resets_in_seconds: b.renews_at.as_deref().and_then(iso_to_seconds_remaining),
         total_window_seconds,
     });
     usage.extras.push(ExtraInfo {

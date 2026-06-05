@@ -221,15 +221,16 @@ impl Session {
             }
             return;
         }
-        let new_since = self.buffer.len().saturating_sub(self.samples_at_last_transcribe);
+        let new_since = self
+            .buffer
+            .len()
+            .saturating_sub(self.samples_at_last_transcribe);
 
         // Intra-sentence refresh is optional (off → far fewer API calls);
         // finalize and flush always transcribe so sentences still get captured.
         let want_regular = new_since >= self.min_chunk_samples && self.intra_refresh;
         if self.has_voice
-            && (want_regular
-                || self.pending_finalize
-                || (self.pending_flush && new_since > 0))
+            && (want_regular || self.pending_finalize || (self.pending_flush && new_since > 0))
         {
             self.start_transcribe();
             return;
@@ -445,7 +446,10 @@ async fn handle_stream(socket: WebSocket, params: StreamQuery) {
         provider,
         global,
         project,
-        min_chunk_samples: params.min_chunk_ms.map(ms_to_samples).unwrap_or(MIN_CHUNK_SAMPLES),
+        min_chunk_samples: params
+            .min_chunk_ms
+            .map(ms_to_samples)
+            .unwrap_or(MIN_CHUNK_SAMPLES),
         silence_rms: params.silence_rms.unwrap_or(SILENCE_RMS),
         silence_hold_samples: params
             .silence_hold_ms
@@ -595,9 +599,7 @@ mod tests {
     #[test]
     fn pcm_to_wav_has_riff_header() {
         // 1600 samples = 100 ms @ 16 kHz
-        let pcm: Vec<f32> = (0..1600)
-            .map(|i| (i as f32 * 0.02).sin() * 0.5)
-            .collect();
+        let pcm: Vec<f32> = (0..1600).map(|i| (i as f32 * 0.02).sin() * 0.5).collect();
         let wav = pcm_to_wav(&pcm, SAMPLE_RATE);
         assert!(wav.len() > 44, "wav must include header + data");
         assert_eq!(&wav[0..4], b"RIFF");

@@ -2829,10 +2829,8 @@ async fn drive_session(
             };
             match resume_result {
                 Ok(resp) => {
-                    (available_modes, current_mode_id) = extract_modes(
-                        &resp.modes,
-                        resp.config_options.as_deref().unwrap_or(&[]),
-                    );
+                    (available_modes, current_mode_id) =
+                        extract_modes(&resp.modes, resp.config_options.as_deref().unwrap_or(&[]));
                     (available_models, current_model_id, model_config_id) =
                         extract_models(&resp.models, resp.config_options.as_deref().unwrap_or(&[]));
                     (
@@ -2875,10 +2873,8 @@ async fn drive_session(
 
             match load_result {
                 Ok(resp) => {
-                    (available_modes, current_mode_id) = extract_modes(
-                        &resp.modes,
-                        resp.config_options.as_deref().unwrap_or(&[]),
-                    );
+                    (available_modes, current_mode_id) =
+                        extract_modes(&resp.modes, resp.config_options.as_deref().unwrap_or(&[]));
                     (available_models, current_model_id, model_config_id) =
                         extract_models(&resp.models, resp.config_options.as_deref().unwrap_or(&[]));
                     (

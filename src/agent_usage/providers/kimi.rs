@@ -4,13 +4,14 @@
 //! entry, then calls `https://api.kimi.com/coding/v1/usages`. Even the
 //! standalone Kimi ACP CLI shares login state with OpenCode.
 
-use super::{
-    clamp_percent, AcpQuotaProvider, AgentUsage, ExtraInfo, UsageWindow, HTTP_TIMEOUT_KIMI,
+use super::super::{
+    clamp_percent, iso_to_seconds_remaining, AcpQuotaProvider, AgentUsage, ExtraInfo, UsageWindow,
+    HTTP_TIMEOUT_KIMI,
 };
 use serde::Deserialize;
 
 const USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
-pub(super) const OPENCODE_KEY: &str = "kimi-for-coding";
+pub(crate) const OPENCODE_KEY: &str = "kimi-for-coding";
 
 #[derive(Debug, Deserialize)]
 struct UsageDetail {
@@ -52,13 +53,13 @@ impl AcpQuotaProvider for KimiProvider {
     }
 
     fn fetch_usage(&self, _model: Option<&str>) -> Result<AgentUsage, String> {
-        let token = super::opencode_auth::read_opencode_token(OPENCODE_KEY)
+        let token = super::super::opencode_auth::read_opencode_token(OPENCODE_KEY)
             .ok_or("Kimi token not found")?;
         fetch_with_token(&token)
     }
 }
 
-pub(super) fn fetch_with_token(token: &str) -> Result<AgentUsage, String> {
+pub(crate) fn fetch_with_token(token: &str) -> Result<AgentUsage, String> {
     let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT_KIMI).build();
     let resp = agent
         .get(USAGE_URL)
@@ -94,7 +95,7 @@ pub(super) fn fetch_with_token(token: &str) -> Result<AgentUsage, String> {
             resets_in_seconds: main
                 .reset_time
                 .as_deref()
-                .and_then(super::iso_to_seconds_remaining),
+                .and_then(iso_to_seconds_remaining),
             // Kimi's main "Total" bucket is the monthly subscription quota.
             total_window_seconds: Some(30 * 86400),
         });
@@ -125,10 +126,7 @@ pub(super) fn fetch_with_token(token: &str) -> Result<AgentUsage, String> {
                     label,
                     percentage_remaining: pct,
                     resets_at: d.reset_time.clone(),
-                    resets_in_seconds: d
-                        .reset_time
-                        .as_deref()
-                        .and_then(super::iso_to_seconds_remaining),
+                    resets_in_seconds: d.reset_time.as_deref().and_then(iso_to_seconds_remaining),
                     total_window_seconds: if window_min > 0 {
                         Some(i64::from(window_min) * 60)
                     } else {
