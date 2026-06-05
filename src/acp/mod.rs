@@ -2300,19 +2300,42 @@ async fn drive_session(
 ) -> acp::Result<(), acp::Error> {
     fn extract_modes(
         modes: &Option<acp::SessionModeState>,
+        config_options: &[acp::SessionConfigOption],
     ) -> (Vec<(String, String)>, Option<String>) {
-        match modes {
-            Some(state) => {
-                let available: Vec<(String, String)> = state
-                    .available_modes
-                    .iter()
-                    .map(|m| (m.id.to_string(), m.name.clone()))
-                    .collect();
-                let current = Some(state.current_mode_id.to_string());
-                (available, current)
-            }
-            None => (vec![], None),
+        if let Some(state) = modes {
+            let available: Vec<(String, String)> = state
+                .available_modes
+                .iter()
+                .map(|m| (m.id.to_string(), m.name.clone()))
+                .collect();
+            let current = Some(state.current_mode_id.to_string());
+            return (available, current);
         }
+        // Fallback: some agents (e.g. OpenCode) report modes via configOptions
+        // with category "mode" instead of the top-level `modes` field.
+        for opt in config_options {
+            let is_mode = matches!(opt.category, Some(acp::SessionConfigOptionCategory::Mode));
+            let is_mode_other = matches!(
+                &opt.category,
+                Some(acp::SessionConfigOptionCategory::Other(s))
+                    if s.eq_ignore_ascii_case("mode")
+            );
+            if !is_mode && !is_mode_other {
+                continue;
+            }
+            let acp::SessionConfigKind::Select(select) = &opt.kind else {
+                continue;
+            };
+            let acp::SessionConfigSelectOptions::Ungrouped(entries) = &select.options else {
+                continue;
+            };
+            let available: Vec<(String, String)> = entries
+                .iter()
+                .map(|e| (e.value.to_string(), e.name.clone()))
+                .collect();
+            return (available, Some(select.current_value.to_string()));
+        }
+        (vec![], None)
     }
 
     /// Lowercase fuzzy-match a free-text query against `(id, name)` pairs.
@@ -2704,7 +2727,10 @@ async fn drive_session(
             }
             let sid = resp.session_id.to_string();
             persist_session_id(&sid);
-            (available_modes, current_mode_id) = extract_modes(&resp.modes);
+            (available_modes, current_mode_id) = extract_modes(
+                &resp.modes,
+                resp.config_options.as_deref().unwrap_or(&[]),
+            );
             (available_models, current_model_id, model_config_id) = extract_models(
                 &resp.models,
                 resp.config_options.as_deref().unwrap_or(&[]),
@@ -2803,7 +2829,10 @@ async fn drive_session(
             };
             match resume_result {
                 Ok(resp) => {
-                    (available_modes, current_mode_id) = extract_modes(&resp.modes);
+                    (available_modes, current_mode_id) = extract_modes(
+                        &resp.modes,
+                        resp.config_options.as_deref().unwrap_or(&[]),
+                    );
                     (available_models, current_model_id, model_config_id) =
                         extract_models(&resp.models, resp.config_options.as_deref().unwrap_or(&[]));
                     (
@@ -2846,7 +2875,10 @@ async fn drive_session(
 
             match load_result {
                 Ok(resp) => {
-                    (available_modes, current_mode_id) = extract_modes(&resp.modes);
+                    (available_modes, current_mode_id) = extract_modes(
+                        &resp.modes,
+                        resp.config_options.as_deref().unwrap_or(&[]),
+                    );
                     (available_models, current_model_id, model_config_id) =
                         extract_models(&resp.models, resp.config_options.as_deref().unwrap_or(&[]));
                     (
