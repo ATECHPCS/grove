@@ -224,16 +224,16 @@ pub fn prompt_and_execute_update(update_info: &UpdateInfo) {
         return; // AppBundle updates are handled in-app via the web UI/Tauri
     }
 
-    println!("\n🔔 检测到有新版本可用: {}", latest);
-    println!("建议更新。更新指令为:\n  {}", command_str);
-    print!("是否现在自动更新？ [y/N]: ");
+    println!("\nA new version is available: {}", latest);
+    println!("It is recommended to update. The update command is:\n  {}", command_str);
+    print!("Would you like to auto-update now? [y/N]: ");
     let _ = io::stdout().flush();
 
     let mut input = String::new();
     if io::stdin().read_line(&mut input).is_ok() {
         let trimmed = input.trim().to_lowercase();
         if trimmed == "y" || trimmed == "yes" {
-            println!("正在执行更新指令: {}\n", command_str);
+            println!("Executing update command: {}\n", command_str);
 
             // Execute the command using the system shell
             let status = if cfg!(windows) {
@@ -246,19 +246,19 @@ pub fn prompt_and_execute_update(update_info: &UpdateInfo) {
 
             match status {
                 Ok(s) if s.success() => {
-                    println!("\n✨ 更新完成！请重新启动 Grove。");
+                    println!("\nUpdate completed! Please restart Grove.");
                     std::process::exit(0);
                 }
                 Ok(s) => {
-                    eprintln!("\n❌ 更新失败，退出代码: {:?}", s.code());
-                    print!("按回车键继续启动 Grove...");
+                    eprintln!("\nUpdate failed, exit code: {:?}", s.code());
+                    print!("Press Enter to continue starting Grove...");
                     let _ = io::stdout().flush();
                     let mut dummy = String::new();
                     let _ = io::stdin().read_line(&mut dummy);
                 }
                 Err(e) => {
-                    eprintln!("\n❌ 无法执行更新指令: {}", e);
-                    print!("按回车键继续启动 Grove...");
+                    eprintln!("\nUnable to execute update command: {}", e);
+                    print!("Press Enter to continue starting Grove...");
                     let _ = io::stdout().flush();
                     let mut dummy = String::new();
                     let _ = io::stdin().read_line(&mut dummy);

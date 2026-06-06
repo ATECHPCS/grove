@@ -4507,7 +4507,7 @@ export function TaskChat({
         // GIF: never re-encode via Canvas (would lose animation)
         if (file.type === "image/gif" && file.size > MAX_IMAGE_BYTES) {
           setMessages((prev) =>
-            appendSystemMessage(prev, `GIF 文件过大（${(file.size / 1024 / 1024).toFixed(1)} MB），请压缩后重试。`),
+            appendSystemMessage(prev, `GIF file is too large (${(file.size / 1024 / 1024).toFixed(1)} MB). Please compress and try again.`),
           );
           return;
         }
@@ -4532,7 +4532,7 @@ export function TaskChat({
             reader.readAsDataURL(blob);
           } catch {
             setMessages((prev) =>
-              appendSystemMessage(prev, `图片压缩失败（${file.name}），请手动压缩后重试。`),
+              appendSystemMessage(prev, `Failed to compress image (${file.name}). Please compress manually and try again.`),
             );
           }
           return;
