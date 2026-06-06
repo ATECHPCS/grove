@@ -228,6 +228,115 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     if (isMobile) setMobileConvSidebarVisible(next);
     else setDesktopConvSidebarVisible(next);
   }, [isMobile]);
+
+  // Resizable sidebar widths (desktop only — mobile uses fixed overlays).
+  // Persisted per task so reopening the panel keeps the user's layout.
+  const DEFAULT_SIDEBAR_WIDTH = 280;
+  const DEFAULT_CONV_SIDEBAR_WIDTH = 320;
+  const SIDEBAR_MIN_WIDTH = 180;
+  const SIDEBAR_MAX_RATIO = 0.5;
+  const sidebarWidthStorageKey = `grove:diff-review-sidebar-width:${projectId}:${taskId}`;
+
+  const readStoredSidebarWidth = (fallback: number, persisted: number | undefined): number => {
+    return typeof persisted === 'number' && Number.isFinite(persisted) && persisted >= SIDEBAR_MIN_WIDTH
+      ? persisted
+      : fallback;
+  };
+
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem(sidebarWidthStorageKey);
+      if (!raw) return DEFAULT_SIDEBAR_WIDTH;
+      const parsed = JSON.parse(raw) as { sidebarWidth?: number; convSidebarWidth?: number };
+      return readStoredSidebarWidth(DEFAULT_SIDEBAR_WIDTH, parsed.sidebarWidth);
+    } catch {
+      return DEFAULT_SIDEBAR_WIDTH;
+    }
+  });
+  const [convSidebarWidth, setConvSidebarWidth] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem(sidebarWidthStorageKey);
+      if (!raw) return DEFAULT_CONV_SIDEBAR_WIDTH;
+      const parsed = JSON.parse(raw) as { sidebarWidth?: number; convSidebarWidth?: number };
+      return readStoredSidebarWidth(DEFAULT_CONV_SIDEBAR_WIDTH, parsed.convSidebarWidth);
+    } catch {
+      return DEFAULT_CONV_SIDEBAR_WIDTH;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(sidebarWidthStorageKey);
+      const parsed: { sidebarWidth?: number; convSidebarWidth?: number } = raw
+        ? JSON.parse(raw)
+        : {};
+      parsed.sidebarWidth = Math.round(sidebarWidth);
+      parsed.convSidebarWidth = Math.round(convSidebarWidth);
+      localStorage.setItem(sidebarWidthStorageKey, JSON.stringify(parsed));
+    } catch {
+      // ignore storage errors
+    }
+  }, [sidebarWidth, convSidebarWidth, sidebarWidthStorageKey]);
+
+  const clampSidebarWidth = (value: number, layoutWidth: number): number => {
+    const max = Math.max(SIDEBAR_MIN_WIDTH, Math.floor(layoutWidth * SIDEBAR_MAX_RATIO));
+    return Math.min(max, Math.max(SIDEBAR_MIN_WIDTH, value));
+  };
+
+  const startSidebarResize = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const layoutEl = event.currentTarget.parentElement;
+    if (!layoutEl) return;
+    const layoutWidth = layoutEl.getBoundingClientRect().width;
+    if (layoutWidth <= 0) return;
+    const startX = event.clientX;
+    const startWidth = sidebarWidth;
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      const next = clampSidebarWidth(
+        startWidth + (moveEvent.clientX - startX),
+        layoutWidth,
+      );
+      setSidebarWidth(next);
+    };
+    const handlePointerUp = () => {
+      document.body.classList.remove('grove-resizing');
+      document.removeEventListener('pointermove', handlePointerMove);
+      document.removeEventListener('pointerup', handlePointerUp);
+    };
+    // While dragging, disable pointer events on iframes so the drag doesn't
+    // stutter when crossing an embedded preview. See index.css body.grove-resizing.
+    document.body.classList.add('grove-resizing');
+    document.addEventListener('pointermove', handlePointerMove);
+    document.addEventListener('pointerup', handlePointerUp);
+  }, [sidebarWidth]);
+
+  const startConvSidebarResize = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const layoutEl = event.currentTarget.parentElement;
+    if (!layoutEl) return;
+    const layoutWidth = layoutEl.getBoundingClientRect().width;
+    if (layoutWidth <= 0) return;
+    const startX = event.clientX;
+    const startWidth = convSidebarWidth;
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      // Right-side resizer: dragging left grows the sidebar.
+      const next = clampSidebarWidth(
+        startWidth + (startX - moveEvent.clientX),
+        layoutWidth,
+      );
+      setConvSidebarWidth(next);
+    };
+    const handlePointerUp = () => {
+      document.body.classList.remove('grove-resizing');
+      document.removeEventListener('pointermove', handlePointerMove);
+      document.removeEventListener('pointerup', handlePointerUp);
+    };
+    document.body.classList.add('grove-resizing');
+    document.addEventListener('pointermove', handlePointerMove);
+    document.addEventListener('pointerup', handlePointerUp);
+  }, [convSidebarWidth]);
   const [focusMode, setFocusMode] = useState<boolean>(() => {
     if (initialCachedOptions && typeof initialCachedOptions.focusMode === 'boolean') {
       return initialCachedOptions.focusMode;
@@ -2093,7 +2202,13 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       </div>
 
       {/* Layout */}
-      <div className="diff-layout">
+      <div
+        className="diff-layout"
+        style={{
+          '--diff-sidebar-width': `${sidebarWidth}px`,
+          '--diff-conv-sidebar-width': `${convSidebarWidth}px`,
+        } as React.CSSProperties}
+      >
         {loading ? (
           <div className="diff-content" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, gap: 8 }}>
             <div className="spinner" />
@@ -2143,6 +2258,19 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
               autoViewedRules={autoViewedRules}
               onUpdateAutoViewedRules={setAutoViewedRules}
             />
+
+            {/* Resizer between file tree sidebar and diff content (desktop only) */}
+            {!isMobile && sidebarVisible && (
+              <div
+                className="diff-resizer"
+                onPointerDown={startSidebarResize}
+                onDoubleClick={() => setSidebarWidth(DEFAULT_SIDEBAR_WIDTH)}
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize file tree sidebar"
+                title="Drag to resize · Double-click to reset"
+              />
+            )}
 
             {/* Diff content */}
             <div className="diff-content" ref={contentRef} tabIndex={-1} style={{ outline: 'none' }}>
@@ -2210,6 +2338,19 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
                 });
               })()}
             </div>
+
+            {/* Resizer between diff content and conversation sidebar (desktop only) */}
+            {!isMobile && convSidebarVisible && (
+              <div
+                className="diff-resizer"
+                onPointerDown={startConvSidebarResize}
+                onDoubleClick={() => setConvSidebarWidth(DEFAULT_CONV_SIDEBAR_WIDTH)}
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize conversation sidebar"
+                title="Drag to resize · Double-click to reset"
+              />
+            )}
 
             {/* Conversation sidebar */}
             <ConversationSidebar

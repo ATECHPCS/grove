@@ -159,7 +159,7 @@
 
 /* File sidebar */
 .diff-sidebar {
-  width: 280px;
+  width: var(--diff-sidebar-width, 280px);
   min-width: 0;
   background: var(--color-bg-secondary);
   border-right: 1px solid var(--color-border);
@@ -178,6 +178,42 @@
   border-right-width: 0;
   opacity: 0;
   pointer-events: none;
+}
+
+/* Drag handle between a sidebar and the diff content.
+   Always present in the DOM (when sidebar is visible on desktop) so the
+   affordance is discoverable; visual cue only on hover/active. */
+.diff-resizer {
+  width: 6px;
+  min-width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  flex-shrink: 0;
+  z-index: 2;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.diff-resizer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 2px;
+  border-radius: 999px;
+  background: transparent;
+  transition: background 0.12s, width 0.12s, left 0.12s;
+}
+
+.diff-resizer:hover::after,
+.diff-resizer:active::after {
+  left: 1px;
+  width: 4px;
+  background: var(--color-highlight);
 }
 
 .diff-sidebar-list {
@@ -1561,7 +1597,7 @@ td.diff-code.diff-line-highlighted::before {
    ============================================================================ */
 
 .conv-sidebar {
-  width: 320px;
+  width: var(--diff-conv-sidebar-width, 320px);
   min-width: 0;
   background: var(--color-bg-secondary);
   border-left: 1px solid var(--color-border);
@@ -2531,6 +2567,11 @@ td.diff-code.diff-line-highlighted::before {
     transform: translateX(100%);
     opacity: 0;
     pointer-events: none;
+  }
+
+  /* --- Resizer: hidden on mobile (sidebars are fixed overlays, no drag) --- */
+  .diff-resizer {
+    display: none;
   }
 
   /* --- Diff gutter compact --- */
