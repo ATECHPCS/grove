@@ -205,6 +205,12 @@ pub fn broadcast_radio_event(event: RadioEvent) {
     let _ = RADIO_EVENTS.send(event);
 }
 
+/// Subscribe to the global radio event stream. The plugin radio bridge uses
+/// this to relay task-scoped events into plugin panels holding `chat:read`.
+pub fn subscribe_radio_events() -> broadcast::Receiver<RadioEvent> {
+    RADIO_EVENTS.subscribe()
+}
+
 // ─── Client → Server Messages ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]

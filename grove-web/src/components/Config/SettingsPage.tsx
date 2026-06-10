@@ -62,6 +62,7 @@ import {
   loadCustomAgentPersonas as loadCustomAgentPersonasIcon,
 } from "../../utils/agentIcon";
 import { getExtensionStatus } from "../../api/extension";
+import { PluginsSection } from "./PluginsSection";
 import { formatShortcut } from "../AI/utils";
 import { useKeyboardScope } from "../../keyboard";
 
@@ -228,6 +229,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
     mcp: false,
     browserControl: false,
     shortcuts: false,
+    plugins: false,
   });
 
   // Environment state
@@ -2705,6 +2707,19 @@ env_vars = [
               <span className="text-sm text-[var(--color-text)] select-none">Learn more about MCP protocol</span>
             </a>
           </div>
+        </Section>
+
+        {/* Plugins Section */}
+        <Section
+          id="plugins"
+          title="Plugins"
+          description="Extend Grove with installed or locally-developed plugins"
+          icon={Package}
+          iconColor="#8b5cf6"
+          isOpen={openSections.plugins}
+          onToggle={() => toggleSection("plugins")}
+        >
+          <PluginsSection />
         </Section>
 
       </div>

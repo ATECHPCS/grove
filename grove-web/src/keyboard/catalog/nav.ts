@@ -30,6 +30,14 @@ export const NAV_COMMANDS: CommandDef[] = [
     passThroughTextInput: true,
   },
   {
+    id: "nav.tasks.studio",
+    name: "Go to Tasks",
+    category: "Navigation",
+    defaultBindings: [{ key: "Mod+2" }],
+    defaultWhen: "studioProject",
+    passThroughTextInput: true,
+  },
+  {
     id: "nav.resource",
     name: "Go to Resource",
     category: "Navigation",

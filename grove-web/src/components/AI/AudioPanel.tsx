@@ -313,6 +313,32 @@ export function AudioPanel({
           </FieldGroup>
 
           <FieldGroup
+            title="Transcription mode"
+            hint="Batch transcribes after you stop. Streaming shows live text and refreshes it as you speak."
+            inlineHint
+          >
+            <div className="flex max-w-[360px] flex-col gap-3">
+              <div className="inline-flex rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)]/35 p-1">
+                {(["batch", "streaming"] as const).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    disabled={!audio.enabled}
+                    onClick={() => patchAudio("transcribeMode", m)}
+                    className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-medium capitalize transition-colors ${
+                      audio.transcribeMode === m
+                        ? "bg-[var(--color-highlight)] text-white"
+                        : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+                    }`}
+                  >
+                    {m}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </FieldGroup>
+
+          <FieldGroup
             title="Language preference"
             hint="Select the languages the user commonly speaks. Multiple preferences are allowed."
             inlineHint

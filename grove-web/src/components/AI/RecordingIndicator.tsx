@@ -21,6 +21,10 @@ interface RecordingIndicatorProps {
   errorMessage?: string | null;
   onStop: () => void;
   onCancel: () => void;
+  /** Streaming mode: stable finalized sentences shown above the controls. */
+  finalizedSentences?: string[];
+  /** Streaming mode: the live, still-refining current sentence (muted). */
+  currentText?: string;
 }
 
 function formatTime(seconds: number): string {
@@ -49,9 +53,13 @@ export function RecordingIndicator({
   errorMessage,
   onStop,
   onCancel,
+  finalizedSentences,
+  currentText,
 }: RecordingIndicatorProps) {
   const isVisible = status === "warming" || status === "recording" || status === "processing" || status === "error";
   const bars = toBars(frequencyData, 16);
+  const transcript = finalizedSentences ?? [];
+  const hasTranscript = status === "recording" && (transcript.length > 0 || !!currentText);
 
   return (
     <AnimatePresence>
@@ -63,12 +71,29 @@ export function RecordingIndicator({
           transition={{ type: "spring", stiffness: 400, damping: 30 }}
           role="status"
           aria-live="polite"
-          className={`fixed bottom-6 right-6 z-[9999] flex items-center gap-3 rounded-full border px-4 py-2.5 shadow-lg backdrop-blur-md ${
+          className={`fixed bottom-6 right-6 z-[9999] border shadow-lg backdrop-blur-md ${
             status === "error"
               ? "border-red-500/30 bg-red-500/10"
               : "border-[var(--color-border)] bg-[var(--color-bg)]/95"
-          }`}
+          } ${hasTranscript ? "w-[min(440px,calc(100vw-3rem))] rounded-3xl" : "rounded-full"}`}
         >
+          {hasTranscript && (
+            <div className="max-h-[35vh] overflow-y-auto px-4 pt-3 pb-2.5">
+              <p className="text-sm leading-6 text-[var(--color-text)] break-words [overflow-wrap:anywhere]">
+                {transcript.map((s, i) => (
+                  <span key={i}>{s} </span>
+                ))}
+                {currentText && (
+                  <span className="text-[var(--color-text-muted)]">{currentText}</span>
+                )}
+              </p>
+            </div>
+          )}
+          {hasTranscript && (
+            <div className="mx-3 border-t border-[var(--color-border)]/70" />
+          )}
+
+          <div className="flex items-center gap-3 px-4 py-2.5">
           {status === "warming" && (
             <>
               <div className="relative flex h-5 w-5 shrink-0 items-center justify-center">
@@ -148,6 +173,7 @@ export function RecordingIndicator({
               </span>
             </>
           )}
+          </div>
         </motion.div>
       )}
     </AnimatePresence>

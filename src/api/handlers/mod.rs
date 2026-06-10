@@ -6,6 +6,7 @@ pub mod agent_pty;
 pub mod agent_usage;
 pub mod agents;
 pub mod ai;
+pub mod ai_stream;
 pub mod automations;
 pub mod common;
 pub mod config;
@@ -21,6 +22,7 @@ pub mod libraries;
 pub mod marketplace;
 #[cfg(feature = "perf-monitor")]
 pub mod perf;
+pub mod plugins;
 pub mod projects;
 pub mod render;
 pub mod skills;

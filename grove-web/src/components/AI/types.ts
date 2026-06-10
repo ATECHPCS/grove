@@ -14,8 +14,14 @@ export type ProviderProfile = {
 
 export type ReplacementRule = { from: string; to: string };
 
+export type TranscribeMode = "batch" | "streaming";
+
 export type AudioSettings = {
   enabled: boolean;
+  /** Transcription mode: 'batch' (record then transcribe) or 'streaming' (live) */
+  transcribeMode: TranscribeMode;
+  /** Whether OS-wide global voice mode is enabled (global shortcut + floating widget) */
+  globalModeEnabled: boolean;
   transcribeProvider: string;
   preferredLanguages: string[];
   /** Combo key shortcut for toggle mode (e.g. "Cmd+Shift+.") — empty = disabled */

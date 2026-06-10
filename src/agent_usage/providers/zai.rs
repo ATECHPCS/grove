@@ -12,11 +12,13 @@
 //! `code == 200 && success == true`. `data.limits[]` may contain
 //! `TOKENS_LIMIT` and/or `TIME_LIMIT` entries — we expose both.
 
-use super::{clamp_percent, AgentUsage, ExtraInfo, UsageWindow, HTTP_TIMEOUT_ZAI};
+use super::super::{
+    clamp_percent, iso_to_seconds_remaining, AgentUsage, ExtraInfo, UsageWindow, HTTP_TIMEOUT_ZAI,
+};
 use serde::Deserialize;
 
 const USAGE_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
-pub(super) const OPENCODE_KEY: &str = "zai-coding-plan";
+pub(crate) const OPENCODE_KEY: &str = "zai-coding-plan";
 
 #[derive(Debug, Deserialize)]
 struct LimitEntry {
@@ -57,7 +59,7 @@ struct ZaiResponse {
     data: Option<DataBlock>,
 }
 
-pub(super) fn resolve_token() -> Option<String> {
+pub(crate) fn resolve_token() -> Option<String> {
     for var in ["ZAI_API_KEY", "GLM_API_KEY"] {
         if let Ok(v) = std::env::var(var) {
             let t = v.trim();
@@ -66,10 +68,10 @@ pub(super) fn resolve_token() -> Option<String> {
             }
         }
     }
-    super::opencode_auth::read_opencode_token(OPENCODE_KEY)
+    super::super::opencode_auth::read_opencode_token(OPENCODE_KEY)
 }
 
-pub(super) fn fetch_with_token(token: &str) -> Result<AgentUsage, String> {
+pub(crate) fn fetch_with_token(token: &str) -> Result<AgentUsage, String> {
     let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT_ZAI).build();
     let resp = agent
         .get(USAGE_URL)
@@ -129,9 +131,7 @@ fn build_usage(data: DataBlock, limits: Vec<LimitEntry>) -> Result<AgentUsage, S
             .next_reset_time
             .and_then(chrono::DateTime::from_timestamp_millis)
             .map(|dt| dt.to_rfc3339());
-        let resets_in_seconds = resets_at
-            .as_deref()
-            .and_then(super::iso_to_seconds_remaining);
+        let resets_in_seconds = resets_at.as_deref().and_then(iso_to_seconds_remaining);
 
         let window_label = format!("{} ({})", label, window_desc);
         usage.windows.push(UsageWindow {

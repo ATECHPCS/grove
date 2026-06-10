@@ -738,20 +738,23 @@ export function DashboardPage({ onNavigate }: DashboardPageProps) {
               <ProjectIcon className="h-5 w-5" style={{ color: projectColor.fg }} />
             </div>
             <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2.5">
-                <h1 className="text-lg font-semibold tracking-tight text-[var(--color-text)]">
+              <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 min-w-0">
+                <h1
+                  className="text-lg font-semibold tracking-tight text-[var(--color-text)] truncate max-w-[180px] sm:max-w-[260px]"
+                  title={selectedProject.name}
+                >
                   {selectedProject.name}
                 </h1>
                 {isStudio ? (
                   <span
-                    className="inline-flex items-center gap-1 rounded-md border border-[var(--color-highlight)]/30 bg-[var(--color-highlight)]/10 px-2 py-0.5 text-xs font-medium text-[var(--color-highlight)]"
+                    className="inline-flex items-center gap-1 rounded-md border border-[var(--color-highlight)]/30 bg-[var(--color-highlight)]/10 px-2 py-0.5 text-xs font-medium text-[var(--color-highlight)] shrink-0"
                   >
                     <Sparkles className="h-3 w-3" />
                     Studio
                   </span>
                 ) : isGitRepo ? (
                   <span
-                    className="inline-flex items-center gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)]/70 px-2 py-0.5 text-xs font-medium"
+                    className="inline-flex items-center gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)]/70 px-2 py-0.5 text-xs font-medium shrink-0"
                     style={{ color: "var(--color-highlight)" }}
                   >
                     <GitBranch className="h-3 w-3" />
@@ -759,7 +762,7 @@ export function DashboardPage({ onNavigate }: DashboardPageProps) {
                   </span>
                 ) : (
                   <span
-                    className="inline-flex items-center gap-1 rounded-md border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/10 px-2 py-0.5 text-xs font-medium text-[var(--color-warning)]"
+                    className="inline-flex items-center gap-1 rounded-md border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/10 px-2 py-0.5 text-xs font-medium text-[var(--color-warning)] shrink-0"
                     title="This project is not a Git repository yet"
                   >
                     <GitBranch className="h-3 w-3" />
@@ -772,7 +775,7 @@ export function DashboardPage({ onNavigate }: DashboardPageProps) {
               </div>
             </div>
             {!isStudio && (
-              <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto justify-end flex-wrap">
+              <div className="flex items-center gap-1.5 shrink-0">
                 {serverPlatform === "macos" && (
                   <>
                     <HeroButton icon={Code2} label="Open IDE" onClick={handleOpenIDE} />
@@ -1217,14 +1220,14 @@ function HeroButton({ icon: Icon, label, onClick, disabled = false, title }: {
     <button
       onClick={onClick}
       disabled={disabled}
-      title={title}
-      className={`inline-flex items-center gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)]/80 backdrop-blur-sm px-3 py-2 text-sm font-medium text-[var(--color-text)] transition-colors ${
+      title={title || label}
+      className={`inline-flex items-center justify-center rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)]/80 backdrop-blur-sm p-1.5 text-sm font-medium text-[var(--color-text)] transition-colors shrink-0 ${
         disabled
           ? "opacity-50 cursor-not-allowed"
           : "hover:border-[var(--color-highlight)] hover:bg-[var(--color-bg)]"
       }`}
     >
-      <Icon className="h-4 w-4" /> <span className="hidden sm:inline">{label}</span>
+      <Icon className="h-4 w-4" />
     </button>
   );
 }

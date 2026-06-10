@@ -85,6 +85,10 @@ pub struct AcpSessionHandle {
     /// Config option id for thought-level（agent 自定义，例如 "effort_level"）。
     /// 前端在下一条 `Prompt.config.thought_level_config_id` 里 echo 回来。
     thought_level_config_id: Mutex<Option<String>>,
+    /// Config option id for the model selector（claude-agent-acp ≥0.40 moves
+    /// model into configOptions; older agents expose session/set_model instead）.
+    /// None = use legacy SetSessionModelRequest; Some(id) = use SetSessionConfigOptionRequest.
+    model_config_id: Mutex<Option<String>>,
     /// Task 工作目录（用于用户直接执行 terminal 命令）
     pub working_dir: String,
     /// 用户终端命令的 kill channel（Shell 模式）
@@ -113,6 +117,14 @@ pub struct AcpSessionHandle {
     /// agent 是否在 initialize 响应里声明了 `session.fork` 能力
     /// (`unstable_session_fork`)。前端据此显示/隐藏 Fork 按钮。
     pub fork_capable: std::sync::atomic::AtomicBool,
+    /// agent 是否在 initialize 响应里声明了 `session.delete` 能力
+    /// (`unstable_session_delete`)。删 chat 时若为 true 且连接活跃,
+    /// best-effort 调 `session/delete` 把 agent 那边的 session 也删掉。
+    pub delete_capable: std::sync::atomic::AtomicBool,
+    /// agent 是否在 initialize 响应里声明了 `session.close` 能力。
+    /// tear down 一个 session 前若为 true,先发 `session/close` 让 agent
+    /// 优雅 cancel + 释放资源,再 SIGKILL 兜底。
+    pub close_capable: std::sync::atomic::AtomicBool,
     /// session/new 阶段被 -32000 卡住后,记录当前 banner 状态(methods + agent_name)。
     /// 用途:WS 重连时,如果还没登录成功,跳过假的 SessionReady,改发 AuthRequired
     /// 让前端继续显示 banner;避免"刷新后看起来连上了但消息发不出去"。
@@ -161,6 +173,11 @@ enum AcpCommand {
     ForkSession {
         cwd: PathBuf,
         reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+    },
+    /// 调用 ACP `session/delete`(`unstable_session_delete`),要求 agent 删掉
+    /// 当前 session(handle 自己的 session_id)。reply 回传成功/失败。
+    DeleteSession {
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
 }
 
@@ -550,6 +567,8 @@ pub struct SessionMetadata {
     pub available_models: Vec<(String, String)>,
     pub current_model_id: Option<String>,
     #[serde(default)]
+    pub model_config_id: Option<String>,
+    #[serde(default)]
     pub available_thought_levels: Vec<(String, String)>,
     #[serde(default)]
     pub current_thought_level_id: Option<String>,
@@ -723,7 +742,208 @@ fn build_mcp_servers(
             )));
         }
     }
+    // Inject stdio MCP servers contributed by installed plugins, forwarding the
+    // task/project context env (so a plugin's MCP server has the same "current
+    // context" the panel gets from host.getInfo).
+    servers.extend(load_plugin_mcp_servers(env_vars));
     Ok(servers)
+}
+
+/// Build stdio MCP servers contributed by installed plugins. A plugin whose
+/// manifest has `contributes.mcp = { command, args?, env? }` gets one stdio
+/// server. Relative file paths in command/args are resolved against the plugin
+/// folder; `GROVE_PLUGIN_DIR` / `GROVE_PLUGIN_DATA_DIR` plus the allowlisted
+/// task/project context (`PLUGIN_MCP_CONTEXT_ENV`, e.g. `GROVE_WORKTREE`) are
+/// injected so the server has the same context the panel gets from
+/// host.getInfo. Best-effort: a missing / malformed manifest is skipped, never
+/// fails the session.
+fn load_plugin_mcp_servers(base_env: &HashMap<String, String>) -> Vec<acp::McpServer> {
+    let plugins = match crate::storage::plugins::list() {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let mut servers = Vec::new();
+    for plugin in plugins {
+        let manifest_path = std::path::Path::new(&plugin.local_path).join("plugin.json");
+        let manifest: serde_json::Value = match std::fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+        {
+            Some(m) => m,
+            None => continue,
+        };
+        let mcp = match manifest.get("contributes").and_then(|c| c.get("mcp")) {
+            Some(m) => m,
+            None => continue,
+        };
+        let plugin_dir = std::path::Path::new(&plugin.local_path);
+        // Resolve a value to an absolute path when it names a file inside the
+        // plugin folder. McpServerStdio has no cwd, so a relative entry like
+        // `dist/server.js` would otherwise resolve against Grove's cwd. Bare
+        // commands (`node`) and flags (`--foo`) don't match a file and pass
+        // through unchanged (PATH resolution handles `node`).
+        let resolve = |s: &str| -> String {
+            let candidate = plugin_dir.join(s);
+            if candidate.is_file() {
+                candidate.display().to_string()
+            } else {
+                s.to_string()
+            }
+        };
+        let command = match mcp.get("command").and_then(|v| v.as_str()) {
+            Some(c) if !c.is_empty() => resolve(c),
+            _ => continue,
+        };
+        let mut args: Vec<String> = mcp
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).map(resolve).collect())
+            .unwrap_or_default();
+        // Declared permissions → Node Permission Model flags. A node-based MCP
+        // server runs under `node --permission` with fs/exec grants matching
+        // exactly what the manifest declares; Grove requires node >= 24 and
+        // refuses (skips) the server otherwise, so a permission is never left
+        // silently unenforced.
+        let perms: std::collections::HashSet<String> = manifest
+            .get("permissions")
+            .and_then(|p| p.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let storage_root = crate::storage::plugin_data::data_dir(&plugin.id);
+        let _ = std::fs::create_dir_all(&storage_root);
+        if crate::plugins::runtime::is_node_command(&command) {
+            if !crate::plugins::runtime::node_supports_permissions(&command) {
+                eprintln!(
+                    "grove: skipping MCP server for plugin '{}': node >= {} is required \
+                     for enforced permissions (check `node --version`)",
+                    plugin.name,
+                    crate::plugins::runtime::MIN_NODE_MAJOR
+                );
+                continue;
+            }
+            let mut flags = crate::plugins::runtime::node_permission_flags(
+                &perms,
+                &plugin.local_path,
+                &storage_root.display().to_string(),
+                base_env.get("GROVE_WORKTREE").map(|s| s.as_str()),
+            );
+            flags.extend(args);
+            args = flags;
+        }
+        let mut env: Vec<acp::EnvVariable> = mcp
+            .get("env")
+            .and_then(|v| v.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, v)| {
+                        v.as_str()
+                            .map(|s| acp::EnvVariable::new(k.clone(), s.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Hand the server a single structured context blob — the SDK's
+        // `getGroveContext()` parses this; plugin authors never read env
+        // directly. Secrets (e.g. Grove's MCP token) are never included.
+        // The three storage scope dirs the MCP server can use directly (it runs
+        // with `--allow-fs-*` on the data root). project/task are present only
+        // when the session carries those ids.
+        use crate::storage::plugin_data::{scope_dir, Scope};
+        let dir_str = |s: Scope| {
+            scope_dir(&plugin.id, &s)
+                .ok()
+                .map(|p| p.display().to_string())
+        };
+        let pid = base_env.get("GROVE_PROJECT_KEY").cloned();
+        let tid = base_env.get("GROVE_TASK_ID").cloned();
+        let storage = serde_json::json!({
+            "global": dir_str(Scope::Global),
+            "project": pid.clone().and_then(|p| dir_str(Scope::Project(p))),
+            "task": pid.clone().zip(tid.clone()).and_then(|(p, t)| dir_str(Scope::Task(p, t))),
+        });
+        // Studio task worktrees live under ~/.grove/studios; everything else is
+        // a coding repo. Mirrors the panel's host.getInfo().projectType.
+        let project_type = base_env.get("GROVE_WORKTREE").map(|w| {
+            if w.contains("studios") {
+                "studio"
+            } else {
+                "repo"
+            }
+        });
+        let context = serde_json::json!({
+            "projectDir": base_env.get("GROVE_WORKTREE"),   // current task's working dir
+            "projectPath": base_env.get("GROVE_PROJECT"),   // project root
+            "projectName": base_env.get("GROVE_PROJECT_NAME"),
+            "projectId": base_env.get("GROVE_PROJECT_KEY"),
+            "projectType": project_type,
+            "taskId": base_env.get("GROVE_TASK_ID"),
+            "taskName": base_env.get("GROVE_TASK_NAME"),
+            "branch": base_env.get("GROVE_BRANCH"),
+            "target": base_env.get("GROVE_TARGET"),
+            "chatId": base_env.get("GROVE_CHAT_ID"),
+            "pluginDir": plugin.local_path,
+            "dataDir": storage_root.display().to_string(),  // data root (all scopes)
+            "storage": storage,
+        });
+        env.push(acp::EnvVariable::new(
+            "GROVE_CONTEXT".to_string(),
+            context.to_string(),
+        ));
+        // Event bus: the MCP server's stdio talks to the agent, not Grove, so
+        // grove.events.emit posts back over HTTP (loopback) with the token.
+        if let Some(url) = crate::plugins::events::events_url(&plugin.id) {
+            env.push(acp::EnvVariable::new(
+                "GROVE_EVENTS_TRANSPORT".to_string(),
+                "http".to_string(),
+            ));
+            env.push(acp::EnvVariable::new("GROVE_EVENTS_URL".to_string(), url));
+            env.push(acp::EnvVariable::new(
+                "GROVE_EVENTS_TOKEN".to_string(),
+                crate::plugins::events::token().to_string(),
+            ));
+        }
+        servers.push(acp::McpServer::Stdio(
+            acp::McpServerStdio::new(
+                plugin_mcp_server_name(&plugin),
+                std::path::PathBuf::from(command),
+            )
+            .args(args)
+            .env(env),
+        ));
+    }
+    servers
+}
+
+/// A readable, tool-safe MCP server name for a plugin — the agent prefixes the
+/// plugin's tools with this, so it must not be the opaque `pl-<uuid>`. Uses the
+/// plugin's folder name (sanitized to `[A-Za-z0-9_-]`), falling back to the id.
+fn plugin_mcp_server_name(plugin: &crate::storage::plugins::Plugin) -> String {
+    let raw = std::path::Path::new(&plugin.local_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&plugin.name);
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            slug.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        format!("plugin-{}", plugin.id)
+    } else {
+        slug.to_string()
+    }
 }
 
 /// 单个 terminal 实例的状态
@@ -888,7 +1108,7 @@ async fn handle_request_permission(
     state.handle.emit(AcpUpdate::PermissionRequest {
         id: request_id,
         description: desc.clone(),
-        options,
+        options: options.clone(),
     });
 
     notify_acp_event(
@@ -898,6 +1118,7 @@ async fn handle_request_permission(
         "Permission Required",
         &desc,
         AcpNotificationEvent::PermissionRequired,
+        Some(&options),
     );
 
     match rx.await {
@@ -1662,6 +1883,7 @@ pub async fn get_or_start_session(
                     current_usage: Mutex::new(None),
                     current_thought_level_id: Mutex::new(None),
                     thought_level_config_id: Mutex::new(None),
+                    model_config_id: Mutex::new(None),
                     working_dir: config.working_dir.to_string_lossy().to_string(),
                     terminal_kill_tx: Mutex::new(None),
                     is_busy: std::sync::atomic::AtomicBool::new(false),
@@ -1672,6 +1894,8 @@ pub async fn get_or_start_session(
                     pending_auth_retry: Mutex::new(None),
                     pending_auth: Mutex::new(None),
                     fork_capable: std::sync::atomic::AtomicBool::new(false),
+                    delete_capable: std::sync::atomic::AtomicBool::new(false),
+                    close_capable: std::sync::atomic::AtomicBool::new(false),
                 });
 
                 // 注册到全局表
@@ -2132,19 +2356,42 @@ async fn drive_session(
 ) -> acp::Result<(), acp::Error> {
     fn extract_modes(
         modes: &Option<acp::SessionModeState>,
+        config_options: &[acp::SessionConfigOption],
     ) -> (Vec<(String, String)>, Option<String>) {
-        match modes {
-            Some(state) => {
-                let available: Vec<(String, String)> = state
-                    .available_modes
-                    .iter()
-                    .map(|m| (m.id.to_string(), m.name.clone()))
-                    .collect();
-                let current = Some(state.current_mode_id.to_string());
-                (available, current)
-            }
-            None => (vec![], None),
+        if let Some(state) = modes {
+            let available: Vec<(String, String)> = state
+                .available_modes
+                .iter()
+                .map(|m| (m.id.to_string(), m.name.clone()))
+                .collect();
+            let current = Some(state.current_mode_id.to_string());
+            return (available, current);
         }
+        // Fallback: some agents (e.g. OpenCode) report modes via configOptions
+        // with category "mode" instead of the top-level `modes` field.
+        for opt in config_options {
+            let is_mode = matches!(opt.category, Some(acp::SessionConfigOptionCategory::Mode));
+            let is_mode_other = matches!(
+                &opt.category,
+                Some(acp::SessionConfigOptionCategory::Other(s))
+                    if s.eq_ignore_ascii_case("mode")
+            );
+            if !is_mode && !is_mode_other {
+                continue;
+            }
+            let acp::SessionConfigKind::Select(select) = &opt.kind else {
+                continue;
+            };
+            let acp::SessionConfigSelectOptions::Ungrouped(entries) = &select.options else {
+                continue;
+            };
+            let available: Vec<(String, String)> = entries
+                .iter()
+                .map(|e| (e.value.to_string(), e.name.clone()))
+                .collect();
+            return (available, Some(select.current_value.to_string()));
+        }
+        (vec![], None)
     }
 
     /// Lowercase fuzzy-match a free-text query against `(id, name)` pairs.
@@ -2196,19 +2443,46 @@ async fn drive_session(
 
     fn extract_models(
         models: &Option<acp::SessionModelState>,
-    ) -> (Vec<(String, String)>, Option<String>) {
-        match models {
-            Some(state) => {
-                let available: Vec<(String, String)> = state
-                    .available_models
-                    .iter()
-                    .map(|m| (m.model_id.to_string(), m.name.clone()))
-                    .collect();
-                let current = Some(state.current_model_id.to_string());
-                (available, current)
-            }
-            None => (vec![], None),
+        config_options: &[acp::SessionConfigOption],
+    ) -> (Vec<(String, String)>, Option<String>, Option<String>) {
+        if let Some(state) = models {
+            let available: Vec<(String, String)> = state
+                .available_models
+                .iter()
+                .map(|m| (m.model_id.to_string(), m.name.clone()))
+                .collect();
+            let current = Some(state.current_model_id.to_string());
+            return (available, current, None);
         }
+        // claude-agent-acp ≥0.40 no longer returns a separate `models` field;
+        // model info is embedded in `configOptions` with category "model".
+        for opt in config_options {
+            let is_model = matches!(opt.category, Some(acp::SessionConfigOptionCategory::Model));
+            let is_model_other = matches!(
+                &opt.category,
+                Some(acp::SessionConfigOptionCategory::Other(s))
+                    if s.eq_ignore_ascii_case("model")
+            );
+            if !is_model && !is_model_other {
+                continue;
+            }
+            let acp::SessionConfigKind::Select(select) = &opt.kind else {
+                continue;
+            };
+            let acp::SessionConfigSelectOptions::Ungrouped(entries) = &select.options else {
+                continue;
+            };
+            let available: Vec<(String, String)> = entries
+                .iter()
+                .map(|e| (e.value.to_string(), e.name.clone()))
+                .collect();
+            return (
+                available,
+                Some(select.current_value.to_string()),
+                Some(opt.id.to_string()),
+            );
+        }
+        (vec![], None, None)
     }
 
     // Grove 内部错误 → acp::Error
@@ -2286,6 +2560,16 @@ async fn drive_session(
     // Trae 目前已在新版中正确声明支持 load_session，此处可直接使用其实际能力声明
     let supports_load = init_resp.agent_capabilities.load_session;
 
+    // Resume 能力(ACP 0.12 stabilized `session/resume`):agent 在 capabilities 里
+    // 声明 resume=Some(_) 表示支持。与 load_session 的本质区别 — resume **不 replay
+    // 历史消息**(load 会把全部历史通过 session/update 回放回来)。Grove 的历史本就
+    // 自己从磁盘加载,所以 resume 路线天然不需要 suppress_emit + 300ms 那套抛弃 hack。
+    let supports_resume = init_resp
+        .agent_capabilities
+        .session_capabilities
+        .resume
+        .is_some();
+
     // Fork 能力(`unstable_session_fork`):agent 在 capabilities 里声明 fork=Some(_)
     // 表示支持 `session/fork`。同时 grove 的 fork 实现依赖 load_session — 派生
     // 出的新 chat 用户首次打开时走的是 fresh process + load_session(forked_id),
@@ -2299,6 +2583,28 @@ async fn drive_session(
     handle
         .fork_capable
         .store(fork_capable, std::sync::atomic::Ordering::Relaxed);
+
+    // Delete 能力(`unstable_session_delete`):agent 声明 session.delete 即可。
+    // 删 chat 时若连接活跃,best-effort 调 session/delete 删掉 agent 侧 session。
+    let delete_capable = init_resp
+        .agent_capabilities
+        .session_capabilities
+        .delete
+        .is_some();
+    handle
+        .delete_capable
+        .store(delete_capable, std::sync::atomic::Ordering::Relaxed);
+
+    // Close 能力(`session/close`,已 stabilized 无需 feature):agent 声明
+    // session.close 即可。tear down 前发 close 让 agent 优雅 cancel + 释放资源。
+    let close_capable = init_resp
+        .agent_capabilities
+        .session_capabilities
+        .close
+        .is_some();
+    handle
+        .close_capable
+        .store(close_capable, std::sync::atomic::Ordering::Relaxed);
 
     // 查找保存的 session_id(从 chat session 读取)
     let saved_id = config.chat_id.as_ref().and_then(|cid| {
@@ -2323,6 +2629,7 @@ async fn drive_session(
     let current_mode_id;
     let available_models;
     let current_model_id;
+    let model_config_id;
     let available_thought_levels;
     let current_thought_level_id;
     let thought_level_config_id;
@@ -2476,8 +2783,14 @@ async fn drive_session(
             }
             let sid = resp.session_id.to_string();
             persist_session_id(&sid);
-            (available_modes, current_mode_id) = extract_modes(&resp.modes);
-            (available_models, current_model_id) = extract_models(&resp.models);
+            (available_modes, current_mode_id) = extract_modes(
+                &resp.modes,
+                resp.config_options.as_deref().unwrap_or(&[]),
+            );
+            (available_models, current_model_id, model_config_id) = extract_models(
+                &resp.models,
+                resp.config_options.as_deref().unwrap_or(&[]),
+            );
             (
                 available_thought_levels,
                 current_thought_level_id,
@@ -2552,74 +2865,145 @@ async fn drive_session(
         }};
     }
 
-    let session_id = if let (true, Some(saved_id)) = (supports_load, saved_id) {
-        // 抑制 agent 的回放通知(Grove 统一从磁盘回放)
-        handle
-            .suppress_emit
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let load_result = {
-            let mcp_servers =
-                build_mcp_servers(&config.env_vars, agent_graph_token).map_err(to_acp_err)?;
-            conn.send_request(
-                acp::LoadSessionRequest::new(acp::SessionId::new(&*saved_id), &config.working_dir)
+    let session_id = match (saved_id, supports_resume, supports_load) {
+        // Resume 路线(优先):agent 支持 session/resume。不 replay 历史,所以
+        // 完全不需要 suppress_emit + 300ms 那套抛弃 agent 回放的机制 — 直接发
+        // ResumeSessionRequest,Grove 照常从磁盘加载自己的历史。
+        (Some(saved_id), true, _) => {
+            let resume_result = {
+                let mcp_servers =
+                    build_mcp_servers(&config.env_vars, agent_graph_token).map_err(to_acp_err)?;
+                conn.send_request(
+                    acp::ResumeSessionRequest::new(
+                        acp::SessionId::new(&*saved_id),
+                        &config.working_dir,
+                    )
                     .mcp_servers(mcp_servers),
-            )
-            .block_task()
-            .await
-        };
-        // load_session spec 保证 response 在所有 replay notification 之后,
-        // 额外等 300ms 作为安全余量
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        handle
-            .suppress_emit
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-
-        match load_result {
-            Ok(resp) => {
-                (available_modes, current_mode_id) = extract_modes(&resp.modes);
-                (available_models, current_model_id) = extract_models(&resp.models);
-                (
-                    available_thought_levels,
-                    current_thought_level_id,
-                    thought_level_config_id,
-                ) = extract_thought_level(resp.config_options.as_deref().unwrap_or(&[]));
-                saved_id
-            }
-            Err(load_err) => {
-                let load_err_msg = format!("{}", load_err);
-                if is_definitive_resume_failure(&load_err_msg) {
-                    // Saved session is genuinely gone. Recover in place by starting
-                    // a fresh session instead of dead-ending the client (which would
-                    // force a full page refresh — Blitz Findings #3). Flag the handle
-                    // so the WS handler sends a one-time "reconnected" notice.
-                    eprintln!(
-                        "[ACP] resume failed for key {} ({}); recovering with a fresh session",
-                        handle.key, load_err_msg
-                    );
-                    handle
-                        .recovered
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    let new_id = create_new_session!(false);
-                    // Persist the fresh id so future reconnects resume IT, not the
-                    // dead one. Idempotent if the fresh path already wrote it.
-                    if let Some(ref cid) = handle.chat_id {
-                        let _ = crate::storage::tasks::update_chat_acp_session_id(
-                            &handle.project_key,
-                            &handle.task_id,
-                            cid,
-                            &new_id,
+                )
+                .block_task()
+                .await
+            };
+            match resume_result {
+                Ok(resp) => {
+                    (available_modes, current_mode_id) =
+                        extract_modes(&resp.modes, resp.config_options.as_deref().unwrap_or(&[]));
+                    (available_models, current_model_id, model_config_id) =
+                        extract_models(&resp.models, resp.config_options.as_deref().unwrap_or(&[]));
+                    (
+                        available_thought_levels,
+                        current_thought_level_id,
+                        thought_level_config_id,
+                    ) = extract_thought_level(resp.config_options.as_deref().unwrap_or(&[]));
+                    saved_id
+                }
+                Err(resume_err) => {
+                    // Saved session couldn't be resumed. If the failure is definitive
+                    // (the session is genuinely gone), recover in place with a fresh
+                    // session instead of dead-ending the client into a full page
+                    // refresh (Blitz Findings #3); flag the handle so the WS handler
+                    // sends a one-time "reconnected" notice. Transient/transport/auth
+                    // failures keep the existing behaviour — return a single error so
+                    // the caller emits one banner (no double-emit, no fall-through).
+                    let resume_err_msg = format!("{}", resume_err);
+                    if is_definitive_resume_failure(&resume_err_msg) {
+                        eprintln!(
+                            "[ACP] resume failed for key {} ({}); recovering with a fresh session",
+                            handle.key, resume_err_msg
                         );
+                        handle
+                            .recovered
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        let new_id = create_new_session!(false);
+                        // Persist the fresh id so future reconnects resume IT, not the
+                        // dead one. Idempotent if the fresh path already wrote it.
+                        if let Some(ref cid) = handle.chat_id {
+                            let _ = crate::storage::tasks::update_chat_acp_session_id(
+                                &handle.project_key,
+                                &handle.task_id,
+                                cid,
+                                &new_id,
+                            );
+                        }
+                        new_id
+                    } else {
+                        return Err(acp::Error::internal_error()
+                            .data(format!("Resume session failed: {}", resume_err)));
                     }
-                    new_id
-                } else {
-                    // Transient/transport/auth failure — keep existing behavior.
-                    return Err(acp::Error::internal_error()
-                        .data(format!("Resume session failed: {}", load_err)));
                 }
             }
         }
-    } else {
-        create_new_session!(false)
+        // Load 路线:agent 不支持 resume 但支持 load_session。agent 会 replay 历史
+        // (Grove 统一从磁盘回放),所以抑制其回放 emit。关键:traecli 等 agent 的
+        // replay 在 LoadSessionResponse **之后**才异步流式发出,固定时间窗口抓不住
+        // → suppress 保持 true,直到 cmd loop 收到首个用户 prompt 才解除(见 Prompt
+        // arm)。恢复 session 后、用户发新消息前,agent 主动 emit 的只可能是 replay。
+        (Some(saved_id), false, true) => {
+            handle
+                .suppress_emit
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let load_result = {
+                let mcp_servers =
+                    build_mcp_servers(&config.env_vars, agent_graph_token).map_err(to_acp_err)?;
+                conn.send_request(
+                    acp::LoadSessionRequest::new(
+                        acp::SessionId::new(&*saved_id),
+                        &config.working_dir,
+                    )
+                    .mcp_servers(mcp_servers),
+                )
+                .block_task()
+                .await
+            };
+
+            match load_result {
+                Ok(resp) => {
+                    (available_modes, current_mode_id) =
+                        extract_modes(&resp.modes, resp.config_options.as_deref().unwrap_or(&[]));
+                    (available_models, current_model_id, model_config_id) =
+                        extract_models(&resp.models, resp.config_options.as_deref().unwrap_or(&[]));
+                    (
+                        available_thought_levels,
+                        current_thought_level_id,
+                        thought_level_config_id,
+                    ) = extract_thought_level(resp.config_options.as_deref().unwrap_or(&[]));
+                    saved_id
+                }
+                Err(load_err) => {
+                    // Same definitive-vs-transient recovery as the resume arm: a
+                    // genuinely-gone session recovers in place with a fresh one (avoids
+                    // forcing a full page refresh — Blitz Findings #3) and flags the
+                    // handle for the one-time "reconnected" notice; transient failures
+                    // return a single error (run_acp_session's caller emits one banner —
+                    // don't double-emit here).
+                    let load_err_msg = format!("{}", load_err);
+                    if is_definitive_resume_failure(&load_err_msg) {
+                        eprintln!(
+                            "[ACP] load failed for key {} ({}); recovering with a fresh session",
+                            handle.key, load_err_msg
+                        );
+                        handle
+                            .recovered
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        let new_id = create_new_session!(false);
+                        if let Some(ref cid) = handle.chat_id {
+                            let _ = crate::storage::tasks::update_chat_acp_session_id(
+                                &handle.project_key,
+                                &handle.task_id,
+                                cid,
+                                &new_id,
+                            );
+                        }
+                        new_id
+                    } else {
+                        return Err(acp::Error::internal_error()
+                            .data(format!("Resume session failed: {}", load_err)));
+                    }
+                }
+            }
+        }
+        // Fresh 路线:无 saved_id,或有 saved_id 但 agent 既不支持 resume 也不支持
+        // load。与现状一致。
+        _ => create_new_session!(false),
     };
 
     let session_id_arc = acp::SessionId::new(&*session_id);
@@ -2645,6 +3029,7 @@ async fn drive_session(
     *handle.current_model_id.lock().unwrap() = current_model_id.clone();
     *handle.current_thought_level_id.lock().unwrap() = current_thought_level_id.clone();
     *handle.thought_level_config_id.lock().unwrap() = thought_level_config_id.clone();
+    *handle.model_config_id.lock().unwrap() = model_config_id.clone();
 
     if let Some(ref chat_id) = handle.chat_id {
         if let Some(existing) = read_session_metadata(&handle.project_key, &handle.task_id, chat_id)
@@ -2720,6 +3105,13 @@ async fn drive_session(
                 terminal,
                 config: prompt_config,
             } => {
+                // load 路线:首个用户 prompt 到来即解除 replay 抑制。此前 agent 的
+                // 主动 emit 都是 load replay(Grove 已从磁盘显示历史),从这条新消息
+                // 起恢复正常。必须在下面第一个 emit(UserMessage) 之前。幂等:
+                // resume/fresh 路线本就 suppress=false,store false 无副作用。
+                handle
+                    .suppress_emit
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 // 提前快照,便于 -32000 AuthRequired 时把这条 prompt 暂存起来
                 // 等 authenticate 成功后自动重试。sender/attachments 后续会被
                 // 移动进 emit / content_blocks,所以必须 clone。
@@ -2778,13 +3170,28 @@ async fn drive_session(
                         if let Some(ref model_id) = cfg.model {
                             let current = handle.current_model_id.lock().unwrap().clone();
                             if current.as_deref() != Some(model_id.as_str()) {
-                                let resp = conn
-                                    .send_request(acp::SetSessionModelRequest::new(
+                                let model_cfg_id = handle.model_config_id.lock().unwrap().clone();
+                                let resp: Result<(), _> = if let Some(ref config_id) = model_cfg_id
+                                {
+                                    // claude-agent-acp ≥0.40: model via generic config option
+                                    conn.send_request(acp::SetSessionConfigOptionRequest::new(
+                                        session_id_arc.clone(),
+                                        acp::SessionConfigId::new(config_id.clone()),
+                                        acp::SessionConfigValueId::new(model_id.clone()),
+                                    ))
+                                    .block_task()
+                                    .await
+                                    .map(|_| ())
+                                } else {
+                                    // Legacy: dedicated session/set_model method
+                                    conn.send_request(acp::SetSessionModelRequest::new(
                                         session_id_arc.clone(),
                                         acp::ModelId::new(model_id.clone()),
                                     ))
                                     .block_task()
-                                    .await;
+                                    .await
+                                    .map(|_| ())
+                                };
                                 match resp {
                                     Ok(_) => {
                                         *handle.current_model_id.lock().unwrap() =
@@ -2946,6 +3353,13 @@ async fn drive_session(
                                         "Cannot fork while agent is busy".to_string(),
                                     ));
                                 }
+                                AcpCommand::DeleteSession { reply } => {
+                                    // 同 fork:busy 期间拒绝。删除是 best-effort,
+                                    // 上层收到 Err 会跳过 agent delete、照常删本地。
+                                    let _ = reply.send(Err(
+                                        "Cannot delete while agent is busy".to_string(),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -2989,6 +3403,7 @@ async fn drive_session(
                             "Task Complete",
                             &summary,
                             AcpNotificationEvent::TurnComplete,
+                            None,
                         );
                         handle.emit(AcpUpdate::Busy { value: false });
                         let turn_end_ts = chrono::Utc::now().timestamp();
@@ -3191,10 +3606,38 @@ async fn drive_session(
                 };
                 let _ = reply.send(outcome);
             }
+            AcpCommand::DeleteSession { reply } => {
+                // best-effort:agent 必须声明 delete capability(调用方已校验)。
+                // 删的是当前 session,直接用 session_id_arc。失败透传给上层。
+                let res = conn
+                    .send_request(acp::DeleteSessionRequest::new(session_id_arc.clone()))
+                    .block_task()
+                    .await;
+                let outcome = match res {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(format!("session/delete failed: {}", e)),
+                };
+                let _ = reply.send(outcome);
+            }
             AcpCommand::Kill => {
                 break;
             }
         }
+    }
+
+    // 优雅退出:tear down 前若 agent 支持 session/close,先让它 cancel 进行中
+    // 的工作 + 释放资源,再由 run_acp_session 的 drop(child) SIGKILL 兜底。
+    // best-effort:失败 / 超时一律忽略,不阻塞 tear down。
+    if handle
+        .close_capable
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            conn.send_request(acp::CloseSessionRequest::new(session_id_arc.clone()))
+                .block_task(),
+        )
+        .await;
     }
 
     Ok(())
@@ -3352,11 +3795,16 @@ impl AcpSessionHandle {
 
     /// 发送更新并记录到 history buffer（带磁盘持久化）
     pub fn emit(&self, mut update: AcpUpdate) {
-        // load_session 期间抑制大部分 emit；保留 available_commands 以恢复 slash commands
+        // load_session 期间抑制大部分 emit；保留 available_commands 以恢复 slash
+        // commands，保留 session_ready 让前端就绪(suppress 现在保持到首个用户
+        // prompt，session_ready 在 cmd loop 之前发，必须放行)。
         if self
             .suppress_emit
             .load(std::sync::atomic::Ordering::Relaxed)
-            && !matches!(update, AcpUpdate::AvailableCommands { .. })
+            && !matches!(
+                update,
+                AcpUpdate::AvailableCommands { .. } | AcpUpdate::SessionReady { .. }
+            )
         {
             return;
         }
@@ -3408,6 +3856,7 @@ impl AcpSessionHandle {
                     *self.current_thought_level_id.lock().unwrap() =
                         current_thought_level_id.clone();
                     *self.thought_level_config_id.lock().unwrap() = thought_level_config_id.clone();
+                    let model_cfg_id = self.model_config_id.lock().unwrap().clone();
 
                     write_session_metadata(
                         &self.project_key,
@@ -3421,6 +3870,7 @@ impl AcpSessionHandle {
                             current_mode_id: current_mode_id.clone(),
                             available_models: available_models.clone(),
                             current_model_id: current_model_id.clone(),
+                            model_config_id: model_cfg_id,
                             available_thought_levels: available_thought_levels.clone(),
                             current_thought_level_id: current_thought_level_id.clone(),
                             thought_level_config_id: thought_level_config_id.clone(),
@@ -3470,6 +3920,7 @@ impl AcpSessionHandle {
                             current_mode_id: None,
                             available_models: Vec::new(),
                             current_model_id: None,
+                            model_config_id: None,
                             available_thought_levels: Vec::new(),
                             current_thought_level_id: None,
                             thought_level_config_id: None,
@@ -3785,6 +4236,23 @@ impl AcpSessionHandle {
             Ok(Err(msg)) => Err(crate::error::GroveError::Session(msg)),
             Err(_) => Err(crate::error::GroveError::Session(
                 "Fork request was dropped by ACP loop".to_string(),
+            )),
+        }
+    }
+
+    /// 通过 ACP `session/delete` 删掉当前 session(`unstable_session_delete`)。
+    /// 删 chat 时 best-effort 调用 — agent 那边把 session 一并删掉。
+    pub async fn delete_session(&self) -> crate::error::Result<()> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(AcpCommand::DeleteSession { reply: reply_tx })
+            .await
+            .map_err(|_| crate::error::GroveError::Session("ACP session closed".to_string()))?;
+        match reply_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(msg)) => Err(crate::error::GroveError::Session(msg)),
+            Err(_) => Err(crate::error::GroveError::Session(
+                "Delete request was dropped by ACP loop".to_string(),
             )),
         }
     }
@@ -4136,6 +4604,7 @@ pub fn new_handle_for_test(
         current_usage: Mutex::new(None),
         current_thought_level_id: Mutex::new(None),
         thought_level_config_id: Mutex::new(None),
+        model_config_id: Mutex::new(None),
         working_dir: "/tmp".to_string(),
         terminal_kill_tx: Mutex::new(None),
         is_busy: std::sync::atomic::AtomicBool::new(false),
@@ -4146,6 +4615,8 @@ pub fn new_handle_for_test(
         pending_auth_retry: Mutex::new(None),
         pending_auth: Mutex::new(None),
         fork_capable: std::sync::atomic::AtomicBool::new(false),
+        delete_capable: std::sync::atomic::AtomicBool::new(false),
+        close_capable: std::sync::atomic::AtomicBool::new(false),
     });
 
     if let Ok(mut sessions) = ACP_SESSIONS.write() {
@@ -4598,6 +5069,12 @@ const BUILTIN_ACP_AGENTS: &[BuiltinAcpAgent] = &[
         icon_id: "trae",
         aliases: &[],
     },
+    BuiltinAcpAgent {
+        id: "hermes",
+        display_name: "Hermes",
+        icon_id: "hermes",
+        aliases: &[],
+    },
 ];
 
 pub fn builtin_acp_agents() -> &'static [BuiltinAcpAgent] {
@@ -4690,6 +5167,7 @@ fn builtin_acp_unavailable_reason(agent_name: &str) -> Option<String> {
         "opencode" => missing_command("opencode"),
         "qwen" => missing_command("qwen"),
         "traecli" => missing_command("traecli"),
+        "hermes" => missing_command("hermes"),
         _ => Some(format!("unsupported agent: {agent_name}")),
     }
 }
@@ -4851,6 +5329,19 @@ pub fn resolve_agent(agent_name: &str) -> Option<ResolvedAgent> {
                 auth_header: None,
             });
         }
+        Some("hermes") => {
+            if !command_exists("hermes") {
+                return None;
+            }
+            return Some(ResolvedAgent {
+                agent_type: "local".into(),
+                agent_name: "hermes".into(),
+                command: "hermes".into(),
+                args: vec!["acp".into()],
+                url: None,
+                auth_header: None,
+            });
+        }
         _ => {}
     }
     // 2. Custom agents from config
@@ -4976,6 +5467,7 @@ fn notify_acp_event(
     title_suffix: &str,
     message: &str,
     event: AcpNotificationEvent,
+    options: Option<&[PermOptionData]>,
 ) {
     use crate::hooks::{self, NotificationLevel};
     use crate::storage::{config, tasks as task_storage};
@@ -5053,7 +5545,41 @@ fn notify_acp_event(
 
         let title = format!("{} - {}", project_name, title_suffix);
         let banner_msg = format!("{} — {}", task_name, message);
-        hooks::send_banner(&title, &banner_msg);
+        let is_permission = event == AcpNotificationEvent::PermissionRequired;
+
+        let mut approve_opt = None;
+        let mut deny_opt = None;
+        if let Some(opts) = options {
+            // 只匹配明确的 allow 类型，找不到就不设按钮（不猜测）
+            approve_opt = opts
+                .iter()
+                .find(|o| o.kind == "allow_once")
+                .or_else(|| opts.iter().find(|o| o.kind == "allow_always"))
+                .or_else(|| opts.iter().find(|o| o.kind.contains("allow")))
+                .map(|o| o.option_id.as_str());
+
+            // 只匹配明确的 reject/deny 类型，找不到就不设按钮（不猜测）
+            deny_opt = opts
+                .iter()
+                .find(|o| o.kind == "reject_once")
+                .or_else(|| opts.iter().find(|o| o.kind == "reject_always"))
+                .or_else(|| {
+                    opts.iter()
+                        .find(|o| o.kind.contains("reject") || o.kind.contains("deny"))
+                })
+                .map(|o| o.option_id.as_str());
+        }
+
+        hooks::send_banner(
+            &title,
+            &banner_msg,
+            project_key,
+            task_id,
+            chat_id,
+            is_permission,
+            approve_opt,
+            deny_opt,
+        );
     }
 
     let level = if title_suffix.contains("Permission") {
@@ -5334,6 +5860,7 @@ mod tests {
             current_mode_id: Some("code".into()),
             available_models: vec![("opus".into(), "Opus".into())],
             current_model_id: Some("opus".into()),
+            model_config_id: None,
             available_thought_levels: vec![],
             current_thought_level_id: None,
             thought_level_config_id: None,

@@ -3,6 +3,7 @@ import { useEffect, useRef } from 'react';
 
 interface CodeSearchBarProps {
   visible: boolean;
+  focusTrigger?: number;
   query: string;
   caseSensitive: boolean;
   currentIndex: number;
@@ -16,6 +17,7 @@ interface CodeSearchBarProps {
 
 export function CodeSearchBar({
   visible,
+  focusTrigger,
   query,
   caseSensitive,
   currentIndex,
@@ -28,13 +30,13 @@ export function CodeSearchBar({
 }: CodeSearchBarProps) {
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Auto-focus input when visible
+  // Auto-focus input when visible or when re-triggered (e.g. Ctrl+F while already open)
   useEffect(() => {
     if (visible && inputRef.current) {
       inputRef.current.focus();
       inputRef.current.select();
     }
-  }, [visible]);
+  }, [visible, focusTrigger]);
 
   if (!visible) return null;
 

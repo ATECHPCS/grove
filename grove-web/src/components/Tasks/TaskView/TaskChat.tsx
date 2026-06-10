@@ -2642,8 +2642,9 @@ export function TaskChat({
     // Sibling chats in the same task (excluding the active one) — feed
     // `Read History` mentions so the AI can inspect another chat's
     // history.jsonl by absolute path.
-    const siblingChats = chats
+    const siblingChats = [...chats]
       .filter((c) => c.id !== activeChatId)
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
       .map((c) => ({
         chat_id: c.id,
         name: c.title,
@@ -3423,7 +3424,8 @@ export function TaskChat({
         }
       };
 
-      ws.onerror = () => {
+      ws.onerror = (event) => {
+        console.warn(`[grove ws] chat ${chatId} error`, event);
         if (chatId === getActiveChatId()) {
           setMessages((prev) => appendSystemMessage(prev, "Connection error."));
         }
@@ -3761,19 +3763,20 @@ export function TaskChat({
     };
   }, []);
 
-  // Synchronize activeChatId to window.__groveActiveChatId and listen to comment send event
+  // Clear the global active-chat pointer when this TaskChat unmounts. The
+  // per-change sync is already handled by useActiveChatId.setActiveChatId
+  // (it writes __groveActiveChatId + dispatches on every switch), so we don't
+  // duplicate it here — the old per-change effect caused ~3 dispatches per
+  // switch plus a transient null. activeChatId starts as null, so there's no
+  // initial value to sync on mount.
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      (window as Window & { __groveActiveChatId?: string | null }).__groveActiveChatId = activeChatId;
-      window.dispatchEvent(new CustomEvent("grove-active-chat-changed", { detail: activeChatId }));
-    }
     return () => {
       if (typeof window !== "undefined") {
         (window as Window & { __groveActiveChatId?: string | null }).__groveActiveChatId = null;
         window.dispatchEvent(new CustomEvent("grove-active-chat-changed", { detail: null }));
       }
     };
-  }, [activeChatId]);
+  }, []);
 
   // Save composer draft to localStorage on page unload / navigation /
   // tab hide. `beforeunload` is unreliable on mobile and on fast tab
@@ -4702,7 +4705,7 @@ export function TaskChat({
         // GIF: never re-encode via Canvas (would lose animation)
         if (file.type === "image/gif" && file.size > MAX_IMAGE_BYTES) {
           setMessages((prev) =>
-            appendSystemMessage(prev, `GIF 文件过大（${(file.size / 1024 / 1024).toFixed(1)} MB），请压缩后重试。`),
+            appendSystemMessage(prev, `GIF file is too large (${(file.size / 1024 / 1024).toFixed(1)} MB). Please compress and try again.`),
           );
           return;
         }
@@ -4727,7 +4730,7 @@ export function TaskChat({
             reader.readAsDataURL(blob);
           } catch {
             setMessages((prev) =>
-              appendSystemMessage(prev, `图片压缩失败（${file.name}），请手动压缩后重试。`),
+              appendSystemMessage(prev, `Failed to compress image (${file.name}). Please compress manually and try again.`),
             );
           }
           return;
@@ -5016,9 +5019,6 @@ export function TaskChat({
           config: buildPromptConfig(),
         })
       );
-      
-      // Let's scroll to bottom if needed
-      enableAutoStickToBottom("auto");
     };
 
     window.addEventListener("grove-send-comment-to-chat", handleSendComment);
@@ -6743,28 +6743,26 @@ export function TaskChat({
     [chatSearchOpen],
   );
 
-  // followOutput callback. Always use "smooth" — Virtuoso coalesces
-  // successive smooth scrolls into one continuous animation, which makes
-  // streaming tokens feel like flowing text rather than chunk-by-chunk
-  // jumps. (The old DOM-based scroll used "auto" during streaming because
-  // smooth scrollTo() couldn't keep up with rapid setState; that
-  // limitation doesn't apply to Virtuoso's internal scroll scheduler.)
+  // followOutput callback. Use "auto" during streaming because smooth
+  // scrollToIndex can fail to keep up with rapid height changes and cause
+  // React-Virtuoso to glitch and render a blank white page.
   const handleFollowOutput = useCallback((isAtBottom: boolean) => {
-    return isAtBottom ? ("smooth" as const) : (false as const);
+    return isAtBottom ? ("auto" as const) : (false as const);
   }, []);
 
   // Typewriter reveals text via setState INSIDE MessageItem — the
   // `messages` array reference doesn't change, so Virtuoso's
   // followOutput never fires. We watch totalListHeightChanged
   // (which DOES fire when the streaming row grows) and re-anchor to
-  // bottom while auto-stick is on.
+  // bottom while auto-stick is on. Use behavior: "auto" to prevent
+  // blank viewport rendering glitches during rapid streaming.
   const handleTotalListHeightChanged = useCallback(() => {
     if (!autoStickToBottomRef.current) return;
     if (isUserScrollingRef.current) return;
     virtuosoRef.current?.scrollToIndex({
       index: "LAST",
       align: "end",
-      behavior: "smooth",
+      behavior: "auto",
     });
   }, []);
 

@@ -20,16 +20,10 @@
 //! exposed by each upstream module (e.g. [`claude::fetch_with_credentials`],
 //! [`codex::fetch_with_token`]) to avoid duplicating upstream API code.
 
-pub mod claude;
-pub mod codex;
-pub mod copilot;
-pub mod gemini;
-pub mod kimi;
-mod minimax;
-mod opencode;
+mod agents;
+mod hermes_auth;
 mod opencode_auth;
-mod synthetic;
-mod zai;
+mod providers;
 
 use once_cell::sync::Lazy;
 use serde::Serialize;
@@ -211,13 +205,14 @@ pub trait AcpQuotaProvider: Send + Sync {
 /// Static registry of all known ACP quota providers, keyed by agent name.
 static PROVIDERS: Lazy<HashMap<&'static str, Box<dyn AcpQuotaProvider>>> = Lazy::new(|| {
     let mut m: HashMap<&'static str, Box<dyn AcpQuotaProvider>> = HashMap::new();
-    m.insert("claude", Box::new(claude::ClaudeProvider));
-    m.insert("codex", Box::new(codex::CodexProvider));
-    m.insert("gemini", Box::new(gemini::GeminiProvider));
-    m.insert("copilot", Box::new(copilot::CopilotProvider));
-    m.insert("kimi", Box::new(kimi::KimiProvider));
-    m.insert("opencode", Box::new(opencode::OpencodeProvider));
-    m.insert("minimax", Box::new(minimax::MiniMaxProvider));
+    m.insert("claude", Box::new(agents::claude::ClaudeProvider));
+    m.insert("codex", Box::new(agents::codex::CodexProvider));
+    m.insert("gemini", Box::new(agents::gemini::GeminiProvider));
+    m.insert("copilot", Box::new(providers::copilot::CopilotProvider));
+    m.insert("kimi", Box::new(providers::kimi::KimiProvider));
+    m.insert("opencode", Box::new(agents::opencode::OpencodeProvider));
+    m.insert("minimax", Box::new(providers::minimax::MiniMaxProvider));
+    m.insert("hermes", Box::new(agents::hermes::HermesProvider));
     m
 });
 

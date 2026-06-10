@@ -193,6 +193,78 @@ pub fn create_api_router() -> Router {
             "/extension/open-chrome",
             post(handlers::extension::open_chrome_extensions),
         )
+        // Plugin development API (scaffold a starter into a chosen folder)
+        .route(
+            "/plugins/browse-folder",
+            get(handlers::plugins::browse_plugin_folder),
+        )
+        .route(
+            "/plugins/scaffold",
+            post(handlers::plugins::scaffold_plugin),
+        )
+        .route(
+            "/plugins/install-local",
+            post(handlers::plugins::install_local),
+        )
+        .route("/plugins/install-git", post(handlers::plugins::install_git))
+        .route(
+            "/plugins/install-zip",
+            post(handlers::plugins::install_zip).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/plugins",
+            get(handlers::plugins::list_plugins).post(handlers::plugins::register_plugin),
+        )
+        .route("/plugins/{id}", delete(handlers::plugins::delete_plugin))
+        .route(
+            "/plugins/{id}/reveal",
+            post(handlers::plugins::reveal_plugin_folder),
+        )
+        .route(
+            "/plugins/{id}/data-dir",
+            get(handlers::plugins::list_plugin_data),
+        )
+        .route(
+            "/plugins/{id}/data/{*path}",
+            get(handlers::plugins::read_plugin_data)
+                .put(handlers::plugins::write_plugin_data)
+                .delete(handlers::plugins::delete_plugin_data),
+        )
+        .route(
+            "/plugins/{id}/data-bytes/{*path}",
+            get(handlers::plugins::read_plugin_bytes).put(handlers::plugins::write_plugin_bytes),
+        )
+        .route(
+            "/plugins/{id}/asset/{*path}",
+            get(handlers::plugins::serve_plugin_asset),
+        )
+        .route(
+            "/plugins/{id}/project-file",
+            get(handlers::plugins::read_project_file),
+        )
+        .route(
+            "/plugins/{id}/project-dir",
+            get(handlers::plugins::list_project_dir),
+        )
+        .route(
+            "/plugins/{id}/backend/invoke",
+            post(handlers::plugins::backend_invoke),
+        )
+        .route("/plugins/{id}/exec", post(handlers::plugins::exec_command))
+        .route("/plugins/{id}/events", post(handlers::plugins::emit_event))
+        .route(
+            "/plugins/{id}/events/subscribe",
+            get(handlers::plugins::subscribe_events),
+        )
+        .route(
+            "/plugins/{id}/update-sdk",
+            post(handlers::plugins::update_plugin_sdk),
+        )
+        .route("/plugins/{id}/chat/list", get(handlers::plugins::chat_list))
+        .route(
+            "/plugins/{id}/chat/send",
+            post(handlers::plugins::chat_send),
+        )
         // Folder selection API
         .route("/browse-folder", get(handlers::folder::browse_folder))
         .route("/folders/list", get(handlers::folder::list_folder))
@@ -661,6 +733,10 @@ pub fn create_api_router() -> Router {
         // AI Settings API — Audio
         .route("/ai/transcribe", post(handlers::ai::transcribe))
         .route(
+            "/ai/transcribe-stream",
+            get(handlers::ai_stream::transcribe_stream_ws_handler),
+        )
+        .route(
             "/ai/audio",
             get(handlers::ai::get_audio).put(handlers::ai::save_audio_global),
         )
@@ -691,6 +767,10 @@ pub fn create_api_router() -> Router {
             post(handlers::skills::sync_all_sources),
         )
         .route(
+            "/skills/sources/auto-sync",
+            post(handlers::skills::auto_sync_sources),
+        )
+        .route(
             "/skills/sources/check-updates",
             post(handlers::skills::check_updates),
         )
@@ -701,6 +781,10 @@ pub fn create_api_router() -> Router {
         .route(
             "/skills/sources/{name}/sync",
             post(handlers::skills::sync_source),
+        )
+        .route(
+            "/skills/sources/{name}/rename",
+            post(handlers::skills::rename_source),
         )
         // Skills API — Explore & Install
         .route("/skills/explore", get(handlers::skills::explore_skills))
@@ -713,6 +797,10 @@ pub fn create_api_router() -> Router {
         .route(
             "/skills/installed/{repo_key}/{*repo_path}",
             delete(handlers::skills::uninstall_skill),
+        )
+        .route(
+            "/skills/local/{source}/{*repo_path}",
+            delete(handlers::skills::delete_local_skill),
         )
         // TaskGroup API
         .route(
@@ -898,10 +986,28 @@ pub fn create_router(
         // /auth/verify can't be probed cross-origin. Sec-Fetch-Site / Origin /
         // Referer are checked for non-safe methods; safe methods (GET/HEAD/OPTIONS,
         // including WebSocket upgrades and CORS preflight) pass through.
-        Router::new()
+        let base = Router::new()
             .nest("/api/v1", protected_api)
             .nest("/api/v1", auth_router)
-            .layer(middleware::from_fn(csrf::csrf_middleware))
+            .layer(middleware::from_fn(csrf::csrf_middleware));
+
+        // GUI-only loopback endpoints: only registered in gui builds (server binds
+        // 127.0.0.1 there). Non-gui builds (web, mobile) simply don't expose these routes.
+        #[cfg(feature = "gui")]
+        let base = {
+            let gui_router = Router::new()
+                .route(
+                    "/gui/open-task",
+                    post(handlers::hooks::handle_gui_open_task),
+                )
+                .route(
+                    "/gui/resolve-permission",
+                    post(handlers::hooks::handle_gui_resolve_permission),
+                );
+            base.nest("/api/v1", gui_router)
+        };
+
+        base
     };
 
     // Priority: external static_dir > embedded assets
@@ -935,6 +1041,7 @@ pub fn create_proxy_router(remote: String) -> Router {
         .route("/api/v1/extension/ws", any(ws_proxy_handler))
         .route("/api/v1/walkie-talkie/ws", any(ws_proxy_handler))
         .route("/api/v1/radio/events/ws", any(ws_proxy_handler))
+        .route("/api/v1/ai/transcribe-stream", any(ws_proxy_handler))
         .route(
             "/api/v1/projects/{id}/tasks/{taskId}/terminal",
             any(ws_proxy_handler),
@@ -1352,6 +1459,16 @@ pub async fn start_server(
     auth: Arc<ServerAuth>,
     tls_mode: crate::cli::web::TlsMode,
 ) -> std::io::Result<()> {
+    // Record our loopback base so a plugin's MCP server (a node child process,
+    // not an authenticated Grove client) knows where to POST events. Always
+    // loopback — the MCP server runs on this same machine regardless of bind.
+    crate::plugins::events::set_server_base(format!("http://127.0.0.1:{}", port));
+
+    // Relay the aggregated radio event stream into plugin panels (holding
+    // `chat:read`) as `grove:radio` events. No-op on the wire until a panel
+    // subscribes; safe to start unconditionally.
+    crate::plugins::radio_bridge::spawn();
+
     // Auto-correct agent defaults based on what's actually installed on PATH.
     // Runs every server start because the user's environment can change between
     // sessions (e.g. they install a new CLI).

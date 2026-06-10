@@ -11,7 +11,7 @@
 //! the Copilot editor clients. Sending a PAT just produces 401s on every
 //! poll while masking that the integration was never wired up.
 
-use super::{AcpQuotaProvider, AgentUsage, ExtraInfo, UsageWindow, HTTP_TIMEOUT_COPILOT};
+use super::super::{AcpQuotaProvider, AgentUsage, ExtraInfo, UsageWindow, HTTP_TIMEOUT_COPILOT};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -73,7 +73,7 @@ fn read_token() -> Result<String, String> {
             return Ok(t.to_string());
         }
     }
-    if let Some(t) = super::opencode_auth::read_opencode_token("github-copilot") {
+    if let Some(t) = super::super::opencode_auth::read_opencode_token("github-copilot") {
         return Ok(t);
     }
     if let Some(t) = read_copilot_cli_token() {
@@ -117,7 +117,7 @@ fn read_copilot_cli_token() -> Option<String> {
     None
 }
 
-pub(super) fn fetch_with_token(token: &str) -> Result<AgentUsage, String> {
+pub(crate) fn fetch_with_token(token: &str) -> Result<AgentUsage, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(HTTP_TIMEOUT_COPILOT)
         .build();

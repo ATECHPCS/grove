@@ -129,7 +129,7 @@ export function canonicalPath(path: string, excludeKeys: string[] = []): string 
     const eqIdx = part.indexOf('=');
     const key = eqIdx < 0 ? part : part.substring(0, eqIdx);
     const value = eqIdx < 0 ? '' : part.substring(eqIdx + 1);
-    if (excludeKeys.includes(key)) continue;
+    if (excludeKeys.includes(key) || key.startsWith('_sm_')) continue;
     pairs.push([key, value]);
   }
   if (pairs.length === 0) return pathname;
@@ -359,6 +359,27 @@ class ApiClient {
       return JSON.parse(text) as R;
     }
     return undefined as R;
+  }
+
+  /**
+   * POST that returns the raw (signed) Response so the caller can read a
+   * streaming body — e.g. the plugin exec NDJSON stream. Throws on non-2xx.
+   */
+  async postStream<T>(path: string, data?: T): Promise<Response> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method: 'POST',
+      headers: await getSignedHeaders('POST', path),
+      body: data ? JSON.stringify(data) : undefined,
+    });
+    if (!response.ok) {
+      const payload = await extractErrorPayload(response);
+      throw {
+        status: response.status,
+        message: payload.message,
+        data: payload.data,
+      } as ApiError;
+    }
+    return response;
   }
 
   async postNoContent(path: string): Promise<void> {

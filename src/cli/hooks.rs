@@ -131,6 +131,13 @@ pub fn execute(level: HookLevel) {
         hooks::play_sound(sound);
     }
 
+    // 无条件记录到通知存储（当用户 detach 回到 Grove 时会被清除）；
+    // update_hook 会广播 HookAdded 让 grove server 上的前端立即刷新。
+    // GROVE_CHAT_ID 是可选的:在 chat 上下文(ACP/agent spawn)启动的 session
+    // 才会注入,纯 task-level shell 没有 → 前端跳转 fallback 只到 task。
+    let project_key = crate::storage::workspace::project_hash(&project_path);
+    let chat_id = env::var("GROVE_CHAT_ID").ok().filter(|s| !s.is_empty());
+
     // 发送系统通知横幅
     if level.should_banner() {
         let title = format!("Grove - {}", level.level_name());
@@ -139,14 +146,17 @@ pub fn execute(level: HookLevel) {
         } else {
             format!("[{}] {}", project_name, task_name)
         };
-        hooks::send_banner(&title, &banner_msg);
+        hooks::send_banner(
+            &title,
+            &banner_msg,
+            &project_key,
+            &task_id,
+            chat_id.as_deref(),
+            false,
+            None,
+            None,
+        );
     }
 
-    // 无条件记录到通知存储（当用户 detach 回到 Grove 时会被清除）；
-    // update_hook 会广播 HookAdded 让 grove server 上的前端立即刷新。
-    // GROVE_CHAT_ID 是可选的:在 chat 上下文(ACP/agent spawn)启动的 session
-    // 才会注入,纯 task-level shell 没有 → 前端跳转 fallback 只到 task。
-    let project_key = crate::storage::workspace::project_hash(&project_path);
-    let chat_id = env::var("GROVE_CHAT_ID").ok().filter(|s| !s.is_empty());
     hooks::update_hook(&project_key, &task_id, level.level(), message, chat_id);
 }

@@ -63,4 +63,31 @@ fn run_npm(dir: &Path, command: &str) -> bool {
 fn build_tauri() {
     #[cfg(feature = "gui")]
     tauri_build::build();
+
+    // macOS dev convenience: `make gui` runs the bare `cargo run` binary, not a
+    // packaged .app, so it has no embedded Info.plist. Without an embedded
+    // `NSMicrophoneUsageDescription`, macOS TCC silently denies microphone
+    // access to the process — the WKWebView's getUserMedia then returns an
+    // empty stream (no permission prompt, blank audio). Embedding the plist as
+    // a `__TEXT,__info_plist` section makes macOS show the mic prompt so voice
+    // transcription works in the dev binary too. (Release .app bundles get the
+    // plist from the Tauri bundler; this section is harmless there.)
+    #[cfg(all(target_os = "macos", feature = "gui"))]
+    embed_info_plist();
+}
+
+#[cfg(all(target_os = "macos", feature = "gui"))]
+fn embed_info_plist() {
+    let plist = Path::new("src-tauri/Info.plist");
+    match std::fs::canonicalize(plist) {
+        Ok(abs) => {
+            println!("cargo:rerun-if-changed=src-tauri/Info.plist");
+            // Path must not contain commas (the -Wl arg is comma-separated).
+            println!(
+                "cargo:rustc-link-arg=-Wl,-sectcreate,__TEXT,__info_plist,{}",
+                abs.display()
+            );
+        }
+        Err(e) => println!("cargo:warning=could not embed Info.plist: {e}"),
+    }
 }

@@ -1,6 +1,6 @@
 // AI Settings API (providers + audio)
 
-import { apiClient } from './client';
+import { apiClient, getApiHost } from './client';
 import type { AudioSettings, ProviderProfile } from '../components/AI/types';
 
 // ─── Provider Types ─────────────────────────────────────────────────────────
@@ -117,6 +117,8 @@ export async function getAudioSettings(projectId?: string): Promise<AudioSetting
 export async function saveAudioGlobal(settings: AudioSettings): Promise<void> {
   const body = {
     enabled: settings.enabled,
+    transcribeMode: settings.transcribeMode,
+    globalModeEnabled: settings.globalModeEnabled,
     transcribeProvider: settings.transcribeProvider,
     preferredLanguages: settings.preferredLanguages,
     toggleShortcut: settings.toggleShortcut,
@@ -165,4 +167,71 @@ export async function transcribeAudio(
     formData.append('project_id', projectId);
   }
   return apiClient.postFormData<TranscribeResult>('/api/v1/ai/transcribe', formData, signal);
+}
+
+// ─── Streaming Transcribe (WebSocket) ────────────────────────────────────────
+
+/** Live transcript update: stable finalized sentences + the replaceable current one. */
+export interface StreamUpdateMsg {
+  type: 'update';
+  finalized: string[];
+  current: string;
+}
+
+/** Terminal message after flush: assembled full text + optional revision. */
+export interface StreamDoneMsg {
+  type: 'done';
+  full: string;
+  revised?: string;
+}
+
+export interface StreamReadyMsg {
+  type: 'ready';
+}
+
+export interface StreamErrorMsg {
+  type: 'error';
+  message: string;
+}
+
+export type StreamServerMsg =
+  | StreamReadyMsg
+  | StreamUpdateMsg
+  | StreamDoneMsg
+  | StreamErrorMsg;
+
+/** Algorithm tuning sent to the streaming endpoint as query params. All
+ *  optional — omitted fields fall back to the backend's defaults. */
+export interface StreamTuning {
+  /** Re-transcribe once this many ms of new audio arrives (default 1000). */
+  minChunkMs?: number;
+  /** RMS silence threshold (default 0.01). */
+  silenceRms?: number;
+  /** Trailing silence (ms) that finalizes a sentence (default 700). */
+  silenceHoldMs?: number;
+  /** Hard buffer cap (ms) that forces finalization (default 30000). */
+  maxBufferMs?: number;
+  /** Refresh the current sentence between boundaries (default true). Set false
+   *  to transcribe only per-sentence — far fewer API calls. */
+  intraSentenceRefresh?: boolean;
+}
+
+/**
+ * Build a WebSocket URL for the streaming-transcribe endpoint.
+ * The caller must append HMAC auth (see `appendHmacToUrl`).
+ */
+export function transcribeStreamWsUrl(projectId?: string, tuning?: StreamTuning): string {
+  const host = getApiHost();
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const qs = new URLSearchParams();
+  if (projectId) qs.set('project_id', projectId);
+  if (tuning?.minChunkMs != null) qs.set('min_chunk_ms', String(tuning.minChunkMs));
+  if (tuning?.silenceRms != null) qs.set('silence_rms', String(tuning.silenceRms));
+  if (tuning?.silenceHoldMs != null) qs.set('silence_hold_ms', String(tuning.silenceHoldMs));
+  if (tuning?.maxBufferMs != null) qs.set('max_buffer_ms', String(tuning.maxBufferMs));
+  if (tuning?.intraSentenceRefresh != null) {
+    qs.set('intra_refresh', String(tuning.intraSentenceRefresh));
+  }
+  const q = qs.toString();
+  return `${proto}//${host}/api/v1/ai/transcribe-stream${q ? `?${q}` : ''}`;
 }

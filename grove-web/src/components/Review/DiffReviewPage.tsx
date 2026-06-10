@@ -199,6 +199,15 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       return new Map();
     }
   });
+
+  const [autoViewedRules, setAutoViewedRules] = useState<string[]>(() => {
+    try {
+      const stored = localStorage.getItem(`grove:project:${projectId}:autoViewedRules`);
+      return stored ? JSON.parse(stored) as string[] : [];
+    } catch {
+      return [];
+    }
+  });
   const [sidebarSearch, setSidebarSearch] = useState('');
   const [collapsedFiles, setCollapsedFiles] = useState<Set<string>>(new Set());
   const [replyFormCommentId, setReplyFormCommentId] = useState<number | null>(null);
@@ -219,6 +228,115 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     if (isMobile) setMobileConvSidebarVisible(next);
     else setDesktopConvSidebarVisible(next);
   }, [isMobile]);
+
+  // Resizable sidebar widths (desktop only — mobile uses fixed overlays).
+  // Persisted per task so reopening the panel keeps the user's layout.
+  const DEFAULT_SIDEBAR_WIDTH = 280;
+  const DEFAULT_CONV_SIDEBAR_WIDTH = 320;
+  const SIDEBAR_MIN_WIDTH = 180;
+  const SIDEBAR_MAX_RATIO = 0.5;
+  const sidebarWidthStorageKey = `grove:diff-review-sidebar-width:${projectId}:${taskId}`;
+
+  const readStoredSidebarWidth = (fallback: number, persisted: number | undefined): number => {
+    return typeof persisted === 'number' && Number.isFinite(persisted) && persisted >= SIDEBAR_MIN_WIDTH
+      ? persisted
+      : fallback;
+  };
+
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem(sidebarWidthStorageKey);
+      if (!raw) return DEFAULT_SIDEBAR_WIDTH;
+      const parsed = JSON.parse(raw) as { sidebarWidth?: number; convSidebarWidth?: number };
+      return readStoredSidebarWidth(DEFAULT_SIDEBAR_WIDTH, parsed.sidebarWidth);
+    } catch {
+      return DEFAULT_SIDEBAR_WIDTH;
+    }
+  });
+  const [convSidebarWidth, setConvSidebarWidth] = useState<number>(() => {
+    try {
+      const raw = localStorage.getItem(sidebarWidthStorageKey);
+      if (!raw) return DEFAULT_CONV_SIDEBAR_WIDTH;
+      const parsed = JSON.parse(raw) as { sidebarWidth?: number; convSidebarWidth?: number };
+      return readStoredSidebarWidth(DEFAULT_CONV_SIDEBAR_WIDTH, parsed.convSidebarWidth);
+    } catch {
+      return DEFAULT_CONV_SIDEBAR_WIDTH;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(sidebarWidthStorageKey);
+      const parsed: { sidebarWidth?: number; convSidebarWidth?: number } = raw
+        ? JSON.parse(raw)
+        : {};
+      parsed.sidebarWidth = Math.round(sidebarWidth);
+      parsed.convSidebarWidth = Math.round(convSidebarWidth);
+      localStorage.setItem(sidebarWidthStorageKey, JSON.stringify(parsed));
+    } catch {
+      // ignore storage errors
+    }
+  }, [sidebarWidth, convSidebarWidth, sidebarWidthStorageKey]);
+
+  const clampSidebarWidth = (value: number, layoutWidth: number): number => {
+    const max = Math.max(SIDEBAR_MIN_WIDTH, Math.floor(layoutWidth * SIDEBAR_MAX_RATIO));
+    return Math.min(max, Math.max(SIDEBAR_MIN_WIDTH, value));
+  };
+
+  const startSidebarResize = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const layoutEl = event.currentTarget.parentElement;
+    if (!layoutEl) return;
+    const layoutWidth = layoutEl.getBoundingClientRect().width;
+    if (layoutWidth <= 0) return;
+    const startX = event.clientX;
+    const startWidth = sidebarWidth;
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      const next = clampSidebarWidth(
+        startWidth + (moveEvent.clientX - startX),
+        layoutWidth,
+      );
+      setSidebarWidth(next);
+    };
+    const handlePointerUp = () => {
+      document.body.classList.remove('grove-resizing');
+      document.removeEventListener('pointermove', handlePointerMove);
+      document.removeEventListener('pointerup', handlePointerUp);
+    };
+    // While dragging, disable pointer events on iframes so the drag doesn't
+    // stutter when crossing an embedded preview. See index.css body.grove-resizing.
+    document.body.classList.add('grove-resizing');
+    document.addEventListener('pointermove', handlePointerMove);
+    document.addEventListener('pointerup', handlePointerUp);
+  }, [sidebarWidth]);
+
+  const startConvSidebarResize = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const layoutEl = event.currentTarget.parentElement;
+    if (!layoutEl) return;
+    const layoutWidth = layoutEl.getBoundingClientRect().width;
+    if (layoutWidth <= 0) return;
+    const startX = event.clientX;
+    const startWidth = convSidebarWidth;
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      // Right-side resizer: dragging left grows the sidebar.
+      const next = clampSidebarWidth(
+        startWidth + (startX - moveEvent.clientX),
+        layoutWidth,
+      );
+      setConvSidebarWidth(next);
+    };
+    const handlePointerUp = () => {
+      document.body.classList.remove('grove-resizing');
+      document.removeEventListener('pointermove', handlePointerMove);
+      document.removeEventListener('pointerup', handlePointerUp);
+    };
+    document.body.classList.add('grove-resizing');
+    document.addEventListener('pointermove', handlePointerMove);
+    document.addEventListener('pointerup', handlePointerUp);
+  }, [convSidebarWidth]);
   const [focusMode, setFocusMode] = useState<boolean>(() => {
     if (initialCachedOptions && typeof initialCachedOptions.focusMode === 'boolean') {
       return initialCachedOptions.focusMode;
@@ -332,6 +450,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
   // Code search state (Ctrl+F)
   const [codeSearchVisible, setCodeSearchVisible] = useState(false);
+  const [codeSearchFocusTrigger, setCodeSearchFocusTrigger] = useState(0);
   const [codeSearchQuery, setCodeSearchQuery] = useState('');
   const [codeSearchCaseSensitive, setCodeSearchCaseSensitive] = useState(false);
   const [codeSearchCurrentIndex, setCodeSearchCurrentIndex] = useState(0);
@@ -431,6 +550,26 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
   const sortedDiffFiles = useMemo(() => {
     if (viewMode === 'full') {
+      // Comment-based virtual files: files that have a review comment but
+      // don't appear in any of the in-repo file lists. Only surfaced in
+      // "All Files" mode so they don't pollute the Changes (vN..latest) range.
+      const realPaths = new Set(allFiles);
+      const commentVirtualFiles: DiffFile[] = [];
+      const seenVirtual = new Set<string>();
+      for (const c of comments) {
+        if (!c.file_path || realPaths.has(c.file_path) || seenVirtual.has(c.file_path)) continue;
+        seenVirtual.add(c.file_path);
+        commentVirtualFiles.push({
+          old_path: '',
+          new_path: c.file_path,
+          change_type: 'added' as const,
+          hunks: [],
+          is_binary: false,
+          additions: 0,
+          deletions: 0,
+          is_virtual: true,
+        });
+      }
       const temporaryVirtualFiles: DiffFile[] = Array.from(temporaryVirtualPaths).map(path => ({
         old_path: '',
         new_path: path,
@@ -450,9 +589,8 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
         additions: 0,
         deletions: 0,
       }));
-      const existingPaths = new Set(allFiles);
-      const uniqueVirtualFiles = temporaryVirtualFiles.filter(vf => !existingPaths.has(vf.new_path));
-      return sortTreeOrder([...allFileDiffFiles, ...uniqueVirtualFiles]);
+      const virtualFiles = [...commentVirtualFiles, ...temporaryVirtualFiles];
+      return sortTreeOrder([...allFileDiffFiles, ...virtualFiles]);
     }
     if (!diffData) return [];
     const statFiles: DiffFile[] = diffData.files.map(e => ({
@@ -466,9 +604,10 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       is_untracked: e.status === 'U',
     }));
     return sortTreeOrder(statFiles);
-  }, [viewMode, allFiles, diffData, temporaryVirtualPaths, sortTreeOrder]);
+  }, [viewMode, allFiles, diffData, temporaryVirtualPaths, comments, sortTreeOrder]);
 
-  const baseFiles = (viewMode === 'full' && focusMode) ? focusFiles : sortedDiffFiles;
+  const baseFiles = (viewMode === 'full' && focusMode) ? (sidebarSearch ? sortedDiffFiles : focusFiles) : sortedDiffFiles;
+
 
   const displayFiles = useMemo(() => {
     if (viewMode !== 'diff' || baseFiles.length === 0) return baseFiles;
@@ -488,22 +627,8 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     displayFilesRef.current = displayFiles;
   }, [displayFiles]);
 
-  const activeFilePath = useMemo(() => {
-    const found = displayFiles.find((f) => f.new_path === selectedFile && !f.new_path.endsWith('/'));
-    if (found) return found.new_path;
-    return displayFiles.find((f) => !f.new_path.endsWith('/'))?.new_path || null;
-  }, [displayFiles, selectedFile]);
-
-
   // Auto-detect iframe mode
   const isEmbedded = embedded ?? (typeof window !== 'undefined' && window !== window.parent);
-
-  // currentFileIndex derived from activeFilePath — stays in sync without setState in effect
-  const currentFileIndex = useMemo(() => {
-    if (!activeFilePath) return 0;
-    const idx = displayFiles.findIndex((f) => f.new_path === activeFilePath);
-    return idx >= 0 ? idx : 0;
-  }, [displayFiles, activeFilePath]);
 
   // Resolve pending navigation once displayFiles updates (after mode switch)
   // Also re-run when navigateToFile changes (for when Review tab already exists)
@@ -678,19 +803,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     }
   }, [projectId, taskId]);
 
-  // Trigger diff load whenever the active file changes in CHANGES mode.
-  // Uses activeFilePath (derived) so the first file's diff loads even when selectedFile is null.
-  // Note: loadFileDiff dedupes via fileDiffCacheRef + loadingDiffsRef, so it is safe to fire
-  // even while a pending navigation is being resolved — without this, when the resolved
-  // navigation target equals the fallback activeFilePath, neither this effect (deps unchanged)
-  // nor the navigation effect (which doesn't load) ever triggers the fetch.
-  // loadFileDiff sets fetch state internally; this is a legitimate fetch-on-prop-change
-  // sync, not the cascading-render pattern the rule targets.
-  useEffect(() => {
-    if (!activeFilePath || viewMode !== 'diff') return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    loadFileDiff(activeFilePath, currentDiffRefs.fromRef, currentDiffRefs.toRef);
-  }, [activeFilePath, viewMode, currentDiffRefs.fromRef, currentDiffRefs.toRef, loadFileDiff]);
+
 
   const handleExpandDir = useCallback(async (dirPath: string): Promise<DirEntry[]> => {
     const result = await getTaskDirEntries(projectId, taskId, dirPath);
@@ -745,14 +858,92 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     return hashes;
   }, [diffData, viewMode, displayFiles]);
 
+  const matchesRules = useCallback((path: string) => {
+    let matched = false;
+    for (const rule of autoViewedRules) {
+      const isNegated = rule.startsWith('!');
+      const pattern = isNegated ? rule.slice(1) : rule;
+      // Convert glob to regex
+      const regexStr = pattern
+        .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+        .replace(/\*\*/g, '___DOUBLE_STAR___')
+        .replace(/\*/g, '[^/]*')
+        .replace(/\?/g, '[^/]')
+        .replace(/___DOUBLE_STAR___/g, '.*');
+      const regex = new RegExp(`^${regexStr}$`);
+      if (regex.test(path)) {
+        matched = !isNegated;
+      }
+    }
+    return matched;
+  }, [autoViewedRules]);
+
   // Compute viewed status per file: 'none' | 'viewed' | 'updated'
   const getFileViewedStatus = useCallback((path: string): 'none' | 'viewed' | 'updated' => {
     const savedHash = viewedFiles.get(path);
+    if (savedHash === 'UNVIEWED') {
+      return 'none';
+    }
+    if (matchesRules(path)) {
+      return 'viewed';
+    }
     if (!savedHash) return 'none';
     const currentHash = fileHashes.get(path);
     if (currentHash && savedHash !== currentHash) return 'updated';
     return 'viewed';
-  }, [viewedFiles, fileHashes]);
+  }, [viewedFiles, fileHashes, matchesRules]);
+
+  // "Hide viewed files" toggle — lifted here (from FileTreeSidebar) so the
+  // jump-to-first-unviewed fallback below re-runs reactively when it changes.
+  const [hideViewed, setHideViewed] = useState<boolean>(
+    () => localStorage.getItem('grove:review.hideViewed') === 'true'
+  );
+  const handleToggleHideViewed = useCallback(() => {
+    setHideViewed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('grove:review.hideViewed', String(next));
+      } catch { /* ignore localStorage issues */ }
+      return next;
+    });
+  }, []);
+
+  const activeFilePath = useMemo(() => {
+    const found = displayFiles.find((f) => f.new_path === selectedFile && !f.new_path.endsWith('/'));
+    if (found) return found.new_path;
+
+    // Fallback: when "hide viewed" is enabled, jump to the first file that is
+    // not a directory placeholder and not yet viewed.
+    if (hideViewed) {
+      const firstNotViewed = displayFiles.find(
+        (f) => !f.new_path.endsWith('/') && getFileViewedStatus(f.new_path) !== 'viewed'
+      );
+      if (firstNotViewed) return firstNotViewed.new_path;
+    }
+
+    return displayFiles.find((f) => !f.new_path.endsWith('/'))?.new_path || null;
+  }, [displayFiles, selectedFile, getFileViewedStatus, hideViewed]);
+
+  // currentFileIndex derived from activeFilePath — stays in sync without setState in effect
+  const currentFileIndex = useMemo(() => {
+    if (!activeFilePath) return 0;
+    const idx = displayFiles.findIndex((f) => f.new_path === activeFilePath);
+    return idx >= 0 ? idx : 0;
+  }, [displayFiles, activeFilePath]);
+
+  // Trigger diff load whenever the active file changes in CHANGES mode.
+  // Uses activeFilePath (derived) so the first file's diff loads even when selectedFile is null.
+  // Note: loadFileDiff dedupes via fileDiffCacheRef + loadingDiffsRef, so it is safe to fire
+  // even while a pending navigation is being resolved — without this, when the resolved
+  // navigation target equals the fallback activeFilePath, neither this effect (deps unchanged)
+  // nor the navigation effect (which doesn't load) ever triggers the fetch.
+  // loadFileDiff sets fetch state internally; this is a legitimate fetch-on-prop-change
+  // sync, not the cascading-render pattern the rule targets.
+  useEffect(() => {
+    if (!activeFilePath || viewMode !== 'diff') return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    loadFileDiff(activeFilePath, currentDiffRefs.fromRef, currentDiffRefs.toRef);
+  }, [activeFilePath, viewMode, currentDiffRefs.fromRef, currentDiffRefs.toRef, loadFileDiff]);
 
   // Version options for FROM / TO selectors
   const versionList = versions;
@@ -829,6 +1020,10 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       }).catch(console.error).finally(() => {
         if (fetchGenRef.current === gen) setLoading(false);
       });
+      getTaskFiles(projectId, taskId).then((result) => {
+        if (fetchGenRef.current !== gen) return;
+        setAllFiles(result.files);
+      }).catch(() => null);
     } else if (viewMode === 'full' && !focusMode) {
       getTaskFiles(projectId, taskId).then((result) => {
         if (fetchGenRef.current !== gen) return;
@@ -1161,26 +1356,11 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
         }
 
         if (!cancelled) {
-          // Detect virtual files (files with comments but not in diff)
-          // Include all comment types (file, inline) - any comment with a file_path
-          const existingFilePaths = new Set(data.files.map(f => f.path));
-          const virtualFilePaths = reviewComments
-            .filter(c => c.file_path && !existingFilePaths.has(c.file_path))
-            .map(c => c.file_path!)
-            .filter((path, idx, arr) => arr.indexOf(path) === idx);
-
-          if (virtualFilePaths.length > 0) {
-            const virtualEntries = virtualFilePaths.map(path => ({
-              path,
-              status: 'A' as const,
-              additions: 0,
-              deletions: 0,
-              is_binary: false,
-            }));
-            setDiffData({ ...data, files: [...data.files, ...virtualEntries] });
-          } else {
-            setDiffData(data);
-          }
+          // Store pure diff data. Virtual files (files with comments that aren't
+          // in the diff range) are computed in sortedDiffFiles for "All Files"
+          // mode only — adding them to diffData would leak them into "Changes"
+          // mode and inflate the file count for the selected vN..latest range.
+          setDiffData(data);
           if (filesData) {
             setAllFiles(filesData.files);
           }
@@ -1280,7 +1460,10 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
   const lightboxNotOpen = useCallback(() => !document.querySelector('[data-lightbox-active]'), []);
 
-  useCommand('diffReview.openSearch', () => setCodeSearchVisible(true), []);
+  useCommand('diffReview.openSearch', () => {
+    setCodeSearchVisible(true);
+    setCodeSearchFocusTrigger((n) => n + 1);
+  }, []);
 
   useCommand(
     'diffReview.closeSearch',
@@ -1468,18 +1651,27 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     setViewedFiles((prev) => {
       const next = new Map(prev);
       const savedHash = prev.get(path);
-      const currentHash = fileHashes.get(path) || '';
+      const matchesRule = matchesRules(path);
 
-      // If already viewed and the hash matches, toggle it off (unviewed)
-      if (savedHash && savedHash === currentHash) {
-        next.delete(path);
-        // When unmarking as viewed, keep current collapsed state
+      if (matchesRule) {
+        if (savedHash === 'UNVIEWED') {
+          next.delete(path);
+        } else {
+          next.set(path, 'UNVIEWED');
+        }
       } else {
-        // If unviewed (no savedHash) OR updated (savedHash !== currentHash),
-        // mark it as viewed (store the new current hash) and clear the Updated status
-        next.set(path, currentHash);
-        // Auto-collapse when marking as viewed
-        setCollapsedFiles((prevCollapsed) => new Set(prevCollapsed).add(path));
+        const currentHash = fileHashes.get(path) || '';
+        // If already viewed and the hash matches, toggle it off (unviewed)
+        if (savedHash && savedHash === currentHash) {
+          next.delete(path);
+          // When unmarking as viewed, keep current collapsed state
+        } else {
+          // If unviewed (no savedHash) OR updated (savedHash !== currentHash),
+          // mark it as viewed (store the new current hash) and clear the Updated status
+          next.set(path, currentHash);
+          // Auto-collapse when marking as viewed
+          setCollapsedFiles((prevCollapsed) => new Set(prevCollapsed).add(path));
+        }
       }
       // Persist to localStorage
       try {
@@ -1487,7 +1679,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       } catch { /* ignore quota errors */ }
       return next;
     });
-  }, [fileHashes, viewedStorageKey]);
+  }, [fileHashes, viewedStorageKey, matchesRules]);
 
   // Toggle viewed status of the active file
   const handleToggleActiveViewed = useCallback(() => {
@@ -1500,22 +1692,33 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   const handleMarkActiveViewed = useCallback(() => {
     if (!activeFilePath) return;
     setViewedFiles((prev) => {
-      const hash = fileHashes.get(activeFilePath) || '';
-      // No-op if already viewed with the same hash — avoids a needless re-render
-      // + localStorage write whenever the user re-fires the command.
-      if (prev.get(activeFilePath) === hash) return prev;
-      const next = new Map(prev);
-      next.set(activeFilePath, hash);
-      try {
-        localStorage.setItem(viewedStorageKey, JSON.stringify(Array.from(next.entries())));
-      } catch { /* ignore quota errors */ }
-      return next;
+      const matchesRule = matchesRules(activeFilePath);
+      if (matchesRule) {
+        if (prev.get(activeFilePath) !== 'UNVIEWED') return prev;
+        const next = new Map(prev);
+        next.delete(activeFilePath);
+        try {
+          localStorage.setItem(viewedStorageKey, JSON.stringify(Array.from(next.entries())));
+        } catch { /* ignore quota errors */ }
+        return next;
+      } else {
+        const hash = fileHashes.get(activeFilePath) || '';
+        // No-op if already viewed with the same hash — avoids a needless re-render
+        // + localStorage write whenever the user re-fires the command.
+        if (prev.get(activeFilePath) === hash) return prev;
+        const next = new Map(prev);
+        next.set(activeFilePath, hash);
+        try {
+          localStorage.setItem(viewedStorageKey, JSON.stringify(Array.from(next.entries())));
+        } catch { /* ignore quota errors */ }
+        return next;
+      }
     });
     setCollapsedFiles((prev) => {
       if (prev.has(activeFilePath)) return prev;
       return new Set(prev).add(activeFilePath);
     });
-  }, [activeFilePath, fileHashes, viewedStorageKey]);
+  }, [activeFilePath, fileHashes, viewedStorageKey, matchesRules]);
 
   // Toggle Changes / All Files mode
   const handleToggleViewMode = useCallback(() => {
@@ -1810,8 +2013,12 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     );
   }
 
-  const viewedCount = displayFiles.filter((f) => getFileViewedStatus(f.new_path) === 'viewed').length;
-  const totalFiles = displayFiles.length;
+  // Exclude directory placeholders (new_path ending in '/') from counts — in
+  // full+focus mode they appear in displayFiles and a broad auto-view rule
+  // (e.g. '**') would otherwise inflate both totals.
+  const countableFiles = displayFiles.filter((f) => !f.new_path.endsWith('/'));
+  const viewedCount = countableFiles.filter((f) => getFileViewedStatus(f.new_path) === 'viewed').length;
+  const totalFiles = countableFiles.length;
   const isEmpty = displayFiles.length === 0;
 
   // Ensure selectedFile is valid - if not, use first file
@@ -1995,7 +2202,13 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       </div>
 
       {/* Layout */}
-      <div className="diff-layout">
+      <div
+        className="diff-layout"
+        style={{
+          '--diff-sidebar-width': `${sidebarWidth}px`,
+          '--diff-conv-sidebar-width': `${convSidebarWidth}px`,
+        } as React.CSSProperties}
+      >
         {loading ? (
           <div className="diff-content" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, gap: 8 }}>
             <div className="spinner" />
@@ -2034,12 +2247,30 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
               fileCommentCounts={fileCommentCounts}
               collapsed={!sidebarVisible}
               getFileViewedStatus={getFileViewedStatus}
+              hideViewed={hideViewed}
+              onToggleHideViewed={handleToggleHideViewed}
               onCreateVirtualPath={handleCreateVirtualPath}
               viewMode={viewMode}
               onExpandDir={viewMode === 'full' && focusMode ? handleExpandDir : undefined}
               onLoadFileDiff={viewMode === 'full' && focusMode ? loadFileDiff : undefined}
               taskPath={taskPath}
+              projectId={projectId}
+              autoViewedRules={autoViewedRules}
+              onUpdateAutoViewedRules={setAutoViewedRules}
             />
+
+            {/* Resizer between file tree sidebar and diff content (desktop only) */}
+            {!isMobile && sidebarVisible && (
+              <div
+                className="diff-resizer"
+                onPointerDown={startSidebarResize}
+                onDoubleClick={() => setSidebarWidth(DEFAULT_SIDEBAR_WIDTH)}
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize file tree sidebar"
+                title="Drag to resize · Double-click to reset"
+              />
+            )}
 
             {/* Diff content */}
             <div className="diff-content" ref={contentRef} tabIndex={-1} style={{ outline: 'none' }}>
@@ -2108,6 +2339,19 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
               })()}
             </div>
 
+            {/* Resizer between diff content and conversation sidebar (desktop only) */}
+            {!isMobile && convSidebarVisible && (
+              <div
+                className="diff-resizer"
+                onPointerDown={startConvSidebarResize}
+                onDoubleClick={() => setConvSidebarWidth(DEFAULT_CONV_SIDEBAR_WIDTH)}
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize conversation sidebar"
+                title="Drag to resize · Double-click to reset"
+              />
+            )}
+
             {/* Conversation sidebar */}
             <ConversationSidebar
               comments={viewMode === 'diff'
@@ -2134,6 +2378,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       {/* Code Search Bar (Ctrl+F) */}
       <CodeSearchBar
         visible={codeSearchVisible}
+        focusTrigger={codeSearchFocusTrigger}
         query={codeSearchQuery}
         caseSensitive={codeSearchCaseSensitive}
         currentIndex={codeSearchQuery ? codeSearchCurrentIndex : 0}

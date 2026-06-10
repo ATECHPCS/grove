@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { X, CheckCircle, RotateCcw, Reply, Send, Trash2, Pencil } from 'lucide-react';
 import type { ReviewCommentEntry } from '../../api/tasks';
 import { AgentAvatar } from './AgentAvatar';
-import { formatAgentDisplay } from './agentDisplay';
+import { AgentDisplay } from './agentDisplay';
 import { MarkdownRenderer, FileMentionDropdown } from '../ui';
 import { useFileMention } from '../../hooks';
 import type { MentionItem } from '../../utils/fileMention';
@@ -234,7 +234,7 @@ export function CommentDetailModal({
             <AgentAvatar agent={comment.agent} size={24} />
             <div>
               <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--color-text)', display: 'flex', alignItems: 'center', gap: 8 }}>
-                {formatAgentDisplay(comment.agent, comment.role, comment.model)}
+                <AgentDisplay agent={comment.agent} role={comment.role} model={comment.model} />
                 <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--color-text-muted)' }}>#{comment.id}</span>
                 <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--color-text-muted)' }}>{formatTime(comment.timestamp)}</span>
               </div>
@@ -371,7 +371,7 @@ export function CommentDetailModal({
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
                     <AgentAvatar agent={reply.agent} size={18} />
                     <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text)' }}>
-                      {formatAgentDisplay(reply.agent, reply.role, reply.model)}
+                      <AgentDisplay agent={reply.agent} role={reply.role} model={reply.model} />
                     </span>
                     <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>{formatTime(reply.timestamp)}</span>
                     <span style={{ flex: 1 }} />

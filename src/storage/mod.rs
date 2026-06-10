@@ -16,6 +16,8 @@ pub mod keymap;
 pub mod libraries;
 pub mod migrate_chats;
 pub mod notes;
+pub mod plugin_data;
+pub mod plugins;
 pub mod sketch_checkpoints;
 pub mod sketches;
 pub mod skills;

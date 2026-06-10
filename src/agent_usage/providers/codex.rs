@@ -1,34 +1,14 @@
-//! Codex (ChatGPT) usage quota fetcher.
+//! Codex (ChatGPT) upstream quota API caller.
 //!
-//! Reads `~/.codex/auth.json` for `tokens.access_token` and calls
-//! `https://chatgpt.com/backend-api/wham/usage`. The endpoint requires a
-//! browser-like User-Agent header — plain ureq UA gets rejected.
-//!
-//! Matches the reference Raycast extension's parsing:
-//!   - Both `primary_window` and `secondary_window` are required
-//!   - `code_review_rate_limit.primary_window` is optional
-//!   - `credits` (has_credits / unlimited / balance) is surfaced as extras
+//! Calls `https://chatgpt.com/backend-api/wham/usage` with an already-resolved
+//! access token. Does NOT read credentials — that is the agent layer's job.
 
-use super::{
-    clamp_percent, AcpQuotaProvider, AgentUsage, ExtraInfo, UsageWindow, HTTP_TIMEOUT_CODEX,
-};
+use super::super::{clamp_percent, AgentUsage, ExtraInfo, UsageWindow, HTTP_TIMEOUT_CODEX};
 use serde::Deserialize;
-use std::fs;
 
-const AUTH_PATH: &str = ".codex/auth.json";
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
                           (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
-#[derive(Debug, Deserialize)]
-struct AuthFile {
-    tokens: Option<TokensBlock>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokensBlock {
-    access_token: Option<String>,
-}
 
 #[derive(Debug, Deserialize)]
 struct UsageResponse {
@@ -63,50 +43,7 @@ struct CreditsBlock {
     balance: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// Provider
-// ---------------------------------------------------------------------------
-
-/// Codex ACP quota provider. Resolves tokens from `~/.codex/auth.json` and
-/// calls the ChatGPT wham/usage API.
-pub struct CodexProvider;
-
-impl AcpQuotaProvider for CodexProvider {
-    fn provider_id(&self) -> &str {
-        "codex"
-    }
-
-    fn quota_id(&self, _model: Option<&str>) -> String {
-        "codex".to_string()
-    }
-
-    fn fetch_usage(&self, _model: Option<&str>) -> Result<AgentUsage, String> {
-        let token = read_access_token()?;
-        fetch_with_token(&token)
-    }
-}
-
-fn read_access_token() -> Result<String, String> {
-    let home = dirs::home_dir().ok_or("no home directory")?;
-    let path = home.join(AUTH_PATH);
-    let raw = fs::read_to_string(&path).map_err(|e| format!("read {:?}: {}", path, e))?;
-    let auth: AuthFile =
-        serde_json::from_str(&raw).map_err(|e| format!("parse auth.json: {}", e))?;
-    let token = auth
-        .tokens
-        .and_then(|t| t.access_token)
-        .ok_or("missing tokens.access_token")?
-        .trim()
-        .to_string();
-    if token.is_empty() {
-        return Err("empty access_token".into());
-    }
-    Ok(token)
-}
-
-/// Lower-level fetcher that takes an already-resolved token. Exposed for reuse
-/// by multi-provider agents.
-pub(super) fn fetch_with_token(token: &str) -> Result<AgentUsage, String> {
+pub(crate) fn fetch_with_token(token: &str) -> Result<AgentUsage, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(HTTP_TIMEOUT_CODEX)
         .build();
@@ -124,7 +61,6 @@ pub(super) fn fetch_with_token(token: &str) -> Result<AgentUsage, String> {
     let rate = body.rate_limit.ok_or("missing rate_limit")?;
     let primary = rate.primary_window.ok_or("missing primary_window")?;
     let secondary = rate.secondary_window.ok_or("missing secondary_window")?;
-    // Both windows must carry used_percent, matching the reference.
     let primary_used = primary.used_percent.ok_or("primary used_percent missing")?;
     let secondary_used = secondary
         .used_percent

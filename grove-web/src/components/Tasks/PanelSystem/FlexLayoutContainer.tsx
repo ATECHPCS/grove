@@ -1,11 +1,12 @@
-import { useState, useRef, useCallback, useEffect, forwardRef, useImperativeHandle } from 'react';
+import { useState, useRef, useCallback, useEffect, forwardRef, useImperativeHandle, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
+import { commandRegistry, userKeymapStore } from '../../../keyboard';
 import { Layout, Model, TabNode, Actions, DockLocation, TabSetNode, BorderNode, Node as FlexNode } from 'flexlayout-react';
 import type { IJsonModel, ITabRenderValues, ITabSetRenderValues } from 'flexlayout-react';
 import {
-  Terminal, MessageSquare, Code, FileCode, BarChart3, GitBranch, FileText,
-  MessageCircle, X, XCircle, Trash2,
-  Plus, Maximize, Minimize2, FolderOpen, Pencil, Network,
+  Terminal, MessageSquare, Code, FileCode,
+  X, XCircle, Trash2,
+  Plus, Maximize, Minimize2, FolderOpen, Puzzle,
 } from 'lucide-react';
 import 'flexlayout-react/style/light.css';
 import './flexlayout-theme.css';
@@ -13,17 +14,25 @@ import type { Task } from '../../../data/types';
 import type { PanelType, TabNodeConfig } from './types';
 import type { FileNavRequest } from '../../Review';
 import { TaskTerminal } from '../TaskView/TaskTerminal';
-import { TaskChat } from '../TaskView/TaskChat';
-import { OptionalPerfProfiler } from '../../../perf/profilerShim';
-import { TaskCodeReview } from '../TaskView/TaskCodeReview';
-import { TaskEditor } from '../TaskView/TaskEditor';
-import { TaskGraph } from '../TaskView/TaskGraph';
-import { StatsTab, GitTab, NotesTab, CommentsTab, ArtifactsTab } from '../TaskInfoPanel/tabs';
 import type { ArtifactPreviewRequest } from '../TaskInfoPanel/tabs';
-import { SketchPage } from '../../Studio/SketchPage';
 import { OPEN_SKETCH_EVENT, type OpenSketchDetail } from '../../ui/sketchChipCache';
 import { ContextMenu, type ContextMenuItem } from '../../ui/ContextMenu';
 import { useConfig, useProject } from '../../../context';
+import { listPlugins, type Plugin } from '../../../api/plugins';
+import {
+  OPEN_PLUGIN_PANEL_EVENT,
+  PLUGINS_CHANGED_EVENT,
+  type OpenPluginPanelDetail,
+} from '../../Plugins/pluginPanelCommands';
+import {
+  renderPanel,
+  flexWrapStyle,
+  buildPanelCatalog,
+  getPanelDescriptor,
+  panelShortcutDisplay,
+  PLUGIN_PANEL_PREFIX,
+  type PanelRenderCtx,
+} from './panelRegistry';
 
 // Strip transient `maximized` flag from any tabset node (recursive). Defined
 // at module scope so it can be reused from both the lazy initializer and the
@@ -283,20 +292,7 @@ export const FlexLayoutContainer = forwardRef<
 
   // Get panel label
   const getPanelLabel = useCallback((type: PanelType): string => {
-    const labels: Record<PanelType, string> = {
-      terminal: 'Terminal',
-      chat: 'Chat',
-      review: 'Code Review',
-      editor: 'Editor',
-      graph: 'Graph',
-      stats: 'Info',
-      git: 'Git',
-      notes: 'Notes',
-      comments: 'Comments',
-      artifacts: 'Artifacts',
-      sketch: 'Sketch',
-    };
-    return labels[type];
+    return getPanelDescriptor(type)?.label ?? type;
   }, []);
 
   // Create tab node
@@ -316,6 +312,31 @@ export const FlexLayoutContainer = forwardRef<
 
   // Initialize model from the layout chosen above (initialLayout / saved / default).
   const [model] = useState<Model>(() => Model.fromJson(initialLayoutJson));
+
+  // Installed plugins that contribute a workspace panel — the dynamic part of
+  // the panel registry. Loaded once; the [+] menu lists them and the factory
+  // looks up a plugin tab's `pluginId` here to render its iframe.
+  const [plugins, setPlugins] = useState<Plugin[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      listPlugins()
+        .then((ps) => { if (!cancelled) setPlugins(ps); })
+        .catch(() => { if (!cancelled) setPlugins([]); });
+    };
+    load();
+    // Re-sync when a plugin is installed/uninstalled while the workspace is open.
+    window.addEventListener(PLUGINS_CHANGED_EVENT, load);
+    return () => {
+      cancelled = true;
+      window.removeEventListener(PLUGINS_CHANGED_EVENT, load);
+    };
+  }, []);
+
+  // Re-render the [+] menu's shortcut hints when the keymap or registered
+  // commands change (so plugin keybindings + user remaps show live).
+  useSyncExternalStore((cb) => commandRegistry.subscribe(cb), () => commandRegistry.listCommands().length);
+  useSyncExternalStore((cb) => userKeymapStore.subscribe(cb), () => userKeymapStore.getVersion());
 
   // Tab rename state
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
@@ -389,6 +410,31 @@ export const FlexLayoutContainer = forwardRef<
     focusPanelContent();
   }, [model, focusPanelContent, getAllTabs, createTabNode]);
 
+  // Add a plugin panel — component is 'plugin', identity carried in config.
+  // id prefix `plugin-<pluginId>-` so per-plugin instance numbering works and
+  // a saved layout can be re-resolved against the installed-plugins registry.
+  const addPluginPanel = useCallback((plugin: Plugin) => {
+    const activeTabset = model.getActiveTabset();
+    const idPrefix = `plugin-${plugin.id}-`;
+    let maxNum = 0;
+    for (const tab of getAllTabs()) {
+      const match = tab.getId().match(new RegExp(`^${idPrefix}(\\d+)$`));
+      if (match) maxNum = Math.max(maxNum, parseInt(match[1], 10));
+    }
+    const instanceNumber = maxNum + 1;
+    const title = plugin.contributes?.panel?.title || plugin.name;
+    const newTab = {
+      type: 'tab',
+      id: `${idPrefix}${instanceNumber}`,
+      name: instanceNumber > 1 ? `${title} #${instanceNumber}` : title,
+      component: 'plugin',
+      config: { panelType: 'plugin', pluginId: plugin.id } as TabNodeConfig,
+    };
+    const targetTabsetId = activeTabset?.getId() ?? model.getRoot().getId();
+    model.doAction(Actions.addNode(newTab, targetTabsetId, DockLocation.CENTER, -1));
+    focusPanelContent();
+  }, [model, focusPanelContent, getAllTabs]);
+
   // Global listener: a SketchChip click dispatches OPEN_SKETCH_EVENT. When
   // the target task is this one, ensure the Sketch panel exists and is
   // focused so the chip feels like navigation. Studio-only.
@@ -439,6 +485,45 @@ export const FlexLayoutContainer = forwardRef<
     window.addEventListener("grove:open-chat", handler);
     return () => window.removeEventListener("grove:open-chat", handler);
   }, [ensurePanel]);
+
+  // While dragging a FlexLayout splitter, iframes (plugin / terminal panels)
+  // swallow pointer events and make the drag stutter. Add `grove-resizing` to
+  // the body for the duration of the drag — index.css disables iframe pointer
+  // events under that class (same guard the IDE-layout resizer uses).
+  useEffect(() => {
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target?.closest('.flexlayout__splitter, .flexlayout__splitter_extra')) return;
+      document.body.classList.add('grove-resizing');
+      const onPointerUp = () => {
+        document.body.classList.remove('grove-resizing');
+        window.removeEventListener('pointerup', onPointerUp);
+      };
+      window.addEventListener('pointerup', onPointerUp);
+    };
+    document.addEventListener('pointerdown', onPointerDown, true);
+    return () => document.removeEventListener('pointerdown', onPointerDown, true);
+  }, []);
+
+  // Global listener: a plugin keybinding (registered in the keymap) opens its
+  // panel — select the existing tab or add one.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<OpenPluginPanelDetail>).detail;
+      if (!detail || detail.projectId !== projectId || detail.taskId !== task.id) return;
+      const plugin = plugins.find((p) => p.id === detail.pluginId);
+      if (!plugin) return;
+      const existing = getAllTabs().find((t) => t.getId().startsWith(`plugin-${plugin.id}-`));
+      if (existing) {
+        model.doAction(Actions.selectTab(existing.getId()));
+        focusPanelContent();
+      } else {
+        addPluginPanel(plugin);
+      }
+    };
+    window.addEventListener(OPEN_PLUGIN_PANEL_EVENT, handler);
+    return () => window.removeEventListener(OPEN_PLUGIN_PANEL_EVENT, handler);
+  }, [projectId, task.id, plugins, model, getAllTabs, addPluginPanel, focusPanelContent]);
 
   // Select a tab by its visual index (0-based) across all tabsets.
   // Returns: "handled" if tab was selected, "no_tabs" if workspace has no tabs,
@@ -610,32 +695,13 @@ export const FlexLayoutContainer = forwardRef<
 
   // Get panel icon and color by type
   const getPanelIconAndColor = (type: string): { icon: typeof Terminal; color: string } => {
-    switch (type) {
-      case 'terminal':
-        return { icon: Terminal, color: 'var(--color-success)' };
-      case 'chat':
-        return { icon: MessageSquare, color: 'var(--color-info)' };
-      case 'review':
-        return { icon: Code, color: 'var(--color-highlight)' };
-      case 'editor':
-        return { icon: FileCode, color: 'var(--color-warning)' };
-      case 'graph':
-        return { icon: Network, color: 'var(--color-accent)' };
-      case 'stats':
-        return { icon: BarChart3, color: 'var(--color-accent)' };
-      case 'git':
-        return { icon: GitBranch, color: 'var(--color-success)' };
-      case 'notes':
-        return { icon: FileText, color: 'var(--color-info)' };
-      case 'comments':
-        return { icon: MessageCircle, color: 'var(--color-error)' };
-      case 'artifacts':
-        return { icon: FolderOpen, color: 'var(--color-highlight)' };
-      case 'sketch':
-        return { icon: Pencil, color: 'var(--color-accent)' };
-      default:
-        return { icon: Terminal, color: 'var(--color-text-muted)' };
-    }
+    // All plugin tabs share the component name 'plugin' — generic puzzle icon.
+    if (type === 'plugin') return { icon: Puzzle, color: 'var(--color-highlight)' };
+    const d = getPanelDescriptor(type);
+    return {
+      icon: (d?.icon ?? Terminal) as typeof Terminal,
+      color: d?.color ?? 'var(--color-text-muted)',
+    };
   };
 
   // Custom tab rendering (supports double-click rename)
@@ -732,37 +798,32 @@ export const FlexLayoutContainer = forwardRef<
   }, [editingTabId, model]);
 
   // Build dropdown items for [+] Add Panel button
+  // Derived entirely from the shared panel catalog — adding a panel/plugin in
+  // the registry makes it appear here automatically (no per-layout list).
   const addPanelItems = useCallback((): DropdownItem[] => {
-    const items: DropdownItem[] = [];
-    items.push({ id: 'chat', label: 'Chat', icon: MessageSquare, onClick: () => addPanel('chat'), shortcut: 'i' });
-    if (isStudio) {
-      items.push({ id: 'artifacts', label: 'Artifacts', icon: FolderOpen, onClick: () => addPanel('artifacts'), shortcut: 'f' });
-      items.push({ id: 'sketch', label: 'Sketch', icon: Pencil, onClick: () => addPanel('sketch') });
-    }
-    if (terminalAvailable) {
-      items.push({ id: 'terminal', label: 'Terminal', icon: Terminal, onClick: () => addPanel('terminal'), shortcut: 't' });
-    }
-    if (!isStudio) {
-      items.push(
-        { id: 'review', label: 'Review', icon: Code, onClick: () => addPanel('review'), shortcut: 'r' },
-      );
-    }
-    items.push(
-      { id: 'editor', label: 'Editor', icon: FileCode, onClick: () => addPanel('editor'), shortcut: 'e' },
-      { id: 'graph', label: 'Graph', icon: Network, onClick: () => addPanel('graph') },
-      { id: 'stats', label: 'Info', icon: BarChart3, onClick: () => addPanel('stats'), separator: true },
-    );
-    if (!isStudio) {
-      items.push({ id: 'git', label: 'Git', icon: GitBranch, onClick: () => addPanel('git') });
-    }
-    items.push(
-      { id: 'notes', label: 'Notes', icon: FileText, onClick: () => addPanel('notes') },
-    );
-    if (!isStudio) {
-      items.push({ id: 'comments', label: 'Comments', icon: MessageCircle, onClick: () => addPanel('comments') });
-    }
-    return items;
-  }, [terminalAvailable, isStudio, addPanel]);
+    const catalog = buildPanelCatalog(plugins, { isStudio, terminalAvailable });
+    let prevCategory: string | null = null;
+    return catalog.map((d) => {
+      const isPlugin = d.key.startsWith(PLUGIN_PANEL_PREFIX);
+      const separator = prevCategory !== null && d.category !== prevCategory;
+      prevCategory = d.category;
+      return {
+        id: d.key,
+        label: d.label,
+        icon: d.icon as typeof Plus,
+        shortcut: panelShortcutDisplay(d.key),
+        separator,
+        onClick: () => {
+          if (isPlugin) {
+            const plugin = plugins.find((p) => `${PLUGIN_PANEL_PREFIX}${p.id}` === d.key);
+            if (plugin) addPluginPanel(plugin);
+          } else {
+            addPanel(d.key as PanelType);
+          }
+        },
+      };
+    });
+  }, [plugins, isStudio, terminalAvailable, addPanel, addPluginPanel]);
 
   // Custom TabSet rendering ([+] add panel + maximize button)
   const onRenderTabSet = useCallback((tabSetNode: TabSetNode | BorderNode, renderValues: ITabSetRenderValues) => {
@@ -811,134 +872,44 @@ export const FlexLayoutContainer = forwardRef<
     );
   }, [addPanelItems, model, fullscreenPanelId, onToggleFullscreen]);
 
-  // Factory function: render panel components based on tab type
+  // Factory: render panel content from the shared registry (the single source
+  // of truth both layouts use). Terminal is layout-specific (per-tab here), so
+  // we inject it via ctx.renderTerminal; everything else comes from renderPanel.
   const factory = useCallback((node: TabNode) => {
-    const component = node.getComponent();
-
-    switch (component) {
-      case 'terminal':
-        return (
-          <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%' }}>
-            <TaskTerminal
-              projectId={projectId}
-              task={task}
-              hideHeader={true}
-              fullscreen={true}
-              onDisconnected={() => closeTabById(node.getId())}
-              instanceId={node.getId()}
-            />
-          </div>
-        );
-
-      case 'chat':
-        return (
-          <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%' }}>
-            <OptionalPerfProfiler id="TaskChat">
-              <TaskChat
-                key={`${projectId}:${task.id}`}
-                projectId={projectId}
-                task={task}
-                fullscreen={true}
-                onNavigateToFile={navigateToFile}
-                onChatBecameIdle={handleChatBecameIdle}
-                onUserMessageSent={handleChatBecameIdle}
-                onBusyStateChange={handleBusyStateChange}
-              />
-            </OptionalPerfProfiler>
-          </div>
-        );
-
-      case 'review':
-        return (
-          <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%' }}>
-            <TaskCodeReview
-              projectId={projectId}
-              taskId={task.id}
-              onClose={() => {
-                model.doAction(Actions.deleteTab(node.getId()));
-              }}
-              navigateToFile={fileNavRequest}
-              hideHeader={true}
-              fullscreen={true}
-              isGitRepo={taskIsGitRepo}
-              isChatBusy={isChatBusy}
-            />
-          </div>
-        );
-
-      case 'editor':
-        return (
-          <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%' }}>
-            <TaskEditor
-              projectId={projectId}
-              taskId={task.id}
-              onClose={() => {
-                model.doAction(Actions.deleteTab(node.getId()));
-              }}
-              hideHeader={true}
-              fullscreen={true}
-            />
-          </div>
-        );
-
-      case 'graph':
-        return (
-          <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', overflow: 'hidden' }}>
-            <TaskGraph projectId={projectId} taskId={task.id} />
-          </div>
-        );
-
-      case 'stats':
-        return (
-          <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', padding: '16px', overflow: 'auto' }}>
-            <StatsTab projectId={projectId} task={task} />
-          </div>
-        );
-
-      case 'git':
-        return (
-          <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', padding: '16px', overflow: 'auto' }}>
-            <GitTab projectId={projectId} task={task} />
-          </div>
-        );
-
-      case 'notes':
-        return (
-          <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', padding: '16px', overflow: 'auto' }}>
-            <NotesTab projectId={projectId} task={task} />
-          </div>
-        );
-
-      case 'comments':
-        return (
-          <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', padding: '16px', overflow: 'auto' }}>
-            <CommentsTab projectId={projectId} task={task} />
-          </div>
-        );
-
-      case 'artifacts':
-        return (
-          <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', overflow: 'hidden' }}>
-            <ArtifactsTab projectId={projectId} task={task} previewRequest={artifactPreviewRequest} lastChatIdleAt={lastChatIdleAt} isChatBusy={isChatBusy} />
-          </div>
-        );
-
-      case 'sketch':
-        return (
-          <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%', overflow: 'hidden' }}>
-            <SketchPage
-              projectId={projectId}
-              taskId={task.id}
-              isChatBusy={isChatBusy}
-              lastChatIdleAt={lastChatIdleAt}
-            />
-          </div>
-        );
-
-      default:
-        return <div className="p-4 text-[var(--color-text-muted)]">Unknown panel type: {component}</div>;
-    }
-  }, [projectId, task, model, closeTabById, navigateToFile, fileNavRequest, artifactPreviewRequest, lastChatIdleAt, isChatBusy, handleChatBecameIdle, handleBusyStateChange, taskIsGitRepo]);
+    const component = node.getComponent() ?? '';
+    const cfg = node.getConfig() as TabNodeConfig | undefined;
+    const key = component === 'plugin'
+      ? `${PLUGIN_PANEL_PREFIX}${cfg?.pluginId ?? ''}`
+      : component;
+    const ctx: PanelRenderCtx = {
+      projectId,
+      task,
+      isStudio,
+      isGitRepo: taskIsGitRepo,
+      terminalAvailable,
+      onClose: () => model.doAction(Actions.deleteTab(node.getId())),
+      navigateToFile,
+      fileNavRequest,
+      artifactPreviewRequest,
+      lastChatIdleAt,
+      isChatBusy,
+      onChatBecameIdle: handleChatBecameIdle,
+      onUserMessageSent: handleChatBecameIdle,
+      onBusyStateChange: handleBusyStateChange,
+      renderTerminal: () => (
+        <TaskTerminal
+          projectId={projectId}
+          task={task}
+          hideHeader={true}
+          fullscreen={true}
+          onDisconnected={() => closeTabById(node.getId())}
+          instanceId={node.getId()}
+        />
+      ),
+      plugins,
+    };
+    return <div style={flexWrapStyle(key)}>{renderPanel(key, ctx)}</div>;
+  }, [projectId, task, model, isStudio, terminalAvailable, closeTabById, navigateToFile, fileNavRequest, artifactPreviewRequest, lastChatIdleAt, isChatBusy, handleChatBecameIdle, handleBusyStateChange, taskIsGitRepo, plugins]);
 
   // Track empty state
   const [isEmpty, setIsEmpty] = useState(() => getAllTabs().length === 0);

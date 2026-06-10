@@ -159,7 +159,7 @@
 
 /* File sidebar */
 .diff-sidebar {
-  width: 280px;
+  width: var(--diff-sidebar-width, 280px);
   min-width: 0;
   background: var(--color-bg-secondary);
   border-right: 1px solid var(--color-border);
@@ -178,6 +178,42 @@
   border-right-width: 0;
   opacity: 0;
   pointer-events: none;
+}
+
+/* Drag handle between a sidebar and the diff content.
+   Always present in the DOM (when sidebar is visible on desktop) so the
+   affordance is discoverable; visual cue only on hover/active. */
+.diff-resizer {
+  width: 6px;
+  min-width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  flex-shrink: 0;
+  z-index: 2;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.diff-resizer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 2px;
+  border-radius: 999px;
+  background: transparent;
+  transition: background 0.12s, width 0.12s, left 0.12s;
+}
+
+.diff-resizer:hover::after,
+.diff-resizer:active::after {
+  left: 1px;
+  width: 4px;
+  background: var(--color-highlight);
 }
 
 .diff-sidebar-list {
@@ -259,6 +295,10 @@
   overflow-y: hidden;
   display: flex;
   flex-direction: column;
+  /* The base rule's `padding-bottom: 75vh` (scroll-past-end space) would, in
+     this flex-column layout, eat the entire content height and collapse the
+     file section/body/preview drawer to 0. Only needed in scroll mode. */
+  padding-bottom: 0;
 }
 
 .diff-content:has(.diff-file-body.with-preview) .diff-file-section {
@@ -880,6 +920,53 @@ td.diff-code.diff-line-highlighted::before {
 
 .diff-sidebar-search-input:focus {
   border-color: var(--color-highlight);
+}
+
+.diff-sidebar-hide-viewed-btn {
+  background: transparent;
+  border: none;
+  padding: 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-muted);
+  opacity: 0.8;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.diff-sidebar-hide-viewed-btn:hover {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text);
+  opacity: 1;
+}
+
+.diff-sidebar-hide-viewed-btn.active {
+  color: var(--color-highlight);
+  background: color-mix(in srgb, var(--color-highlight) 15%, var(--color-bg-secondary));
+  opacity: 1;
+}
+
+.hover-bg:hover {
+  background: var(--color-bg-tertiary) !important;
+}
+
+.preset-btn:hover {
+  border-color: var(--color-highlight) !important;
+  background: color-mix(in srgb, var(--color-highlight) 5%, var(--color-bg-secondary)) !important;
+}
+
+@keyframes modalFadeIn {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
 }
 
 /* Sidebar viewed/updated badges */
@@ -1510,7 +1597,7 @@ td.diff-code.diff-line-highlighted::before {
    ============================================================================ */
 
 .conv-sidebar {
-  width: 320px;
+  width: var(--diff-conv-sidebar-width, 320px);
   min-width: 0;
   background: var(--color-bg-secondary);
   border-left: 1px solid var(--color-border);
@@ -2480,6 +2567,11 @@ td.diff-code.diff-line-highlighted::before {
     transform: translateX(100%);
     opacity: 0;
     pointer-events: none;
+  }
+
+  /* --- Resizer: hidden on mobile (sidebars are fixed overlays, no drag) --- */
+  .diff-resizer {
+    display: none;
   }
 
   /* --- Diff gutter compact --- */

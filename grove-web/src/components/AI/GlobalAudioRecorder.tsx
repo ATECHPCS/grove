@@ -11,6 +11,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAudioRecorder } from "../../hooks/useAudioRecorder";
+import { useStreamingTranscription } from "../../hooks/useStreamingTranscription";
 import { getAudioSettings, saveAudioGlobal, transcribeAudio } from "../../api";
 import { matchesShortcut, matchesPTTKey } from "./utils";
 import { RecordingIndicator } from "./RecordingIndicator";
@@ -113,6 +114,44 @@ export function GlobalAudioRecorder({ projectId }: GlobalAudioRecorderProps) {
   useEffect(() => {
     recorderRef.current = recorder;
   });
+
+  // ── Streaming mode ──────────────────────────────────────────────────────
+  // A second recorder pipeline (AudioWorklet + WebSocket) used when the user
+  // picks "streaming" mode. Both hooks are always mounted (hooks can't be
+  // conditional); we route start/stop/status to whichever mode is active.
+  const isStreaming = settings?.transcribeMode === "streaming";
+  const isStreamingRef = useRef(isStreaming);
+  useEffect(() => { isStreamingRef.current = isStreaming; });
+
+  // Insert the final transcript into the previously focused element (+ clipboard).
+  const insertFinalText = useCallback((text: string) => {
+    if (!text) return;
+    try { void navigator.clipboard.writeText(text); } catch { /* ignore */ }
+    const el = activeElementRef.current;
+    if (el && (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement)) {
+      insertTextIntoInput(el, text);
+    } else if (el && (el as HTMLElement).isContentEditable) {
+      insertTextIntoContentEditable(el as HTMLElement, text);
+    }
+  }, []);
+
+  const streaming = useStreamingTranscription({
+    projectId: projectId ?? undefined,
+    maxDuration: settings?.maxDuration ?? 0,
+    onMaxReached: (r) => { if (r) insertFinalText(r.revised ?? r.full); },
+  });
+  const streamingRef = useRef(streaming);
+  useEffect(() => { streamingRef.current = streaming; });
+
+  // Route start / status to the active mode. (doStop/doCancel are defined
+  // below, after handleRecordingComplete which they depend on.)
+  const doStart = useCallback(() => {
+    if (isStreamingRef.current) { void streamingRef.current.start(); }
+    else { recorderRef.current.start(); }
+  }, []);
+  const curStatus = useCallback((): string => (
+    isStreamingRef.current ? streamingRef.current.status : recorderRef.current.status
+  ), []);
 
   // Load audio settings (on mount, projectId change, or after settings saved)
   const fetchSettings = useCallback(() => {
@@ -248,28 +287,23 @@ export function GlobalAudioRecorder({ projectId }: GlobalAudioRecorderProps) {
       return;
     }
 
-    const text = result.final;
-
-    // 1. Copy to clipboard as fallback
-    try { await navigator.clipboard.writeText(text); } catch { /* ignore */ }
-
-    // 2. Insert into previously active element
-    const el = activeElementRef.current;
-    if (el && (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement)) {
-      insertTextIntoInput(el, text);
-    } else if (el && (el as HTMLElement).isContentEditable) {
-      insertTextIntoContentEditable(el as HTMLElement, text);
-    }
+    insertFinalText(result.final);
     setTranscribing(false);
-  }, [projectId]);
+  }, [projectId, insertFinalText]);
 
-  // Toggle mode: stop and process
+  // Toggle mode: stop and process. Routes to the active mode — streaming
+  // returns assembled text directly; batch returns a blob to transcribe.
   const handleToggleStop = useCallback(async () => {
+    if (isStreamingRef.current) {
+      const r = await streamingRef.current.stop();
+      if (r) insertFinalText(r.revised ?? r.full);
+      return;
+    }
     const blob = await recorderRef.current.stop();
     if (blob) {
       handleRecordingComplete(blob);
     }
-  }, [handleRecordingComplete]);
+  }, [handleRecordingComplete, insertFinalText]);
 
   // Command-style entry points. These are the handlers registered for
   // `audio.ptt.start` / `audio.ptt.stop` / `audio.recording.cancel` via
@@ -281,19 +315,20 @@ export function GlobalAudioRecorder({ projectId }: GlobalAudioRecorderProps) {
   const startRecording = useCallback(() => {
     const s = settingsRef.current;
     if (!s?.enabled) return;
-    const status = recorderRef.current.status;
+    const status = curStatus();
     if (status !== "idle" && status !== "error") return;
     captureActiveElement();
     setErrorMessage(null);
-    recorderRef.current.start();
-  }, [captureActiveElement]);
+    doStart();
+  }, [captureActiveElement, curStatus, doStart]);
 
   const stopRecording = useCallback(() => {
     void handleToggleStop();
   }, [handleToggleStop]);
 
   const cancelRecording = useCallback(() => {
-    recorder.cancel();
+    if (isStreamingRef.current) streamingRef.current.cancel();
+    else recorder.cancel();
     abortRef.current?.abort();
     setTranscribing(false);
     setErrorMessage(null);
@@ -311,12 +346,15 @@ export function GlobalAudioRecorder({ projectId }: GlobalAudioRecorderProps) {
   // - `pttActive` is true while the PTT key is held — covers both the
   //   warming-delay window and the active recording phase, and clears
   //   on key release / cancel. Used to gate `audio.ptt.stop`.
-  const micEnabled = !!settings?.enabled && !recorder.error;
+  const micEnabled = !!settings?.enabled && !recorder.error && !streaming.error;
   useContextKey("micEnabled", micEnabled);
   useContextKey("pttActive", pttActive);
-  // `recording` gates audio.recording.cancel — true only while the recorder
-  // is actively capturing (not idle / warming / processing).
-  useContextKey("recording", recorder.status === "recording");
+  // `recording` gates audio.recording.cancel — true only while actively
+  // capturing (not idle / warming / processing).
+  const activeRecording = isStreaming
+    ? streaming.status === "recording"
+    : recorder.status === "recording";
+  useContextKey("recording", activeRecording);
 
   // Cancel PTT warming
   const cancelPTTWarming = useCallback(() => {
@@ -353,11 +391,16 @@ export function GlobalAudioRecorder({ projectId }: GlobalAudioRecorderProps) {
       pttWarmIntervalRef.current = null;
     }
 
-    const blob = await recorderRef.current.stop();
-    if (blob) {
-      handleRecordingComplete(blob);
+    if (isStreamingRef.current) {
+      const r = await streamingRef.current.stop();
+      if (r) insertFinalText(r.revised ?? r.full);
+    } else {
+      const blob = await recorderRef.current.stop();
+      if (blob) {
+        handleRecordingComplete(blob);
+      }
     }
-  }, [handleRecordingComplete, cancelPTTWarming]);
+  }, [handleRecordingComplete, cancelPTTWarming, insertFinalText]);
 
   // Global keyboard listeners
   useEffect(() => {
@@ -365,7 +408,7 @@ export function GlobalAudioRecorder({ projectId }: GlobalAudioRecorderProps) {
       const s = settingsRef.current;
       if (!s?.enabled) return;
 
-      const status = recorderRef.current.status;
+      const status = curStatus();
 
       // Toggle mode: combo key toggles recording
       if (s.toggleShortcut && matchesShortcut(event, s.toggleShortcut)) {
@@ -377,7 +420,7 @@ export function GlobalAudioRecorder({ projectId }: GlobalAudioRecorderProps) {
           // pill goes away as soon as the user retries, even if the 4s timer
           // hasn't fired yet for some reason.
           setErrorMessage(null);
-          recorderRef.current.start();
+          doStart();
         } else if (status === "recording") {
           handleToggleStop();
         }
@@ -419,7 +462,7 @@ export function GlobalAudioRecorder({ projectId }: GlobalAudioRecorderProps) {
               pttWarmIntervalRef.current = null;
             }
             if (pttActiveRef.current) {
-              recorderRef.current.start();
+              doStart();
             }
           }, PTT_ACTIVATION_DELAY_MS);
         }
@@ -451,38 +494,49 @@ export function GlobalAudioRecorder({ projectId }: GlobalAudioRecorderProps) {
       window.removeEventListener("keyup", handleKeyUp, true);
       window.removeEventListener("blur", handleWindowBlur);
     };
-  }, [handleToggleStop, handlePTTStop, captureActiveElement]);
+  }, [handleToggleStop, handlePTTStop, captureActiveElement, doStart, curStatus]);
 
   if (!settings?.enabled) return null;
 
-  // Derive combined status for the indicator
-  let indicatorStatus: IndicatorStatus = recorder.status;
+  // Derive combined status for the indicator (routes to the active mode).
+  let indicatorStatus: IndicatorStatus;
+  if (isStreaming) {
+    indicatorStatus =
+      streaming.status === "finishing" ? "processing"
+      : streaming.status === "recording" ? "recording"
+      : streaming.status === "error" ? "error"
+      : "idle";
+  } else {
+    indicatorStatus = recorder.status;
+    if (transcribing) indicatorStatus = "processing";
+  }
   if (pttWarming) indicatorStatus = "warming";
-  if (transcribing) indicatorStatus = "processing";
-  if (errorMessage && !transcribing) indicatorStatus = "error";
+  if (errorMessage && indicatorStatus !== "processing") indicatorStatus = "error";
 
   // Prefer the recorder's own error (mic permission denied, codec missing,
   // etc.) over our generic message — Tauri webviews on macOS commonly fail
   // here when microphone permission hasn't been granted, and the user needs
   // to see the actual reason to fix it.
-  const indicatorErrorMessage = errorMessage ?? recorder.error;
+  const indicatorErrorMessage =
+    errorMessage ?? (isStreaming ? streaming.error : recorder.error);
+  const indicatorElapsed = isStreaming ? streaming.elapsed : recorder.elapsed;
+  const indicatorFrequency = isStreaming ? streaming.frequencyData : recorder.frequencyData;
 
   return (
     <RecordingIndicator
       status={indicatorStatus}
-      elapsed={recorder.elapsed}
+      elapsed={indicatorElapsed}
       maxDuration={settings.maxDuration}
-      frequencyData={recorder.frequencyData}
+      frequencyData={indicatorFrequency}
       warmingProgress={pttWarmElapsed / PTT_ACTIVATION_DELAY_MS}
       errorMessage={indicatorErrorMessage}
       onStop={handleToggleStop}
       onCancel={() => {
         cancelPTTWarming();
-        recorder.cancel();
-        abortRef.current?.abort();
-        setTranscribing(false);
-        setErrorMessage(null);
+        cancelRecording();
       }}
+      finalizedSentences={isStreaming ? streaming.finalizedSentences : undefined}
+      currentText={isStreaming ? streaming.currentText : undefined}
     />
   );
 }

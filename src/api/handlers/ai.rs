@@ -221,6 +221,8 @@ pub struct AudioSettingsResponse {
     pub forbidden_terms_project: Vec<String>,
     pub replacements_global: Vec<ReplacementRuleDto>,
     pub replacements_project: Vec<ReplacementRuleDto>,
+    pub transcribe_mode: String,
+    pub global_mode_enabled: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -251,6 +253,14 @@ pub struct SaveAudioGlobalRequest {
     pub preferred_terms_global: Vec<String>,
     pub forbidden_terms_global: Vec<String>,
     pub replacements_global: Vec<ReplacementRuleDto>,
+    #[serde(default = "default_transcribe_mode")]
+    pub transcribe_mode: String,
+    #[serde(default)]
+    pub global_mode_enabled: bool,
+}
+
+fn default_transcribe_mode() -> String {
+    "batch".to_string()
 }
 
 /// PUT /api/v1/projects/{id}/ai/audio request (project settings)
@@ -313,6 +323,8 @@ pub async fn get_audio(Query(query): Query<AudioQuery>) -> Json<AudioSettingsRes
                 to: r.to,
             })
             .collect(),
+        transcribe_mode: global.transcribe_mode,
+        global_mode_enabled: global.global_mode_enabled,
     })
 }
 
@@ -341,6 +353,8 @@ pub async fn save_audio_global(
                 to: r.to,
             })
             .collect(),
+        transcribe_mode: req.transcribe_mode,
+        global_mode_enabled: req.global_mode_enabled,
     };
     ai::save_audio_global(&data).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
@@ -535,7 +549,7 @@ pub async fn transcribe(mut multipart: Multipart) -> Result<Json<TranscribeRespo
 }
 
 /// Call an OpenAI-compatible /audio/transcriptions endpoint
-fn call_transcription_api(
+pub(crate) fn call_transcription_api(
     base_url: &str,
     api_key: &str,
     model: &str,
@@ -593,7 +607,7 @@ fn call_transcription_api(
 }
 
 /// Call an OpenAI-compatible /chat/completions endpoint for revision
-fn call_revision_api(
+pub(crate) fn call_revision_api(
     base_url: &str,
     api_key: &str,
     model: &str,
@@ -645,7 +659,7 @@ const VOCAB_TOP_K: usize = 30;
 /// Vocabulary entries are fuzzy-matched against the raw transcript and scored.
 /// Each category (preferred, forbidden, replacements) independently picks
 /// its top-K most relevant entries to keep the prompt concise.
-fn build_revision_prompt(
+pub(crate) fn build_revision_prompt(
     global: &ai::AudioSettingsGlobal,
     project: Option<&ai::AudioSettingsProject>,
     transcript: &str,
