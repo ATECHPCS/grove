@@ -1093,7 +1093,7 @@ pub async fn list_chats(
 /// Create a new chat for a task
 /// Resolve an agent id to a human-friendly display name, for use as a default
 /// chat title. Personas (`ca-…`) → their configured name; custom ACP servers →
-/// their name; built-in agents → the supplement display name ("Claude Code",
+/// their name; built-in agents → the registry display name ("Claude Code",
 /// "Gemini", …); anything else falls back to the raw id.
 pub(crate) fn agent_display_name(agent: &str, cfg: &config::Config) -> String {
     // Persona (SQLite) — try_get_persona only touches the DB for `ca-` ids.
@@ -1104,11 +1104,14 @@ pub(crate) fn agent_display_name(agent: &str, cfg: &config::Config) -> String {
     if let Some(server) = cfg.acp.custom_agents.iter().find(|s| s.id == agent) {
         return server.name.clone();
     }
-    // Built-in agent — supplement display name (matches canonical or legacy id).
-    if let Some(name) = crate::storage::agent_supplement::find_supplement(agent)
-        .and_then(|entry| entry.display_name)
+    // Built-in agent — canonical registry display name.
+    let canonical = crate::storage::installed_agents::canonicalize_agent_id(agent);
+    if let Some(entry) = crate::storage::agent_registry::get()
+        .agents
+        .into_iter()
+        .find(|entry| entry.id == canonical)
     {
-        return name.to_string();
+        return entry.name;
     }
     agent.to_string()
 }

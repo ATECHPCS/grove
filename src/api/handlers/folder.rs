@@ -104,7 +104,7 @@ pub async fn browse_folder() -> Json<BrowseFolderResponse> {
         } else {
             zenity
         };
-        return response_for(outcome);
+        response_for(outcome)
     }
 
     #[cfg(target_os = "windows")]

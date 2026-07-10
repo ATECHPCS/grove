@@ -2,7 +2,6 @@ pub mod agent_capabilities;
 pub mod agent_graph;
 pub mod agent_install;
 pub mod agent_registry;
-pub mod agent_supplement;
 pub mod ai;
 pub mod automations;
 pub mod chat_attachments;

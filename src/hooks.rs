@@ -302,6 +302,7 @@ pub fn load_hooks_with_cleanup(project_path: &str) -> HooksFile {
 
 // === Notification utilities (shared by CLI hooks and ACP) ===
 
+#[allow(dead_code)]
 pub static ACTIVE_BASE_URL: once_cell::sync::OnceCell<String> = once_cell::sync::OnceCell::new();
 
 #[cfg(feature = "gui")]
@@ -314,6 +315,7 @@ pub fn set_active_base_url(url: String) {
     }
 }
 
+#[allow(dead_code)]
 pub fn get_active_base_url() -> String {
     if let Some(url) = ACTIVE_BASE_URL.get() {
         return url.clone();
@@ -491,6 +493,7 @@ fn log_notify_error(msg: &str) {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[allow(clippy::too_many_arguments)]
 pub fn send_banner(
     title: &str,
     message: &str,
