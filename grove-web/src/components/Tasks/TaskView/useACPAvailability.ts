@@ -23,7 +23,7 @@ export interface BaseAgent {
   icon_id: string;
   icon_url?: string | null;
   available: boolean;
-  supported_launch_modes: string[];
+  supported_launch_modes?: string[];
 }
 
 interface Result {
