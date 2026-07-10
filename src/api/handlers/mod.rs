@@ -1,10 +1,10 @@
 //! API handlers
 
 pub mod acp;
-pub mod agents;
 pub mod agent_graph_mcp;
 pub mod agent_pty;
 pub mod agent_usage;
+pub mod agents;
 pub mod ai;
 pub mod ai_stream;
 pub mod automations;
