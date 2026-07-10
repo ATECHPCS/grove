@@ -1050,7 +1050,7 @@ mod tests {
                 rusqlite::params![
                     "ca-reviewer",
                     "Reviewer",
-                    "claude",
+                    "traecli",
                     Some("review implementation and tests"),
                     "do not expose this prompt",
                     Utc::now().to_rfc3339(),
