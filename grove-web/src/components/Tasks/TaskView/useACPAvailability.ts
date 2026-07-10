@@ -23,6 +23,7 @@ export interface BaseAgent {
   icon_id: string;
   icon_url?: string | null;
   available: boolean;
+  supported_launch_modes: string[];
 }
 
 interface Result {
@@ -52,6 +53,9 @@ function toBaseAgent(a: MarketplaceAgent): BaseAgent {
     icon_id: a.id,
     icon_url: a.icon_url,
     available: true,
+    supported_launch_modes: a.supports_terminal_launch
+      ? ["acp", "terminal"]
+      : ["acp"],
   };
 }
 
