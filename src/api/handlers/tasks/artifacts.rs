@@ -541,6 +541,31 @@ pub async fn sync_artifact_to_resource(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// POST /api/v1/projects/{id}/tasks/{taskId}/artifacts/open?dir=<input|output>&path=<rel>
+///
+/// Open an artifact file with the OS-configured default application. The
+/// `open` action runs on the machine hosting the Grove server (the user's
+/// machine in GUI/local-web mode), mirroring the existing folder/workdir
+/// `open` endpoints.
+pub async fn open_artifact(
+    Path((id, task_id)): Path<(String, String)>,
+    Query(query): Query<ArtifactQuery>,
+) -> Result<StatusCode, ApiErr> {
+    let (project, project_key) = find_project_by_id(&id).map_err(|s| {
+        (
+            s,
+            Json(ApiError {
+                error: "Project not found".to_string(),
+            }),
+        )
+    })?;
+    let task_dir = resolve_task_dir(&project, &project_key, &task_id).ok_or_else(task_not_found)?;
+    let file_path = task_dir.join(&query.dir).join(&query.path);
+    let canonical_file = studio_common::validate_path_containment(&task_dir, &file_path)?;
+    studio_common::open_with_default_app(&canonical_file);
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// POST /api/v1/projects/{id}/tasks/{taskId}/open-folder
 pub async fn open_folder(
     Path((id, task_id)): Path<(String, String)>,
@@ -549,10 +574,9 @@ pub async fn open_folder(
     let (project, project_key) = find_project_by_id(&id)?;
     let task_dir =
         resolve_task_dir(&project, &project_key, &task_id).ok_or(StatusCode::NOT_FOUND)?;
-    let folder = task_dir.join(&query.dir);
-    if !folder.exists() {
-        return Err(StatusCode::NOT_FOUND);
-    }
+    let folder_path = task_dir.join(&query.dir).join(&query.path);
+    let folder = studio_common::validate_path_containment(&task_dir, &folder_path)
+        .map_err(|(status, _)| status)?;
     studio_common::open_in_file_manager(&folder);
     Ok(StatusCode::NO_CONTENT)
 }

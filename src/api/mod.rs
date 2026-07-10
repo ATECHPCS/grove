@@ -376,6 +376,10 @@ pub fn create_api_router() -> Router {
             get(handlers::projects::download_resource),
         )
         .route(
+            "/projects/{id}/resource/open",
+            post(handlers::projects::open_resource),
+        )
+        .route(
             "/projects/{id}/resource/folder",
             post(handlers::projects::create_resource_folder),
         )
@@ -602,6 +606,10 @@ pub fn create_api_router() -> Router {
             post(handlers::tasks::open_artifact_workdir),
         )
         .route(
+            "/projects/{id}/tasks/{taskId}/artifacts/open",
+            post(handlers::tasks::open_artifact),
+        )
+        .route(
             "/projects/{id}/tasks/{taskId}/artifacts/sync-to-resource",
             post(handlers::tasks::sync_artifact_to_resource),
         )
@@ -634,6 +642,10 @@ pub fn create_api_router() -> Router {
         .route(
             "/projects/{id}/tasks/{taskId}/fs/move",
             post(handlers::tasks::move_file),
+        )
+        .route(
+            "/projects/{id}/tasks/{taskId}/fs/open",
+            post(handlers::tasks::open_file),
         )
         // Task Stats API
         .route(
@@ -739,6 +751,15 @@ pub fn create_api_router() -> Router {
         .route(
             "/ai/audio",
             get(handlers::ai::get_audio).put(handlers::ai::save_audio_global),
+        )
+        .route(
+            "/ai/voice-control",
+            get(handlers::ai::get_voice_control).put(handlers::ai::save_voice_control),
+        )
+        .route(
+            "/ai/voice-control/execute",
+            post(handlers::ai::execute_voice_control)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route(
             "/projects/{id}/ai/audio",
@@ -857,6 +878,27 @@ pub fn create_api_router() -> Router {
         .route(
             "/radio/events/ws",
             get(handlers::walkie_talkie::radio_events_ws_handler),
+        )
+        // Tray composer: send a follow-up prompt to a chat. The phone hits the
+        // same path on the radio server; the desktop tray webview hits it here.
+        .route(
+            "/tray/send-prompt",
+            post(handlers::walkie_talkie::tray_send_prompt),
+        )
+        // Approve/deny a pending permission over HTTP — used by the phone
+        // tray page (no Tauri bridge) and the main app's Dynamic Island
+        // live-activity alert. The desktop tray popover itself goes through
+        // the `tray_resolve_permission` Tauri command instead, so this was
+        // never wired up until now.
+        .route(
+            "/tray/resolve-permission",
+            post(handlers::walkie_talkie::tray_resolve_permission),
+        )
+        // Desktop tray mirrors its accumulated panel state here so a phone that
+        // connects later seeds the full Running / NEEDS YOU / Done view.
+        .route(
+            "/tray/state",
+            post(handlers::walkie_talkie::post_tray_state),
         );
 
     #[cfg(feature = "perf-monitor")]
@@ -1496,6 +1538,41 @@ pub async fn start_server(
         loop {
             ticker.tick().await;
             crate::storage::agent_registry::refresh_if_stale().await;
+        }
+    });
+
+    // Boot-time PATH scan: register/deregister External installations for
+    // any registry agent whose binary is (or isn't) on the user's PATH.
+    // Without this, the first chat the user opens would resolve against a
+    // stale installed_agents row (e.g. claude-acp's External installation
+    // missing because no Marketplace render has triggered the scan yet),
+    // which manifests as "Waiting for connection…" stuck states.
+    //
+    // Runs once at startup on the blocking pool — the scan is just PATH
+    // stats + sqlite writes, fast but synchronous. We don't await it from
+    // the boot path; the chat WS / launch handlers tolerate missing rows
+    // (resolve_agent falls back to defaults), this just makes the steady
+    // state arrive sooner.
+    tokio::task::spawn_blocking(|| {
+        let registry = crate::storage::agent_registry::get();
+        if let Err(e) = crate::storage::installed_agents::auto_scan_path_binaries(&registry) {
+            eprintln!("[startup] PATH binary scan failed: {}", e);
+        }
+    });
+
+    // Curated agent seed: guarantees every chat / config referencing a
+    // curated id (`claude-acp`, `codex-acp`, `gemini`, `opencode`,
+    // `github-copilot-cli`, `qwen-code`) has a resolvable row before the
+    // user opens any UI. Idempotent — only inserts rows that don't
+    // already exist; never touches user customizations. This covers BOTH:
+    //   - fresh installs (no prior rows) — same effect as the old
+    //     `seed_curated_if_fresh` Marketplace-handler call
+    //   - v2.5→v2.6 upgrades whose chats referenced builtin agents that
+    //     previously needed no `installed_agents` row
+    tokio::task::spawn_blocking(|| {
+        let registry = crate::storage::agent_registry::get();
+        if let Err(e) = crate::storage::installed_agents::ensure_curated_agents_seeded(&registry) {
+            eprintln!("[startup] curated agent seed failed: {}", e);
         }
     });
 

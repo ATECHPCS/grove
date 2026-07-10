@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useLayoutEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
-import { FileText, FolderPlus, Trash2, Copy } from "lucide-react";
+import { FileText, FolderPlus, Trash2, Copy, SquareArrowOutUpRight } from "lucide-react";
 
 export interface ContextMenuPosition {
   x: number;
@@ -23,6 +23,7 @@ interface FileContextMenuProps {
   onDelete: (path: string) => void;
   onCopyRelativePath: (path: string) => void;
   onCopyFullPath: (path: string) => void;
+  onOpenInApp: (path: string) => void;
 }
 
 export function FileContextMenu({
@@ -36,6 +37,7 @@ export function FileContextMenu({
   onDelete,
   onCopyRelativePath,
   onCopyFullPath,
+  onOpenInApp,
 }: FileContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
@@ -100,7 +102,7 @@ export function FileContextMenu({
       />
       <div
         ref={menuRef}
-        className="fixed z-[9999] min-w-[200px] bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-lg shadow-xl overflow-hidden"
+        className="fixed z-[9999] min-w-[176px] bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-md shadow-xl overflow-hidden"
         style={{
           left: `${adjustedPosition.x}px`,
           top: `${adjustedPosition.y}px`,
@@ -108,56 +110,68 @@ export function FileContextMenu({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="py-1">
+          {/* Open in default app */}
+          <button
+            onClick={() => handleAction(() => onOpenInApp(targetPath))}
+            className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-[var(--color-bg-tertiary)] text-left transition-colors"
+          >
+            <SquareArrowOutUpRight className="w-3.5 h-3.5 text-[var(--color-text-muted)]" />
+            <span className="text-[13px] text-[var(--color-text)]">Open</span>
+          </button>
+
+          {/* Divider */}
+          <div className="my-0.5 h-px bg-[var(--color-border)]" />
+
           {/* New File */}
           <button
             onClick={() => handleAction(() => onNewFile(isDirectory ? targetPath : parentPath))}
-            className="w-full flex items-center gap-3 px-4 py-2 hover:bg-[var(--color-bg-tertiary)] text-left transition-colors"
+            className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-[var(--color-bg-tertiary)] text-left transition-colors"
           >
-            <FileText className="w-4 h-4 text-[var(--color-text-muted)]" />
-            <span className="text-sm text-[var(--color-text)]">New File</span>
+            <FileText className="w-3.5 h-3.5 text-[var(--color-text-muted)]" />
+            <span className="text-[13px] text-[var(--color-text)]">New File</span>
           </button>
 
           {/* New Folder */}
           <button
             onClick={() => handleAction(() => onNewDirectory(isDirectory ? targetPath : parentPath))}
-            className="w-full flex items-center gap-3 px-4 py-2 hover:bg-[var(--color-bg-tertiary)] text-left transition-colors"
+            className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-[var(--color-bg-tertiary)] text-left transition-colors"
           >
-            <FolderPlus className="w-4 h-4 text-[var(--color-text-muted)]" />
-            <span className="text-sm text-[var(--color-text)]">New Folder</span>
+            <FolderPlus className="w-3.5 h-3.5 text-[var(--color-text-muted)]" />
+            <span className="text-[13px] text-[var(--color-text)]">New Folder</span>
           </button>
 
           {/* Divider */}
-          <div className="my-1 h-px bg-[var(--color-border)]" />
+          <div className="my-0.5 h-px bg-[var(--color-border)]" />
 
           {/* Copy Relative Path */}
           <button
             onClick={() => handleAction(() => onCopyRelativePath(targetPath))}
-            className="w-full flex items-center gap-3 px-4 py-2 hover:bg-[var(--color-bg-tertiary)] text-left transition-colors"
+            className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-[var(--color-bg-tertiary)] text-left transition-colors"
           >
-            <Copy className="w-4 h-4 text-[var(--color-text-muted)]" />
-            <span className="text-sm text-[var(--color-text)]">Copy Relative Path</span>
+            <Copy className="w-3.5 h-3.5 text-[var(--color-text-muted)]" />
+            <span className="text-[13px] text-[var(--color-text)]">Copy Relative Path</span>
           </button>
 
           {/* Copy Full Path */}
           <button
             onClick={() => handleAction(() => onCopyFullPath(targetPath))}
             disabled={!taskPath}
-            className="w-full flex items-center gap-3 px-4 py-2 hover:bg-[var(--color-bg-tertiary)] text-left transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-[var(--color-bg-tertiary)] text-left transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            <FileText className="w-4 h-4 text-[var(--color-text-muted)]" />
-            <span className="text-sm text-[var(--color-text)]">Copy Full Path</span>
+            <FileText className="w-3.5 h-3.5 text-[var(--color-text-muted)]" />
+            <span className="text-[13px] text-[var(--color-text)]">Copy Full Path</span>
           </button>
 
           {/* Divider */}
-          <div className="my-1 h-px bg-[var(--color-border)]" />
+          <div className="my-0.5 h-px bg-[var(--color-border)]" />
 
           {/* Delete */}
           <button
             onClick={() => handleAction(() => onDelete(targetPath))}
-            className="w-full flex items-center gap-3 px-4 py-2 hover:bg-[var(--color-error)]/10 text-left transition-colors"
+            className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-[var(--color-error)]/10 text-left transition-colors"
           >
-            <Trash2 className="w-4 h-4 text-[var(--color-error)]" />
-            <span className="text-sm text-[var(--color-error)]">Delete</span>
+            <Trash2 className="w-3.5 h-3.5 text-[var(--color-error)]" />
+            <span className="text-[13px] text-[var(--color-error)]">Delete</span>
           </button>
         </div>
       </div>

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { getDiffStats, getSingleFileDiff, createInlineComment, createFileComment, createProjectComment, deleteComment as apiDeleteComment, replyReviewComment as apiReplyComment, updateCommentStatus as apiUpdateCommentStatus, getFileContent, editComment as apiEditComment, editReply as apiEditReply, deleteReply as apiDeleteReply, bulkDeleteComments as apiBulkDeleteComments } from '../../api/review';
 import type { DiffFile, DiffStatsResult } from '../../api/review';
-import { getReviewComments, getCommits, getTaskFiles, getTaskDirEntries, listTasks } from '../../api/tasks';
+import { getReviewComments, getCommits, getTaskFiles, getTaskDirEntries, getTask, openTaskFile } from '../../api/tasks';
 import type { ReviewCommentEntry, ReviewCommentsResponse, DirEntry, CommitsResponse } from '../../api/tasks';
 import { buildMentionItems } from '../../utils/fileMention';
 
@@ -108,24 +108,17 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   const [taskPath, setTaskPath] = useState<string | null>(null);
   useEffect(() => {
     const ac = new AbortController();
-    const lookup = async () => {
-      for (const filter of ['active', 'archived'] as const) {
-        if (ac.signal.aborted) return;
-        try {
-          const tasks = await listTasks(projectId, filter, ac.signal);
-          if (ac.signal.aborted) return;
-          const match = tasks.find((t) => t.id === taskId);
-          if (match) {
-            setTaskPath(match.path);
-            return;
-          }
-        } catch {
-          // Aborted requests, transient network errors — both fine to swallow.
-          // "Copy Full Path" briefly unavailable; next render will retry.
-        }
-      }
-    };
-    void lookup();
+    // Fetch by id rather than scanning the task list: `listTasks` omits the
+    // Local Task (`_local`), which left `taskPath` null and greyed out "Copy
+    // Full Path". `getTask` resolves both worktree-backed and local tasks.
+    getTask(projectId, taskId, ac.signal)
+      .then((task) => {
+        if (!ac.signal.aborted) setTaskPath(task.path);
+      })
+      .catch(() => {
+        // Aborted requests / transient errors — fine to swallow.
+        // "Copy Full Path" briefly unavailable; next render will retry.
+      });
     return () => ac.abort();
   }, [projectId, taskId]);
   const [allFiles, setAllFiles] = useState<string[]>([]); // All git-tracked files for File Mode
@@ -278,8 +271,15 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     }
   }, [sidebarWidth, convSidebarWidth, sidebarWidthStorageKey]);
 
-  const clampSidebarWidth = (value: number, layoutWidth: number): number => {
-    const max = Math.max(SIDEBAR_MIN_WIDTH, Math.floor(layoutWidth * SIDEBAR_MAX_RATIO));
+  // Min width the diff content keeps when a sidebar is dragged to its max, so
+  // the two sidebars can't jointly squeeze the content to near-zero.
+  const MIN_CONTENT_WIDTH = 320;
+  // `otherWidth` is the currently-visible opposite sidebar's width (0 if hidden);
+  // we reserve it plus MIN_CONTENT_WIDTH so the dragged sidebar can't overlap it.
+  const clampSidebarWidth = (value: number, layoutWidth: number, otherWidth = 0): number => {
+    const ratioMax = Math.floor(layoutWidth * SIDEBAR_MAX_RATIO);
+    const fitMax = layoutWidth - otherWidth - MIN_CONTENT_WIDTH;
+    const max = Math.max(SIDEBAR_MIN_WIDTH, Math.min(ratioMax, fitMax));
     return Math.min(max, Math.max(SIDEBAR_MIN_WIDTH, value));
   };
 
@@ -292,10 +292,12 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     const startX = event.clientX;
     const startWidth = sidebarWidth;
 
+    const otherWidth = convSidebarVisible ? convSidebarWidth : 0;
     const handlePointerMove = (moveEvent: PointerEvent) => {
       const next = clampSidebarWidth(
         startWidth + (moveEvent.clientX - startX),
         layoutWidth,
+        otherWidth,
       );
       setSidebarWidth(next);
     };
@@ -309,7 +311,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     document.body.classList.add('grove-resizing');
     document.addEventListener('pointermove', handlePointerMove);
     document.addEventListener('pointerup', handlePointerUp);
-  }, [sidebarWidth]);
+  }, [sidebarWidth, convSidebarWidth, convSidebarVisible]);
 
   const startConvSidebarResize = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -320,11 +322,13 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     const startX = event.clientX;
     const startWidth = convSidebarWidth;
 
+    const otherWidth = sidebarVisible ? sidebarWidth : 0;
     const handlePointerMove = (moveEvent: PointerEvent) => {
       // Right-side resizer: dragging left grows the sidebar.
       const next = clampSidebarWidth(
         startWidth + (startX - moveEvent.clientX),
         layoutWidth,
+        otherWidth,
       );
       setConvSidebarWidth(next);
     };
@@ -336,7 +340,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     document.body.classList.add('grove-resizing');
     document.addEventListener('pointermove', handlePointerMove);
     document.addEventListener('pointerup', handlePointerUp);
-  }, [convSidebarWidth]);
+  }, [convSidebarWidth, sidebarWidth, sidebarVisible]);
   const [focusMode, setFocusMode] = useState<boolean>(() => {
     if (initialCachedOptions && typeof initialCachedOptions.focusMode === 'boolean') {
       return initialCachedOptions.focusMode;
@@ -2255,6 +2259,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
               onLoadFileDiff={viewMode === 'full' && focusMode ? loadFileDiff : undefined}
               taskPath={taskPath}
               projectId={projectId}
+              onOpenInApp={(path) => { void openTaskFile(projectId, taskId, path); }}
               autoViewedRules={autoViewedRules}
               onUpdateAutoViewedRules={setAutoViewedRules}
             />

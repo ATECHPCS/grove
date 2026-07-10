@@ -82,24 +82,21 @@ pub async fn agent_pty_handler(
         )));
     }
 
-    // Currently only claude exposes the `--session-id` / `--resume` UUID
-    // contract that makes resume across Grove restarts work. Other agents
-    // can be added once they have an equivalent contract.
-    //
-    // Resolve through the alias map so both `claude` (legacy id stored by
-    // the chat-create path) and `claude-acp` (canonical registry id) hit
-    // the same branch — without this, swapping write/read sides
-    // legacy↔canonical anywhere would produce confusing "not supported"
-    // errors. Today writes use legacy and we accept both sides; future
-    // canonicalization of chat.agent stays safe.
-    let canonical_agent =
-        crate::storage::agent_supplement::resolve_agent_id(&chat.agent).into_owned();
-    if canonical_agent != "claude-acp" {
-        return Err(AgentPtyError::BadRequest(format!(
-            "terminal launch_mode is only supported for 'claude' (got {:?})",
-            chat.agent
-        )));
-    }
+    // Resolve historic ids before consulting the v2.6 registry. The registry
+    // owns the terminal argv contract; tmux below owns process persistence.
+    let canonical_agent = crate::storage::installed_agents::canonicalize_agent_id(&chat.agent);
+    let registry = crate::storage::agent_registry::get();
+    let registry_agent = registry
+        .agents
+        .iter()
+        .find(|a| a.id == canonical_agent)
+        .ok_or_else(|| AgentPtyError::BadRequest(format!("unknown agent {:?}", chat.agent)))?;
+    let terminal_launch = registry_agent.terminal_launch.clone().ok_or_else(|| {
+        AgentPtyError::BadRequest(format!(
+            "agent {:?} does not declare terminal launch support",
+            canonical_agent
+        ))
+    })?;
 
     // tmux-backed terminal session. The agent CLI runs *inside* a detached
     // tmux session owned by the tmux server, not as a child of this PTY. So
@@ -155,16 +152,12 @@ pub async fn agent_pty_handler(
             Some(&chat_id),
         );
 
-        // Per-agent overrides from the marketplace settings sheet (matches the
-        // ACP launcher's behavior). Claude is always npx/external in practice
-        // — `spawn_for` returns None for External so we fall back to plain
-        // `claude` on PATH (terminal mode's only supported binary today). When
-        // a future terminal-capable agent ships as Binary, `spawn_for` honors
-        // install_path (with disk-existence fallback) automatically.
+        // Per-agent overrides from the marketplace settings sheet match the
+        // ACP launcher. Terminal mode uses the External installation path when
+        // auto-scan resolved one, otherwise the registry's bare command.
         let installed_record = crate::storage::installed_agents::get(&canonical_agent)
             .ok()
             .flatten();
-        let supplement = crate::storage::agent_supplement::find_supplement(&canonical_agent);
         let extra_args: Vec<String> = installed_record
             .as_ref()
             .map(|r| r.args_override.clone())
@@ -174,10 +167,11 @@ pub async fn agent_pty_handler(
                 grove_env.insert(k.clone(), v.clone());
             }
         }
-        let (claude_cmd, prefix_args) = installed_record
+        let agent_cmd = installed_record
             .as_ref()
-            .and_then(|r| crate::storage::installed_agents::spawn_for(r, supplement))
-            .unwrap_or_else(|| ("claude".to_string(), Vec::new()));
+            .and_then(|r| r.selected_installation())
+            .and_then(|i| i.install_path.clone())
+            .unwrap_or_else(|| terminal_launch.cmd.clone());
 
         // agent_graph MCP token: register one for this chat so claude (via
         // `grove mcp-bridge` spawned out of the mcp-config below) can reach
@@ -221,17 +215,16 @@ pub async fn agent_pty_handler(
         // agents) → session args → mcp config → user extras. Mirrors how claude
         // itself parses flags, with grove-mandatory ones in front. tmux runs
         // this argv directly (no shell), so no quoting is needed.
-        let mut argv: Vec<String> = Vec::with_capacity(prefix_args.len() + extra_args.len() + 5);
-        argv.push(claude_cmd);
-        argv.extend(prefix_args);
+        let mut argv: Vec<String> = Vec::with_capacity(extra_args.len() + 5);
+        argv.push(agent_cmd);
         if is_resume {
-            argv.push("--resume".to_string());
+            argv.push(terminal_launch.resume_arg.clone());
             argv.push(uuid);
         } else {
-            argv.push("--session-id".to_string());
+            argv.push(terminal_launch.session_id_arg.clone());
             argv.push(uuid);
         }
-        argv.push("--mcp-config".to_string());
+        argv.push(terminal_launch.mcp_config_arg.clone());
         argv.push(mcp_config_path.to_string_lossy().into_owned());
         argv.extend(extra_args);
 

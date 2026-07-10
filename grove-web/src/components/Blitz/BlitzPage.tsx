@@ -17,6 +17,7 @@ import {
   useTaskGroups,
   useRadioEvents,
   buildCommands,
+  useChatDeepLink,
 } from "../../hooks";
 import { useCommand, useDefineCommand, useKeyboardScope, useContextKey, useHelpKeyDisplay } from "../../keyboard";
 import { RadioConnectDialog } from "./RadioConnectDialog";
@@ -28,6 +29,7 @@ import { MAIN_GROUP_ID, LOCAL_GROUP_ID } from "../../data/types";
 import type { PendingArchiveConfirm } from "../../utils/archiveHelpers";
 import type { PanelType } from "../Tasks/PanelSystem/types";
 import { buildContextMenuItems, type TaskOperationHandlers } from "../../utils/taskOperationUtils";
+import { fuzzyFindByName } from "../../utils/fuzzySearch";
 
 
 interface DragInfo {
@@ -52,9 +54,31 @@ const shouldAvoidTrafficLights = isTauri && isMac;
 interface BlitzPageProps {
   onSwitchToZen: () => void;
   onNavigate?: (page: string) => void;
+  // Tray / notification deep-link. Mirrors the TasksPage contract so
+  // App.tsx can plumb the same `navigationData` to both surfaces
+  // without branching on tasksMode.
+  initialTaskId?: string;
+  // Required when the target task is a Local task (id "_local"): every
+  // project has one with the same id, so without projectId the
+  // blitzTasks.find lookup ambiguously matches the first local task in
+  // the project list and the user lands in the wrong project (and the
+  // chat list query returns the wrong project's chats, so the
+  // __grove_pending_chat match fails too).
+  initialProjectId?: string;
+  initialChatId?: string;
+  initialViewMode?: string;
+  onNavigationConsumed?: () => void;
 }
 
-export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
+export function BlitzPage({
+  onSwitchToZen,
+  onNavigate,
+  initialTaskId,
+  initialProjectId,
+  initialChatId,
+  initialViewMode,
+  onNavigationConsumed,
+}: BlitzPageProps) {
   const { blitzTasks, isLoading, refresh } = useBlitzTasks();
   const { getTaskNotification, dismissNotification } = useNotifications();
   const { isMobile } = useIsMobile();
@@ -331,6 +355,120 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
   }, [customGroups, expandedGroups, getGroupTasks]);
 
   const displayTasks = useMemo(() => [...mainListTasks, ...expandedGroupTasks, ...folderLocalTasks], [mainListTasks, expandedGroupTasks, folderLocalTasks]);
+
+  // Handle initial task selection from navigation (tray / notification).
+  // Mirrors TasksPage's contract (see TasksPage.tsx useEffect on
+  // initialTaskId). TasksPage's consumer is gated off in Blitz mode by
+  // App.tsx, so we own the consume path here. Without this, clicking a
+  // notification while in Blitz mode produced no visible effect:
+  // navigationData was set but BlitzPage never read it.
+  useEffect(() => {
+    if (!initialTaskId) return;
+    // Wait for tasks to load — blitzTasks is the single source of truth
+    // across all projects in Blitz (vs TasksPage's selectedProject.tasks).
+    if (blitzTasks.length === 0) return;
+
+    // Filter by both task id AND project id. The local task always has
+    // id "_local" (LOCAL_TASK_ID, one per project), so a project-less
+    // lookup would ambiguous-match the first local task in the project
+    // list — landing the user in the wrong project (wrong chat list,
+    // wrong row, wrong scroll target). initialProjectId is plumbed in
+    // by App.tsx from both applyNavigate (tray) and handleNavigate
+    // (notification); we tolerate a missing projectId for forward
+    // compatibility with older callers by falling back to id-only
+    // matching (worktree tasks have unique ids, so this is safe for
+    // non-local navigation).
+    const bt = blitzTasks.find(
+      (t) =>
+        t.task.id === initialTaskId &&
+        (initialProjectId === undefined || t.projectId === initialProjectId),
+    );
+    if (!bt) {
+      console.warn("[BlitzNav] task NOT FOUND in blitzTasks", {
+        initialTaskId,
+        initialProjectId,
+      });
+      return;
+    }
+
+    // If the task lives inside a custom (collapsed) group folder, expand
+    // it first so the row is in the DOM and the scrollIntoView below can
+    // find it. Main / local groups are always rendered. setState is the
+    // right tool here — we need to coordinate with a user-driven
+    // expandedGroups set; computing the desired state outside the effect
+    // and pushing it in is the standard "derive from props, push to state"
+    // pattern, not the cascading-render anti-pattern the rule targets.
+    const customGroup = customGroups.find((g) =>
+      g.slots.some((s) => s.project_id === bt.projectId && s.task_id === initialTaskId),
+    );
+    if (customGroup && !expandedGroups.has(customGroup.id)) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setExpandedGroups((prev) => {
+        const next = new Set(prev);
+        next.add(customGroup.id);
+        return next;
+      });
+    }
+
+    // Local group is collapsed by default (`localTasksExpanded` starts
+    // false) and its row is only rendered when the user clicks the
+    // "Local" header. The tray / notification deep-link doesn't go
+    // through the header, so without this branch the local task row
+    // never enters the DOM and the scrollIntoView retry below times
+    // out. Worktree tasks are unaffected (they live in the always-open
+    // Main group). Same state-push pattern as the custom-group branch.
+    if (bt.task.isLocal) {
+      if (!localTasksExpanded) {
+        setLocalTasksExpanded(true);
+      }
+    }
+
+    // Highlight the row. setSelectedBlitzTask is the single source of
+    // truth for the right-pane TaskView and the list-item "isSelected"
+    // styling (BlitzTaskListItem.tsx reads it via prop).
+    setSelectedBlitzTask(bt);
+
+    // viewMode "terminal" is the tray/notification "open this in detail"
+    // signal — mirror TasksPage's behavior by entering the workspace and
+    // ensuring the chat panel is open (notifications are chat-bound).
+    if (initialViewMode === "terminal") {
+      pageHandlers.setInWorkspace(true);
+      ensureRadioPanel("chat");
+    }
+
+    // Scroll the row into view. Retry briefly because expanding a
+    // collapsed group + re-rendering the list + TaskView mounting all
+    // happen async after our setSelectedBlitzTask. The retry pattern
+    // mirrors ensureRadioPanel above.
+    const selector = `[data-project-id="${bt.projectId}"][data-task-id="${initialTaskId}"]`;
+    const tryScroll = (attempts: number) => {
+      const el = document.querySelector(selector);
+      if (el) {
+        el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      } else if (attempts > 0) {
+        setTimeout(() => tryScroll(attempts - 1), 80);
+      } else {
+        console.warn("[BlitzNav] scroll target NOT FOUND after all retries", { selector });
+      }
+    };
+    tryScroll(5);
+
+    onNavigationConsumed?.();
+    // onNavigationConsumed / pageHandlers intentionally omitted from
+    // deps: pageHandlers is recreated every render (re-firing would
+    // re-enter workspace); onNavigationConsumed is a stable setter.
+  }, [initialTaskId, initialProjectId, initialChatId, initialViewMode, blitzTasks, customGroups, expandedGroups, localTasksExpanded, ensureRadioPanel, onNavigationConsumed]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Navigate to the specific chat session if provided (deep-link — tray,
+  // notifications, the Dynamic Island live-activity alert, ...). Separate
+  // from the task-selection effect above; fires once `selectedBlitzTask`
+  // catches up to the target task set by that effect (dep change re-runs
+  // this), so ordering between the two doesn't matter.
+  useChatDeepLink({
+    chatId: initialChatId,
+    projectId: selectedBlitzTask?.projectId,
+    taskId: selectedBlitzTask?.task.id,
+  });
 
   // Task selection handlers (Blitz-specific: handle BlitzTask)
   const handleSelectTask = useCallback((bt: BlitzTask) => {
@@ -636,21 +774,66 @@ export function BlitzPage({ onSwitchToZen, onNavigate }: BlitzPageProps) {
 
   const enabledTask = useCallback(() => hasTask, [hasTask]);
   const enabledOpenWorkspace = useCallback(
-    () => !!selectedTask && selectedTask.status !== "archived",
-    [selectedTask],
+    () => !pageState.inWorkspace && !!selectedTask && selectedTask.status !== "archived",
+    [pageState.inWorkspace, selectedTask],
   );
 
   useCommand("task.selectNext", navHandlers.selectNextTask, [navHandlers]);
   useCommand("task.selectPrevious", navHandlers.selectPreviousTask, [navHandlers]);
   useCommand(
     "task.open",
-    () => {
-      if (!pageState.inWorkspace && selectedTask && selectedTask.status !== "archived") {
-        pageHandlers.handleEnterWorkspace();
+    (args?: unknown) => {
+      const typedArgs = args as { taskId?: string; taskName?: string; taskIndex?: number } | undefined;
+
+      const openFound = (found: BlitzTask) => {
+        // Expand the containing group if it is currently collapsed
+        const customGroup = customGroups.find((g) =>
+          g.slots.some((s) => s.project_id === found.projectId && s.task_id === found.task.id),
+        );
+        if (customGroup && !expandedGroups.has(customGroup.id)) {
+          setExpandedGroups((prev) => { const next = new Set(prev); next.add(customGroup.id); return next; });
+        }
+        if (found.task.isLocal && !localTasksExpanded) {
+          setLocalTasksExpanded(true);
+        }
+        handleSelectTask(found);
+        if (!pageState.inWorkspace && found.task.status !== "archived") {
+          pageHandlers.handleEnterWorkspace();
+        }
+      };
+
+      const allTasks = [...mainListTasks, ...expandedGroupTasks, ...folderLocalTasks];
+
+      if (typedArgs?.taskId) {
+        const found = allTasks.find((t) => t.task.id === typedArgs.taskId);
+        if (found) openFound(found);
+      } else if (typedArgs?.taskIndex !== undefined) {
+        const idx = typedArgs.taskIndex - 1;
+        const found = allTasks[idx];
+        if (found) openFound(found);
+      } else if (typedArgs?.taskName) {
+        const found = fuzzyFindByName(allTasks, (t) => t.task.name, typedArgs.taskName);
+        if (found) openFound(found);
+      } else {
+        if (!pageState.inWorkspace && selectedTask && selectedTask.status !== "archived") {
+          pageHandlers.handleEnterWorkspace();
+        }
       }
     },
     { enabled: enabledOpenWorkspace },
-    [pageState.inWorkspace, selectedTask, pageHandlers, enabledOpenWorkspace],
+    [
+      pageState.inWorkspace,
+      selectedTask,
+      pageHandlers,
+      mainListTasks,
+      expandedGroupTasks,
+      folderLocalTasks,
+      customGroups,
+      expandedGroups,
+      localTasksExpanded,
+      handleSelectTask,
+      enabledOpenWorkspace,
+    ],
   );
   useCommand(
     "task.contextMenu",

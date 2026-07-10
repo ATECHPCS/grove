@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import type { ShortcutHandler } from "@tauri-apps/plugin-global-shortcut";
 import { Sidebar } from "./components/Layout/Sidebar";
 import { PluginFrame } from "./components/Plugins/PluginFrame";
 import { listPlugins, type Plugin } from "./api/plugins";
@@ -23,7 +24,7 @@ import { StatusBoard } from "./components/StatusBoard/StatusBoard";
 import { OfficeFloor } from "./components/GrooveOffice/OfficeFloor";
 import { HelpOverlay } from "./components/Tasks/HelpOverlay";
 import { SkillsPage } from "./components/Skills";
-import { AIPage, GlobalAudioRecorder } from "./components/AI";
+import { AIPage, GlobalAudioRecorder, GlobalVoiceControlRecorder } from "./components/AI";
 import { AutomationPage } from "./components/Automation/AutomationPage";
 import { ProjectStatsPage } from "./components/Stats/ProjectStatsPage";
 import { UpdateBanner } from "./components/ui/UpdateBanner";
@@ -37,15 +38,100 @@ import { AuthGate } from "./components/AuthGate";
 import { OptionalPerfProfiler } from "./perf/profilerShim";
 import type { Task } from "./data/types";
 import { mockConfig } from "./data/mockData";
-import { getConfig, patchConfig, checkCommands, openIDE, openTerminal } from "./api";
-import { agentOptions } from "./components/ui";
+import { getConfig, patchConfig, openIDE, openTerminal } from "./api";
+import { listMarketplace } from "./api/marketplace";
+import { setMarketplaceIcons } from "./utils/agentIcon";
 import { useIsMobile, buildCommands, useAddLibraryHashHandler } from "./hooks";
 import type { UseCommandsOptions } from "./hooks/useCommands";
 import { REPO_NAV_IDS, STUDIO_NAV_IDS } from "./data/nav";
-import { useCommand, useContextKey, commandRegistry } from "./keyboard";
+import { readLastProjectView, writeLastProjectView } from "./utils/lastProjectView";
+import { fuzzyFindByName } from "./utils/fuzzySearch";
+import { useCommand, useContextKey, commandRegistry, useVoiceControlContext } from "./keyboard";
 import { ActionCommandPalette } from "./components/Palette/ActionCommandPalette";
 
 export type TasksMode = "zen" | "blitz";
+
+const isTauriShellForTrafficLights = typeof window !== "undefined" && (
+  "__TAURI__" in window ||
+  "__TAURI_INTERNALS__" in window
+);
+
+const isMacForTrafficLights = typeof navigator !== "undefined" && (
+  /Mac|iPhone|iPad|iPod/i.test(navigator.userAgent || "") ||
+  /Mac|iPhone|iPad/i.test(navigator.platform || "")
+);
+
+// Island mode floats the sidebar away from the top-left corner, so the IDE
+// toolbar becomes the top-left-most thing on screen and shares the traffic
+// lights' row instead of sitting below them like every other page does.
+// Matches the pattern used elsewhere (e.g. Tasks page): give main extra top
+// clearance in island mode instead of squeezing the toolbar sideways.
+const shouldAvoidTrafficLightsInIsland = isTauriShellForTrafficLights && isMacForTrafficLights;
+
+// Register a process-global hotkey that survives a webview reload (Cmd+R).
+// The native registration lives on the Rust side and lingers after a reload
+// while its JS callback dies, so the next mount's register() throws "already
+// registered" and the fresh callback never binds (the shortcut goes dead). We
+// catch that, clear the stale binding, and retry once. Returns a cleanup that
+// unregisters on unmount; a no-op outside Tauri or when the shortcut is empty.
+function registerGlobalShortcut(
+  displayShortcut: string,
+  handler: ShortcutHandler,
+  label: string,
+): () => void {
+  const isTauri = !!((window as Window & {
+    __TAURI__?: unknown;
+    __TAURI_INTERNALS__?: unknown;
+  }).__TAURI__ || (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
+  if (!isTauri || !displayShortcut) return () => {};
+
+  const tauriShortcut = displayShortcut
+    .split("+")
+    .map((part) => part === "Cmd" ? "CommandOrControl" : part === "Ctrl" ? "Control" : part)
+    .join("+");
+  let registered = false;
+  let disposed = false;
+  const unregisterShortcut = () => {
+    import("@tauri-apps/plugin-global-shortcut")
+      .then(({ unregister }) => unregister(tauriShortcut))
+      .catch((err) => console.error(`Failed to unregister ${label} shortcut:`, err));
+  };
+
+  import("@tauri-apps/plugin-global-shortcut")
+    .then(async ({ register, unregister }) => {
+      if (disposed) return false;
+      try {
+        await register(tauriShortcut, handler);
+      } catch {
+        // Stale registration from a prior reload blocks us — drop it and retry
+        // once so the live callback actually binds.
+        try {
+          await unregister(tauriShortcut);
+        } catch {
+          // Nothing stale to clear — fall through to the retry.
+        }
+        await register(tauriShortcut, handler);
+      }
+      return true;
+    })
+    .then((didRegister) => {
+      if (!didRegister) return;
+      if (disposed) {
+        unregisterShortcut();
+        return;
+      }
+      registered = true;
+    })
+    .catch((err) => {
+      if (!disposed) console.error(`Failed to register ${label} shortcut:`, err);
+    });
+
+  return () => {
+    disposed = true;
+    if (!registered) return;
+    unregisterShortcut();
+  };
+}
 
 // Main sidebar nav items for Cmd+1-6 and Option+Cmd+Up/Down cycling.
 // "settings" and "projects" are excluded as they are utility pages, not part of the main nav cycle.
@@ -64,8 +150,45 @@ function AppContent() {
 
   const [activeItem, setActiveItem] = useState("dashboard");
   const [tasksMode, setTasksMode] = useState<TasksMode>("zen");
+  // Ref mirror of tasksMode for use inside stable callbacks (e.g. the
+  // tray:navigate listener) that capture the initial closure and would
+  // otherwise see a stale mode. Sync via effect — refs cannot be
+  // mutated during render.
+  const tasksModeRef = useRef(tasksMode);
+  useEffect(() => {
+    tasksModeRef.current = tasksMode;
+  }, [tasksMode]);
   const [tasksExitSignal, setTasksExitSignal] = useState(0);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return window.localStorage.getItem("grove:sidebar.mode") === "collapsed";
+    } catch {
+      return false;
+    }
+  });
+  // Three-state sidebar mode: full → collapsed → island (Dynamic Island).
+  // Kept in addition to `sidebarCollapsed` for the legacy Mod+B toggle path —
+  // `effectiveSidebarMode` derives a single SSoT below.
+  const [sidebarIsland, setSidebarIsland] = useState(() => {
+    try {
+      return window.localStorage.getItem("grove:sidebar.mode") === "island";
+    } catch {
+      return false;
+    }
+  });
+  // Persist the user's last explicit choice (not the viewport-forced
+  // override below — that only affects `effectiveSidebarMode`, never these
+  // two raw booleans) so the sidebar mode survives an app restart.
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        "grove:sidebar.mode",
+        sidebarIsland ? "island" : (sidebarCollapsed ? "collapsed" : "expanded")
+      );
+    } catch {
+      /* ignore */
+    }
+  }, [sidebarIsland, sidebarCollapsed]);
   // Auto-collapse sidebar when the viewport is too narrow to host an expanded
   // sidebar (256px) plus the workspace's minimum content width. Keeps the
   // chat composer / panel system from being squeezed below their min-widths.
@@ -137,7 +260,18 @@ function AppContent() {
     };
   }, []);
 
-  const effectiveSidebarCollapsed = sidebarCollapsed || viewportTooNarrowForSidebar;
+  // Single SSoT for the sidebar's three visual modes. Viewport-too-narrow
+  // forces collapsed (not island), since the pill + main-content flex don't
+  // compose well under ~1000px wide.
+  const effectiveSidebarMode: "expanded" | "collapsed" | "island" = viewportTooNarrowForSidebar
+    ? "collapsed"
+    : sidebarIsland
+      ? "island"
+      : (sidebarCollapsed ? "collapsed" : "expanded");
+  const setSidebarMode = useCallback((next: "expanded" | "collapsed" | "island") => {
+    setSidebarIsland(next === "island");
+    setSidebarCollapsed(next === "collapsed");
+  }, []);
   const [hasExitedWelcome, setHasExitedWelcome] = useState(false);
   const [navigationData, setNavigationData] = useState<Record<string, unknown> | null>(null);
 
@@ -160,6 +294,21 @@ function AppContent() {
   }, []);
   const { selectedProject, currentProjectId, isLoading, selectProject, projects, addProject, createNewProject, cloneProject, refreshProjects, refreshSelectedProject } = useProject();
   useReportDebugId("projectId", selectedProject?.id ?? null);
+  useVoiceControlContext("projects_list", () => ({
+    selectedProjectId: selectedProject?.id ?? null,
+    projects: projects.map((p, index) => {
+      const nameParts = p.name.split(/[_-]+/);
+      const displayName = nameParts.map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ");
+      return {
+        index: index + 1,
+        id: p.id,
+        name: p.name,
+        displayName,
+        aliases: [p.name, p.name.toLowerCase().replace(/_agent$/, ""), nameParts.join(" ")],
+        path: p.path,
+      };
+    }),
+  }));
   const [showAddProject, setShowAddProject] = useState(false);
   const [addProjectInitialMode, setAddProjectInitialMode] = useState<"coding" | "studio">("coding");
   const [isAddingProject, setIsAddingProject] = useState(false);
@@ -272,53 +421,17 @@ function AppContent() {
   }, []);
 
   useEffect(() => {
-    const isTauri = !!((window as Window & {
-      __TAURI__?: unknown;
-      __TAURI_INTERNALS__?: unknown;
-    }).__TAURI__ || (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
-    const shortcut = globalConfig?.web?.show_hide_window_shortcut || "";
-    if (!isTauri || !shortcut) return;
-
-    const tauriShortcut = shortcut
-      .split("+")
-      .map((part) => part === "Cmd" ? "CommandOrControl" : part === "Ctrl" ? "Control" : part)
-      .join("+");
-    let registered = false;
-    let disposed = false;
-    const unregisterShortcut = () => {
-      import("@tauri-apps/plugin-global-shortcut")
-        .then(({ unregister }) => unregister(tauriShortcut))
-        .catch((err) => console.error("Failed to unregister window shortcut:", err));
-    };
-
-    import("@tauri-apps/plugin-global-shortcut")
-      .then(({ register }) => {
-        if (disposed) return false;
-        return register(tauriShortcut, (event) => {
-          if (event.state === "Pressed") {
-            invoke("toggle_main_window_visibility").catch((err) => {
-              console.error("Failed to toggle Grove window:", err);
-            });
-          }
-        }).then(() => true);
-      })
-      .then((didRegister) => {
-        if (!didRegister) return;
-        if (disposed) {
-          unregisterShortcut();
-          return;
+    return registerGlobalShortcut(
+      globalConfig?.web?.show_hide_window_shortcut || "",
+      (event) => {
+        if (event.state === "Pressed") {
+          invoke("toggle_main_window_visibility").catch((err) => {
+            console.error("Failed to toggle Grove window:", err);
+          });
         }
-        registered = true;
-      })
-      .catch((err) => {
-        if (!disposed) console.error("Failed to register window shortcut:", err);
-      });
-
-    return () => {
-      disposed = true;
-      if (!registered) return;
-      unregisterShortcut();
-    };
+      },
+      "window",
+    );
   }, [globalConfig?.web?.show_hide_window_shortcut]);
 
   // Menubar popover global shortcut — parallel to the main window one.
@@ -326,60 +439,25 @@ function AppContent() {
   // skip registration (Tauri's global-shortcut plugin would error
   // anyway; this just keeps the log noise actionable).
   useEffect(() => {
-    const isTauri = !!((window as Window & {
-      __TAURI__?: unknown;
-      __TAURI_INTERNALS__?: unknown;
-    }).__TAURI__ || (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__);
     const shortcut = globalConfig?.notifications?.menubar_shortcut || "";
     const mainShortcut = globalConfig?.web?.show_hide_window_shortcut || "";
-    if (!isTauri || !shortcut) return;
-    if (shortcut === mainShortcut) {
+    if (shortcut && shortcut === mainShortcut) {
       console.warn(
         "[shortcut] menubar_shortcut conflicts with show_hide_window_shortcut — skipping registration",
       );
       return;
     }
-
-    const tauriShortcut = shortcut
-      .split("+")
-      .map((part) => part === "Cmd" ? "CommandOrControl" : part === "Ctrl" ? "Control" : part)
-      .join("+");
-    let registered = false;
-    let disposed = false;
-    const unregisterShortcut = () => {
-      import("@tauri-apps/plugin-global-shortcut")
-        .then(({ unregister }) => unregister(tauriShortcut))
-        .catch((err) => console.error("Failed to unregister menubar shortcut:", err));
-    };
-
-    import("@tauri-apps/plugin-global-shortcut")
-      .then(({ register }) => {
-        if (disposed) return false;
-        return register(tauriShortcut, (event) => {
-          if (event.state === "Pressed") {
-            invoke("toggle_tray_popover_visibility").catch((err) => {
-              console.error("Failed to toggle Grove menubar:", err);
-            });
-          }
-        }).then(() => true);
-      })
-      .then((didRegister) => {
-        if (!didRegister) return;
-        if (disposed) {
-          unregisterShortcut();
-          return;
+    return registerGlobalShortcut(
+      shortcut,
+      (event) => {
+        if (event.state === "Pressed") {
+          invoke("toggle_tray_popover_visibility").catch((err) => {
+            console.error("Failed to toggle Grove menubar:", err);
+          });
         }
-        registered = true;
-      })
-      .catch((err) => {
-        if (!disposed) console.error("Failed to register menubar shortcut:", err);
-      });
-
-    return () => {
-      disposed = true;
-      if (!registered) return;
-      unregisterShortcut();
-    };
+      },
+      "menubar",
+    );
   }, [
     globalConfig?.notifications?.menubar_shortcut,
     globalConfig?.web?.show_hide_window_shortcut,
@@ -396,34 +474,76 @@ function AppContent() {
     setNavigationData(null);
   }, []);
 
+  // Restore the last view the user was on for a given project. Falls back to
+  // "dashboard" if nothing is recorded. We don't validate the saved view
+  // against the project's nav set — renderContent handles unknown views by
+  // falling through to its "coming soon" placeholder, but in practice the
+  // sidebar won't navigate to a view that isn't in the current nav set.
+  const navigateToProjectLastView = useCallback(
+    (projectId: string) => {
+      const saved = readLastProjectView(projectId);
+      if (saved) {
+        setActiveItem(saved);
+        setNavigationData(null);
+      } else {
+        navigateToProjectDashboard();
+      }
+    },
+    [navigateToProjectDashboard],
+  );
+
+  // Persist the current top-level view per project. Sub-state (selected
+  // taskId / chatId / sketch tab) is restored by per-(project,task)
+  // mechanisms like readLastActiveTab; this only covers the sidebar-level
+  // page the user is on.
+  useEffect(() => {
+    if (!selectedProject) return;
+    writeLastProjectView(selectedProject.id, activeItem);
+  }, [selectedProject, activeItem]);
+
   // Initialize agent configuration on app startup
   useEffect(() => {
     const initializeAgentConfig = async () => {
       try {
-        // Load current config
-        const cfg = await getConfig();
+        // Load current config + marketplace snapshot (single source of truth
+        // for "what's launchable on this machine").
+        const [cfg, marketplace] = await Promise.all([
+          getConfig(),
+          listMarketplace(),
+        ]);
 
-        // Check command availability
-        const cmds = new Set<string>();
-        for (const opt of agentOptions) {
-          if (opt.terminalCheck) cmds.add(opt.terminalCheck);
-          if (opt.acpCheck) cmds.add(opt.acpCheck);
-        }
-        const commandAvailability = await checkCommands([...cmds]);
+        // Refresh the global icon CDN map (bundled brand > CDN > Bot).
+        setMarketplaceIcons(
+          marketplace.agents.map((a) => ({ id: a.id, icon_url: a.icon_url })),
+        );
+
+        const launchable = marketplace.agents.filter(
+          (a) =>
+            (a.install_state === "grove-installed" ||
+              a.install_state === "auto-detected") &&
+            !(a.installed?.hidden ?? false),
+        );
+        const launchableIds = new Set(launchable.map((a) => a.id));
+        const terminalIds = new Set(
+          launchable
+            .filter((a) => a.supports_terminal_launch)
+            .map((a) => a.id),
+        );
+
+        // Post-v2.6 migration, config.toml's agent_command values are
+        // already canonical, so a direct set lookup is enough.
+        const matches = (saved: string, set: Set<string>): boolean => set.has(saved);
 
         let needsUpdate = false;
         const updates: { layout?: { agent_command?: string }, acp?: { agent_command?: string } } = {};
 
-        // Check Terminal Agent
+        // Terminal agent fallback: only kicks in if user's chosen one isn't
+        // installed terminal-capable any more.
         if (cfg.layout?.agent_command) {
-          const currentAgent = agentOptions.find(a => a.id === cfg.layout.agent_command);
-          const cmd = currentAgent?.terminalCheck;
-          if (cmd && commandAvailability[cmd] === false) {
-            // Find first available terminal agent
-            const firstAvailable = agentOptions.find(a => {
-              const check = a.terminalCheck;
-              return check && commandAvailability[check] !== false;
-            });
+          if (!matches(cfg.layout.agent_command, terminalIds)) {
+            const firstAvailable = launchable.find((a) =>
+              a.supports_terminal_launch,
+            );
             if (firstAvailable) {
               updates.layout = { agent_command: firstAvailable.id };
               needsUpdate = true;
@@ -431,16 +551,10 @@ function AppContent() {
           }
         }
 
-        // Check Chat Agent
+        // Chat / ACP agent fallback: anything launchable is acp-capable.
         if (cfg.acp?.agent_command) {
-          const currentAgent = agentOptions.find(a => a.id === cfg.acp.agent_command);
-          const cmd = currentAgent?.acpCheck;
-          if (cmd && commandAvailability[cmd] === false) {
-            // Find first available chat agent
-            const firstAvailable = agentOptions.find(a => {
-              const check = a.acpCheck;
-              return check && commandAvailability[check] !== false;
-            });
+          if (!matches(cfg.acp.agent_command, launchableIds)) {
+            const firstAvailable = launchable[0];
             if (firstAvailable) {
               updates.acp = { agent_command: firstAvailable.id };
               needsUpdate = true;
@@ -448,7 +562,6 @@ function AppContent() {
           }
         }
 
-        // Save updated config if needed
         if (needsUpdate) {
           await patchConfig(updates);
         }
@@ -529,9 +642,11 @@ function AppContent() {
     setActiveItem("projects");
   };
 
-  // Auto-navigate to dashboard when a project is auto-selected via currentProjectId.
-  // Uses the documented "Adjusting state on prop change" pattern (compare to a
-  // memoised marker stored in state) so we don't setState inside an effect.
+  // Auto-navigate when a project is auto-selected via currentProjectId.
+  // Restore the user's last view for that project, or fall back to the
+  // dashboard if they've never visited it. Uses the documented
+  // "Adjusting state on prop change" pattern (compare to a memoised marker
+  // stored in state) so we don't setState inside an effect.
   // https://react.dev/reference/react/useState#storing-information-from-previous-renders
   const [autoNavigatedFor, setAutoNavigatedFor] = useState<string | null>(null);
   if (
@@ -542,7 +657,8 @@ function AppContent() {
   ) {
     setAutoNavigatedFor(currentProjectId);
     setHasExitedWelcome(true);
-    setActiveItem("dashboard");
+    const saved = readLastProjectView(currentProjectId);
+    setActiveItem(saved ?? "dashboard");
   }
 
   // Tray popover navigation. Rust emits `tray:navigate` with a route and
@@ -574,6 +690,7 @@ function AppContent() {
       "projects",
     ]);
     const applyNavigate = (p: NavigatePayload) => {
+      console.log("[BlitzNav] applyNavigate (tray/Radio)", p, { tasksMode: tasksModeRef.current });
       const { route, project_id, task_id, chat_id } = p;
       const project = project_id
         ? projectsRef.current.find((pr) => pr.id === project_id)
@@ -585,14 +702,20 @@ function AppContent() {
       // Local tasks always have id "_local" (backend constant LOCAL_TASK_ID).
       // The projects list uses convertProjectListItem which sets localTask: null,
       // so we cannot rely on project.localTask here — check the id directly.
+      // Skip the redirect in Blitz mode: BlitzPage shows local tasks in the
+      // "Local" group and consumes the navigation data itself. Routing to
+      // "work" would set navigationData=null and leave the notification
+      // click with no visible effect.
       let effectiveRoute = route;
-      if (task_id && route === "tasks") {
+      if (task_id && route === "tasks" && tasksModeRef.current !== "blitz") {
         const task = project?.tasks?.find((t) => t.id === task_id);
         const isLocalTask =
           task?.isLocal || task_id === "_local";
         if (isLocalTask) {
           effectiveRoute = "work";
         }
+      } else if (task_id && route === "tasks" && task_id === "_local") {
+        console.log("[BlitzNav] applyNavigate: Blitz mode, skipping local-task→work redirect");
       }
 
       // Guard against typos / future nav-id renames so the tray can't
@@ -602,8 +725,16 @@ function AppContent() {
         // viewMode "terminal" makes TasksPage drop into Workspace mode
         // (chat / terminal panes) — what the user expects when clicking
         // Open from the tray.
+        // projectId is plumbed in for the Blitz consumer: the local task
+        // always has id "_local", so a project-less lookup would
+        // ambiguous-match the first local task in the project list and
+        // route the user to the wrong project. Same flow for
+        // handleNavigate (notification) — its data already carries
+        // projectId from NotificationPopover.
+        console.log("[BlitzNav] applyNavigate: setNavigationData", { taskId: task_id, projectId: project_id, chatId: chat_id, viewMode: "terminal" });
         setNavigationData({
           taskId: task_id,
+          projectId: project_id ?? undefined,
           chatId: chat_id ?? undefined,
           viewMode: "terminal",
         });
@@ -661,6 +792,7 @@ function AppContent() {
 
 
   const handleNavigate = (page: string, data?: Record<string, unknown>) => {
+    console.log("[BlitzNav] handleNavigate (notification)", { page, data, tasksMode });
     let targetProject = selectedProject;
     if (data?.projectId) {
       const found = projects.find((p) => p.id === data.projectId);
@@ -682,13 +814,24 @@ function AppContent() {
       if (isLocalTask) effectivePage = "work";
     }
     setActiveItem(effectivePage);
+    console.log("[BlitzNav] handleNavigate: setNavigationData", { effectivePage, data });
     setNavigationData(data ?? null);
   };
 
-  // When project changes via sidebar ProjectSelector, go back to dashboard
-  const handleProjectSwitch = useCallback(() => {
-    navigateToProjectDashboard();
-  }, [navigateToProjectDashboard]);
+  // When project changes via sidebar ProjectSelector, restore the user's
+  // last view for that project (falls back to dashboard if the saved view
+  // isn't valid for the new project type).
+  const handleProjectSwitch = useCallback(
+    (newProjectId?: string) => {
+      const targetId = newProjectId ?? selectedProject?.id ?? null;
+      if (targetId) {
+        navigateToProjectLastView(targetId);
+      } else {
+        navigateToProjectDashboard();
+      }
+    },
+    [navigateToProjectLastView, navigateToProjectDashboard, selectedProject?.id],
+  );
 
   // Task palette: navigate to tasks page and select the task
   const handleTaskSelectFromPalette = useCallback((task: Task) => {
@@ -705,8 +848,25 @@ function AppContent() {
     setTasksMode((prev) => (prev === "zen" ? "blitz" : "zen"));
   }, []);
   const toggleSidebar = useCallback(() => {
+    // Mod+B: binary expanded ⇄ collapsed. If currently in island mode,
+    // first leave the island — Mod+B shouldn't drop you into collapsed
+    // when you were already in a "hidden" state.
+    if (sidebarIsland) {
+      setSidebarIsland(false);
+      setSidebarCollapsed(false);
+      return;
+    }
     setSidebarCollapsed((prev) => !prev);
-  }, []);
+  }, [sidebarIsland]);
+  const archiveSidebar = useCallback(() => {
+    // Mod+. : three-state cycle.
+    //   expanded → collapsed → island → expanded
+    // Anchored on the current mode, so repeated presses always walk the same
+    // loop in the same order — easier to remember than forward/backward.
+    setSidebarMode(
+      sidebarIsland ? "expanded" : (sidebarCollapsed ? "island" : "collapsed")
+    );
+  }, [sidebarIsland, sidebarCollapsed, setSidebarMode]);
   const handleOpenIDE = useCallback(() => {
     if (selectedProject) openIDE(selectedProject.id);
   }, [selectedProject]);
@@ -770,9 +930,27 @@ function AppContent() {
     setAddProjectInitialMode("coding");
     setShowAddProject(true);
   }, []);
-  // Cmd+P toggles the project palette (press again to close); other palettes
-  // close automatically via the context's mutual exclusion.
   useCommand("project.switch", () => toggleProjectPalette(), [toggleProjectPalette]);
+  useCommand(
+    "project.open",
+    (args?: unknown) => {
+      const typedArgs = args as { projectId?: string; projectName?: string } | undefined;
+      if (typedArgs?.projectId) {
+        const found = projects.find((p) => p.id === typedArgs.projectId);
+        if (found) {
+          selectProject(found);
+          handleProjectSwitch(found.id);
+        }
+      } else if (typedArgs?.projectName) {
+        const found = fuzzyFindByName(projects, (p) => p.name, typedArgs.projectName);
+        if (found) {
+          selectProject(found);
+          handleProjectSwitch(found.id);
+        }
+      }
+    },
+    [handleProjectSwitch, projects, selectProject],
+  );
   useCommand(
     "project.refresh",
     () => {
@@ -798,8 +976,9 @@ function AppContent() {
     [selectedProject],
   );
 
-  // View — sidebar toggle, zoom, density
-  useCommand("view.sidebar.toggle", () => setSidebarCollapsed((v) => !v), []);
+  // View — sidebar toggle, archive (Dynamic Island), zoom, density
+  useCommand("view.sidebar.toggle", toggleSidebar, [toggleSidebar]);
+  useCommand("view.sidebar.archive", archiveSidebar, [archiveSidebar]);
 
   const setZoom = useCallback((z: number) => {
     if (typeof document === "undefined") return;
@@ -985,6 +1164,9 @@ function AppContent() {
       onOpenProjectPalette: openProjectPalette,
       onOpenTaskPalette: openTaskPalette,
     },
+    taskSwitch: {
+      onSelectTask: handleTaskSelectFromPalette,
+    },
     projectActions: selectedProject ? {
       onOpenIDE: handleOpenIDE,
       onOpenTerminal: handleOpenTerminal,
@@ -1031,7 +1213,13 @@ function AppContent() {
       case "projects":
         return <ProjectsPage onNavigate={setActiveItem} key={"projects-" + (navigationData?.tab ?? "coding")} initialTab={navigationData?.tab as "coding" | "studio" | undefined} />;
       case "work":
-        return <WorkPage key="work" />;
+        return (
+          <WorkPage
+            key="work"
+            initialChatId={navigationData?.chatId as string | undefined}
+            onNavigationConsumed={() => setNavigationData(null)}
+          />
+        );
       case "resource":
         return <ResourcePage />;
       case "automation":
@@ -1119,8 +1307,8 @@ function AppContent() {
   const sidebarProps = {
     activeItem,
     onItemClick: handleItemClick,
-    collapsed: effectiveSidebarCollapsed,
-    onToggleCollapse: () => setSidebarCollapsed(!sidebarCollapsed),
+    mode: effectiveSidebarMode,
+    onSetMode: setSidebarMode,
     onManageProjects: (tab?: "coding" | "studio") => handleNavigate("projects", { tab }),
     onAddProject: (studioMode?: "studio") => {
       setAddProjectInitialMode(studioMode === "studio" ? "studio" : "coding");
@@ -1252,10 +1440,10 @@ function AppContent() {
           >
             <TasksPage
               pageVisible={activeItem === "tasks" && tasksMode !== "blitz"}
-              initialTaskId={navigationData?.taskId as string | undefined}
-              initialChatId={navigationData?.chatId as string | undefined}
-              initialViewMode={navigationData?.viewMode as string | undefined}
-              initialOpenNewTask={navigationData?.openNewTask as boolean | undefined}
+              initialTaskId={tasksMode === "blitz" ? undefined : navigationData?.taskId as string | undefined}
+              initialChatId={tasksMode === "blitz" ? undefined : navigationData?.chatId as string | undefined}
+              initialViewMode={tasksMode === "blitz" ? undefined : navigationData?.viewMode as string | undefined}
+              initialOpenNewTask={tasksMode === "blitz" ? undefined : navigationData?.openNewTask as boolean | undefined}
               onNavigationConsumed={() => setNavigationData(null)}
               onNavByIndex={navigateSidebar}
               exitWorkspaceSignal={tasksExitSignal}
@@ -1273,7 +1461,15 @@ function AppContent() {
                   exit={{ opacity: 0 }}
                   transition={{ duration: 0.2 }}
                 >
-                  <BlitzPage onSwitchToZen={handleSwitchToZen} onNavigate={setActiveItem} />
+                  <BlitzPage
+                    onSwitchToZen={handleSwitchToZen}
+                    onNavigate={setActiveItem}
+                    initialTaskId={navigationData?.taskId as string | undefined}
+                    initialProjectId={navigationData?.projectId as string | undefined}
+                    initialChatId={navigationData?.chatId as string | undefined}
+                    initialViewMode={navigationData?.viewMode as string | undefined}
+                    onNavigationConsumed={() => setNavigationData(null)}
+                  />
                 </motion.div>
               ) : (
                 <motion.div
@@ -1325,6 +1521,7 @@ function AppContent() {
           onTaskSelect={handleTaskSelectFromPalette}
         />
         <GlobalAudioRecorder projectId={selectedProject?.id ?? null} />
+        <GlobalVoiceControlRecorder isLoading={isLoading} />
         {addLibraryDialog}
       </div>
     );
@@ -1363,7 +1560,15 @@ function AppContent() {
             exit={{ opacity: 0, x: 40 }}
             transition={{ duration: 0.3, ease: [0.25, 1, 0.5, 1] }}
           >
-            <BlitzPage onSwitchToZen={handleSwitchToZen} onNavigate={setActiveItem} />
+            <BlitzPage
+              onSwitchToZen={handleSwitchToZen}
+              onNavigate={setActiveItem}
+              initialTaskId={navigationData?.taskId as string | undefined}
+              initialProjectId={navigationData?.projectId as string | undefined}
+              initialChatId={navigationData?.chatId as string | undefined}
+              initialViewMode={navigationData?.viewMode as string | undefined}
+              onNavigationConsumed={() => setNavigationData(null)}
+            />
           </motion.div>
         ) : (
           <motion.div
@@ -1383,14 +1588,24 @@ function AppContent() {
             <main
               className={`fixed top-3 right-3 bottom-3 rounded-2xl bg-[var(--color-bg)] transition-[left] duration-200 ease-in-out ${isFullWidthPage && !isDashboardPage ? "overflow-hidden" : "overflow-y-auto"}`}
               style={{
-                left: effectiveSidebarCollapsed ? "96px" : "280px",
+                // Three-tier left: island → 12px (pill is at top-center, sidebar is
+                // effectively absent on the left edge so main uses full width);
+                // collapsed → 96px; expanded → 280px. Matches the visual gap of the
+                // sidebar's left:12 in both expanded/collapsed modes, so the
+                // floating-panel language stays consistent.
+                left: effectiveSidebarMode === "island"
+                  ? "12px"
+                  : (effectiveSidebarMode === "collapsed" ? "96px" : "280px"),
                 boxShadow:
                   "0 1px 3px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.06), 0 0 0 1px color-mix(in oklab, var(--color-border) 35%, transparent)",
               }}
             >
-              {/* TasksPage always mounted to preserve workspace state across tab switches */}
+              {/* TasksPage always mounted to preserve workspace state across tab switches.
+                  No padding when in a workspace: the IDE toolbar's own rounded card
+                  (.ide-workbench) now matches main's rounded-2xl corners exactly, so
+                  an extra p-2 here would just reintroduce a redundant border gap. */}
               <div
-                className={`h-full transition-[padding] duration-300 ease-out ${inWorkspace ? 'p-2' : 'p-6'}`}
+                className={`h-full transition-[padding] duration-300 ease-out ${inWorkspace ? '' : 'p-6'} ${inWorkspace && effectiveSidebarMode === "island" && shouldAvoidTrafficLightsInIsland ? 'ide-traffic-light-clearance' : ''}`}
                 style={{ display: activeItem === "tasks" ? "block" : "none" }}
               >
                 <TasksPage
@@ -1405,7 +1620,7 @@ function AppContent() {
                 />
               </div>
               {activeItem !== "tasks" && (
-                <div className={isFullWidthPage ? `h-full transition-[padding] duration-300 ease-out ${inWorkspace && activeItem === "work" ? 'p-2' : 'p-6'}` : "max-w-5xl mx-auto p-6"}>
+                <div className={isFullWidthPage ? `h-full transition-[padding] duration-300 ease-out ${activeItem === "work" ? '' : 'p-6'} ${activeItem === "work" && effectiveSidebarMode === "island" && shouldAvoidTrafficLightsInIsland ? 'ide-traffic-light-clearance' : ''}` : "max-w-5xl mx-auto p-6"}>
                   {renderContent()}
                 </div>
               )}
@@ -1447,6 +1662,7 @@ function AppContent() {
         onTaskSelect={handleTaskSelectFromPalette}
       />
       <GlobalAudioRecorder projectId={selectedProject?.id ?? null} />
+      <GlobalVoiceControlRecorder isLoading={isLoading} />
       <HelpOverlay isOpen={showHelp} onClose={() => setShowHelp(false)} />
       {addLibraryDialog}
     </div>

@@ -30,6 +30,7 @@ import {
   Download,
   Share2,
   ChevronRight,
+  Clock,
 } from "lucide-react";
 import { Button, Combobox, AppPicker, AgentPicker, agentOptions, ideAppOptions, terminalAppOptions, CustomAgentModal, VSCodeIcon } from "../ui";
 import type { ComboboxOption } from "../ui";
@@ -40,17 +41,16 @@ import {
   patchConfig,
   previewHookSound,
   checkAllDependencies,
-  checkCommands,
-  listBaseAgents,
   listApplications,
   listCustomAgents,
   getAgentCapabilities,
   type AppInfo,
-  type BaseAgent,
   type AgentCapabilities,
   type CustomAgentServer,
   type CustomAgentPersona,
 } from "../../api";
+import { listMarketplace, type MarketplaceAgent } from "../../api/marketplace";
+import type { BaseAgent } from "../Tasks/TaskView/useACPAvailability";
 import { LayoutEditor, type CustomLayoutConfig, type PaneType, type LayoutNode, createDefaultLayout, countPanes } from "./LayoutEditor";
 import { CustomAgentsModal } from "./CustomAgentsModal";
 import { MarketplaceModal } from "./MarketplaceModal";
@@ -60,6 +60,7 @@ import { ShortcutSettingsPanel } from "./ShortcutSettingsPanel";
 import {
   setCustomAgentPersonas as setCustomAgentPersonasIconRegistry,
   loadCustomAgentPersonas as loadCustomAgentPersonasIcon,
+  setMarketplaceIcons,
 } from "../../utils/agentIcon";
 import { getExtensionStatus } from "../../api/extension";
 import { PluginsSection } from "./PluginsSection";
@@ -250,7 +251,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
   const [serverPlatform, setServerPlatform] = useState<string | null>(null);
 
   // ACP / Custom agents state
-  const [acpAgent, setAcpAgent] = useState("claude"); // Chat mode agent
+  const [acpAgent, setAcpAgent] = useState(""); // Populated from config.acp.agent_command after load
   // Per-agent chat defaults, keyed by agent id. UI uses "" for unset; the
   // backend stores null and tri-state-applies per agent (pruning all-empty).
   const [chatDefaultsByAgent, setChatDefaultsByAgent] = useState<
@@ -309,6 +310,15 @@ export function SettingsPage({ config }: SettingsPageProps) {
   const [systemNotifShowPermission, setSystemNotifShowPermission] = useState(true);
   const [systemNotifShowDone, setSystemNotifShowDone] = useState(true);
   const [systemNotifShowRunning, setSystemNotifShowRunning] = useState(false);
+
+  // Tray "Done" chat retention. Two-mode UI: `forever` keeps everything
+  // until the user dismisses; `expire` auto-prunes done chats after N
+  // hours/days. Wire shape matches the Rust enum (externally tagged):
+  //   forever → { "forever": null }
+  //   expire  → { "expire": { "value": <u32>, "unit": "hours" | "days" } }
+  const [trayDoneRetentionMode, setTrayDoneRetentionMode] = useState<"forever" | "expire">("expire");
+  const [trayDoneRetentionValue, setTrayDoneRetentionValue] = useState<number>(3);
+  const [trayDoneRetentionUnit, setTrayDoneRetentionUnit] = useState<"hours" | "days">("days");
 
   // MCP state
   const [copiedField, setCopiedField] = useState<string | null>(null);
@@ -493,6 +503,14 @@ export function SettingsPage({ config }: SettingsPageProps) {
       setSystemNotifShowPermission(cfg.notifications.notification_show_permission);
       setSystemNotifShowDone(cfg.notifications.notification_show_done);
       setSystemNotifShowRunning(cfg.notifications.notification_show_running);
+      const ret = cfg.notifications.tray_done_retention;
+      if (ret && "forever" in ret) {
+        setTrayDoneRetentionMode("forever");
+      } else if (ret && "expire" in ret && ret.expire) {
+        setTrayDoneRetentionMode("expire");
+        setTrayDoneRetentionValue(Math.max(1, Math.floor(ret.expire.value ?? 3)));
+        setTrayDoneRetentionUnit(ret.expire.unit === "hours" ? "hours" : "days");
+      }
     }
 
     if (cfg.indexing) {
@@ -577,38 +595,61 @@ export function SettingsPage({ config }: SettingsPageProps) {
     setIsChecking(false);
   }, []);
 
-  // Check agent command availability
-  const checkAgentCommands = useCallback(async () => {
-    const cmds = new Set<string>();
-    for (const opt of agentOptions) {
-      if (opt.terminalCheck) cmds.add(opt.terminalCheck);
-    }
-    try {
-      const results = await checkCommands([...cmds]);
-      setCommandAvailability(results);
-    } catch {
-      // API not available, assume all available
-    }
-  }, []);
+  // Terminal-capable installed agent ids (canonical form). Populated from
+  // marketplace data; replaces the old PATH-probe via `checkCommands`.
+  const [terminalLaunchableIds, setTerminalLaunchableIds] = useState<Set<string>>(
+    new Set(),
+  );
 
   const loadBaseAgents = useCallback(async () => {
     setBaseAgentsLoading(true);
     try {
-      const agents = await listBaseAgents();
-      setBaseAgents(agents);
-    } catch {
-      // Fall back to static list so the UI stays functional when the backend is unavailable.
-      // Mark all as available (fail-open) — the user will get an error when they actually try to use one.
-      setBaseAgents(
-        agentOptions
-          .filter((opt) => opt.acpCheck)
-          .map((opt) => ({
-            id: opt.id,
-            display_name: opt.label,
-            icon_id: opt.id,
-            available: true,
-          })),
+      const resp = await listMarketplace();
+      setMarketplaceIcons(
+        resp.agents.map((a) => ({ id: a.id, icon_url: a.icon_url })),
       );
+      const launchable = resp.agents.filter(
+        (a: MarketplaceAgent) =>
+          (a.install_state === "grove-installed" ||
+            a.install_state === "auto-detected") &&
+          !(a.installed?.hidden ?? false),
+      );
+      setBaseAgents(
+        launchable.map((a) => ({
+          id: a.id,
+          display_name: a.name,
+          icon_id: a.id,
+          icon_url: a.icon_url,
+          available: true,
+        })),
+      );
+      setTerminalLaunchableIds(
+        new Set(
+          launchable
+            .filter((a) => a.supports_terminal_launch)
+            .map((a) => a.id),
+        ),
+      );
+      // Trigger downstream `hasAvailability` gating that watches a non-empty
+      // commandAvailability map. Marker entry stands in for the old probe map.
+      setCommandAvailability({ __marketplace_loaded__: true });
+    } catch {
+      // Fail-open: surface the static catalog so the picker isn't
+      // blank. User will get a runtime error if they pick an agent the
+      // backend can't actually launch. NOTE: terminal-launchability
+      // is intentionally LEFT EMPTY — surfacing every static id as
+      // terminal-capable would let the user pick e.g. codex-acp for
+      // the terminal slot and hit a 400 on launch.
+      setBaseAgents(
+        agentOptions.map((opt) => ({
+          id: opt.id,
+          display_name: opt.label,
+          icon_id: opt.id,
+          available: true,
+        })),
+      );
+      setTerminalLaunchableIds(new Set());
+      setCommandAvailability({ __marketplace_loaded__: true });
     }
     setBaseAgentsLoading(false);
   }, []);
@@ -680,6 +721,10 @@ export function SettingsPage({ config }: SettingsPageProps) {
         notification_show_done: systemNotifShowDone,
         notification_show_running: systemNotifShowRunning,
         menubar_shortcut: menubarShortcut,
+        tray_done_retention:
+          trayDoneRetentionMode === "forever"
+            ? { forever: null }
+            : { expire: { value: Math.max(1, Math.floor(trayDoneRetentionValue)), unit: trayDoneRetentionUnit } },
       },
       indexing: {
         enabled: indexingEnabled,
@@ -697,7 +742,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
     } catch {
       console.error("Failed to save config");
     }
-  }, [isLoaded, selectedLayout, agentCommand, acpAgent, chatDefaultsByAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, refreshGlobalConfig]);
+  }, [isLoaded, selectedLayout, agentCommand, acpAgent, chatDefaultsByAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, trayDoneRetentionMode, trayDoneRetentionUnit, trayDoneRetentionValue, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, refreshGlobalConfig]);
 
   // Handle theme change with immediate save
   const handleModeChange = useCallback((newMode: "auto" | "light" | "dark") => {
@@ -912,12 +957,11 @@ export function SettingsPage({ config }: SettingsPageProps) {
         loadConfig(),
         checkDependencies(),
         loadApplications(),
-        checkAgentCommands(),
         loadBaseAgents(),
         loadCustomAgentPersonas(),
       ]);
     })();
-  }, [loadConfig, checkDependencies, loadApplications, checkAgentCommands, loadBaseAgents, loadCustomAgentPersonas]);
+  }, [loadConfig, checkDependencies, loadApplications, loadBaseAgents, loadCustomAgentPersonas]);
 
   // Terminal availability
   const tmuxInstalled = depStates["tmux"]?.status === "installed";
@@ -975,15 +1019,19 @@ export function SettingsPage({ config }: SettingsPageProps) {
     return map;
   }, [baseAgents]);
 
-  // Terminal Agent 选项（检测 terminalCheck 命令）
+  // Terminal Agent options — derived from marketplace data. An agent is
+  // enabled iff the marketplace reports it installed (grove-installed or
+  // auto-detected) AND `supports_terminal_launch === true` (i.e. its
+  // registry entry declares a `terminal_launch` config).
   const terminalAgentOptions = useMemo(() => agentOptions.map(a => {
     if (!hasAvailability) return a;
-    const cmd = a.terminalCheck;
-    if (cmd && commandAvailability[cmd] === false) {
-      return { ...a, disabled: true, disabledReason: `${cmd} not found — install to enable` };
+    const available =
+      terminalLaunchableIds.has(a.id) || terminalLaunchableIds.has(a.value);
+    if (!available) {
+      return { ...a, disabled: true, disabledReason: `Not installed — install via Marketplace to enable` };
     }
     return a;
-  }), [commandAvailability, hasAvailability]);
+  }), [terminalLaunchableIds, hasAvailability]);
 
   // Chat Agent 选项：ACP base agent availability comes from backend.
   const chatAgentOptions = useMemo(() => {
@@ -1027,9 +1075,8 @@ export function SettingsPage({ config }: SettingsPageProps) {
     // the setStates aren't synchronous within the effect body.
     let nextAgentCommand: string | undefined;
     if (hasTerminalAvailability && agentCommand) {
-      const currentAgent = agentOptions.find(a => a.id === agentCommand);
-      const cmd = currentAgent?.terminalCheck;
-      if (cmd && commandAvailability[cmd] === false) {
+      const currentOption = terminalAgentOptions.find(a => a.id === agentCommand);
+      if (currentOption?.disabled) {
         const firstAvailable = terminalAgentOptions.find(a => !a.disabled);
         nextAgentCommand = firstAvailable?.id ?? "";
       }
@@ -1227,7 +1274,109 @@ env_vars = [
         </div>
       ) : null}
     </div>
-  ) : null;
+    ) : null;
+  const trayRetentionControl = (
+    <div>
+      <div className="flex items-center gap-2 mb-3 select-none">
+        <Clock className="w-4 h-4 text-[var(--color-highlight)]" />
+        <span className="text-sm font-medium text-[var(--color-text)]">
+          Done chat retention
+        </span>
+      </div>
+      <div className="space-y-2.5">
+        {/* Mode toggle — "Keep forever" vs "Auto-expire after". Two equal
+            chips so it reads as a question, not a checkbox. */}
+        <div
+          className="grid grid-cols-2 rounded-lg border p-0.5"
+          style={{
+            borderColor: "var(--color-border)",
+            backgroundColor: "var(--color-bg-secondary)",
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => setTrayDoneRetentionMode("forever")}
+            className="rounded-md px-3 py-1.5 text-xs font-medium transition-colors"
+            style={{
+              color: trayDoneRetentionMode === "forever" ? "var(--color-highlight)" : "var(--color-text-muted)",
+              backgroundColor: trayDoneRetentionMode === "forever" ? "color-mix(in srgb, var(--color-highlight) 15%, transparent)" : "transparent",
+            }}
+          >
+            Keep forever
+          </button>
+          <button
+            type="button"
+            onClick={() => setTrayDoneRetentionMode("expire")}
+            className="rounded-md px-3 py-1.5 text-xs font-medium transition-colors"
+            style={{
+              color: trayDoneRetentionMode === "expire" ? "var(--color-highlight)" : "var(--color-text-muted)",
+              backgroundColor: trayDoneRetentionMode === "expire" ? "color-mix(in srgb, var(--color-highlight) 15%, transparent)" : "transparent",
+            }}
+          >
+            Auto-expire after…
+          </button>
+        </div>
+        {trayDoneRetentionMode === "expire" ? (
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              min={1}
+              max={365}
+              value={trayDoneRetentionValue}
+              onChange={(e) => {
+                const n = Math.floor(Number(e.target.value));
+                if (!Number.isFinite(n)) return;
+                setTrayDoneRetentionValue(Math.min(365, Math.max(1, n)));
+              }}
+              className="h-9 w-20 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-2 text-sm text-[var(--color-text)] focus:border-[var(--color-highlight)] focus:outline-none"
+            />
+            <div
+              className="grid grid-cols-2 rounded-lg border p-0.5"
+              style={{
+                borderColor: "var(--color-border)",
+                backgroundColor: "var(--color-bg-secondary)",
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => setTrayDoneRetentionUnit("hours")}
+                className="rounded-md px-3 py-1 text-xs font-medium transition-colors"
+                style={{
+                  color: trayDoneRetentionUnit === "hours" ? "var(--color-highlight)" : "var(--color-text-muted)",
+                  backgroundColor: trayDoneRetentionUnit === "hours" ? "color-mix(in srgb, var(--color-highlight) 15%, transparent)" : "transparent",
+                }}
+              >
+                Hours
+              </button>
+              <button
+                type="button"
+                onClick={() => setTrayDoneRetentionUnit("days")}
+                className="rounded-md px-3 py-1 text-xs font-medium transition-colors"
+                style={{
+                  color: trayDoneRetentionUnit === "days" ? "var(--color-highlight)" : "var(--color-text-muted)",
+                  backgroundColor: trayDoneRetentionUnit === "days" ? "color-mix(in srgb, var(--color-highlight) 15%, transparent)" : "transparent",
+                }}
+              >
+                Days
+              </button>
+            </div>
+            <span className="text-xs text-[var(--color-text-muted)]">
+              Running and permission-required chats are never auto-pruned.
+            </span>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+  const menubarExtraControl = menubarShortcutControl ? (
+    <div className="space-y-4">
+      {menubarShortcutControl}
+      <div className="border-t border-[color-mix(in_srgb,var(--color-border)_60%,transparent)]" />
+      {trayRetentionControl}
+    </div>
+  ) : (
+    trayRetentionControl
+  );
   const windowShortcutControl = isTauriGui ? (
     <div>
       <div className="flex items-center gap-2 mb-3 select-none">
@@ -1294,9 +1443,21 @@ env_vars = [
         <Section
           id="chat"
           title="Agent"
-          description={isChatAvailable ? "Ready" : "Need Setup"}
+          description={
+            baseAgentsLoading
+              ? "Loading…"
+              : isChatAvailable
+                ? "Ready"
+                : "Need Setup"
+          }
           icon={Bot}
-          iconColor={isChatAvailable ? "#a855f7" : "var(--color-warning)"}
+          iconColor={
+            baseAgentsLoading
+              ? "var(--color-text-muted)"
+              : isChatAvailable
+                ? "#a855f7"
+                : "var(--color-warning)"
+          }
           isOpen={openSections.chat}
           onToggle={() => toggleSection("chat")}
         >
@@ -1473,12 +1634,19 @@ env_vars = [
           id="terminal"
           title="Terminal"
           description={
-            !isTerminalAvailable ? "Need Setup"
+            baseAgentsLoading ? "Loading…"
+              : !isTerminalAvailable ? "Need Setup"
               : webTerminalMode === "direct" ? "Direct"
               : `${dependencyInfo[terminalMultiplexer]?.name || terminalMultiplexer}`
           }
           icon={Terminal}
-          iconColor={isTerminalAvailable ? "#0ea5e9" : "var(--color-warning)"}
+          iconColor={
+            baseAgentsLoading
+              ? "var(--color-text-muted)"
+              : isTerminalAvailable
+                ? "#0ea5e9"
+                : "var(--color-warning)"
+          }
           isOpen={openSections.terminal}
           onToggle={() => toggleSection("terminal")}
         >
@@ -1490,7 +1658,7 @@ env_vars = [
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={() => { checkDependencies(); checkAgentCommands(); }}
+                  onClick={() => { checkDependencies(); loadBaseAgents(); }}
                   disabled={isChecking}
                   className="!p-1 !h-auto"
                 >
@@ -2492,7 +2660,7 @@ env_vars = [
               onShowDoneChange={setTrayShowDone}
               showRunning={trayShowRunning}
               onShowRunningChange={setTrayShowRunning}
-              extraControl={menubarShortcutControl}
+              extraControl={menubarExtraControl}
               note="Disabling the tray takes effect on next Grove launch."
             />
           </div>

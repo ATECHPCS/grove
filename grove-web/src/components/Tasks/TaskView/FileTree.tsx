@@ -7,6 +7,8 @@ import { VSCodeIcon } from "../../ui";
 interface FileTreeProps {
   nodes: FileTreeNode[];
   selectedFile: string | null;
+  /** Path of the row currently targeted by the open context menu (highlighted). */
+  contextMenuPath?: string | null;
   onSelectFile: (path: string) => void;
   onContextMenu?: (e: React.MouseEvent, path: string, isDir: boolean) => void;
   creatingPath?: { type: 'file' | 'directory'; parentPath: string; depth: number } | null;
@@ -15,11 +17,14 @@ interface FileTreeProps {
   onExpandDir?: (path: string) => Promise<DirEntry[]>;
   onMoveFile?: (source: string, destination: string) => void;
   onUploadFile?: (parentPath: string, file: File) => void;
+  /** Bumped to re-fetch expanded directories in place (preserves expansion). */
+  refreshSignal?: number;
 }
 
 export function FileTree({
   nodes,
   selectedFile,
+  contextMenuPath,
   onSelectFile,
   onContextMenu,
   creatingPath,
@@ -28,6 +33,7 @@ export function FileTree({
   onExpandDir,
   onMoveFile,
   onUploadFile,
+  refreshSignal,
 }: FileTreeProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [isTreeDragOver, setIsTreeDragOver] = useState(false);
@@ -82,7 +88,7 @@ export function FileTree({
       onDragLeave={handleDragLeave}
       onDragOver={handleDragOver}
       onDrop={handleDrop}
-      className={`flex flex-col text-sm overflow-y-auto h-full py-1 transition-all duration-200 relative
+      className={`flex flex-col text-sm overflow-y-auto h-full py-1 transition-all duration-200 relative editor-scroll-container
         ${isTreeDragOver ? "bg-[var(--color-highlight)]/5 border-2 border-dashed border-[var(--color-highlight)]/30 rounded-lg m-1" : ""}
       `}
     >
@@ -102,6 +108,7 @@ export function FileTree({
           node={node}
           depth={0}
           selectedFile={selectedFile}
+          contextMenuPath={contextMenuPath}
           onSelectFile={onSelectFile}
           onContextMenu={onContextMenu}
           creatingPath={creatingPath}
@@ -111,6 +118,7 @@ export function FileTree({
           onExpandDir={onExpandDir}
           onMoveFile={onMoveFile}
           onUploadFile={onUploadFile}
+          refreshSignal={refreshSignal}
         />
       ))}
     </div>
@@ -172,6 +180,7 @@ interface FileTreeItemProps {
   node: FileTreeNode;
   depth: number;
   selectedFile: string | null;
+  contextMenuPath?: string | null;
   onSelectFile: (path: string) => void;
   onContextMenu?: (e: React.MouseEvent, path: string, isDir: boolean) => void;
   creatingPath?: { type: 'file' | 'directory'; parentPath: string; depth: number } | null;
@@ -181,12 +190,14 @@ interface FileTreeItemProps {
   onExpandDir?: (path: string) => Promise<DirEntry[]>;
   onMoveFile?: (source: string, destination: string) => void;
   onUploadFile?: (parentPath: string, file: File) => void;
+  refreshSignal?: number;
 }
 
 function FileTreeItem({
   node,
   depth,
   selectedFile,
+  contextMenuPath,
   onSelectFile,
   onContextMenu,
   creatingPath,
@@ -196,6 +207,7 @@ function FileTreeItem({
   onExpandDir,
   onMoveFile,
   onUploadFile,
+  refreshSignal,
 }: FileTreeItemProps) {
   // Lazy mode: always start collapsed (load on first click).
   // Static mode: auto-expand root level (depth < 1).
@@ -205,50 +217,71 @@ function FileTreeItem({
   const [expandError, setExpandError] = useState<string | null>(null);
   const loadedRef = useRef(false);
   const isSelected = !node.isDir && selectedFile === node.path;
+  const isContextTarget = contextMenuPath === node.path;
   const [isDragOver, setIsDragOver] = useState(false);
 
+
+  // Fetch (or re-fetch) this directory's children. Returns false on failure.
+  const loadChildren = useCallback(async (): Promise<boolean> => {
+    if (!onExpandDir) return false;
+    setLoading(true);
+    try {
+      const entries = await onExpandDir(node.path);
+      loadedRef.current = true;
+      const childNodes: FileTreeNode[] = entries
+        .sort((a, b) => {
+          if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+          const aName = a.path.split('/').pop() || a.path;
+          const bName = b.path.split('/').pop() || b.path;
+          return aName.localeCompare(bName);
+        })
+        .map(e => {
+          const name = e.path.split('/').pop() || e.path;
+          return {
+            name,
+            path: e.path,
+            isDir: e.is_dir,
+            children: e.is_dir ? [] : undefined,
+          };
+        });
+      setChildren(childNodes);
+      setExpandError(null);
+      setLoading(false);
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isForbidden = msg.includes('403') || msg.toLowerCase().includes('forbidden');
+      setExpandError(isForbidden ? 'Symlink folders cannot be expanded' : 'Failed to load folder');
+      setLoading(false);
+      return false;
+    }
+  }, [node.path, onExpandDir]);
 
   const handleClick = useCallback(async () => {
     if (node.isDir) {
       // Once a symlink/forbidden error is set, treat the folder as non-expandable
       if (expandError) return;
       if (!expanded && onExpandDir && !loadedRef.current) {
-        setLoading(true);
-        let failed = false;
-        try {
-          const entries = await onExpandDir(node.path);
-          loadedRef.current = true;
-          const childNodes: FileTreeNode[] = entries
-            .sort((a, b) => {
-              if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
-              const aName = a.path.split('/').pop() || a.path;
-              const bName = b.path.split('/').pop() || b.path;
-              return aName.localeCompare(bName);
-            })
-            .map(e => {
-              const name = e.path.split('/').pop() || e.path;
-              return {
-                name,
-                path: e.path,
-                isDir: e.is_dir,
-                children: e.is_dir ? [] : undefined,
-              };
-            });
-          setChildren(childNodes);
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          const isForbidden = msg.includes('403') || msg.toLowerCase().includes('forbidden');
-          setExpandError(isForbidden ? 'Symlink folders cannot be expanded' : 'Failed to load folder');
-          failed = true;
-        }
-        setLoading(false);
-        if (failed) return;
+        const ok = await loadChildren();
+        if (!ok) return;
       }
       setExpanded((prev) => !prev);
     } else {
       onSelectFile(node.path);
     }
-  }, [node, onSelectFile, onExpandDir, expanded, expandError]);
+  }, [node, onSelectFile, onExpandDir, expanded, expandError, loadChildren]);
+
+  // On a refresh signal, re-fetch children for directories that are currently
+  // expanded and already loaded — keeps the tree's expansion state intact
+  // instead of remounting and collapsing everything.
+  const prevRefreshSignal = useRef(refreshSignal);
+  useEffect(() => {
+    if (prevRefreshSignal.current === refreshSignal) return;
+    prevRefreshSignal.current = refreshSignal;
+    if (expanded && loadedRef.current && onExpandDir && !expandError) {
+      void loadChildren();
+    }
+  }, [refreshSignal, expanded, onExpandDir, expandError, loadChildren]);
 
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -345,6 +378,7 @@ function FileTreeItem({
           flex items-center gap-1 w-full text-left px-2 py-0.5 hover:bg-[var(--color-bg-tertiary)] transition-all duration-150 relative
           ${isSelected ? "bg-[var(--color-highlight)]/15 text-[var(--color-highlight)]" : "text-[var(--color-text)] opacity-80 hover:opacity-100"}
           ${isDragOver ? "bg-[var(--color-highlight)]/10 border-l-2 border-[var(--color-highlight)] text-[var(--color-highlight)] pl-3" : ""}
+          ${isContextTarget && !isSelected ? "bg-[var(--color-highlight)]/10 ring-1 ring-inset ring-[var(--color-highlight)]/40" : ""}
         `}
         style={{ paddingLeft: `${depth * 16 + 8}px` }}
         draggable={true}
@@ -399,6 +433,7 @@ function FileTreeItem({
               node={child}
               depth={depth + 1}
               selectedFile={selectedFile}
+              contextMenuPath={contextMenuPath}
               onSelectFile={onSelectFile}
               onContextMenu={onContextMenu}
               creatingPath={creatingPath}
@@ -408,6 +443,7 @@ function FileTreeItem({
               onExpandDir={onExpandDir}
               onMoveFile={onMoveFile}
               onUploadFile={onUploadFile}
+              refreshSignal={refreshSignal}
             />
           ))}
         </>

@@ -4,12 +4,12 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
   Download, Trash2, Eye,
   Loader2, Upload, MoreHorizontal, FolderOpen, RefreshCw, ArrowUpFromLine,
-  Link as LinkIcon, Edit3, Plus,
+  Link as LinkIcon, Edit3, Plus, SquareArrowOutUpRight,
 } from "lucide-react";
 import type { Task } from "../../../../data/types";
 import {
   listArtifacts, previewArtifact, artifactDownloadUrl, deleteArtifact,
-  uploadArtifacts, createArtifactLink, updateArtifactLink, syncArtifactToResource, listArtifactWorkdirs, addArtifactWorkdir, deleteArtifactWorkdir, openArtifactWorkdir,
+  uploadArtifacts, createArtifactLink, updateArtifactLink, syncArtifactToResource, listArtifactWorkdirs, addArtifactWorkdir, deleteArtifactWorkdir, openArtifactWorkdir, openArtifactFile,
   listResources,
   type ArtifactFile, type ArtifactWorkDirectoryEntry, type DisplayItem,
 } from "../../../../api";
@@ -73,7 +73,7 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
     existingNames: Set<string>;
   } | null>(null);
 
-  const [previewFile, setPreviewFile] = useState<{ file: ArtifactFile; content: string } | null>(null);
+  const [previewFile, setPreviewFile] = useState<{ file: ArtifactFile; content: string; downloadUrl?: string } | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
 
   const [isUploading, setIsUploading] = useState(false);
@@ -106,7 +106,11 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
   const [previewError, setPreviewError] = useState<string | null>(null);
 
   const refreshPreviewContent = useCallback((file: ArtifactFile, seq: number) => {
-    if (!projectId || getPreviewType(file.name) === "image") return;
+    if (!projectId) return;
+    const t = getPreviewType(file.name);
+    // Image previews use the URL as <img src>; binary previews fetch their
+    // own bytes — neither can be re-polled via the text endpoint.
+    if (t === "image" || t === "binary") return;
     previewArtifact(projectId, task.id, file.directory, file.path)
       .then((content) => {
         if (seq !== liveRefreshSeqRef.current) return;
@@ -255,10 +259,20 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
 
   const handlePreview = useCallback(async (file: ArtifactFile, force?: boolean) => {
     if (!projectId || file.is_dir) return;
-    if (getPreviewType(file.name) === "image") {
+    const previewType = getPreviewType(file.name);
+    if (previewType === "image") {
       const url = artifactDownloadUrl(projectId, task.id, file.directory, file.path);
       setPreviewFile({ file, content: url });
       lastGoodContentRef.current = url;
+      setPreviewError(null);
+      return;
+    }
+    if (previewType === "binary") {
+      // Renderer fetches the URL itself (e.g. xlsx via SheetJS). We just
+      // hand it the download URL; content is unused.
+      const url = artifactDownloadUrl(projectId, task.id, file.directory, file.path);
+      setPreviewFile({ file, content: "", downloadUrl: url });
+      lastGoodContentRef.current = "";
       setPreviewError(null);
       return;
     }
@@ -411,6 +425,11 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
     );
   }, [projectId, task.id]);
 
+  const handleOpenInApp = useCallback((file: ArtifactFile) => {
+    if (!projectId || file.is_dir) return;
+    void openArtifactFile(projectId, task.id, file.directory, file.path);
+  }, [projectId, task.id]);
+
   const handleCreatePreviewComment = useCallback((file: ArtifactFile, locator: PreviewCommentLocator, comment: string, rendererId: string) => {
     if (!projectId) return;
     addDraft({
@@ -538,9 +557,10 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
     setError(err instanceof Error ? err.message : "Sync failed");
   }, [projectId, task.id]);
 
-  const handleOpenFolder = (dir: string) => {
+  const handleOpenFolder = (dir: string, subpath?: string) => {
     if (!projectId) return;
-    apiClient.post(`/api/v1/projects/${projectId}/tasks/${task.id}/open-folder?dir=${encodeURIComponent(dir)}&path=.`).catch(() => {});
+    const pathQuery = subpath ? encodeURIComponent(subpath) : ".";
+    apiClient.post(`/api/v1/projects/${projectId}/tasks/${task.id}/open-folder?dir=${encodeURIComponent(dir)}&path=${pathQuery}`).catch(() => {});
   };
 
   useEffect(() => {
@@ -635,6 +655,7 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
           <FilePreviewDrawer
             fileName={previewFile.file.name}
             content={previewFile.content}
+            downloadUrl={previewFile.downloadUrl}
             loading={previewLoading}
             error={previewError}
             isLive={!!isChatBusy}
@@ -755,7 +776,7 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
                 ) : (
                   <FileCard key={`f-${item.data.directory}/${item.data.path}`} file={item.data} projectId={projectId} taskId={task.id}
                     onPreview={handlePreview} onDownload={handleDownload} onDelete={handleDelete} allowDelete
-                    onSyncToResource={handleSyncToResource} onOpenLink={handleOpenLink} onEditLink={handleEditLink} />
+                    onSyncToResource={handleSyncToResource} onOpenLink={handleOpenLink} onEditLink={handleEditLink} onOpenInApp={handleOpenInApp} />
                 )
               )
             )}
@@ -787,7 +808,7 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
             count={outputFileCount}
             isOpen={downloadsOpen}
             onToggle={() => setDownloadsOpen(!downloadsOpen)}
-            onOpenFolder={() => handleOpenFolder("output")}
+            onOpenFolder={() => handleOpenFolder("output", currentOutputPath)}
           />
           <div className="overflow-y-auto px-3 pb-3" style={{
             flex: downloadsOpen ? "1 1 0%" : "0 0 0px",
@@ -834,8 +855,9 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
                 />
               ) : (
                 <FileCard key={entry.path} file={entry} projectId={projectId} taskId={task.id}
+                  viewPath={currentOutputPath}
                   onPreview={handlePreview} onDownload={handleDownload}
-                  onSyncToResource={handleSyncToResource} onOpenLink={handleOpenLink} onEditLink={handleEditLink} />
+                  onSyncToResource={handleSyncToResource} onOpenLink={handleOpenLink} onEditLink={handleEditLink} onOpenInApp={handleOpenInApp} />
               )
             ))}
             {outputFileCount === 0 && (
@@ -1146,20 +1168,26 @@ function FolderEntryRow({
 /* ─── FileCard ─── */
 
 function FileCard({
-  file, projectId, taskId, onPreview, onDownload, onDelete, allowDelete, onSyncToResource, onOpenLink, onEditLink,
+  file, projectId, taskId, viewPath = "", onPreview, onDownload, onDelete, allowDelete, onSyncToResource, onOpenLink, onEditLink, onOpenInApp,
 }: {
   file: ArtifactFile; projectId?: string; taskId: string;
+  viewPath?: string;
   onPreview: (f: ArtifactFile) => void; onDownload: (f: ArtifactFile) => void;
   onDelete?: (f: ArtifactFile) => void; allowDelete?: boolean;
   onSyncToResource?: (f: ArtifactFile) => void;
   onOpenLink?: (f: ArtifactFile) => void;
   onEditLink?: (f: ArtifactFile) => void;
+  onOpenInApp?: (f: ArtifactFile) => void;
 }) {
   const isLink = isLinkFile(file.name);
   const canPreview = !isLink && canPreviewFile(file.name);
   const ext = getExtBadge(file.name);
   const isImage = !isLink && getPreviewType(file.name) === "image";
-  const displayName = isLink ? linkDisplayName(file.name) : (file.path.includes("/") ? file.path : file.name);
+  const displayName = isLink
+    ? linkDisplayName(file.name)
+    : viewPath && file.path.startsWith(viewPath + "/")
+      ? file.path.slice(viewPath.length + 1)
+      : file.name;
   const [showMenu, setShowMenu] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
@@ -1284,6 +1312,14 @@ function FileCard({
               onMouseEnter={e => e.currentTarget.style.background = "var(--color-bg-secondary)"}
               onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
               <Download className="w-3.5 h-3.5" /> Download
+            </button>
+          )}
+          {!isLink && onOpenInApp && (
+            <button onClick={(e) => { e.stopPropagation(); setShowMenu(false); onOpenInApp(file); }}
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors"
+              onMouseEnter={e => e.currentTarget.style.background = "var(--color-bg-secondary)"}
+              onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+              <SquareArrowOutUpRight className="w-3.5 h-3.5" /> Open
             </button>
           )}
           {onSyncToResource && (

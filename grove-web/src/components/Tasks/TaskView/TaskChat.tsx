@@ -79,6 +79,7 @@ import type { AskFormDefinition } from "./formPillTypes";
 import {
   agentIconComponent,
   agentIconUrl,
+  resolveAgentIcon,
   usePersonaRegistry,
 } from "../../../utils/agentIcon";
 import type { MentionItem, FilteredMentionItem } from "../../../utils/fileMention";
@@ -129,7 +130,9 @@ import {
 import type { ChatSessionResponse, CustomAgentServer } from "../../../api";
 import { listProjects, getProject, listResources, type ProjectListItem } from "../../../api/projects";
 import { openExternalUrl } from "../../../utils/openExternal";
-import { useCommand, useContextKey } from "../../../keyboard";
+import { ansiToHtml, stripAnsi } from "../../../utils/ansi";
+import { fuzzyFindByName } from "../../../utils/fuzzySearch";
+import { useCommand, useContextKey, useVoiceControlContext } from "../../../keyboard";
 import "./task-chat.css";
 
 // ─── Chat draft persistence (localStorage) ────────────────────────────────
@@ -1688,6 +1691,21 @@ export function TaskChat({
     setActiveChatId,
   } = useActiveChatId(pinnedChatId ?? null);
   useReportDebugId("chatId", activeChatId);
+
+  // Voice control context contribution for active chat sessions
+  useVoiceControlContext("active_chat", () => {
+    return {
+      selectedSessionId: activeChatId,
+      sessions: chats.map((c, idx) => ({
+        index: idx + 1,
+        id: c.id,
+        title: c.title,
+        agent: c.agent,
+        createdAt: c.created_at,
+        isSelected: activeChatId === c.id,
+      })),
+    };
+  });
   const [showChatMenu, setShowChatMenu] = useState(false);
   const [editingTitle, setEditingTitle] = useState<{
     chatId: string;
@@ -1716,6 +1734,54 @@ export function TaskChat({
       return window.localStorage.getItem(sessionModeStorageKey) !== "sidebar";
     },
   );
+
+  const DEFAULT_SESSION_RAIL_WIDTH = 228;
+  const MIN_SESSION_RAIL_WIDTH = 180;
+  const MAX_SESSION_RAIL_WIDTH = 450;
+
+  const [sessionRailWidth, setSessionRailWidth] = useState<number>(() => {
+    if (typeof window === "undefined") return DEFAULT_SESSION_RAIL_WIDTH;
+    try {
+      const saved = window.localStorage.getItem(`taskchat:session-rail-width:${projectId}`);
+      if (saved) {
+        const parsed = parseInt(saved, 10);
+        if (!isNaN(parsed) && parsed >= MIN_SESSION_RAIL_WIDTH && parsed <= MAX_SESSION_RAIL_WIDTH) {
+          return parsed;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return DEFAULT_SESSION_RAIL_WIDTH;
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(`taskchat:session-rail-width:${projectId}`, sessionRailWidth.toString());
+    } catch {
+      // ignore
+    }
+  }, [sessionRailWidth, projectId]);
+
+  const startSessionRailResize = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = sessionRailWidth;
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      const nextWidth = startWidth + (moveEvent.clientX - startX);
+      setSessionRailWidth(Math.max(MIN_SESSION_RAIL_WIDTH, Math.min(MAX_SESSION_RAIL_WIDTH, nextWidth)));
+    };
+    const handlePointerUp = () => {
+      document.body.classList.remove("grove-resizing");
+      document.removeEventListener("pointermove", handlePointerMove);
+      document.removeEventListener("pointerup", handlePointerUp);
+    };
+    document.body.classList.add("grove-resizing");
+    document.addEventListener("pointermove", handlePointerMove);
+    document.addEventListener("pointerup", handlePointerUp);
+  }, [sessionRailWidth]);
 
   // Per-chat state cache (preserved across chat switches)
   const perChatStateRef = useRef<Map<string, PerChatState>>(new Map());
@@ -2475,7 +2541,7 @@ export function TaskChat({
   // the chat-create flow isn't blank during the first fetch.
   const acpAgentOptions = useMemo(() => {
     if (!acpAvailabilityLoaded) {
-      return agentOptions.filter((opt) => opt.acpCheck);
+      return agentOptions;
     }
     return baseAgents
       .filter((base) => base.available)
@@ -2536,28 +2602,29 @@ export function TaskChat({
   // Resolve agent label and icon from active chat's agent
   useEffect(() => {
     const resolve = (cmd: string, customAgents?: CustomAgentServer[]) => {
-      const match = agentOptions.find((a) => a.value === cmd);
-      if (match) {
-        setAgentLabel(match.label);
-        if (match.icon) setAgentIcon(() => match.icon!);
-        return;
-      }
       // Check Custom Agents (personas) first — their id starts with "ca-"
+      // Persona has its own display name; icon falls through to the base.
       const persona = customAgentPersonas.find((p) => p.id === cmd);
       if (persona) {
         setAgentLabel(persona.name);
-        // Icon falls through to whatever the base agent's icon is. Look it up.
-        const base = agentOptions.find((a) => a.id === persona.base_agent);
-        if (base?.icon) setAgentIcon(() => base.icon!);
+        const baseInfo = resolveAgentIcon(persona.base_agent);
+        setAgentIcon(() => baseInfo.Component);
         return;
       }
       // Custom Agent Servers
       const custom = customAgents?.find((a) => a.id === cmd);
       if (custom) {
         setAgentLabel(custom.name);
-      } else {
-        setAgentLabel(cmd);
+        return;
       }
+      // Fall back to the unified icon util — handles every alias the
+      // bundled brand catalog knows (traex → Trae label/icon,
+      // claude-acp → Claude Code, etc.) AND the marketplace CDN map.
+      // resolveAgentIcon returns `cmd` itself as label only when truly
+      // unknown, matching the old "show raw id as fallback" behaviour.
+      const info = resolveAgentIcon(cmd);
+      setAgentLabel(info.label || cmd);
+      setAgentIcon(() => info.Component);
     };
 
     if (activeChat) {
@@ -2568,9 +2635,9 @@ export function TaskChat({
     } else {
       getConfig()
         .then((cfg) =>
-          resolve(cfg.layout.agent_command || "claude", cfg.acp?.custom_agents),
+          resolve(cfg.layout.agent_command || "", cfg.acp?.custom_agents),
         )
-        .catch(() => resolve("claude"));
+        .catch(() => resolve(""));
     }
   }, [activeChat, customAgentPersonas]);
 
@@ -3165,6 +3232,37 @@ export function TaskChat({
     setActiveChatId,
     pinnedChatId,
   });
+
+  // Restore the composer draft on initial mount.
+  //
+  // `useInitialChatLoad` sets `activeChatId` directly, NOT through
+  // `switchChat`/`restoreChatState` — and `restoreChatState` is the only path
+  // that reads `loadChatDraft` back into the editor. So a freshly mounted
+  // TaskChat never restored its draft: it survived chat switches *within* a
+  // task (in-memory `perChatStateRef`) but vanished whenever the component
+  // remounted — switching task, or a page reload — where only localStorage is
+  // left. This one-shot effect closes that gap.
+  //
+  // Strictly one-shot: every later `activeChatId` change goes through
+  // `switchChat → restoreChatState`, which owns draft restoration and may
+  // intentionally restore an *empty* draft (user cleared it on a tab switch).
+  // Re-running here would resurrect a cleared draft — exactly what the
+  // restoreChatState comment warns against.
+  const didInitialDraftRestoreRef = useRef(false);
+  useEffect(() => {
+    if (didInitialDraftRestoreRef.current || !activeChatId) return;
+    didInitialDraftRestoreRef.current = true;
+    const el = editableRef.current;
+    if (!el) return;
+    // Never clobber content the user already typed while the chat connected.
+    const hasChips = el.querySelector("[data-command],[data-file]") !== null;
+    if ((el.textContent?.trim().length ?? 0) > 0 || hasChips) return;
+    const draftHtml = loadChatDraft(activeChatId);
+    if (!draftHtml) return;
+    el.innerHTML = draftHtml;
+    const text = el.textContent?.trim() || "";
+    setHasContent(text.length > 0 || el.querySelector("[data-command],[data-file]") !== null);
+  }, [activeChatId]);
 
   // Forward-declared ref for connectChatWs so handlers defined before its
   // useCallback (e.g. the ChatListChanged refetch handler) can call it
@@ -4067,7 +4165,15 @@ export function TaskChat({
           }
           break;
         case "error": {
-          const isStalePermission = msg.message?.includes("No pending permission");
+          const msgText = msg.message ?? "";
+          // The backend surfaces a stale permission click in two flavors —
+          // `respond_permission` returning false ("No pending permission
+          // request") and the live-id mismatch ("Permission request X is no
+          // longer pending"). Both mean the panel we're rendering is gone
+          // server-side; collapse it locally so the user isn't stuck.
+          const isStalePermission =
+            msgText.includes("No pending permission") ||
+            msgText.includes("is no longer pending");
           if (isStalePermission) {
             // The permission we tried to respond to no longer exists on the backend.
             // Resolve all unresolved permissions as cancelled so the UI unblocks.
@@ -4518,11 +4624,10 @@ export function TaskChat({
   );
 
   // Listen for the two agent-related catalog dispatches:
-  //   agent.new.default    → spawn a session with whatever agent the
-  //                          user has flagged as default. TODO: read
-  //                          from a user-preference store; for now we
-  //                          fall back to the last session's agent and
-  //                          ultimately "claude".
+  //   agent.new.default    → spawn a session with the agent used by the
+  //                          most recent chat. No prior chat → open the
+  //                          picker so the user chooses, rather than
+  //                          guessing a hardcoded fallback.
   //   agent.picker.show    → just open the picker, user chooses.
   useEffect(() => {
     const onDefault = () => {
@@ -5033,6 +5138,9 @@ export function TaskChat({
     // Guard activeChatId before consuming any UI state — if we return after
     // clearing the editable, the user's typed message is silently lost.
     if (!activeChatId) return;
+    // Same reason for the connecting phase: input is editable so users can
+    // pre-compose, but the session has nowhere to receive the prompt yet.
+    if (!isConnected) return;
     const prompt = getPromptFromEditable(el);
 
     // Terminal launch mode: chatbox forwards the typed text + any attachment
@@ -5121,12 +5229,19 @@ export function TaskChat({
       return;
     }
 
-    if (
-      (!prompt && attachments.length === 0) ||
-      !wsRef.current ||
-      wsRef.current.readyState !== WebSocket.OPEN
-    )
+    if (!prompt && attachments.length === 0) return;
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      // Not connected yet — keep the draft, surface a hint so the user
+      // doesn't think their Enter was eaten. appendSystemMessage dedupes
+      // repeated presses of the same message.
+      setMessages((prev) =>
+        appendSystemMessage(
+          prev,
+          "Waiting for the agent to connect. Your message will be sent once the session is ready — try again in a moment.",
+        ),
+      );
       return;
+    }
 
     // Shell mode → send terminal_execute directly (bypasses AI)
     if (isTerminalMode) {
@@ -5267,7 +5382,7 @@ export function TaskChat({
       onUserMessageSent?.();
       el.focus();
     }
-  }, [isTerminalMode, isBusy, attachments, activeChatId, projectId, task.id, enableAutoStickToBottom, onUserMessageSent, buildPromptConfig, isTerminalLaunchMode, agentPtyWsUrl]);
+  }, [isTerminalMode, isBusy, attachments, activeChatId, isConnected, projectId, task.id, enableAutoStickToBottom, onUserMessageSent, buildPromptConfig, isTerminalLaunchMode, agentPtyWsUrl]);
 
   const sendPreviewComments = useCallback((comments: PreviewCommentDraft[]) => {
     if (
@@ -5535,6 +5650,30 @@ export function TaskChat({
   }, [activeChatId, switchChat]);
   useCommand("agent.switch.next", () => cycleChat(1), [cycleChat]);
   useCommand("agent.switch.previous", () => cycleChat(-1), [cycleChat]);
+  useCommand(
+    "chat.switchSession",
+    (args?: unknown) => {
+      const typedArgs = args as { sessionId?: string; sessionTitle?: string; sessionIndex?: number } | undefined;
+      if (typedArgs?.sessionId) {
+        void switchChat(typedArgs.sessionId);
+      } else if (typedArgs?.sessionIndex !== undefined) {
+        const idx = typedArgs.sessionIndex - 1;
+        if (idx >= 0 && idx < chatsRef.current.length) {
+          void switchChat(chatsRef.current[idx].id);
+        }
+      } else if (typedArgs?.sessionTitle) {
+        const found = fuzzyFindByName(
+          chatsRef.current.filter((c) => !!c.title),
+          (c) => c.title!,
+          typedArgs.sessionTitle
+        );
+        if (found) {
+          void switchChat(found.id);
+        }
+      }
+    },
+    [switchChat],
+  );
 
   /** Submit an ask_form response as a regular user prompt. Mirrors the queue /
    *  prompt branch in onSendPrompt — busy session gets queued, idle session
@@ -6215,7 +6354,7 @@ export function TaskChat({
       // Large text: convert to .txt attachment to avoid freezing contentEditable
       if (text.length > 10 * 1024) {
         const blob = new Blob([text], { type: "text/plain" });
-        const file = new File([blob], "pasted-text.txt", { type: "text/plain" });
+        const file = new File([blob], `pasted-text-${Date.now()}.txt`, { type: "text/plain" });
         void addFileAsAttachment(file);
         return;
       }
@@ -6754,17 +6893,46 @@ export function TaskChat({
   // `messages` array reference doesn't change, so Virtuoso's
   // followOutput never fires. We watch totalListHeightChanged
   // (which DOES fire when the streaming row grows) and re-anchor to
-  // bottom while auto-stick is on. Use behavior: "auto" to prevent
-  // blank viewport rendering glitches during rapid streaming.
+  // bottom. Use behavior: "auto" to prevent blank viewport rendering
+  // glitches during rapid streaming.
+  //
+  // Auto-stick behavior: once the user scrolls up to read history we
+  // leave them alone, BUT if a brand-new row is appended (a new tool
+  // section, a new thought chunk) and the user is still within a
+  // reasonable "tail" window of the list, we re-arm auto-stick. This
+  // matches the user's mental model — "I was watching the agent, a new
+  // tool ran, take me back to the bottom so I see what it did" — without
+  // yanking them away while they're actively reading earlier content.
   const handleTotalListHeightChanged = useCallback(() => {
-    if (!autoStickToBottomRef.current) return;
     if (isUserScrollingRef.current) return;
+    if (autoStickToBottomRef.current) {
+      virtuosoRef.current?.scrollToIndex({
+        index: "LAST",
+        align: "end",
+        behavior: "auto",
+      });
+      return;
+    }
+    // Re-arm only makes sense when a running agent APPENDS a brand-new row.
+    // While idle no rows are appended, so a height change here is purely
+    // Virtuoso re-measuring existing rows — and re-arming + scrollToIndex
+    // would self-excite (scroll -> new rows enter viewport -> heights
+    // re-measured -> height changes -> scroll again ...), which the user
+    // sees as constant flicker when stopped near, but not at, the bottom.
+    if (!isBusy) return;
+    const viewport = messagesViewportRef.current;
+    if (!viewport) return;
+    // Within ~30px of the bottom counts as "still in the tail".
+    const distanceFromBottom =
+      viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+    if (distanceFromBottom > 30) return;
+    autoStickToBottomRef.current = true;
     virtuosoRef.current?.scrollToIndex({
       index: "LAST",
       align: "end",
       behavior: "auto",
     });
-  }, []);
+  }, [isBusy]);
 
   // Track the message index where the current busy turn started
   const turnStartIndexRef = useRef(0);
@@ -7051,7 +7219,8 @@ export function TaskChat({
 
       <div className="flex min-h-0 flex-1">
         <div
-          className={`shrink-0 border-r border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_20%,transparent)] transition-all duration-200 ${sessionRailCollapsed ? "w-0 overflow-hidden border-r-transparent" : "w-[228px] overflow-hidden"}`}
+          className={`taskchat-session-rail shrink-0 border-r border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_20%,transparent)] transition-all duration-200 ${sessionRailCollapsed ? "w-0 overflow-hidden border-r-transparent" : "overflow-hidden"}`}
+          style={{ width: sessionRailCollapsed ? 0 : sessionRailWidth }}
         >
           <div className="flex h-full flex-col">
             <div className="border-b border-[color-mix(in_srgb,var(--color-border)_68%,transparent)] p-2 space-y-1.5">
@@ -7227,6 +7396,18 @@ export function TaskChat({
             </div>
           </div>
         </div>
+
+        {/* Drag handle */}
+        {!sessionRailCollapsed && (
+          <div
+            className="diff-resizer"
+            onPointerDown={startSessionRailResize}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize session sidebar"
+            title="Drag to resize"
+          />
+        )}
 
         <div className="relative min-h-0 min-w-0 flex-1">
           {/* Terminal launch mode: agent CLI runs in xterm.js (PTY).
@@ -8087,9 +8268,7 @@ export function TaskChat({
                     <div
                       ref={editableRef}
                       contentEditable={
-                        isConnected &&
-                        !isRemoteSession &&
-                        !activePermissionMessage
+                        !isRemoteSession && !activePermissionMessage
                       }
                       suppressContentEditableWarning
                       onInput={handleInput}
@@ -8111,7 +8290,7 @@ export function TaskChat({
                         isInputExpanded
                           ? "min-h-[32vh] max-h-[56vh]"
                           : "min-h-[56px] max-h-32"
-                      } ${!isConnected || isRemoteSession || activePermissionMessage ? "opacity-50 cursor-not-allowed" : ""} ${
+                      } ${isRemoteSession || activePermissionMessage ? "opacity-50 cursor-not-allowed" : ""} ${
                         isTerminalMode ? "font-mono" : ""
                       }`}
                       style={{
@@ -8518,6 +8697,56 @@ function UserMessageBody({ content }: { content: string }) {
   return <>{nodes}</>;
 }
 
+/**
+ * Renders the body of a "thinking" message.
+ *
+ * Layout decision: while the agent is still streaming, we let the chunk
+ * grow with the typewriter text instead of capping it at a fixed height.
+ * That way the surrounding Virtuoso row grows, `totalListHeightChanged`
+ * fires, and the outer chat viewport auto-anchors to the bottom — the
+ * user always sees the latest text being generated. (A 160px cap during
+ * streaming would push the latest text behind a tiny inner scrollbar
+ * the user has to chase by hand.)
+ *
+ * Once the message is complete, the cap kicks in so a long thought
+ * doesn't dominate the chat forever. We pin the inner scroll to the
+ * bottom on mount so the final sentence of the reasoning is visible
+ * (the most useful bit — the earlier paragraphs are reasoning history).
+ */
+function ThoughtChunkBody({
+  content,
+  complete,
+}: {
+  content: string;
+  collapsed: boolean;
+  complete: boolean;
+}) {
+  const innerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!complete) return;
+    const el = innerRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [complete, content]);
+  if (!complete) {
+    return (
+      <div className="ml-5 rounded-lg bg-[var(--color-bg-tertiary)] text-xs text-[var(--color-text-muted)] italic">
+        <div className="px-3 py-2 whitespace-pre-wrap">{content}</div>
+      </div>
+    );
+  }
+  return (
+    <div className="ml-5 rounded-lg bg-[var(--color-bg-tertiary)] text-xs text-[var(--color-text-muted)] italic overflow-hidden">
+      <div
+        ref={innerRef}
+        className="thought-chunk-scroll px-3 py-2 whitespace-pre-wrap max-h-40 overflow-y-auto"
+      >
+        {content}
+      </div>
+    </div>
+  );
+}
+
 /** Individual message rendering */
 const MessageItem = memo(function MessageItem({
   message,
@@ -8721,7 +8950,7 @@ const MessageItem = memo(function MessageItem({
       if (!shown.trim()) return null;
       return (
         <div className="flex justify-start">
-          <div className="max-w-[82%] min-w-0 text-sm text-[var(--color-text)]">
+          <div className="w-full min-w-0 text-sm text-[var(--color-text)]">
             <MarkdownRenderer
               content={shown}
               onFileClick={onFileClick}
@@ -8751,7 +8980,7 @@ const MessageItem = memo(function MessageItem({
     case "thinking":
       return (
         <div className="flex justify-start" data-grove-search-skip="true">
-          <div className="max-w-[82%] w-full">
+          <div className="w-full min-w-0">
             <button
               onClick={() => onToggleThinkingCollapse(index)}
               className="flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors mb-1"
@@ -8767,9 +8996,12 @@ const MessageItem = memo(function MessageItem({
               </span>
             </button>
             {!message.collapsed && (
-              <div className="ml-5 rounded-lg px-3 py-2 bg-[var(--color-bg-tertiary)] text-xs text-[var(--color-text-muted)] italic whitespace-pre-wrap max-h-40 overflow-y-auto">
-                {message.complete ? message.content : streamDisplay}
-              </div>
+              <ThoughtChunkBody
+                key={`tc-${index}-${message.complete ? "done" : "stream"}`}
+                content={message.complete ? message.content : streamDisplay}
+                collapsed={false}
+                complete={message.complete}
+              />
             )}
           </div>
         </div>
@@ -8802,7 +9034,7 @@ const MessageItem = memo(function MessageItem({
     case "terminal_output": {
       const hasExited = message.exitCode !== undefined;
       const isError = hasExited && message.exitCode !== 0;
-      const output = message.chunks.join("");
+      const output = ansiToHtml(message.chunks.join(""));
       return (
         <div className="flex justify-start">
           <div className="max-w-[90%] w-full">
@@ -8814,9 +9046,10 @@ const MessageItem = memo(function MessageItem({
               } bg-[var(--color-bg-secondary)]`}
             >
               {output && (
-                <pre className="px-3 py-2 text-[12px] font-mono text-[var(--color-text-secondary)] whitespace-pre-wrap overflow-x-auto max-h-[300px] overflow-y-auto">
-                  {output}
-                </pre>
+                <pre
+                  className="px-3 py-2 text-[12px] font-mono text-[var(--color-text-secondary)] whitespace-pre-wrap overflow-x-auto max-h-[300px] overflow-y-auto"
+                  dangerouslySetInnerHTML={{ __html: output }}
+                />
               )}
               {hasExited && (
                 <div
@@ -9135,15 +9368,32 @@ function extractActionChipLabel(
   switch (kind) {
     case "bash":
     case "bash_output": {
-      // Content typically starts with the command or its output.
+      // 1. Try to extract command from rawInput first if available.
+      if (message.rawInput) {
+        if (typeof message.rawInput === "string") {
+          const firstCmd = firstNonEmptyLine(message.rawInput);
+          if (firstCmd) return firstCmd;
+        } else if (typeof message.rawInput === "object" && message.rawInput !== null) {
+          const obj = message.rawInput as Record<string, unknown>;
+          if (typeof obj.command === "string") {
+            const firstCmd = firstNonEmptyLine(obj.command);
+            if (firstCmd) return firstCmd;
+          }
+        }
+      }
+
+      // 2. Fallback to content typically starts with the command or its output.
       // If it looks like a shell command (starts with a letter and no obvious
       // error/usage prefix), surface its first line. Otherwise fall back to
       // the tool title so we at least say "bash".
       const first = firstNonEmptyLine(content);
       if (!first) return extractRawActionLabel(message);
-      // Heuristic: if first line starts with a known error/usage marker, it's
-      // output not the command — fall back to title so we don't mislabel.
-      if (/^(error|usage|traceback|panic|command not found)/i.test(first)) {
+      // Heuristic: if first line starts with a known error/usage marker, or doesn't look like a command
+      // (e.g., starts with JSON opening curly/bracket), fall back to title so we don't mislabel.
+      if (
+        /^(error|usage|traceback|panic|command not found)/i.test(first) ||
+        /^[{[]/.test(first)
+      ) {
         return extractRawActionLabel(message);
       }
       return first;
@@ -9518,7 +9768,7 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
     return {
       key: tool.message.id,
       kind,
-      label: truncateChipLabel(derived),
+      label: truncateChipLabel(stripAnsi(derived)),
       rawTitle: tool.message.title,
       content: tool.message.content ?? "",
       locations: tool.message.locations ?? [],
@@ -9812,9 +10062,12 @@ function ActionChipList({
                 className="rounded-lg border border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_58%,transparent)] px-3 py-2"
               >
                 <div className="flex items-center gap-2 mb-1.5">
-                  <span className="text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
-                    {item.rawTitle || "action"}
-                  </span>
+                  <span
+                    className="text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]"
+                    dangerouslySetInnerHTML={{
+                      __html: ansiToHtml(item.rawTitle) || "action",
+                    }}
+                  />
                   <button
                     type="button"
                     onClick={(e) => {
@@ -9833,9 +10086,12 @@ function ActionChipList({
                       <MarkdownRenderer content={item.content} />
                     </div>
                   ) : (
-                    <pre className="text-[11px] leading-[1.45] font-mono whitespace-pre-wrap break-all text-[var(--color-text)] m-0">
-                      {item.content || "(no output)"}
-                    </pre>
+                    <pre
+                      className="text-[11px] leading-[1.45] font-mono whitespace-pre-wrap break-all text-[var(--color-text)] m-0"
+                      dangerouslySetInnerHTML={{
+                        __html: ansiToHtml(item.content) || "(no output)",
+                      }}
+                    />
                   );
                   return (
                     <div className="space-y-2">

@@ -1,17 +1,27 @@
 /* Drag handle between the file tree sidebar and the editor area.
    Mirrors .diff-resizer in components/Review/diffTheme.css. */
 .editor-resizer {
-  width: 6px;
-  min-width: 6px;
+  width: 0;
+  min-width: 0;
   height: 100%;
   cursor: col-resize;
   background: transparent;
   position: relative;
   flex-shrink: 0;
-  z-index: 2;
+  z-index: 10;
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
+}
+
+.editor-resizer::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -4px;
+  width: 9px;
+  background: transparent;
 }
 
 .editor-resizer::after {
@@ -19,7 +29,7 @@
   position: absolute;
   top: 0;
   bottom: 0;
-  left: 2px;
+  left: -1px;
   width: 2px;
   border-radius: 999px;
   background: transparent;
@@ -28,13 +38,41 @@
 
 .editor-resizer:hover::after,
 .editor-resizer:active::after {
-  left: 1px;
+  left: -2px;
   width: 4px;
   background: var(--color-highlight);
 }
 
+/* 1199px == useIsMobile's TABLET_BREAKPOINT (1200) - 1: below it the JS gate
+   `!isMobile` already stops rendering the resizer. Keep these in sync — if the
+   TABLET_BREAKPOINT in hooks/useIsMobile.ts changes, update this value too. */
 @media (max-width: 1199px) {
   .editor-resizer {
     display: none;
   }
+}
+
+/* Custom scrollbar for Editor containers */
+.editor-scroll-container::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.editor-scroll-container::-webkit-scrollbar-track {
+  background: var(--color-bg);
+}
+
+.editor-scroll-container::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
+
+.editor-scroll-container::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+
+/* Firefox support */
+.editor-scroll-container {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) var(--color-bg);
 }
