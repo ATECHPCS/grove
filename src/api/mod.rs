@@ -74,8 +74,7 @@ pub fn create_api_router() -> Router {
             "/config/applications/icon",
             get(handlers::config::get_app_icon),
         )
-        // Agent discovery API
-        .route("/agents/base", get(handlers::agents::list_base_agents))
+        // Agent capability cache API
         .route(
             "/agents/{id}/capabilities",
             get(handlers::agents::get_agent_capabilities),

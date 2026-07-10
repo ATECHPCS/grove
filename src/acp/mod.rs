@@ -3109,9 +3109,7 @@ async fn drive_session(
                 .map(|chat| chat.agent)
             })
             .unwrap_or_else(|| {
-                canonical_builtin_acp_agent(&agent_name)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| agent_name.clone())
+                crate::storage::installed_agents::canonicalize_agent_id(&agent_name)
             });
         crate::storage::agent_capabilities::upsert(
             &agent_key,
