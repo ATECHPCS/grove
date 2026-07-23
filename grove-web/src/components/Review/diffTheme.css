@@ -309,7 +309,7 @@ body.grove-resizing .conv-sidebar {
 
 /* When a preview drawer is open, make diff-content a flex column so the file section
    can stretch to fill all available height (avoiding both triple scrollbars and clipping) */
-.diff-content:has(.diff-file-body.with-preview) {
+.diff-content-focus:has(.diff-file-body.with-preview) {
   overflow-y: hidden;
   display: flex;
   flex-direction: column;
@@ -319,7 +319,7 @@ body.grove-resizing .conv-sidebar {
   padding-bottom: 0;
 }
 
-.diff-content:has(.diff-file-body.with-preview) .diff-file-section {
+.diff-content-focus:has(.diff-file-body.with-preview) .diff-file-section {
   flex: 1;
   min-height: 0;
   display: flex;
@@ -344,6 +344,19 @@ body.grove-resizing .conv-sidebar {
 .diff-file-section {
   margin-bottom: 2px;
   position: relative;
+}
+
+/* Keep expanded files at their natural height while skipping off-screen
+   rendering work. This supports variable-height diffs, previews and images
+   without losing stable scroll-to-file anchors. */
+.diff-content-all-files {
+  overflow: hidden;
+  padding-bottom: 0;
+}
+
+.diff-file-virtuoso {
+  height: 100%;
+  width: 100%;
 }
 
 .diff-file-header {
