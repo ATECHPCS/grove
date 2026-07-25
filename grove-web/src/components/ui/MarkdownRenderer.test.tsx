@@ -67,3 +67,17 @@ describe("MarkdownRenderer emphasis", () => {
     expect(html).not.toContain("**商家上下文分散");
   });
 });
+
+describe("MarkdownRenderer lists", () => {
+  it("keeps loose-list markers on the same line as the first paragraph", () => {
+    const html = renderToStaticMarkup(
+      <MarkdownRenderer
+        content={'- **Workflow：**需求分析\n\n- **Skill 与工具：**分享 CLI'}
+      />,
+    );
+
+    expect(html).toContain("[li&gt;&amp;:first-child]:inline");
+    expect(html).toContain("<li");
+    expect(html).toContain("<p");
+  });
+});

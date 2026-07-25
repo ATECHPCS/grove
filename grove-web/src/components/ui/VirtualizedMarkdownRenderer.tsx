@@ -78,6 +78,7 @@ export interface VirtualizedMarkdownRendererProps {
   sketchRenderMode?: React.ComponentProps<typeof MarkdownRenderer>["sketchRenderMode"];
   /** Storage namespace and path of the markdown file. */
   location?: React.ComponentProps<typeof MarkdownRenderer>["location"];
+  renderMode?: React.ComponentProps<typeof MarkdownRenderer>["renderMode"];
 }
 
 /** Recursively pull text out of an mdast node. Must match exactly what the
@@ -300,6 +301,7 @@ export const VirtualizedMarkdownRenderer = forwardRef<
     sketchContext,
     sketchRenderMode,
     location,
+    renderMode,
   } = props;
 
   const virtuosoRef = useRef<VirtuosoHandle>(null);
@@ -588,7 +590,7 @@ export const VirtualizedMarkdownRenderer = forwardRef<
       // (TocPanel + IntersectionObserver) and hash navigation both work
       // off this anchor, which is the primary use case.
       return (
-        <div data-virt-block={index} className="px-5">
+        <div data-virt-block={index} className={renderMode === "document" ? "px-8 lg:px-12" : "px-5"}>
           {headingId && (
             <span
               id={headingId}
@@ -607,6 +609,7 @@ export const VirtualizedMarkdownRenderer = forwardRef<
             sketchContext={sketchContext}
             sketchRenderMode={sketchRenderMode}
             location={location}
+            renderMode={renderMode}
             // Heading IDs are owned by the virtualized wrapper above (via
             // `id={headingId}` derived from a single global slugger), not by
             // per-block render. Leaving this off avoids the per-block
@@ -629,6 +632,7 @@ export const VirtualizedMarkdownRenderer = forwardRef<
       sketchContext,
       sketchRenderMode,
       location,
+      renderMode,
     ],
   );
 

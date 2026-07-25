@@ -1795,56 +1795,58 @@ export function DiffFileView({
       )}
 
       {pendingPreviewLocator && (
-        <div
-          data-hotkeys-dialog="true"
-          onMouseDown={(e) => { if (e.target === e.currentTarget) closePreviewCommentModal(); }}
-          style={{ position: 'fixed', inset: 0, zIndex: 1001, background: 'rgba(0,0,0,.4)', backdropFilter: 'blur(2px)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-        >
-          <div style={{ width: 'min(92vw,460px)', background: 'var(--color-bg)', border: '1px solid var(--color-border)', borderRadius: 12, boxShadow: '0 18px 50px rgba(0,0,0,.28)', overflow: 'hidden' }}>
-            <div style={{ padding: '8px 12px', borderBottom: '1px solid var(--color-border)', background: 'var(--color-bg-secondary)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
-                <MessageSquarePlus style={{ width: 13, height: 13, color: 'var(--color-highlight)', flexShrink: 0 }} />
-                <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text)' }}>
-                  {editingPreviewDraftId ? 'Edit preview comment' : 'New preview comment'}
-                </span>
-              </div>
-              <button
-                onClick={closePreviewCommentModal}
-                title="Close (Esc)"
-                style={{ display: 'inline-flex', padding: 4, border: 'none', background: 'transparent', borderRadius: 4, color: 'var(--color-text-muted)', cursor: 'pointer' }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--color-bg-tertiary)'; e.currentTarget.style.color = 'var(--color-text)'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--color-text-muted)'; }}
-              >
-                <X style={{ width: 13, height: 13 }} />
-              </button>
-            </div>
-            <div style={{ padding: '12px 16px 0' }}>
-              <div
-                title={pendingPreviewLocator.selector || pendingPreviewLocator.tagName}
-                style={{ fontFamily: 'ui-monospace,SFMono-Regular,Menlo,monospace', fontSize: 10.5, color: 'var(--color-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-              >
-                {pendingPreviewLocator.selector || pendingPreviewLocator.tagName}
-              </div>
-              {pendingPreviewLocator.text && (
-                <div style={{ marginTop: 8, padding: '6px 10px', border: '1px solid var(--color-border)', borderRadius: 6, background: 'var(--color-bg-secondary)', color: 'var(--color-text-muted)', fontSize: 11, lineHeight: 1.4, maxHeight: 160, overflowY: 'auto', whiteSpace: 'pre-wrap' }}>
-                  {pendingPreviewLocator.text}
-                </div>
-              )}
-            </div>
-            <div style={{ padding: '12px 16px' }}>
+        <>
+          {pendingPreviewLocator.rect && (
+            <div
+              style={{
+                position: 'fixed',
+                zIndex: 1000,
+                pointerEvents: 'none',
+                left: pendingPreviewLocator.rect.x,
+                top: pendingPreviewLocator.rect.y,
+                width: pendingPreviewLocator.rect.width,
+                height: pendingPreviewLocator.rect.height,
+                border: '1.5px solid rgba(59,130,246,.7)',
+                background: 'rgba(59,130,246,.2)',
+                borderRadius: 3,
+              }}
+            />
+          )}
+          <div
+            data-hotkeys-dialog="true"
+            style={{
+              position: 'fixed',
+              zIndex: 1001,
+              width: 'min(260px, calc(100vw - 20px))',
+              left: pendingPreviewLocator.rect
+                ? (window.innerWidth - (pendingPreviewLocator.rect.x + pendingPreviewLocator.rect.width) >= 280
+                    ? pendingPreviewLocator.rect.x + pendingPreviewLocator.rect.width + 12
+                    : Math.max(10, pendingPreviewLocator.rect.x - 272))
+                : Math.max(10, window.innerWidth - 270),
+              top: pendingPreviewLocator.rect
+                ? (window.innerHeight - (pendingPreviewLocator.rect.y + pendingPreviewLocator.rect.height) >= 140
+                    ? pendingPreviewLocator.rect.y + pendingPreviewLocator.rect.height + 8
+                    : Math.max(10, pendingPreviewLocator.rect.y - 132))
+                : 24,
+              padding: 8,
+              background: 'var(--color-bg)',
+              border: '1px solid var(--color-border)',
+              borderRadius: 12,
+              boxShadow: '0 10px 28px rgba(0,0,0,.18)',
+            }}
+          >
               <textarea
                 value={previewCommentText}
                 onChange={(e) => setPreviewCommentText(e.target.value)}
-                autoFocus
                 rows={3}
-                placeholder="What should change about this area?"
+                placeholder="Add a comment…"
                 onKeyDown={(e) => {
                   if (e.key === 'Escape') { e.preventDefault(); closePreviewCommentModal(); }
                   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submitReviewPreviewComment();
                 }}
-                style={{ width: '100%', resize: 'none', border: '1px solid var(--color-border)', borderRadius: 8, background: 'var(--color-bg-secondary)', color: 'var(--color-text)', padding: '8px 10px', outline: 'none', fontSize: 13, lineHeight: 1.4 }}
+                style={{ display: 'block', width: '100%', resize: 'none', border: 'none', background: 'transparent', color: 'var(--color-text)', padding: '4px 6px', outline: 'none', fontSize: 12, lineHeight: 1.4 }}
               />
-              <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+              <div style={{ marginTop: 4, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   {editingPreviewDraftId && (
                     <button
@@ -1858,9 +1860,6 @@ export function DiffFileView({
                       Delete
                     </button>
                   )}
-                  <span style={{ fontSize: 10, color: 'var(--color-text-muted)' }}>
-                    <kbd style={{ border: '1px solid var(--color-border)', background: 'var(--color-bg-secondary)', borderRadius: 3, padding: '0 4px', fontFamily: 'ui-monospace,SFMono-Regular,Menlo,monospace', fontSize: 10 }}>⌘↵</kbd> to submit
-                  </span>
                 </div>
                 <div style={{ display: 'flex', gap: 8 }}>
                   <button
@@ -1876,13 +1875,12 @@ export function DiffFileView({
                     onClick={submitReviewPreviewComment}
                     style={{ border: 'none', borderRadius: 6, padding: '4px 12px', background: 'var(--color-highlight)', color: 'white', fontSize: 11, fontWeight: 600, opacity: previewCommentText.trim() ? 1 : .4, boxShadow: '0 1px 2px rgba(0,0,0,.12)', cursor: previewCommentText.trim() ? 'pointer' : 'not-allowed' }}
                   >
-                    {editingPreviewDraftId ? 'Save' : 'Add comment'}
+                    Save
                   </button>
                 </div>
               </div>
-            </div>
           </div>
-        </div>
+        </>
       )}
 
       {/* Floating comment button on text selection */}

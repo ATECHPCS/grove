@@ -1,4 +1,4 @@
-import { Children, isValidElement, useState, useEffect, useRef, useId, memo, useMemo } from "react";
+import { Children, isValidElement, useState, useEffect, useRef, useId, memo, useMemo, type IframeHTMLAttributes } from "react";
 import { Check, Code, Copy, FileText, Hash, Loader2, Play, Terminal, WrapText } from "lucide-react";
 import { renderD2 } from "../../api";
 import type { RenderD2Error } from "../../api";
@@ -748,6 +748,9 @@ function CodeBlock({
 
 export interface MarkdownRendererProps {
   content: string;
+  /** `document` is the relaxed, long-form typography used by file previews.
+   * Other surfaces (chat, comments, cards) retain the compact default. */
+  renderMode?: "compact" | "document";
   /** When provided, inline code matching file path patterns become clickable.
    *  Must return whether the navigation succeeded — `false` triggers the
    *  FileChip to fall back to its original markdown rendering (raw <code>
@@ -930,7 +933,118 @@ function parseFileHref(href: string): { filePath: string; line?: number } | null
   };
 }
 
-export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFileClick, resolveImageUrl, location, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode = "chip", enableHeadingIds }: MarkdownRendererProps) {
+function sourceForMarkdownNode(node: unknown, markdown: string): string | undefined {
+  const position = (node as { position?: { start?: { offset?: number }; end?: { offset?: number } } } | undefined)?.position;
+  const start = position?.start?.offset;
+  const end = position?.end?.offset;
+  if (typeof start !== "number" || typeof end !== "number" || start < 0 || end <= start) return undefined;
+  return markdown.slice(start, end);
+}
+
+function copySelectedMarkdown(event: React.ClipboardEvent<HTMLDivElement>, root: HTMLDivElement | null) {
+  const selection = window.getSelection();
+  if (!root || !selection || selection.isCollapsed || selection.rangeCount === 0) return;
+  const range = selection.getRangeAt(0);
+  if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return;
+  const allBlocks = Array.from(root.querySelectorAll<HTMLElement>("[data-grove-markdown-source]"))
+    .filter((block) => range.intersectsNode(block));
+  const blocks = allBlocks.filter((block) => !allBlocks.some((other) => other !== block && other.contains(block)));
+  const markdown = blocks.map((block) => block.dataset.groveMarkdownSource).filter((source): source is string => Boolean(source)).join("\n\n");
+  if (!markdown) return;
+  event.preventDefault();
+  event.clipboardData.setData("text/plain", markdown);
+  event.clipboardData.setData("text/markdown", markdown);
+}
+
+const EMBEDDED_HTML_FIT_MESSAGE = "grove:embedded-html-fit";
+
+function injectEmbeddedHtmlFitScript(html: string, frameId: string): string {
+  // Local architecture diagrams are commonly authored on a fixed-size canvas.
+  // An iframe cannot inspect cross-origin content, so put the measurement logic
+  // inside its already-sandboxed document and communicate only the final height
+  // to the parent. This keeps arbitrary HTML isolated while allowing the whole
+  // diagram to fit the markdown column instead of clipping its right edge.
+  const script = `<script>(function(){
+    var channel=${JSON.stringify(EMBEDDED_HTML_FIT_MESSAGE)};
+    var frameId=${JSON.stringify(frameId)};
+    function fit(){
+      var root=document.documentElement, body=document.body;
+      if(!body || !window.innerWidth) return;
+      body.style.transform='';
+      root.style.height='';
+      var width=Math.max(root.scrollWidth, body.scrollWidth, root.offsetWidth, body.offsetWidth);
+      var height=Math.max(root.scrollHeight, body.scrollHeight, root.offsetHeight, body.offsetHeight);
+      if(!width || !height) return;
+      var scale=Math.min(1, window.innerWidth / width);
+      body.style.transformOrigin='top left';
+      body.style.transform='scale('+scale+')';
+      var fittedHeight=Math.ceil(height * scale);
+      root.style.overflow='hidden';
+      root.style.height=fittedHeight+'px';
+      window.parent.postMessage({channel:channel, frameId:frameId, height:fittedHeight}, '*');
+    }
+    window.addEventListener('load', function(){ requestAnimationFrame(fit); });
+    window.addEventListener('resize', fit);
+    requestAnimationFrame(fit);
+  })();</script>`;
+  return /<\/head\s*>/i.test(html)
+    ? html.replace(/<\/head\s*>/i, `${script}</head>`)
+    : `${script}${html}`;
+}
+
+interface EmbeddedHtmlIframeProps extends IframeHTMLAttributes<HTMLIFrameElement> {
+  src: string;
+  fitLocalHtml: boolean;
+}
+
+function EmbeddedHtmlIframe({ src, fitLocalHtml, className, height, ...props }: EmbeddedHtmlIframeProps) {
+  const frameRef = useRef<HTMLIFrameElement>(null);
+  const frameId = useId();
+  const [loadedDocument, setLoadedDocument] = useState<{ src: string; html: string } | null>(null);
+  const [reportedHeight, setReportedHeight] = useState<{ src: string; height: number } | null>(null);
+  const srcDoc = fitLocalHtml && loadedDocument?.src === src ? loadedDocument.html : undefined;
+  const fittedHeight = reportedHeight?.src === src ? reportedHeight.height : undefined;
+
+  useEffect(() => {
+    if (!fitLocalHtml) return;
+    const controller = new AbortController();
+    fetch(src, { signal: controller.signal, credentials: "same-origin" })
+      .then((response) => response.ok ? response.text() : Promise.reject(new Error(`Unable to load embedded HTML: ${response.status}`)))
+      .then((html) => {
+        if (!controller.signal.aborted) setLoadedDocument({ src, html: injectEmbeddedHtmlFitScript(html, frameId) });
+      })
+      .catch(() => {
+        // Keep the normal iframe as a resilient fallback for unavailable files
+        // and documents that are not readable through the raw-file endpoint.
+      });
+    return () => controller.abort();
+  }, [fitLocalHtml, frameId, src]);
+
+  useEffect(() => {
+    const onMessage = (event: MessageEvent<unknown>) => {
+      if (event.source !== frameRef.current?.contentWindow || !event.data || typeof event.data !== "object") return;
+      const data = event.data as { channel?: string; frameId?: string; height?: unknown };
+      if (data.channel !== EMBEDDED_HTML_FIT_MESSAGE || data.frameId !== frameId || typeof data.height !== "number") return;
+      if (Number.isFinite(data.height) && data.height > 0) setReportedHeight({ src, height: data.height });
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [frameId, src]);
+
+  return (
+    <iframe
+      ref={frameRef}
+      src={srcDoc ? undefined : src}
+      srcDoc={srcDoc}
+      height={fittedHeight ?? height}
+      {...props}
+      className={`w-full my-2 border-0${className ? ` ${className}` : ""}`}
+    />
+  );
+}
+
+export const MarkdownRenderer = memo(function MarkdownRenderer({ content, renderMode = "compact", onFileClick, resolveImageUrl, location, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode = "chip", enableHeadingIds }: MarkdownRendererProps) {
+  const markdownRootRef = useRef<HTMLDivElement>(null);
   const processedContent = useMemo(() => {
     let out = normalizeStrongEmphasis(content);
     out = preprocessInlineCodeUrls(out);
@@ -952,24 +1066,26 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFile
   const sluggerRef = useRef<(text: string) => string>(createSlugger());
   // eslint-disable-next-line react-hooks/refs
   sluggerRef.current = createSlugger();
+  const isDocument = renderMode === "document";
   const components = useMemo((): Components => {
     const slug = (children: React.ReactNode, fallback: string | undefined) => {
       if (fallback) return fallback;
       if (!enableHeadingIds) return undefined;
       return sluggerRef.current(extractText(children));
     };
+    const source = (node: unknown) => sourceForMarkdownNode(node, processedContent);
     return ({
-        h1: ({ children, ...props }) => (
-          <h1 id={slug(children, props.id)} className="text-xl font-bold text-[var(--color-text)] mt-4 mb-2 first:mt-0 scroll-mt-4">{children}</h1>
+        h1: ({ children, node, ...props }) => (
+          <h1 data-grove-markdown-source={source(node)} id={slug(children, props.id)} className={isDocument ? "text-3xl leading-tight font-bold text-[var(--color-text)] mt-10 mb-4 first:mt-0 scroll-mt-6" : "text-xl font-bold text-[var(--color-text)] mt-4 mb-2 first:mt-0 scroll-mt-4"}>{children}</h1>
         ),
-        h2: ({ children, ...props }) => (
-          <h2 id={slug(children, props.id)} className="text-lg font-semibold text-[var(--color-text)] mt-3 mb-2 scroll-mt-4">{children}</h2>
+        h2: ({ children, node, ...props }) => (
+          <h2 data-grove-markdown-source={source(node)} id={slug(children, props.id)} className={isDocument ? "text-[28px] leading-tight font-bold text-[var(--color-text)] mt-7 mb-3 first:mt-0 scroll-mt-6" : "text-lg font-semibold text-[var(--color-text)] mt-3 mb-2 scroll-mt-4"}>{children}</h2>
         ),
-        h3: ({ children, ...props }) => (
-          <h3 id={slug(children, props.id)} className="text-base font-semibold text-[var(--color-text)] mt-3 mb-1 scroll-mt-4">{children}</h3>
+        h3: ({ children, node, ...props }) => (
+          <h3 data-grove-markdown-source={source(node)} id={slug(children, props.id)} className={isDocument ? "text-2xl leading-snug font-bold text-[var(--color-text)] mt-7 mb-2 scroll-mt-6" : "text-base font-semibold text-[var(--color-text)] mt-3 mb-1 scroll-mt-4"}>{children}</h3>
         ),
-        h4: ({ children, ...props }) => (
-          <h4 id={slug(children, props.id)} className="text-sm font-medium text-[var(--color-text)] mt-2 mb-1 scroll-mt-4">{children}</h4>
+        h4: ({ children, node, ...props }) => (
+          <h4 data-grove-markdown-source={source(node)} id={slug(children, props.id)} className={isDocument ? "text-xl leading-7 font-bold text-[var(--color-text)] mt-4 mb-2 scroll-mt-6" : "text-sm font-medium text-[var(--color-text)] mt-2 mb-1 scroll-mt-4"}>{children}</h4>
         ),
         h5: ({ children, ...props }) => (
           <h5 id={slug(children, props.id)} className="text-xs font-semibold text-[var(--color-text)] mt-2 mb-1 scroll-mt-4">{children}</h5>
@@ -977,17 +1093,17 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFile
         h6: ({ children, ...props }) => (
           <h6 id={slug(children, props.id)} className="text-xs font-medium text-[var(--color-text-muted)] mt-2 mb-1 scroll-mt-4">{children}</h6>
         ),
-        p: ({ children }) => (
-          <p className="text-sm text-[var(--color-text)] mb-2 last:mb-0 [li>&]:mb-0 break-words">{children}</p>
+        p: ({ children, node }) => (
+          <p data-grove-markdown-source={source(node)} className={isDocument ? "text-[17px] leading-7 text-[var(--color-text)] mb-4 last:mb-0 [li>&]:mb-0 [li>&:first-child]:inline break-words" : "text-sm text-[var(--color-text)] mb-2 last:mb-0 [li>&]:mb-0 [li>&:first-child]:inline break-words"}>{children}</p>
         ),
-        ul: ({ children }) => (
-          <ul className="list-disc list-inside text-sm text-[var(--color-text)] mb-2 ml-2 space-y-0.5">{children}</ul>
+        ul: ({ children, node }) => (
+          <ul data-grove-markdown-source={source(node)} className={isDocument ? "list-disc list-outside text-[17px] leading-7 text-[var(--color-text)] mb-4 ml-7 space-y-1" : "list-disc list-inside text-sm text-[var(--color-text)] mb-2 ml-2 space-y-0.5"}>{children}</ul>
         ),
-        ol: ({ children }) => (
-          <ol className="list-decimal list-inside text-sm text-[var(--color-text)] mb-2 ml-2 space-y-0.5">{children}</ol>
+        ol: ({ children, node }) => (
+          <ol data-grove-markdown-source={source(node)} className={isDocument ? "list-decimal list-outside text-[17px] leading-7 text-[var(--color-text)] mb-4 ml-7 space-y-1" : "list-decimal list-outside text-sm text-[var(--color-text)] mb-2 ml-2 space-y-0.5"}>{children}</ol>
         ),
         li: ({ children }) => (
-          <li className="text-sm text-[var(--color-text)] break-words">{children}</li>
+          <li className={isDocument ? "text-[17px] leading-8 text-[var(--color-text)] break-words" : "text-sm text-[var(--color-text)] break-words"}>{children}</li>
         ),
         a: ({ href, children }) => {
           // sketch:// chip — render first so bare sketch URLs never fall
@@ -1065,7 +1181,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFile
           <em className="italic">{children}</em>
         ),
         blockquote: ({ children }) => (
-          <blockquote className="border-l-2 border-[var(--color-highlight)] pl-3 my-2 text-sm text-[var(--color-text-muted)]">
+          <blockquote className={isDocument ? "border-l-2 border-[var(--color-highlight)] pl-4 my-6 text-[17px] leading-8 text-[var(--color-text-muted)]" : "border-l-2 border-[var(--color-highlight)] pl-3 my-2 text-sm text-[var(--color-text-muted)]"}>
             {children}
           </blockquote>
         ),
@@ -1177,12 +1293,12 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFile
             );
           }
           return (
-            <iframe
+            <EmbeddedHtmlIframe
               src={resolvedSrc}
+              fitLocalHtml={Boolean(location && !isAbsoluteFileReference(rawSrc) && /\.html?(?:[?#]|$)/i.test(rawSrc))}
               sandbox={sandbox ?? IFRAME_DEFAULT_SANDBOX}
               referrerPolicy={referrerPolicy ?? "no-referrer"}
               {...props}
-              className={`w-full my-2 border-0${props.className ? ` ${props.className}` : ""}`}
             />
           );
         },
@@ -1220,10 +1336,15 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFile
           return <input {...props} />;
         },
     });
-  }, [onFileClick, resolveImageUrl, location, resourceSrcResolver, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode, enableHeadingIds]);
+  }, [onFileClick, resolveImageUrl, location, resourceSrcResolver, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode, enableHeadingIds, isDocument, processedContent]);
 
   return (
-    <ReactMarkdown
+    <div
+      ref={markdownRootRef}
+      className={isDocument ? "markdown-document-preview mx-auto max-w-[78rem]" : undefined}
+      onCopy={(event) => copySelectedMarkdown(event, markdownRootRef.current)}
+    >
+      <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       rehypePlugins={[rehypeRaw, [rehypeSanitize, markdownSanitizeSchema]]}
       components={components}
@@ -1233,8 +1354,9 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFile
         if (url.startsWith("file://")) return url;
         return defaultUrlTransform(url);
       }}
-    >
-      {processedContent}
-    </ReactMarkdown>
+      >
+        {processedContent}
+      </ReactMarkdown>
+    </div>
   );
 });

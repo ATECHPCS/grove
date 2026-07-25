@@ -209,6 +209,10 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
   const [hoverRects, setHoverRects] = useState<DOMRect[]>([]);
   const [markerRects, setMarkerRects] = useState<ResolvedMarker[]>([]);
   const [hostRect, setHostRect] = useState<DOMRect | null>(null);
+  const [selectionAction, setSelectionAction] = useState<{
+    locator: PreviewCommentLocator;
+    rect: DOMRect;
+  } | null>(null);
 
   const enabled = !!previewComment?.enabled;
   const previewId = previewComment?.previewId;
@@ -337,6 +341,68 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
       window.removeEventListener('mouseup', onMouseUp, true);
       content.style.cursor = '';
       setHoverRects([]);
+    };
+  }, [enabled, previewId]);
+
+  // Native text selection is available even when block comment mode is off.
+  // Keep the browser selection intact and offer a small contextual action;
+  // choosing it feeds the same draft flow as element comments.
+  useEffect(() => {
+    const content = contentRef.current;
+    if (!content || !previewId) return;
+
+    const updateSelectionAction = () => {
+      if (enabled) {
+        setSelectionAction(null);
+        return;
+      }
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+        setSelectionAction(null);
+        return;
+      }
+      const range = selection.getRangeAt(0);
+      if (!content.contains(range.startContainer) || !content.contains(range.endContainer)) {
+        setSelectionAction(null);
+        return;
+      }
+      const text = clean(selection.toString(), 1200);
+      const rect = range.getBoundingClientRect();
+      if (!text || rect.width <= 0 || rect.height <= 0) {
+        setSelectionAction(null);
+        return;
+      }
+      const ancestor = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+        ? range.commonAncestorContainer as Element
+        : range.commonAncestorContainer.parentElement;
+      const block = pickBlock(ancestor, content);
+      if (!block) {
+        setSelectionAction(null);
+        return;
+      }
+      setSelectionAction({
+        locator: {
+          ...describe(block, content),
+          text,
+          html: `[text selection] ${text}`,
+          rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+        },
+        rect,
+      });
+    };
+
+    const clearOnPointerDown = (event: MouseEvent) => {
+      if ((event.target as HTMLElement | null)?.closest('[data-grove-selection-action="true"]')) return;
+      setSelectionAction(null);
+    };
+
+    content.addEventListener('mouseup', updateSelectionAction);
+    content.addEventListener('keyup', updateSelectionAction);
+    document.addEventListener('mousedown', clearOnPointerDown, true);
+    return () => {
+      content.removeEventListener('mouseup', updateSelectionAction);
+      content.removeEventListener('keyup', updateSelectionAction);
+      document.removeEventListener('mousedown', clearOnPointerDown, true);
     };
   }, [enabled, previewId]);
 
@@ -494,6 +560,31 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
           />
         );
       })()}
+      {selectionAction && hostRect && (
+        <button
+          type="button"
+          data-grove-comment-overlay="true"
+          data-grove-selection-action="true"
+          className="absolute z-[60] inline-flex -translate-x-1/2 items-center gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-xs font-medium text-[var(--color-text)] shadow-lg transition-colors hover:bg-[var(--color-bg-secondary)]"
+          style={{
+            left: selectionAction.rect.left - hostRect.left + selectionAction.rect.width / 2,
+            top: Math.max(4, selectionAction.rect.top - hostRect.top - 38),
+          }}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => {
+            window.postMessage({
+              type: 'grove-preview-comment:selected',
+              previewId,
+              payload: selectionAction.locator,
+            }, '*');
+            window.getSelection()?.removeAllRanges();
+            setSelectionAction(null);
+          }}
+        >
+          <span aria-hidden="true">＋</span>
+          Comment
+        </button>
+      )}
       {hostRect && markerRects.map(({ id, label, rects }) => {
         const u = unionRect(rects)!;
         return (

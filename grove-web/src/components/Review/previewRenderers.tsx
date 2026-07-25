@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { lazy, Suspense, useEffect, useRef, useMemo, useState, type ReactNode } from 'react';
+import { lazy, Suspense, useEffect, useRef, useMemo, useState, useId, type ReactNode } from 'react';
 import { MarkdownRenderer, MermaidBlock, D2Block } from '../ui/MarkdownRenderer';
 import { PreviewCommentHost } from './PreviewCommentHost';
 import { highlightCode as highlightLocal, detectLanguage as detectLanguageLocal } from './syntaxHighlight';
@@ -117,6 +117,7 @@ const markdownRenderer: PreviewRenderer = {
   renderFull: ({ content, onImageClick, onSvgClick, previewComment, sketchContext, location }) => withCommentHost(
     <MarkdownRenderer
       content={content}
+      renderMode="document"
       onImageClick={onImageClick}
       onMermaidClick={onSvgClick}
       onD2Click={onSvgClick}
@@ -395,11 +396,26 @@ function HtmlPreviewFrame({
   previewComment?: RenderFullProps["previewComment"];
 }) {
   const frameRef = useRef<HTMLIFrameElement>(null);
+  const frameId = useId();
+  const [reportedHeight, setReportedHeight] = useState<{ content: string; height: number } | null>(null);
+  const fittedHeight = reportedHeight?.content === content ? reportedHeight.height : undefined;
   // srcDoc only depends on content + stable previewId — never on `enabled` or
   // markers. Toggling comment mode / editing markers must not remount iframe.
-  const srcDoc = previewComment
+  const previewSrcDoc = previewComment
     ? buildHtmlPreviewSrcdoc(content, previewComment.previewId)
     : injectPreviewBase(content);
+  const srcDoc = injectHtmlPreviewFitBridge(previewSrcDoc, frameId);
+
+  useEffect(() => {
+    const onMessage = (event: MessageEvent<unknown>) => {
+      if (event.source !== frameRef.current?.contentWindow || !event.data || typeof event.data !== 'object') return;
+      const data = event.data as { type?: string; frameId?: string; height?: unknown };
+      if (data.type !== HTML_PREVIEW_FIT_MESSAGE || data.frameId !== frameId || typeof data.height !== 'number') return;
+      if (Number.isFinite(data.height) && data.height > 0) setReportedHeight({ content, height: data.height });
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [content, frameId]);
 
   useEffect(() => {
     postPreviewCommentTheme(frameRef.current, previewComment?.previewId);
@@ -415,11 +431,43 @@ function HtmlPreviewFrame({
       ref={frameRef}
       srcDoc={srcDoc}
       sandbox={PREVIEW_IFRAME_SANDBOX}
-      className="w-full h-full border-0 min-h-[200px]"
+      className="w-full shrink-0 border-0 min-h-[200px]"
+      style={{ height: fittedHeight ? `${fittedHeight}px` : '100%' }}
       title="HTML Preview"
       onLoad={() => syncPreviewCommentState(frameRef.current, previewComment)}
     />
   );
+}
+
+const HTML_PREVIEW_FIT_MESSAGE = 'grove:html-preview-fit';
+
+function injectHtmlPreviewFitBridge(html: string, frameId: string): string {
+  // HTML assets often use a fixed-size canvas. Fit that canvas to the preview
+  // width and report its scaled height so the surrounding Review pane owns the
+  // vertical scrollbar instead of clipping the lower part of the document.
+  const bridge = [
+    '<script>',
+    '(function(){',
+    `var frameId=${JSON.stringify(frameId)};`,
+    `var type=${JSON.stringify(HTML_PREVIEW_FIT_MESSAGE)};`,
+    'function fit(){',
+    'var root=document.documentElement,body=document.body;if(!body||!window.innerWidth)return;',
+    "body.style.transform='';root.style.height='';",
+    'var width=Math.max(root.scrollWidth,body.scrollWidth,root.offsetWidth,body.offsetWidth);',
+    'var height=Math.max(root.scrollHeight,body.scrollHeight,root.offsetHeight,body.offsetHeight);',
+    'if(!width||!height)return;',
+    'var scale=Math.min(1,window.innerWidth/width);',
+    "body.style.transformOrigin='top left';body.style.transform='scale('+scale+')';",
+    'var fittedHeight=Math.ceil(height*scale);root.style.overflow=\'hidden\';root.style.height=fittedHeight+\'px\';',
+    "window.parent.postMessage({type:type,frameId:frameId,height:fittedHeight},'*');",
+    '}',
+    "window.addEventListener('load',function(){requestAnimationFrame(fit);});window.addEventListener('resize',fit);requestAnimationFrame(fit);",
+    '})();',
+    '</script>',
+  ].join('');
+  return /<\/body\s*>/i.test(html)
+    ? html.replace(/<\/body\s*>/i, `${bridge}</body>`)
+    : `${html}${bridge}`;
 }
 
 function buildPreviewCommentBridge(previewId: string): string {
