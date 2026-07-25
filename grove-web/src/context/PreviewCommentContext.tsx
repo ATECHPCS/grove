@@ -41,7 +41,7 @@ export interface PreviewCommentLocator {
 
 export interface PreviewCommentDraft {
   id: string;
-  source: "artifact" | "review" | "resource";
+  source: "artifact" | "review" | "resource" | "chat";
   projectId: string;
   taskId?: string;
   filePath: string;

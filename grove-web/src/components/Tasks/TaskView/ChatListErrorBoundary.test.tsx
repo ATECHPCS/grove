@@ -62,6 +62,52 @@ describe("ChatListErrorBoundary", () => {
     expect(container.textContent).toContain("Recovered messages");
   });
 
+  it("copies developer-readable diagnostics with chat context", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const ChatList = () => {
+      throw new TypeError("Failed to fetch dynamically imported module");
+    };
+
+    act(() => {
+      root.render(
+        <ChatListErrorBoundary
+          resetKey="chat-a"
+          projectId="project-a"
+          taskId="task-a"
+        >
+          <ChatList />
+        </ChatListErrorBoundary>,
+      );
+    });
+
+    expect(container.textContent).toContain("Copy diagnostics");
+    expect(container.textContent).toContain("Show crash details");
+    const details = container.querySelector<HTMLTextAreaElement>(
+      'textarea[aria-label="Chat crash diagnostics"]',
+    );
+    expect(details?.value).toContain(
+      "TypeError: Failed to fetch dynamically imported module",
+    );
+    expect(details?.value).toContain("Project: project-a");
+    expect(details?.value).toContain("Task: task-a");
+    expect(details?.value).toContain("Chat: chat-a");
+
+    const copyButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Copy diagnostics",
+    );
+    expect(copyButton).toBeDefined();
+    await act(async () => copyButton?.click());
+
+    expect(writeText).toHaveBeenCalledWith(
+      expect.stringContaining("Chat context:\nProject: project-a"),
+    );
+    expect(container.textContent).toContain("Diagnostics copied");
+  });
+
   it("resets automatically when the active chat changes", () => {
     const ChatList = ({ shouldThrow }: { shouldThrow: boolean }) => {
       if (shouldThrow) throw new Error("Virtuoso failed");
