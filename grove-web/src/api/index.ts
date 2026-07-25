@@ -82,6 +82,7 @@ export {
   deleteArtifact,
   openArtifactFile,
   openTaskFile,
+  revealTaskFile,
   uploadArtifacts,
   createArtifactLink,
   updateArtifactLink,

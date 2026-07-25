@@ -899,6 +899,17 @@ export async function openTaskFile(
   );
 }
 
+/** Reveal a worktree file in the host file manager (selects it in Finder on macOS). */
+export async function revealTaskFile(
+  projectId: string,
+  taskId: string,
+  path: string
+): Promise<void> {
+  await apiClient.postNoContent(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/fs/reveal?path=${encodeURIComponent(path)}`
+  );
+}
+
 interface MoveFileRequest {
   source: string;
   destination: string;

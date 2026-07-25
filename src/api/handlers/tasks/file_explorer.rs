@@ -767,6 +767,70 @@ pub async fn open_file(
     }))
 }
 
+/// POST /api/v1/projects/{id}/tasks/{taskId}/fs/reveal?path=src/main.rs
+///
+/// Reveal a worktree entry in the host's file manager. On macOS this selects
+/// the file in Finder rather than opening it in its default application.
+pub async fn reveal_file(
+    Path((id, task_id)): Path<(String, String)>,
+    Query(params): Query<FilePathQuery>,
+) -> Result<Json<FsOperationResponse>, (StatusCode, Json<ApiError>)> {
+    let (_project, project_key) = find_project_by_id(&id).map_err(|s| {
+        (
+            s,
+            Json(ApiError {
+                error: "Project not found".to_string(),
+            }),
+        )
+    })?;
+    let task = tasks::get_task(&project_key, &task_id)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: format!("Failed to load task: {e}"),
+                }),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: "Task not found".to_string(),
+                }),
+            )
+        })?;
+    let full_path = resolve_safe_path(&task.worktree_path, &params.path)?;
+
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open")
+        .arg("-R")
+        .arg(&full_path)
+        .spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", full_path.display()))
+        .spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open")
+        .arg(full_path.parent().unwrap_or(&full_path))
+        .spawn();
+
+    result.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("Failed to reveal path: {e}"),
+            }),
+        )
+    })?;
+
+    Ok(Json(FsOperationResponse {
+        success: true,
+        message: format!("Revealed: {}", params.path),
+    }))
+}
+
 /// POST /api/v1/projects/{id}/tasks/{taskId}/fs/copy
 pub async fn copy_file(
     Path((id, task_id)): Path<(String, String)>,

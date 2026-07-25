@@ -2,8 +2,8 @@ import { useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import type { DiffFile } from '../../api/review';
 import type { DirEntry } from '../../api/tasks';
-import { FolderOpen, Folder, Search, MessageSquare, FilePlus, FolderPlus, Copy, FileText, Eye, EyeOff, Settings, X, Plus, Info, SquareArrowOutUpRight } from 'lucide-react';
-import { VSCodeIcon } from '../ui';
+import { FolderOpen, Folder, Search, MessageSquare, FilePlus, FolderPlus, Copy, FileText, Eye, EyeOff, Settings, X, Plus, Info, SquareArrowOutUpRight, FolderSearch } from 'lucide-react';
+import { ExternalFileDragHandle, VSCodeIcon, type TaskFileDragLocation } from '../ui';
 
 interface FileCommentCount {
   total: number;
@@ -26,8 +26,11 @@ interface FileTreeSidebarProps {
   /** Absolute worktree path — used to compute "Copy Full Path" */
   taskPath?: string | null;
   projectId?: string | null;
+  taskId?: string | null;
   /** Open a worktree-relative path with the OS default app (server host) */
   onOpenInApp?: (path: string) => void;
+  /** Reveal a worktree-relative path in the host file manager. */
+  onRevealInFileManager?: (path: string) => void;
   autoViewedRules?: string[];
   onUpdateAutoViewedRules?: (rules: string[]) => void;
   /** "Hide viewed files" toggle — controlled by the parent (DiffReviewPage) so
@@ -67,7 +70,9 @@ export function FileTreeSidebar({
   onLoadFileDiff,
   taskPath,
   projectId,
+  taskId,
   onOpenInApp,
+  onRevealInFileManager,
   autoViewedRules,
   onUpdateAutoViewedRules,
   hideViewed = false,
@@ -154,6 +159,17 @@ export function FileTreeSidebar({
     onOpenInApp?.(contextMenu.targetPath);
     setContextMenu(null);
   };
+
+  const handleRevealInFileManager = () => {
+    if (!contextMenu) return;
+    onRevealInFileManager?.(contextMenu.targetPath);
+    setContextMenu(null);
+  };
+
+  const revealLabel =
+    typeof navigator !== 'undefined' && /mac/i.test(navigator.userAgent)
+      ? 'Show in Finder'
+      : 'Show in File Manager';
 
   const handleCreateVirtual = (type: 'file' | 'directory') => {
     if (!contextMenu) return;
@@ -263,6 +279,7 @@ export function FileTreeSidebar({
             viewMode={viewMode}
             onExpandDir={onExpandDir}
             onLoadFileDiff={onLoadFileDiff}
+            dragLocation={viewMode === 'full' && projectId && taskId ? { projectId, taskId } : undefined}
           />
         ))}
       </div>
@@ -289,6 +306,12 @@ export function FileTreeSidebar({
                   <SquareArrowOutUpRight style={{ width: 14, height: 14 }} />
                   Open
                 </button>
+                {onRevealInFileManager && (
+                  <button onClick={handleRevealInFileManager}>
+                    <FolderSearch style={{ width: 14, height: 14 }} />
+                    {revealLabel}
+                  </button>
+                )}
                 <div className="file-tree-context-menu-separator" />
               </>
             )}
@@ -375,6 +398,7 @@ function TreeNode({
   viewMode,
   onExpandDir,
   onLoadFileDiff,
+  dragLocation,
 }: {
   node: DirNode | FileNode;
   depth: number;
@@ -391,6 +415,7 @@ function TreeNode({
   viewMode?: 'diff' | 'full';
   onExpandDir?: (dirPath: string) => Promise<DirEntry[]>;
   onLoadFileDiff?: (filePath: string, fromRef?: string, toRef?: string) => Promise<void>;
+  dragLocation?: Omit<TaskFileDragLocation, 'path'>;
 }) {
   // In lazy dir mode (onExpandDir provided) start collapsed, UNLESS the selected file is
   // a descendant of this directory — in which case start expanded so the file is visible.
@@ -483,6 +508,7 @@ function TreeNode({
                 viewMode={viewMode}
                 onExpandDir={onExpandDir}
                 onLoadFileDiff={onLoadFileDiff}
+                dragLocation={dragLocation}
               />
             ))}
           </>
@@ -498,7 +524,7 @@ function TreeNode({
 
   return (
     <button
-      className={`diff-sidebar-item ${isActive ? 'active' : ''} ${file.is_virtual ? 'virtual' : ''} ${contextMenuPath === file.new_path ? 'context-target' : ''}`}
+      className={`diff-sidebar-item group ${isActive ? 'active' : ''} ${file.is_virtual ? 'virtual' : ''} ${contextMenuPath === file.new_path ? 'context-target' : ''}`}
       style={{ paddingLeft: depth * 12 + 12 }}
       onClick={() => onSelectFile(file.new_path)}
       onContextMenu={(e) => onContextMenu?.(e, file.new_path, false)}
@@ -528,6 +554,9 @@ function TreeNode({
         <span className="diff-sidebar-updated-badge">Updated</span>
       )}
       <span className="diff-sidebar-item-right">
+        {dragLocation && !file.is_virtual && file.change_type !== 'deleted' && (
+          <ExternalFileDragHandle location={{ ...dragLocation, path: file.new_path }} />
+        )}
         {commentInfo && commentInfo.unresolved > 0 && (
           <span className="diff-sidebar-comment-badge">
             <MessageSquare style={{ width: 10, height: 10 }} />

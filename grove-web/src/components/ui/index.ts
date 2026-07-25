@@ -18,6 +18,7 @@ export type { OpenSketchDetail } from "./sketchChipCache";
 export { KeyBadge } from "./KeyBadge";
 export { VSCodeIcon } from "./VSCodeIcon";
 export { FileMentionDropdown } from "./FileMentionDropdown";
+export { ExternalFileDragHandle, type TaskFileDragLocation } from "./ExternalFileDragHandle";
 export { FilePreviewDrawer, getExtBadge, downloadViaIframe, saveBlobAsFile, getPreviewType, canPreviewFile } from "./filePreview";
 export { AddLinkDialog } from "./AddLinkDialog";
 export { isLinkFile, linkDisplayName, parseLinkFile, hostnameOf, LINK_SUFFIX } from "./linkFile";

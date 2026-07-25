@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useLayoutEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
-import { FileText, FolderPlus, Trash2, Copy, SquareArrowOutUpRight } from "lucide-react";
+import { FileText, FolderPlus, Trash2, Copy, FolderSearch, SquareArrowOutUpRight } from "lucide-react";
 
 export interface ContextMenuPosition {
   x: number;
@@ -24,6 +24,7 @@ interface FileContextMenuProps {
   onCopyRelativePath: (path: string) => void;
   onCopyFullPath: (path: string) => void;
   onOpenInApp: (path: string) => void;
+  onRevealInFileManager: (path: string) => void;
 }
 
 export function FileContextMenu({
@@ -38,6 +39,7 @@ export function FileContextMenu({
   onCopyRelativePath,
   onCopyFullPath,
   onOpenInApp,
+  onRevealInFileManager,
 }: FileContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
@@ -83,6 +85,16 @@ export function FileContextMenu({
 
   const isDirectory = target?.isDirectory ?? false;
   const targetPath = target?.path ?? "";
+  // File manager actions execute on the Grove server host. They are useful in
+  // both Desktop and local `grove web`, but must not appear when this frontend
+  // proxies a remote server (where they would operate somebody else's machine).
+  const canUseHostFileActions =
+    typeof window !== "undefined" &&
+    (window as unknown as Record<string, unknown>).__GROVE_REMOTE__ !== true;
+  const revealLabel =
+    typeof navigator !== "undefined" && /mac/i.test(navigator.userAgent)
+      ? "Show in Finder"
+      : "Show in File Manager";
 
   // Get parent directory path for "New File" / "New Folder" actions
   const parentPath = isDirectory ? targetPath : targetPath.split("/").slice(0, -1).join("/");
@@ -110,17 +122,28 @@ export function FileContextMenu({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="py-1">
-          {/* Open in default app */}
-          <button
-            onClick={() => handleAction(() => onOpenInApp(targetPath))}
-            className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-[var(--color-bg-tertiary)] text-left transition-colors"
-          >
-            <SquareArrowOutUpRight className="w-3.5 h-3.5 text-[var(--color-text-muted)]" />
-            <span className="text-[13px] text-[var(--color-text)]">Open</span>
-          </button>
+          {canUseHostFileActions && (
+            <>
+              {/* Open in default app */}
+              <button
+                onClick={() => handleAction(() => onOpenInApp(targetPath))}
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-[var(--color-bg-tertiary)] text-left transition-colors"
+              >
+                <SquareArrowOutUpRight className="w-3.5 h-3.5 text-[var(--color-text-muted)]" />
+                <span className="text-[13px] text-[var(--color-text)]">Open</span>
+              </button>
+              <button
+                onClick={() => handleAction(() => onRevealInFileManager(targetPath))}
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 hover:bg-[var(--color-bg-tertiary)] text-left transition-colors"
+              >
+                <FolderSearch className="w-3.5 h-3.5 text-[var(--color-text-muted)]" />
+                <span className="text-[13px] text-[var(--color-text)]">{revealLabel}</span>
+              </button>
 
-          {/* Divider */}
-          <div className="my-0.5 h-px bg-[var(--color-border)]" />
+              {/* Divider */}
+              <div className="my-0.5 h-px bg-[var(--color-border)]" />
+            </>
+          )}
 
           {/* New File */}
           <button

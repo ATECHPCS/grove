@@ -35,6 +35,7 @@ import {
   deleteFileOrDir,
   moveFileOrDir,
   openTaskFile,
+  revealTaskFile,
   lookupSymbol,
   getTask,
   getConfig,
@@ -977,6 +978,12 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
     });
   }, [projectId, taskId]);
 
+  const handleRevealInFileManager = useCallback((path: string) => {
+    revealTaskFile(projectId, taskId, path).catch((err) => {
+      setError(err instanceof Error ? err.message : 'Failed to show file in Finder');
+    });
+  }, [projectId, taskId]);
+
   // Create file submit handler
   const handleCreateFile = useCallback(async (path: string) => {
     try {
@@ -1273,6 +1280,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
                 onMoveFile={handleMoveFile}
                 onUploadFile={handleUploadFile}
                 refreshSignal={refreshSignal}
+                dragLocation={{ projectId, taskId }}
               />
             </motion.div>
           )}
@@ -1602,6 +1610,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
         onCopyRelativePath={handleCopyRelativePath}
         onCopyFullPath={handleCopyFullPath}
         onOpenInApp={handleOpenInApp}
+        onRevealInFileManager={handleRevealInFileManager}
       />
 
       {/* Confirm Dialog for deletion */}

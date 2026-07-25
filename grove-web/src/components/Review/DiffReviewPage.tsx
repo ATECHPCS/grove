@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { getDiffStats, getSingleFileDiff, createInlineComment, createFileComment, createProjectComment, deleteComment as apiDeleteComment, replyReviewComment as apiReplyComment, updateCommentStatus as apiUpdateCommentStatus, getFileContent, editComment as apiEditComment, editReply as apiEditReply, deleteReply as apiDeleteReply, bulkDeleteComments as apiBulkDeleteComments } from '../../api/review';
 import type { DiffFile, DiffStatsResult } from '../../api/review';
-import { getReviewComments, getCommits, getTaskFiles, getTaskDirEntries, getTask, openTaskFile } from '../../api/tasks';
+import { getReviewComments, getCommits, getTaskFiles, getTaskDirEntries, getTask, openTaskFile, revealTaskFile } from '../../api/tasks';
 import type { ReviewCommentEntry, ReviewCommentsResponse, DirEntry, CommitsResponse } from '../../api/tasks';
 import { buildMentionItems } from '../../utils/fileMention';
 
@@ -104,6 +104,11 @@ import { getPreviewRenderer } from './previewRenderers';
 
 
 export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, isGitRepo, isChatBusy }: DiffReviewPageProps) {
+  // Host-side file actions would open the remote Grove server's desktop, not
+  // the reviewing user's machine. Local web and Desktop remain eligible.
+  const canUseHostFileActions =
+    typeof window !== 'undefined' &&
+    (window as unknown as Record<string, unknown>).__GROVE_REMOTE__ !== true;
   const { isMobile } = useIsMobile();
   const [diffData, setDiffData] = useState<DiffStatsResult | null>(null);
   const [taskPath, setTaskPath] = useState<string | null>(null);
@@ -2239,7 +2244,13 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
               onLoadFileDiff={viewMode === 'full' && focusMode ? loadFileDiff : undefined}
               taskPath={taskPath}
               projectId={projectId}
-              onOpenInApp={(path) => { void openTaskFile(projectId, taskId, path); }}
+              taskId={taskId}
+              onOpenInApp={canUseHostFileActions
+                ? (path) => { void openTaskFile(projectId, taskId, path); }
+                : undefined}
+              onRevealInFileManager={canUseHostFileActions
+                ? (path) => { void revealTaskFile(projectId, taskId, path); }
+                : undefined}
               autoViewedRules={autoViewedRules}
               onUpdateAutoViewedRules={setAutoViewedRules}
             />

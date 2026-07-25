@@ -16,7 +16,7 @@ use crate::api::handlers::common::find_project_by_id;
 use crate::api::handlers::studio_common;
 use crate::storage::{tasks, workspace};
 
-type ApiErr = (StatusCode, Json<ApiError>);
+pub(crate) type ApiErr = (StatusCode, Json<ApiError>);
 
 #[derive(Debug, Deserialize)]
 pub struct RawFileQuery {
@@ -164,6 +164,40 @@ fn resolve_file(
     Ok(canonical)
 }
 
+/// Resolve a file using the same containment rules as the raw-file endpoint.
+///
+/// The Desktop shell uses this before it hands a path to the OS drag-and-drop
+/// system. Keeping it here prevents the native bridge from becoming a second,
+/// weaker path-validation implementation.
+pub(crate) fn resolve_local_file(
+    project_id: &str,
+    root: FileRoot,
+    requested_path: &str,
+) -> Result<PathBuf, ApiErr> {
+    let (project, project_key) =
+        find_project_by_id(project_id).map_err(|status| error(status, "Project not found"))?;
+    let project_base = project_root(&project);
+    let (base, extra_roots) = match root {
+        FileRoot::Project => (project_base.clone(), Vec::new()),
+        FileRoot::Resource => {
+            if project.project_type != workspace::ProjectType::Studio {
+                return Err(error(StatusCode::NOT_FOUND, "Resource root not found"));
+            }
+            (project_base.join("resource"), Vec::new())
+        }
+        FileRoot::Task(task_id) => {
+            let base = task_root(&project, &project_key, &task_id)?;
+            let extras = if project.project_type == workspace::ProjectType::Studio {
+                vec![project_base.join("resource")]
+            } else {
+                vec![project_base.clone()]
+            };
+            (base, extras)
+        }
+    };
+    resolve_file(&base, &extra_roots, requested_path)
+}
+
 fn parse_range(value: &str, file_size: u64) -> Option<(u64, u64)> {
     let value = value.strip_prefix("bytes=")?;
     if value.contains(',') || file_size == 0 {
@@ -196,28 +230,7 @@ pub(crate) async fn serve(
     query: RawFileQuery,
     headers: HeaderMap,
 ) -> Result<Response<Body>, ApiErr> {
-    let (project, project_key) =
-        find_project_by_id(&project_id).map_err(|status| error(status, "Project not found"))?;
-    let project_base = project_root(&project);
-    let (base, extra_roots) = match root {
-        FileRoot::Project => (project_base.clone(), Vec::new()),
-        FileRoot::Resource => {
-            if project.project_type != workspace::ProjectType::Studio {
-                return Err(error(StatusCode::NOT_FOUND, "Resource root not found"));
-            }
-            (project_base.join("resource"), Vec::new())
-        }
-        FileRoot::Task(task_id) => {
-            let base = task_root(&project, &project_key, &task_id)?;
-            let extras = if project.project_type == workspace::ProjectType::Studio {
-                vec![project_base.join("resource")]
-            } else {
-                vec![project_base.clone()]
-            };
-            (base, extras)
-        }
-    };
-    let canonical = resolve_file(&base, &extra_roots, &query.path)?;
+    let canonical = resolve_local_file(&project_id, root, &query.path)?;
     let mut file = tokio::fs::File::open(&canonical)
         .await
         .map_err(|_| error(StatusCode::NOT_FOUND, "Failed to read file"))?;
