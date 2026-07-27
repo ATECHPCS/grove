@@ -1289,27 +1289,50 @@ async fn handle_session_notification(
                 .handle
                 .pending_text_separator
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            let locations = tool_call
+            let explicit_locations = tool_call
                 .locations
                 .iter()
                 .map(|l| (l.path.display().to_string(), l.line))
                 .collect();
+            // Some ACP adapters (notably @agentclientprotocol/codex-acp 1.1.x)
+            // put edited file paths only in ToolCallContent::Diff and leave the
+            // top-level locations empty. Preserve those paths before the
+            // content-only start event is followed by a status-only update.
+            let locations = merge_diff_locations(explicit_locations, &tool_call.content);
             state.handle.emit(AcpUpdate::ToolCall {
                 id: tool_call.tool_call_id.to_string(),
                 title: tool_call.title.clone(),
-                locations,
+                locations: locations.clone(),
                 timestamp: Some(Utc::now()),
                 raw_input: tool_call.raw_input.clone(),
             });
 
+            // `tool_call` is already allowed to carry output. In particular,
+            // codex-acp reports completed file edits as a single ToolCall whose
+            // Diff entries never reappear in a ToolCallUpdate. Mirror that
+            // initial payload into Grove's update-shaped event instead of
+            // dropping it at the ACP boundary.
+            let initial_content = tool_contents_to_text(state.adapter.as_ref(), &tool_call.content)
+                .or_else(|| tool_raw_output_text(tool_call.raw_output.as_ref()));
+            if initial_content.is_some() {
+                state.handle.emit(AcpUpdate::ToolCallUpdate {
+                    id: tool_call.tool_call_id.to_string(),
+                    status: format!("{:?}", tool_call.status).to_lowercase(),
+                    content: initial_content,
+                    locations: locations.clone(),
+                    raw_input: tool_call.raw_input.clone(),
+                });
+            }
+
             // 记录 Write 工具的 tool_call_id → file_path(用于 PlanFileUpdate 检测)。
             // 路径可能在第二个 ToolCall 事件才出现,所以每次有 locations 时更新。
             if tool_call.title.starts_with("Write") {
-                if let Some(loc) = tool_call.locations.first() {
-                    state.write_tool_paths.lock().unwrap().insert(
-                        tool_call.tool_call_id.to_string(),
-                        loc.path.display().to_string(),
-                    );
+                if let Some((path, _)) = locations.first() {
+                    state
+                        .write_tool_paths
+                        .lock()
+                        .unwrap()
+                        .insert(tool_call.tool_call_id.to_string(), path.clone());
                 } else {
                     state
                         .write_tool_paths
@@ -1337,11 +1360,11 @@ async fn handle_session_notification(
             // 缓存 Write/Edit 文件快照(locations 在第二个 ToolCall 事件才有路径)
             let title = &tool_call.title;
             if title.starts_with("Write") || title.starts_with("Edit") {
-                if let Some(loc) = tool_call.locations.first() {
+                if let Some((path, _)) = locations.first() {
                     let id_str = tool_call.tool_call_id.to_string();
                     let mut snapshots = state.file_snapshots.lock().unwrap();
                     snapshots.entry(id_str).or_insert_with(|| {
-                        let abs_path = loc.path.clone();
+                        let abs_path = PathBuf::from(path);
                         let old_content = std::fs::read_to_string(&abs_path).ok();
                         (abs_path, old_content)
                     });
@@ -1352,16 +1375,16 @@ async fn handle_session_notification(
             let mut content = update
                 .fields
                 .content
-                .as_ref()
-                .and_then(|blocks| blocks.first())
-                .map(|tc| state.adapter.tool_call_content_to_text(tc));
+                .as_deref()
+                .and_then(|blocks| tool_contents_to_text(state.adapter.as_ref(), blocks))
+                .or_else(|| tool_raw_output_text(update.fields.raw_output.as_ref()));
             let status = update
                 .fields
                 .status
                 .as_ref()
                 .map(|s| format!("{:?}", s).to_lowercase())
                 .unwrap_or_default();
-            let locations: Vec<(String, Option<u32>)> = update
+            let explicit_locations: Vec<(String, Option<u32>)> = update
                 .fields
                 .locations
                 .as_ref()
@@ -1371,6 +1394,10 @@ async fn handle_session_notification(
                         .collect()
                 })
                 .unwrap_or_default();
+            let locations = merge_diff_locations(
+                explicit_locations,
+                update.fields.content.as_deref().unwrap_or_default(),
+            );
 
             // 如果 ACP 没提供 content 且状态为 completed,从文件快照生成 diff
             let is_completed = update
@@ -1548,6 +1575,69 @@ async fn handle_session_notification(
         _ => {}
     }
     Ok(())
+}
+
+fn merge_diff_locations(
+    mut locations: Vec<(String, Option<u32>)>,
+    content: &[acp::ToolCallContent],
+) -> Vec<(String, Option<u32>)> {
+    let mut seen: std::collections::HashSet<String> =
+        locations.iter().map(|(path, _)| path.clone()).collect();
+
+    for item in content {
+        if let acp::ToolCallContent::Diff(diff) = item {
+            let path = diff.path.display().to_string();
+            if seen.insert(path.clone()) {
+                locations.push((path, None));
+            }
+        }
+    }
+
+    locations
+}
+
+fn tool_contents_to_text(
+    adapter: &dyn adapter::AgentContentAdapter,
+    content: &[acp::ToolCallContent],
+) -> Option<String> {
+    let text = content
+        .iter()
+        .map(|item| adapter.tool_call_content_to_text(item))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn tool_raw_output_text(raw_output: Option<&serde_json::Value>) -> Option<String> {
+    let value = raw_output?;
+    if let Some(text) = value.as_str() {
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+
+    let object = value.as_object()?;
+    for key in ["formatted_output", "output", "content", "text"] {
+        if let Some(text) = object.get(key).and_then(serde_json::Value::as_str) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+
+    let stdout = object
+        .get("stdout")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let stderr = object
+        .get("stderr")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let combined = [stdout, stderr]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(if stdout.ends_with('\n') { "" } else { "\n" });
+    (!combined.is_empty()).then_some(combined)
 }
 
 /// Emit a synthetic `ThoughtLevelsUpdate` after a successful
@@ -5621,6 +5711,75 @@ async fn drain_stderr_to_file(stderr: tokio::process::ChildStderr, path: PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_diff_locations_recovers_paths_from_tool_content() {
+        let content = vec![
+            acp::ToolCallContent::Diff(acp::Diff::new("/repo/model/config.go", "new config")),
+            acp::ToolCallContent::Diff(acp::Diff::new(
+                "/repo/dependency/fornax/client.go",
+                "new client",
+            )),
+        ];
+
+        assert_eq!(
+            merge_diff_locations(Vec::new(), &content),
+            vec![
+                ("/repo/model/config.go".to_string(), None),
+                ("/repo/dependency/fornax/client.go".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_diff_locations_preserves_lines_and_deduplicates_paths() {
+        let explicit = vec![("/repo/model/config.go".to_string(), Some(88))];
+        let content = vec![
+            acp::ToolCallContent::Diff(acp::Diff::new("/repo/model/config.go", "new config")),
+            acp::ToolCallContent::Content(acp::Content::new(acp::ContentBlock::Text(
+                acp::TextContent::new("not a file"),
+            ))),
+        ];
+
+        assert_eq!(merge_diff_locations(explicit.clone(), &content), explicit);
+    }
+
+    #[test]
+    fn tool_contents_to_text_preserves_every_content_block() {
+        let content = vec![
+            acp::ToolCallContent::Content(acp::Content::new(acp::ContentBlock::Text(
+                acp::TextContent::new("first"),
+            ))),
+            acp::ToolCallContent::Content(acp::Content::new(acp::ContentBlock::Text(
+                acp::TextContent::new("second"),
+            ))),
+        ];
+
+        assert_eq!(
+            tool_contents_to_text(&adapter::DefaultAdapter, &content).as_deref(),
+            Some("first\n\nsecond")
+        );
+    }
+
+    #[test]
+    fn tool_raw_output_text_reads_codex_formatted_output() {
+        let raw_output = serde_json::json!({
+            "formatted_output": "diff --git a/model/config.go b/model/config.go\n",
+            "exit_code": 0
+        });
+
+        assert_eq!(
+            tool_raw_output_text(Some(&raw_output)).as_deref(),
+            Some("diff --git a/model/config.go b/model/config.go\n")
+        );
+    }
+
+    #[test]
+    fn tool_raw_output_text_keeps_truly_empty_output_empty() {
+        let raw_output = serde_json::json!({ "formatted_output": "", "exit_code": 0 });
+
+        assert_eq!(tool_raw_output_text(Some(&raw_output)), None);
+    }
 
     #[test]
     fn socket_command_serde_roundtrip() {

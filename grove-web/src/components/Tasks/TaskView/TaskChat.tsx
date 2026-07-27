@@ -93,6 +93,12 @@ import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useChatSearch } from "./useChatSearch";
 import { useChatPositioning } from "./useChatPositioning";
 import { ChatListErrorBoundary } from "./ChatListErrorBoundary";
+import { useDeferredVirtuosoRangeValue } from "./useDeferredVirtuosoRangeValue";
+import {
+  extractDiffForEditPath,
+  extractEditToolPaths,
+} from "./editToolPaths";
+import { nextExpandedToolDetail } from "./toolDetailExpansion";
 import { useACPAvailability } from "./useACPAvailability";
 import { useInitialChatLoad } from "./useInitialChatLoad";
 import { useActiveChatId } from "./useActiveChatId";
@@ -2212,9 +2218,6 @@ export function TaskChat({
   // Bumped whenever Virtuoso renders a different range of items. Drives
   // useChatSearch's "re-apply highlights to freshly mounted DOM" effect.
   const [renderToken, setRenderToken] = useState(0);
-  // First rendered chat row, reported by Virtuoso. Used by the conversation
-  // minimap to mark the turn the reader is currently reviewing.
-  const [visibleRenderStart, setVisibleRenderStart] = useState(0);
   // Footer height = current input area height + slack. Stored in state so
   // Virtuoso can pad the bottom of the scroll area, ensuring the last
   // message is never obscured by the input composer. Initial value is
@@ -6928,19 +6931,22 @@ export function TaskChat({
     () => buildConversationTurns(messages, renderItems),
     [messages, renderItems],
   );
-  const activeConversationTurnMessageIndex = useMemo(() => {
+  const resolveActiveConversationTurnMessageIndex = useCallback((range: { startIndex: number }) => {
     let active = conversationTurns[0];
     for (const turn of conversationTurns) {
-      if (turn.renderIndex > visibleRenderStart) break;
+      if (turn.renderIndex > range.startIndex) break;
       active = turn;
     }
     return active?.messageIndex ?? null;
-  }, [conversationTurns, visibleRenderStart]);
-  const handleConversationRangeChanged = useCallback((range: { startIndex: number }) => {
-    setVisibleRenderStart((previous) =>
-      previous === range.startIndex ? previous : range.startIndex,
+  }, [conversationTurns]);
+  // Virtuoso can synchronously replay range events while measuring streaming
+  // rows. Defer those notifications and only re-render when the active turn
+  // actually changes; row-level range jitter within one turn is UI noise.
+  const [activeConversationTurnMessageIndex, handleConversationRangeChanged] =
+    useDeferredVirtuosoRangeValue(
+      resolveActiveConversationTurnMessageIndex,
+      conversationTurns[0]?.messageIndex ?? null,
     );
-  }, []);
   const navigateToConversationTurn = useCallback((turn: ConversationTurn) => {
     // User navigation should detach follow-output, otherwise a running agent
     // would immediately pull the viewport back to the newest response.
@@ -7096,6 +7102,28 @@ export function TaskChat({
       if (distanceFromBottom <= 2) return;
       scrollMessagesToBottom("auto");
     });
+  }, [isBusy, scrollMessagesToBottom]);
+
+  // Sending a prompt scrolls before the backend's busy event mounts the
+  // Thinking footer. That footer then increases the list height while the
+  // first programmatic scroll is still settling, so the generic height-change
+  // callback can legitimately skip the re-anchor. Re-align once after the new
+  // footer has completed layout. Respect autoStickToBottomRef so a reader who
+  // intentionally moved into history is never pulled back down.
+  useEffect(() => {
+    if (!isBusy || !autoStickToBottomRef.current) return;
+    let secondFrame: number | null = null;
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        if (autoStickToBottomRef.current) {
+          scrollMessagesToBottom("auto");
+        }
+      });
+    });
+    return () => {
+      cancelAnimationFrame(firstFrame);
+      if (secondFrame !== null) cancelAnimationFrame(secondFrame);
+    };
   }, [isBusy, scrollMessagesToBottom]);
 
   // Track the message index where the current busy turn started
@@ -7751,9 +7779,13 @@ export function TaskChat({
                     animate={{ opacity: 1, y: 0, height: "auto" }}
                     exit={{ opacity: 0, y: 8, height: 0 }}
                     transition={{ duration: 0.2, ease: "easeOut" }}
-                    className="mb-3 overflow-hidden rounded-2xl border border-[color-mix(in_srgb,var(--color-border)_62%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_92%,transparent)] shadow-[0_12px_32px_rgba(0,0,0,0.14)] backdrop-blur-md"
+                    className={
+                      activeComposerPanel === "pending"
+                        ? "mb-2 overflow-hidden rounded-xl border border-[color-mix(in_srgb,var(--color-border)_38%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_48%,transparent)]"
+                        : "mb-3 overflow-hidden rounded-2xl border border-[color-mix(in_srgb,var(--color-border)_62%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_92%,transparent)] shadow-[0_12px_32px_rgba(0,0,0,0.14)] backdrop-blur-md"
+                    }
                   >
-                    <div className={`max-h-[min(360px,48vh)] overflow-y-auto overscroll-contain ${activeComposerPanel === "previewComments" ? "" : "px-3 py-3"}`}>
+                    <div className={`max-h-[min(360px,48vh)] overflow-y-auto overscroll-contain ${activeComposerPanel === "previewComments" ? "" : activeComposerPanel === "pending" ? "px-2.5 py-1.5" : "px-3 py-3"}`}>
                       {activeComposerPanel === "todo" && (
                         <div className="space-y-1">
                           {planEntries.map((entry, i) => (
@@ -7816,12 +7848,12 @@ export function TaskChat({
                       )}
 
                       {activeComposerPanel === "pending" && (
-                        <div className="space-y-1">
-                          <div className="flex items-center justify-between pb-1">
-                            <div className="text-[11px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
-                              Send Mode
+                        <div>
+                          <div className="flex h-5 items-center gap-2 px-0.5">
+                            <div className="text-[9px] font-medium uppercase tracking-[0.08em] text-[var(--color-text-muted)] opacity-55">
+                              Queued · {pendingMessages.length}
                             </div>
-                            <div className="inline-flex rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] p-0.5">
+                            <div className="ml-auto inline-flex items-center gap-2 text-[9px]">
                               {(
                                 [
                                   {
@@ -7840,10 +7872,10 @@ export function TaskChat({
                                   key={opt.id}
                                   onClick={() => handleSetQueueMode(opt.id)}
                                   title={opt.title}
-                                  className={`rounded-md px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                                  className={`rounded px-1 py-0.5 transition-colors ${
                                     queueMode === opt.id
-                                      ? "bg-[var(--color-bg)] text-[var(--color-text)] shadow-sm"
-                                      : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+                                      ? "text-[var(--color-highlight)]"
+                                      : "text-[var(--color-text-muted)] opacity-60 hover:opacity-100"
                                   }`}
                                 >
                                   {opt.label}
@@ -7854,7 +7886,7 @@ export function TaskChat({
                           {pendingMessages.map((msg, i) => (
                             <div
                               key={pendingMessageKeys[i] ?? `idx-${i}`}
-                              className="flex items-center gap-2 py-1 text-sm"
+                              className="flex min-h-7 items-center gap-2 rounded-lg px-0.5 text-sm transition-colors hover:bg-[color-mix(in_srgb,var(--color-text)_3%,transparent)]"
                             >
                               <span className="w-4 shrink-0 text-right text-xs text-[var(--color-text-muted)]">
                                 {i + 1}
@@ -9259,7 +9291,10 @@ const MessageItem = memo(function MessageItem({
     Icon: React.ComponentType<{ size?: number; className?: string }>;
   };
 }) {
-  const sketchContext = isStudio ? { projectId, taskId } : undefined;
+  const sketchContext = useMemo(
+    () => (isStudio ? { projectId, taskId } : undefined),
+    [isStudio, projectId, taskId],
+  );
   // Typewriter reveal for streaming assistant/thinking text. Hook must
   // be called unconditionally; for other message types (or any
   // non-busy chat — i.e. history loads) we feed instant=true so it's
@@ -10251,32 +10286,57 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
 
   // Merge edits on the same file: accumulate +/- and keep the latest tool id/status
   const editItems = (() => {
-    const merged = new Map<string, { key: string; toolId: string; label: string; fullPath: string; additions: number; deletions: number; status: string }>();
+    const merged = new Map<string, {
+      key: string;
+      toolId: string;
+      label: string;
+      fullPath: string;
+      diff: string;
+      additions: number;
+      deletions: number;
+      status: string;
+    }>();
     for (const tool of edits) {
-      const loc = tool.message.locations?.[0];
-      const fullPath = loc?.path ?? "";
-      const label =
-        fullPath.split("/").pop() ||
-        tool.message.title.replace(/^(Edit|Write)\s+/i, "");
-      const stat = parseDiffStat(tool.message.content);
-      const existing = merged.get(label);
-      if (existing) {
-        existing.additions += stat?.additions ?? 0;
-        existing.deletions += stat?.deletions ?? 0;
-        existing.toolId = tool.message.id;
-        existing.status = tool.message.status;
-        // Use the longest (most specific) full path
-        if (fullPath.length > existing.fullPath.length) existing.fullPath = fullPath;
-      } else {
-        merged.set(label, {
-          key: `${tool.message.id}:${label}`,
-          toolId: tool.message.id,
-          label,
+      const editPaths = extractEditToolPaths({
+        locations: tool.message.locations,
+        rawInput: tool.message.rawInput,
+        content: tool.message.content,
+      });
+      const targets = editPaths.length > 0 ? editPaths : [""];
+      for (const fullPath of targets) {
+        const diff = extractDiffForEditPath(
+          tool.message.content,
           fullPath,
-          additions: stat?.additions ?? 0,
-          deletions: stat?.deletions ?? 0,
-          status: tool.message.status,
-        });
+          targets,
+        );
+        const stat = parseDiffStat(diff);
+        const label =
+          fullPath.split("/").pop() ||
+          tool.message.title.replace(/^(Edit|Write)\s+/i, "");
+        const mergeKey = fullPath || label;
+        const existing = merged.get(mergeKey);
+        if (existing) {
+          existing.additions += stat?.additions ?? 0;
+          existing.deletions += stat?.deletions ?? 0;
+          if (diff && !existing.diff.includes(diff)) {
+            existing.diff = existing.diff
+              ? `${existing.diff}\n\n${diff}`
+              : diff;
+          }
+          existing.toolId = tool.message.id;
+          existing.status = tool.message.status;
+        } else {
+          merged.set(mergeKey, {
+            key: `${tool.message.id}:${mergeKey}`,
+            toolId: tool.message.id,
+            label,
+            fullPath,
+            diff,
+            additions: stat?.additions ?? 0,
+            deletions: stat?.deletions ?? 0,
+            status: tool.message.status,
+          });
+        }
       }
     }
     return Array.from(merged.values());
@@ -10468,36 +10528,42 @@ function ActionChip({
   ) => Promise<boolean>;
 }) {
   const hasContent = item.content.trim().length > 0;
+  const requestText = formatRawInput(item.rawInput, item.kind);
+  const hasDetails = hasContent || requestText !== null;
   const hasLocation = item.locations.length > 0;
-  // Click priority: navigate to first location if one exists; otherwise
-  // toggle inline expand. If neither exists, the chip is still a button
-  // (keeps UI consistent) but click is a no-op.
+  // Prefer details when the tool exposes a request or response. Running tools
+  // often have rawInput before they have output; treating those as expandable
+  // lets the user inspect the complete command while it is still executing.
+  // Location-only chips retain their direct file navigation behavior.
   const handleClick = (e: React.MouseEvent) => {
     e.stopPropagation();
+    if (hasDetails) {
+      onToggleExpand();
+      return;
+    }
     if (hasLocation) {
       const loc = item.locations[0];
       onFileClick?.(loc.path, loc.line, "full");
-      return;
     }
-    if (hasContent) onToggleExpand();
   };
-  const isInteractive = hasLocation || hasContent;
-  // chip 尾部提示：有 location → 箭头出链（可跳文件）；有 content → Chevron
-  // 指示可展开/已展开；无交互 → 不显示，避免骗点击。
-  const trailingHint = hasLocation ? (
-    <ExternalLink className="h-3 w-3 shrink-0 text-[var(--color-text-muted)] opacity-70" />
-  ) : hasContent ? (
+  const isInteractive = hasLocation || hasDetails;
+  // Details take precedence over navigation so long commands are never hidden
+  // behind truncation. Location-only chips keep the external-link affordance.
+  const trailingHint = hasDetails ? (
     expanded ? (
       <ChevronUp className="h-3 w-3 shrink-0 text-[var(--color-text-muted)]" />
     ) : (
       <ChevronDown className="h-3 w-3 shrink-0 text-[var(--color-text-muted)] opacity-70" />
     )
+  ) : hasLocation ? (
+    <ExternalLink className="h-3 w-3 shrink-0 text-[var(--color-text-muted)] opacity-70" />
   ) : null;
   return (
     <button
       type="button"
       onClick={handleClick}
       disabled={!isInteractive}
+      title={requestText ?? item.rawTitle}
       className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] transition-colors max-w-[320px] ${
         isInteractive
           ? "cursor-pointer hover:brightness-110"
@@ -10528,14 +10594,14 @@ function ActionChipList({
   items,
   overflowCount,
   onShowMore,
-  expandedKeys,
+  expandedKey,
   onToggleExpand,
   onFileClick,
 }: {
   items: ActionChipItem[];
   overflowCount: number;
   onShowMore: () => void;
-  expandedKeys: Set<string>;
+  expandedKey: string | null;
   onToggleExpand: (key: string) => void;
   onFileClick?: (
     filePath: string,
@@ -10543,7 +10609,7 @@ function ActionChipList({
     mode?: "diff" | "full",
   ) => Promise<boolean>;
 }) {
-  const expandedItems = items.filter((it) => expandedKeys.has(it.key));
+  const expandedItem = items.find((item) => item.key === expandedKey);
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap gap-1.5">
@@ -10551,7 +10617,7 @@ function ActionChipList({
           <ActionChip
             key={item.key}
             item={item}
-            expanded={expandedKeys.has(item.key)}
+            expanded={expandedKey === item.key}
             onToggleExpand={() => onToggleExpand(item.key)}
             onFileClick={onFileClick}
           />
@@ -10569,9 +10635,9 @@ function ActionChipList({
           </button>
         )}
       </div>
-      {expandedItems.length > 0 && (
-        <div className="space-y-2">
-          {expandedItems.map((item) => {
+      {expandedItem && (
+        <div>
+          {[expandedItem].map((item) => {
             const renderMarkdown =
               item.kind === "skill" ||
               item.kind === "todo" ||
@@ -10753,15 +10819,12 @@ const ToolSectionView = memo(function ToolSectionView({
   const [actionExpanded, setActionExpanded] = useState(false);
   const [actionItemsExpanded, setActionItemsExpanded] = useState(false);
   const [inspectionItemsExpanded, setInspectionItemsExpanded] = useState(false);
-  const [expandedActionKeys, setExpandedActionKeys] = useState<Set<string>>(
-    () => new Set(),
-  );
-  const [expandedInspectionKeys, setExpandedInspectionKeys] = useState<
-    Set<string>
-  >(() => new Set());
-  const [expandedEditKeys, setExpandedEditKeys] = useState<Set<string>>(
-    () => new Set(),
-  );
+  // This state intentionally lives inside ToolSectionView: each action block
+  // owns its own accordion, while all tool detail kinds within that block are
+  // mutually exclusive.
+  const [expandedDetailKey, setExpandedDetailKey] = useState<string | null>(null);
+  const toggleDetail = (key: string) =>
+    setExpandedDetailKey((current) => nextExpandedToolDetail(current, key));
   const hasDetails =
     summary.inspectionEntries.length > 0 ||
     summary.inspectionActionItems.length > 0 ||
@@ -10896,15 +10959,8 @@ const ToolSectionView = memo(function ToolSectionView({
                           : summary.inspectionItemOverflow
                       }
                       onShowMore={() => setInspectionItemsExpanded(true)}
-                      expandedKeys={expandedInspectionKeys}
-                      onToggleExpand={(key) =>
-                        setExpandedInspectionKeys((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(key)) next.delete(key);
-                          else next.add(key);
-                          return next;
-                        })
-                      }
+                      expandedKey={expandedDetailKey}
+                      onToggleExpand={toggleDetail}
                       onFileClick={onFileClick}
                     />
                   )}
@@ -10918,12 +10974,12 @@ const ToolSectionView = memo(function ToolSectionView({
                   </div>
                   <div className="flex flex-wrap gap-1.5">
                     {summary.editItems.map((item) => {
-                      const isExpanded = expandedEditKeys.has(item.key);
+                      const isExpanded = expandedDetailKey === item.key;
                       const tool = tools.find(
                         (t) => t.message.id === item.toolId,
                       )?.message;
                       const path = item.fullPath || tool?.locations?.[0]?.path;
-                      const hasDiff = (tool?.content?.trim()?.length ?? 0) > 0;
+                      const hasDiff = item.diff.trim().length > 0;
                       return (
                         <div
                           key={item.key}
@@ -10937,12 +10993,7 @@ const ToolSectionView = memo(function ToolSectionView({
                             type="button"
                             onClick={() => {
                               if (!hasDiff) return;
-                              setExpandedEditKeys((prev) => {
-                                const next = new Set(prev);
-                                if (next.has(item.key)) next.delete(item.key);
-                                else next.add(item.key);
-                                return next;
-                              });
+                              toggleDetail(item.key);
                             }}
                             disabled={!hasDiff}
                             className={`inline-flex items-center gap-1.5 ${hasDiff ? "cursor-pointer" : "cursor-default"} max-w-[320px]`}
@@ -10993,12 +11044,8 @@ const ToolSectionView = memo(function ToolSectionView({
                     })}
                   </div>
                   {summary.editItems
-                    .filter((item) => expandedEditKeys.has(item.key))
+                    .filter((item) => expandedDetailKey === item.key)
                     .map((item) => {
-                      const tool = tools.find(
-                        (t) => t.message.id === item.toolId,
-                      )?.message;
-                      const diff = tool?.content ?? "";
                       return (
                         <div
                           key={`${item.key}:diff`}
@@ -11011,19 +11058,13 @@ const ToolSectionView = memo(function ToolSectionView({
                             </span>
                             <button
                               type="button"
-                              onClick={() =>
-                                setExpandedEditKeys((prev) => {
-                                  const next = new Set(prev);
-                                  next.delete(item.key);
-                                  return next;
-                                })
-                              }
+                              onClick={() => toggleDetail(item.key)}
                               className="ml-auto text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] cursor-pointer transition-colors"
                             >
                               collapse
                             </button>
                           </div>
-                          <DiffPreview diff={diff || "(empty diff)"} />
+                          <DiffPreview diff={item.diff} />
                         </div>
                       );
                     })}
@@ -11057,15 +11098,8 @@ const ToolSectionView = memo(function ToolSectionView({
                         actionItemsExpanded ? 0 : summary.actionItemOverflow
                       }
                       onShowMore={() => setActionItemsExpanded(true)}
-                      expandedKeys={expandedActionKeys}
-                      onToggleExpand={(key) =>
-                        setExpandedActionKeys((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(key)) next.delete(key);
-                          else next.add(key);
-                          return next;
-                        })
-                      }
+                      expandedKey={expandedDetailKey}
+                      onToggleExpand={toggleDetail}
                       onFileClick={onFileClick}
                     />
                   )}

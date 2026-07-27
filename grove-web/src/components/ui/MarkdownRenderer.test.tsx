@@ -1,6 +1,11 @@
 import { renderToStaticMarkup } from "react-dom/server";
+import { act } from "react";
+import { createRoot } from "react-dom/client";
 import { describe, expect, it } from "vitest";
 import { MarkdownRenderer } from "./MarkdownRenderer";
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
+  .IS_REACT_ACT_ENVIRONMENT = true;
 
 describe("MarkdownRenderer file resources", () => {
   it("routes a relative iframe src through the worktree raw endpoint", () => {
@@ -79,5 +84,40 @@ describe("MarkdownRenderer lists", () => {
     expect(html).toContain("[li&gt;&amp;:first-child]:inline");
     expect(html).toContain("<li");
     expect(html).toContain("<p");
+  });
+});
+
+describe("MarkdownRenderer streaming reconciliation", () => {
+  it("preserves completed rich nodes when later text is appended", () => {
+    const stableContent = [
+      "![diagram](https://example.com/diagram.png)",
+      "",
+      "```ts",
+      "const stable = true;",
+      "```",
+    ].join("\n");
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => root.render(<MarkdownRenderer content={stableContent} />));
+    const image = container.querySelector("img");
+    const codeBlock = container.querySelector(".markdown-code-block");
+
+    expect(image).not.toBeNull();
+    expect(codeBlock).not.toBeNull();
+
+    act(() =>
+      root.render(
+        <MarkdownRenderer
+          content={`${stableContent}\n\nThe response keeps streaming after the rich blocks.`}
+        />,
+      ),
+    );
+
+    expect(container.querySelector("img")).toBe(image);
+    expect(container.querySelector(".markdown-code-block")).toBe(codeBlock);
+
+    act(() => root.unmount());
+    container.remove();
   });
 });

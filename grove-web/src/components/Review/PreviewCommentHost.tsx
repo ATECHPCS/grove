@@ -665,10 +665,14 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
           type="button"
           data-grove-comment-overlay="true"
           data-grove-selection-action="true"
-          className="absolute z-[60] inline-flex -translate-x-1/2 items-center gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-xs font-medium text-[var(--color-text)] shadow-lg transition-colors hover:bg-[var(--color-bg-secondary)]"
+          className={`absolute z-[60] inline-flex -translate-x-1/2 items-center gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-xs font-medium text-[var(--color-text)] shadow-lg transition-colors hover:bg-[var(--color-bg-secondary)] ${
+            selectionAction.rect.top - hostRect.top >= 48 ? '-translate-y-full' : ''
+          }`}
           style={{
             left: selectionAction.rect.left - hostRect.left + selectionAction.rect.width / 2,
-            top: Math.max(4, selectionAction.rect.top - hostRect.top - 38),
+            top: selectionAction.rect.top - hostRect.top >= 48
+              ? selectionAction.rect.top - hostRect.top - 8
+              : selectionAction.rect.bottom - hostRect.top + 8,
           }}
           onMouseDown={(event) => event.preventDefault()}
           onClick={() => {

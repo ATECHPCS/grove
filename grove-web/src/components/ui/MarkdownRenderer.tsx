@@ -1092,6 +1092,15 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, render
     if (sketchContext) out = preprocessSketchUrls(out);
     return out;
   }, [content, sketchContext]);
+  // Custom renderer function identities must stay stable while markdown is
+  // streaming. If `components` is rebuilt for every content chunk,
+  // react-markdown treats images, code blocks, diagrams, and iframes as new
+  // component types and remounts them, producing visible blank/full flashes.
+  // Source annotations still need the latest markdown, so read it through a
+  // render-time ref instead of closing over it in the component map.
+  const processedContentRef = useRef(processedContent);
+  // eslint-disable-next-line react-hooks/refs
+  processedContentRef.current = processedContent;
   // Resolve file-relative resources through the adapter selected by location.
   // Without a location, references retain the browser's default behavior.
   const resourceSrcResolver = useMemo(
@@ -1114,7 +1123,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, render
       if (!enableHeadingIds) return undefined;
       return sluggerRef.current(extractText(children));
     };
-    const source = (node: unknown) => sourceForMarkdownNode(node, processedContent);
+    const source = (node: unknown) => sourceForMarkdownNode(node, processedContentRef.current);
     return ({
         h1: ({ children, node, ...props }) => (
           <h1 data-grove-markdown-source={source(node)} id={slug(children, props.id)} className={isDocument ? "text-3xl leading-tight font-bold text-[var(--color-text)] mt-10 mb-4 first:mt-0 scroll-mt-6" : "text-xl font-bold text-[var(--color-text)] mt-4 mb-2 first:mt-0 scroll-mt-4"}>{children}</h1>
@@ -1377,7 +1386,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, render
           return <input {...props} />;
         },
     });
-  }, [onFileClick, resolveImageUrl, location, resourceSrcResolver, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode, enableHeadingIds, isDocument, processedContent]);
+  }, [onFileClick, resolveImageUrl, location, resourceSrcResolver, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode, enableHeadingIds, isDocument]);
 
   const rendered = (
     <div

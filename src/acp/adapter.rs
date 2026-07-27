@@ -48,11 +48,7 @@ impl AgentContentAdapter for ClaudeAdapter {
 
 /// Convert ACP Diff to display string.
 fn format_diff(diff: &acp::Diff) -> String {
-    let path_str = diff
-        .path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| diff.path.display().to_string());
+    let path_str = diff.path.display().to_string();
     format_diff_content(&path_str, diff.old_text.as_deref(), &diff.new_text)
 }
 
@@ -60,58 +56,26 @@ fn format_diff(diff: &acp::Diff) -> String {
 ///
 /// Used for Write/Edit tool calls where the agent doesn't send content in ToolCallUpdate.
 pub fn generate_file_diff(path: &Path, old: Option<&str>, new: &str) -> String {
-    // Use file name only (title already shows the full path)
-    let path_str = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
+    let path_str = path.display().to_string();
     format_diff_content(&path_str, old, new)
 }
 
-/// Core diff formatting: new file → markdown code block, edit → real unified diff.
+/// Format one ACP Diff as a self-contained git-style patch.
+///
+/// The file headers are intentionally retained even though the UI already has
+/// a file chip: a single ACP tool call may contain several Diff blocks, and
+/// downstream clients need an unambiguous boundary to associate each patch and
+/// its line counts with the correct file.
 fn format_diff_content(path: &str, old: Option<&str>, new: &str) -> String {
-    match old {
-        None | Some("") => {
-            // New file: markdown code fence with language from extension
-            let lang = path.rsplit('.').next().map(ext_to_lang).unwrap_or("");
-            format!("```{lang}\n{new}\n```")
-        }
-        Some(old_text) => {
-            // Edit: real unified diff with 3 lines of context.
-            build_unified_diff(path, old_text, new)
-        }
-    }
-}
-
-/// Map file extension to markdown language identifier.
-fn ext_to_lang(ext: &str) -> &str {
-    // Case-insensitive matching via known lowercase variants
-    match ext {
-        "rs" => "rust",
-        "ts" | "tsx" => "typescript",
-        "js" | "jsx" | "mjs" | "cjs" => "javascript",
-        "py" => "python",
-        "rb" => "ruby",
-        "go" => "go",
-        "java" => "java",
-        "kt" | "kts" => "kotlin",
-        "swift" => "swift",
-        "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" => "cpp",
-        "cs" => "csharp",
-        "sh" | "bash" | "zsh" => "bash",
-        "json" => "json",
-        "yaml" | "yml" => "yaml",
-        "toml" => "toml",
-        "xml" => "xml",
-        "html" | "htm" => "html",
-        "css" | "scss" | "less" => "css",
-        "sql" => "sql",
-        "md" | "markdown" => "markdown",
-        "dockerfile" => "dockerfile",
-        "txt" | "text" | "log" | "" => "",
-        _ => ext,
-    }
+    let git_path = path.trim_start_matches('/');
+    let old_text = old.unwrap_or_default();
+    let old_header = if old.is_none() {
+        "/dev/null".to_string()
+    } else {
+        format!("a/{git_path}")
+    };
+    let body = build_unified_diff(path, old_text, new);
+    format!("diff --git a/{git_path} b/{git_path}\n--- {old_header}\n+++ b/{git_path}\n{body}")
 }
 
 /// Build unified diff using `similar` crate with context lines.
@@ -252,10 +216,10 @@ mod tests {
     fn test_format_diff_new_file() {
         let diff = acp::Diff::new("src/main.rs", "fn main() {\n    println!(\"hello\");\n}");
         let result = format_diff(&diff);
-        // New file → markdown code block with language
-        assert!(result.starts_with("```rust\n"));
-        assert!(result.contains("fn main() {"));
-        assert!(result.ends_with("\n```"));
+        assert!(result.starts_with(
+            "diff --git a/src/main.rs b/src/main.rs\n--- /dev/null\n+++ b/src/main.rs\n"
+        ));
+        assert!(result.contains("+fn main() {"));
     }
 
     #[test]
@@ -263,9 +227,9 @@ mod tests {
         let diff = acp::Diff::new("src/lib.rs", "line 1\nnew content\nline 3")
             .old_text("line 1\nold content\nline 3".to_string());
         let result = format_diff(&diff);
-        // Edit → unified diff without file header (starts with @@ hunk)
-        assert!(result.starts_with("@@"));
-        assert!(!result.contains("---"));
+        assert!(result.starts_with(
+            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n"
+        ));
         assert!(result.contains("-old content"));
         assert!(result.contains("+new content"));
         assert!(result.contains(" line 1"));
@@ -275,17 +239,10 @@ mod tests {
     fn test_format_diff_empty_old() {
         let diff = acp::Diff::new("new.txt", "hello").old_text(String::new());
         let result = format_diff(&diff);
-        // Empty old → treated as new file
-        assert!(result.starts_with("```\n"));
-        assert!(result.contains("hello"));
-    }
-
-    #[test]
-    fn test_ext_to_lang() {
-        assert_eq!(ext_to_lang("rs"), "rust");
-        assert_eq!(ext_to_lang("tsx"), "typescript");
-        assert_eq!(ext_to_lang("py"), "python");
-        assert_eq!(ext_to_lang("txt"), "");
+        assert!(
+            result.starts_with("diff --git a/new.txt b/new.txt\n--- a/new.txt\n+++ b/new.txt\n")
+        );
+        assert!(result.contains("+hello"));
     }
 
     #[test]
@@ -293,8 +250,10 @@ mod tests {
         use std::path::PathBuf;
         let path = PathBuf::from("/tmp/test.py");
         let result = generate_file_diff(&path, None, "print('hello')");
-        assert!(result.starts_with("```python\n"));
-        assert!(result.contains("print('hello')"));
+        assert!(result.starts_with(
+            "diff --git a/tmp/test.py b/tmp/test.py\n--- /dev/null\n+++ b/tmp/test.py\n"
+        ));
+        assert!(result.contains("+print('hello')"));
     }
 
     #[test]
