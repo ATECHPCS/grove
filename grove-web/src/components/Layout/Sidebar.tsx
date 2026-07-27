@@ -351,10 +351,10 @@ export function Sidebar({
 
   const onIslandLeave = useCallback(() => {
     if (!hoverEnabledRef.current) return;
-    // Longer leave delay once expanded — gives the user time to settle the
-    // cursor inside the wide horizontal pill before it collapses. 300ms is
-    // the resting default; the expanded state bumps to 500ms.
-    const delay = islandHovered ? 500 : 300;
+    // Keep a short grace period so grazing the edge does not cause flicker,
+    // while still letting the island collapse promptly after the pointer
+    // leaves the visible surface.
+    const delay = islandHovered ? 180 : 100;
     hideTimerRef.current = setTimeout(() => setIslandHovered(false), delay);
   }, [islandHovered]);
 
@@ -731,27 +731,7 @@ export function Sidebar({
             onMouseEnter={() => setAlertHovered(true)}
             onMouseLeave={() => setAlertHovered(false)}
           />
-        ) : (
-          // Invisible hover pad — extends the resting pill's hit area.
-          // The visual pill is 120×16 (very small target). Adding a 240×32
-          // transparent pad centered below it doubles the width and gives
-          // a 16px vertical buffer, so the user's cursor doesn't have to
-          // land pixel-perfect on the thin black bar to trigger expand.
-          // Removed the instant the pill expands — the expanded 720×64
-          // surface is large enough to catch movement on its own.
-          <div
-            aria-hidden
-            style={{
-              position: "absolute",
-              top: "100%",
-              left: "50%",
-              transform: "translateX(-50%)",
-              width: 240,
-              height: 32,
-              pointerEvents: "auto",
-            }}
-          />
-        )
+        ) : null
       ) : (
         content
       )}

@@ -52,6 +52,9 @@ import { createSlugger } from "./headingSlug";
 import { useTheme } from "../../context/ThemeContext";
 import { isAbsoluteFileReference, resolveFileReference, type FileLocation } from "./fileLocation";
 import { normalizeStrongEmphasis } from "./markdownPreprocess";
+import { MarkdownCommentHost, type MarkdownCommentConfig } from "../Review/PreviewCommentHost";
+import { selectedMarkdownForRange } from "./markdownClipboard";
+import { previewCommentTaskLabel, useOptionalPreviewComments, type PreviewCommentLocator } from "../../context";
 
 /** Languages whose code blocks may be executed in the terminal. */
 const RUNNABLE_SHELL_LANGS = new Set(["bash", "sh", "shell", "zsh"]);
@@ -786,6 +789,10 @@ export interface MarkdownRendererProps {
    * heading ids would collide across messages. Opt in only on surfaces that
    * own their preview pane (file preview drawer, code review preview). */
   enableHeadingIds?: boolean;
+  /** Shared Markdown annotation capability used by chat, artifacts, and file previews. */
+  /** Explicit annotation config. Omit to auto-enable for task-scoped files;
+   * pass false only when a parent annotation host owns the whole document. */
+  comments?: MarkdownCommentConfig | false;
 }
 
 /** Extract filename from a full file path */
@@ -946,10 +953,7 @@ function copySelectedMarkdown(event: React.ClipboardEvent<HTMLDivElement>, root:
   if (!root || !selection || selection.isCollapsed || selection.rangeCount === 0) return;
   const range = selection.getRangeAt(0);
   if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return;
-  const allBlocks = Array.from(root.querySelectorAll<HTMLElement>("[data-grove-markdown-source]"))
-    .filter((block) => range.intersectsNode(block));
-  const blocks = allBlocks.filter((block) => !allBlocks.some((other) => other !== block && other.contains(block)));
-  const markdown = blocks.map((block) => block.dataset.groveMarkdownSource).filter((source): source is string => Boolean(source)).join("\n\n");
+  const markdown = selectedMarkdownForRange(root, range);
   if (!markdown) return;
   event.preventDefault();
   event.clipboardData.setData("text/plain", markdown);
@@ -1043,8 +1047,45 @@ function EmbeddedHtmlIframe({ src, fitLocalHtml, className, height, ...props }: 
   );
 }
 
-export const MarkdownRenderer = memo(function MarkdownRenderer({ content, renderMode = "compact", onFileClick, resolveImageUrl, location, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode = "chip", enableHeadingIds }: MarkdownRendererProps) {
+export const MarkdownRenderer = memo(function MarkdownRenderer({ content, renderMode = "compact", onFileClick, resolveImageUrl, location, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode = "chip", enableHeadingIds, comments }: MarkdownRendererProps) {
   const markdownRootRef = useRef<HTMLDivElement>(null);
+  const previewComments = useOptionalPreviewComments();
+  const automaticCommentId = useId().replace(/:/g, "");
+  const automaticComments = useMemo<MarkdownCommentConfig | undefined>(() => {
+    if (!previewComments || !location || location.root.kind !== "task") return undefined;
+    const { projectId, path } = location;
+    const taskId = location.root.taskId;
+    const matchingDrafts = previewComments.drafts.filter(
+      (draft) => draft.projectId === projectId && draft.taskId === taskId && draft.filePath === path,
+    );
+    return {
+      previewId: `markdown-${automaticCommentId}`,
+      markers: matchingDrafts.map((draft) => ({
+        id: draft.id,
+        label: previewCommentTaskLabel(previewComments.drafts, draft),
+        selector: draft.locator.selector,
+        xpath: draft.locator.xpath,
+        extraBlocks: draft.locator.extraBlocks,
+        locator: draft.locator,
+        comment: draft.comment,
+      })),
+      onAdd: (locator: PreviewCommentLocator, comment: string) => {
+        previewComments.addDraft({
+          source: "review",
+          projectId,
+          taskId,
+          filePath: path,
+          fileName: path.split("/").pop() || path,
+          rendererId: "markdown",
+          locator,
+          comment,
+        });
+      },
+      onUpdate: (id: string, comment: string) => previewComments.updateDraft(id, { comment }),
+      onDelete: previewComments.removeDraft,
+    };
+  }, [automaticCommentId, location, previewComments]);
+  const effectiveComments = comments === false ? undefined : comments ?? automaticComments;
   const processedContent = useMemo(() => {
     let out = normalizeStrongEmphasis(content);
     out = preprocessInlineCodeUrls(out);
@@ -1338,7 +1379,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, render
     });
   }, [onFileClick, resolveImageUrl, location, resourceSrcResolver, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode, enableHeadingIds, isDocument, processedContent]);
 
-  return (
+  const rendered = (
     <div
       ref={markdownRootRef}
       className={isDocument ? "markdown-document-preview mx-auto max-w-[78rem]" : undefined}
@@ -1359,4 +1400,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, render
       </ReactMarkdown>
     </div>
   );
+  return effectiveComments
+    ? <MarkdownCommentHost previewComment={effectiveComments}>{rendered}</MarkdownCommentHost>
+    : rendered;
 });

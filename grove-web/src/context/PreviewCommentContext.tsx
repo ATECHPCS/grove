@@ -37,6 +37,8 @@ export interface PreviewCommentLocator {
   role?: string;
   rect?: { x: number; y: number; width: number; height: number };
   extraBlocks?: Array<{ selector: string; xpath: string }>;
+  /** Character offsets inside the resolved Markdown block for exact text selections. */
+  textRange?: { start: number; end: number; quote: string };
 }
 
 export interface PreviewCommentDraft {
@@ -130,4 +132,9 @@ export function usePreviewComments() {
     throw new Error("usePreviewComments must be used within PreviewCommentProvider");
   }
   return ctx;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function useOptionalPreviewComments() {
+  return useContext(PreviewCommentContext);
 }

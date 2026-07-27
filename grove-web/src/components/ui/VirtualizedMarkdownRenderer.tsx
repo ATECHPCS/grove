@@ -616,6 +616,7 @@ export const VirtualizedMarkdownRenderer = forwardRef<
             // slugger resetting and minting colliding `#setup` ids across
             // multiple blocks.
             enableHeadingIds={false}
+            comments={false}
           />
         </div>
       );

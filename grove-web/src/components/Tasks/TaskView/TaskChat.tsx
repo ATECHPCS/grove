@@ -87,7 +87,7 @@ import { getMentionCandidates } from "../../../api";
 import { listExtensionTabs, getExtensionStatus } from "../../../api/extension";
 import { useProject } from "../../../context/ProjectContext";
 import { useConfig } from "../../../context/ConfigContext";
-import { usePreviewComments, type PreviewCommentDraft } from "../../../context";
+import { previewCommentTaskLabel, usePreviewComments, type PreviewCommentDraft, type PreviewCommentLocator } from "../../../context";
 import { PreviewSearchBar } from "../../Review/PreviewSearchBar";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useChatSearch } from "./useChatSearch";
@@ -2228,67 +2228,6 @@ export function TaskChat({
   const thoughtLevelMenuRef = useRef<HTMLDivElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
   const slashItemRefs = useRef<(HTMLButtonElement | null)[]>([]);
-  const [chatSelectionAction, setChatSelectionAction] = useState<{
-    text: string;
-    messageIndex: number;
-    rect: DOMRect;
-    range: Range;
-  } | null>(null);
-
-  useEffect(() => {
-    const root = taskChatRootRef.current;
-    if (!root) return;
-
-    const handleSelection = () => {
-      const selection = window.getSelection();
-      if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
-        setChatSelectionAction(null);
-        return;
-      }
-      const range = selection.getRangeAt(0);
-      const start = range.startContainer.nodeType === Node.ELEMENT_NODE
-        ? range.startContainer as Element
-        : range.startContainer.parentElement;
-      const end = range.endContainer.nodeType === Node.ELEMENT_NODE
-        ? range.endContainer as Element
-        : range.endContainer.parentElement;
-      const startMessage = start?.closest<HTMLElement>('[data-grove-commentable-message="true"]');
-      const endMessage = end?.closest<HTMLElement>('[data-grove-commentable-message="true"]');
-      if (!startMessage || startMessage !== endMessage || !root.contains(startMessage)) {
-        setChatSelectionAction(null);
-        return;
-      }
-      const text = selection.toString().replace(/\s+/g, ' ').trim().slice(0, 1200);
-      const messageIndex = Number(startMessage.dataset.groveMessageIndex);
-      const clientRects = Array.from(range.getClientRects());
-      const rect = clientRects[clientRects.length - 1] ?? range.getBoundingClientRect();
-      if (!text || !Number.isFinite(messageIndex) || rect.width <= 0 || rect.height <= 0) {
-        setChatSelectionAction(null);
-        return;
-      }
-      setChatSelectionAction({
-        text,
-        messageIndex,
-        rect,
-        range: range.cloneRange(),
-      });
-    };
-
-    const clearSelectionAction = (event: MouseEvent) => {
-      if ((event.target as Element | null)?.closest?.('[data-grove-chat-comment-action="true"]')) return;
-      setChatSelectionAction(null);
-    };
-
-    root.addEventListener('mouseup', handleSelection);
-    root.addEventListener('keyup', handleSelection);
-    document.addEventListener('mousedown', clearSelectionAction, true);
-    return () => {
-      root.removeEventListener('mouseup', handleSelection);
-      root.removeEventListener('keyup', handleSelection);
-      document.removeEventListener('mousedown', clearSelectionAction, true);
-    };
-  }, []);
-
   const [taskFiles, setTaskFiles] = useState<string[]>([]);
   const [taskFilesMeta, setTaskFilesMeta] = useState<import("../../../api/tasks").FileMetadata[]>([]);
   const [sketchMeta, setSketchMeta] = useState<SketchMeta[]>([]);
@@ -2429,35 +2368,6 @@ export function TaskChat({
   const [showPreviewComments, setShowPreviewComments] = useState(false);
   const [editingPreviewCommentId, setEditingPreviewCommentId] = useState<string | null>(null);
   const [editingPreviewCommentText, setEditingPreviewCommentText] = useState("");
-  const [chatCommentComposer, setChatCommentComposer] = useState<{
-    text: string;
-    messageIndex: number;
-    rect: DOMRect;
-    range: Range;
-  } | null>(null);
-  const [chatCommentText, setChatCommentText] = useState("");
-  const chatDraftRangesRef = useRef<Map<string, Range>>(new Map());
-  const [savedChatCommentMarkers, setSavedChatCommentMarkers] = useState<Array<{
-    id: string;
-    label: number;
-    rect: DOMRect;
-    comment: string;
-  }>>([]);
-  useEffect(() => {
-    const highlightName = "grove-chat-comment-selection";
-    if (!chatCommentComposer || !("highlights" in CSS) || typeof Highlight === "undefined") return;
-    let style = document.getElementById("grove-chat-comment-highlight-style");
-    if (!style) {
-      style = document.createElement("style");
-      style.id = "grove-chat-comment-highlight-style";
-      document.head.appendChild(style);
-    }
-    style.textContent = `::highlight(grove-chat-comment-selection),::highlight(grove-chat-saved-comments){background-color:rgba(59,130,246,.32);color:inherit;}`;
-    try { CSS.highlights.set(highlightName, new Highlight(chatCommentComposer.range)); } catch { /* noop */ }
-    return () => {
-      try { CSS.highlights.delete(highlightName); } catch { /* noop */ }
-    };
-  }, [chatCommentComposer]);
   const [chatSearchOpen, setChatSearchOpen] = useState(false);
   const [chatSearchQuery, setChatSearchQuery] = useState("");
   const planFilePathRef = useRef("");
@@ -2564,48 +2474,6 @@ export function TaskChat({
     () => previewCommentDrafts.filter((draft) => draft.projectId === projectId && draft.taskId === task.id),
     [previewCommentDrafts, projectId, task.id],
   );
-  useEffect(() => {
-    const chatDrafts = taskPreviewCommentDrafts.filter((draft) => draft.source === "chat");
-    const liveIds = new Set(chatDrafts.map((draft) => draft.id));
-    for (const id of chatDraftRangesRef.current.keys()) {
-      if (!liveIds.has(id)) chatDraftRangesRef.current.delete(id);
-    }
-
-    const refresh = () => {
-      const highlight = new Highlight();
-      const markers: Array<{ id: string; label: number; rect: DOMRect; comment: string }> = [];
-      chatDrafts.forEach((draft) => {
-        const range = chatDraftRangesRef.current.get(draft.id);
-        if (!range) return;
-        try {
-          highlight.add(range);
-          const rects = Array.from(range.getClientRects());
-          const rect = rects[rects.length - 1] ?? range.getBoundingClientRect();
-          if (rect.width > 0 && rect.height > 0) {
-            markers.push({
-              id: draft.id,
-              label: taskPreviewCommentDrafts.findIndex((item) => item.id === draft.id) + 1,
-              rect,
-              comment: draft.comment,
-            });
-          }
-        } catch {
-          chatDraftRangesRef.current.delete(draft.id);
-        }
-      });
-      try { CSS.highlights.set("grove-chat-saved-comments", highlight); } catch { /* noop */ }
-      setSavedChatCommentMarkers(markers);
-    };
-
-    refresh();
-    window.addEventListener("scroll", refresh, true);
-    window.addEventListener("resize", refresh);
-    return () => {
-      window.removeEventListener("scroll", refresh, true);
-      window.removeEventListener("resize", refresh);
-      try { CSS.highlights.delete("grove-chat-saved-comments"); } catch { /* noop */ }
-    };
-  }, [taskPreviewCommentDrafts]);
   const hasPreviewCommentsPanel = taskPreviewCommentDrafts.length > 0;
   const activeComposerPanel =
     showAuthPanel && activeAuthMessage
@@ -7252,29 +7120,6 @@ export function TaskChat({
     });
   }, []);
 
-  const submitChatSelectionComment = useCallback(() => {
-    if (!chatCommentComposer || !chatCommentText.trim() || !activeChatId) return;
-    const draft = addPreviewCommentDraft({
-      source: "chat",
-      projectId,
-      taskId: task.id,
-      filePath: `chat/${activeChatId}/message-${chatCommentComposer.messageIndex + 1}`,
-      fileName: `Conversation · message ${chatCommentComposer.messageIndex + 1}`,
-      rendererId: "chat-markdown",
-      locator: {
-        type: "dom",
-        selector: `[data-grove-message-index="${chatCommentComposer.messageIndex}"]`,
-        tagName: "div",
-        text: chatCommentComposer.text,
-        html: `[chat text selection] ${chatCommentComposer.text}`,
-      },
-      comment: chatCommentText.trim(),
-    });
-    chatDraftRangesRef.current.set(draft.id, chatCommentComposer.range.cloneRange());
-    setChatCommentComposer(null);
-    setChatCommentText("");
-  }, [activeChatId, addPreviewCommentDraft, chatCommentComposer, chatCommentText, projectId, task.id]);
-
   // ─── Collapsed mode ──────────────────────────────────────────────────────
 
   if (collapsed) {
@@ -7335,122 +7180,6 @@ export function TaskChat({
         }
       }}
     >
-      {savedChatCommentMarkers.length > 0 && typeof document !== "undefined" && createPortal(
-        <>
-          {savedChatCommentMarkers.map((marker) => (
-            <button
-              key={marker.id}
-              type="button"
-              data-grove-chat-comment-action="true"
-              className="fixed z-[138] flex h-5 min-w-5 items-center justify-center rounded-full bg-[var(--color-highlight)] px-1.5 text-[10px] font-bold text-white shadow-sm transition-transform hover:scale-110"
-              style={{
-                left: Math.min(window.innerWidth - 28, marker.rect.right + 6),
-                top: Math.max(8, marker.rect.top - 2),
-              }}
-              title={marker.comment}
-              onClick={() => {
-                setEditingPreviewCommentId(marker.id);
-                setEditingPreviewCommentText(marker.comment);
-                setShowPreviewComments(true);
-              }}
-            >
-              {marker.label}
-            </button>
-          ))}
-        </>,
-        document.body,
-      )}
-      {chatSelectionAction && typeof document !== "undefined" && createPortal(
-        <button
-          type="button"
-          data-grove-chat-comment-action="true"
-          className="fixed z-[140] inline-flex -translate-x-1/2 items-center gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-xs font-medium text-[var(--color-text)] shadow-[0_10px_28px_rgba(0,0,0,0.18)] transition-colors hover:bg-[var(--color-bg-secondary)]"
-          style={{
-            left: Math.min(window.innerWidth - 58, Math.max(58, chatSelectionAction.rect.left + chatSelectionAction.rect.width / 2)),
-            top: Math.max(8, chatSelectionAction.rect.top - 40),
-          }}
-          onMouseDown={(event) => event.preventDefault()}
-          onClick={() => {
-            setChatCommentComposer({
-              text: chatSelectionAction.text,
-              messageIndex: chatSelectionAction.messageIndex,
-              rect: chatSelectionAction.rect,
-              range: chatSelectionAction.range,
-            });
-            setChatCommentText("");
-            setChatSelectionAction(null);
-          }}
-        >
-          <MessageSquarePlus className="h-3.5 w-3.5 text-[var(--color-highlight)]" />
-          Comment
-        </button>,
-        document.body,
-      )}
-      {chatCommentComposer && typeof document !== "undefined" && createPortal(
-        <>
-          <div
-            className="pointer-events-none fixed z-[139] flex h-5 min-w-5 items-center justify-center rounded-full bg-[var(--color-highlight)] px-1.5 text-[10px] font-bold text-white shadow-sm"
-            style={{
-              left: Math.min(window.innerWidth - 28, chatCommentComposer.rect.right + 6),
-              top: Math.max(8, chatCommentComposer.rect.top - 2),
-            }}
-          >
-            {taskPreviewCommentDrafts.length + 1}
-          </div>
-          <div
-            data-grove-chat-comment-action="true"
-            className="fixed z-[140] w-[min(220px,calc(100vw-20px))] rounded-xl border border-[var(--color-border)] bg-[var(--color-bg)] p-2 shadow-[0_10px_24px_rgba(0,0,0,0.16)]"
-            style={{
-              left: window.innerWidth - chatCommentComposer.rect.right >= 248
-                ? chatCommentComposer.rect.right + 28
-                : Math.max(10, chatCommentComposer.rect.left - 228),
-              top: window.innerHeight - chatCommentComposer.rect.bottom >= 132
-                ? chatCommentComposer.rect.bottom + 8
-                : Math.max(10, chatCommentComposer.rect.top - 124),
-            }}
-          >
-            <textarea
-              rows={3}
-              value={chatCommentText}
-              onChange={(event) => setChatCommentText(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Escape") {
-                  event.preventDefault();
-                  setChatCommentComposer(null);
-                  setChatCommentText("");
-                }
-                if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-                  event.preventDefault();
-                  submitChatSelectionComment();
-                }
-              }}
-              placeholder="Add a comment…"
-              className="block w-full resize-none rounded-lg border-0 bg-transparent px-1.5 py-1 text-xs leading-4 text-[var(--color-text)] outline-none placeholder:text-[var(--color-text-muted)]"
-            />
-            <div className="mt-1 flex items-center justify-end gap-1">
-              <button
-                type="button"
-                className="rounded-md px-2 py-1 text-[10px] font-medium text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
-                onClick={() => {
-                  setChatCommentComposer(null);
-                  setChatCommentText("");
-                }}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                disabled={!chatCommentText.trim()}
-                className="rounded-md px-2 py-1 text-[10px] font-semibold text-[var(--color-highlight)] hover:bg-[color-mix(in_srgb,var(--color-highlight)_12%,transparent)] disabled:cursor-not-allowed disabled:opacity-40"
-                onClick={submitChatSelectionComment}
-              >
-                Save
-              </button>
-            </div>
-          </div>
-        </>,
-        document.body,
-      )}
       {chatSearchOpen && (
         <PreviewSearchBar
           query={chatSearchQuery}
@@ -7922,6 +7651,11 @@ export function TaskChat({
                     agentLabel={agentLabel}
                     projectId={projectId}
                     taskId={task.id}
+                    activeChatId={activeChatId ?? undefined}
+                    previewCommentDrafts={taskPreviewCommentDrafts}
+                    onAddPreviewComment={addPreviewCommentDraft}
+                    onUpdatePreviewComment={updatePreviewCommentDraft}
+                    onRemovePreviewComment={removePreviewCommentDraft}
                     isStudio={isStudioProject}
                     resolveSender={resolveSender}
                     onToggleThinkingCollapse={toggleThinkingCollapse}
@@ -8017,9 +7751,9 @@ export function TaskChat({
                     animate={{ opacity: 1, y: 0, height: "auto" }}
                     exit={{ opacity: 0, y: 8, height: 0 }}
                     transition={{ duration: 0.2, ease: "easeOut" }}
-                    className="mb-3 overflow-hidden rounded-[26px] border border-[color-mix(in_srgb,var(--color-border)_62%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_82%,transparent)] shadow-[0_16px_40px_rgba(0,0,0,0.14)] backdrop-blur-md"
+                    className="mb-3 overflow-hidden rounded-2xl border border-[color-mix(in_srgb,var(--color-border)_62%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_92%,transparent)] shadow-[0_12px_32px_rgba(0,0,0,0.14)] backdrop-blur-md"
                   >
-                    <div className="max-h-72 overflow-y-auto px-3 py-3">
+                    <div className={`max-h-[min(360px,48vh)] overflow-y-auto overscroll-contain ${activeComposerPanel === "previewComments" ? "" : "px-3 py-3"}`}>
                       {activeComposerPanel === "todo" && (
                         <div className="space-y-1">
                           {planEntries.map((entry, i) => (
@@ -8192,8 +7926,8 @@ export function TaskChat({
                       )}
 
                       {activeComposerPanel === "previewComments" && (
-                        <div className="space-y-2.5">
-                          <div className="sticky top-0 z-20 -mx-3 -mt-3 flex items-center justify-between gap-2 border-b border-[color-mix(in_srgb,var(--color-border)_55%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_94%,transparent)] px-3 pb-2 pt-3 backdrop-blur-md">
+                        <div>
+                          <div className="sticky top-0 z-20 flex items-center justify-between gap-2 border-b border-[color-mix(in_srgb,var(--color-border)_55%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_94%,transparent)] px-3 py-2.5 backdrop-blur-md">
                             <div className="flex items-center gap-1.5">
                               <MessageSquarePlus className="h-3.5 w-3.5 text-[var(--color-highlight)]" />
                               <span className="text-[11px] font-medium uppercase tracking-[0.1em] text-[var(--color-text-muted)]">
@@ -8212,7 +7946,7 @@ export function TaskChat({
                               Send all
                             </button>
                           </div>
-                          <div className="space-y-1.5">
+                          <div className="space-y-1.5 px-2.5 py-2.5">
                             {taskPreviewCommentDrafts.map((draft, idx) => {
                               const fileLabel = draft.source === "chat"
                                 ? `Conversation · message ${draft.filePath.split("-").pop()}`
@@ -9486,6 +9220,11 @@ const MessageItem = memo(function MessageItem({
   agentLabel,
   projectId,
   taskId,
+  activeChatId,
+  previewCommentDrafts,
+  onAddPreviewComment,
+  onUpdatePreviewComment,
+  onRemovePreviewComment,
   isStudio,
   onToggleThinkingCollapse,
   onPermissionResponse,
@@ -9502,6 +9241,11 @@ const MessageItem = memo(function MessageItem({
   agentLabel?: string;
   projectId: string;
   taskId: string;
+  activeChatId?: string;
+  previewCommentDrafts: PreviewCommentDraft[];
+  onAddPreviewComment: ReturnType<typeof usePreviewComments>["addDraft"];
+  onUpdatePreviewComment: ReturnType<typeof usePreviewComments>["updateDraft"];
+  onRemovePreviewComment: ReturnType<typeof usePreviewComments>["removeDraft"];
   isStudio: boolean;
   onToggleThinkingCollapse: (index: number) => void;
   onPermissionResponse?: (optionId: string, requestId: string) => void;
@@ -9542,6 +9286,46 @@ const MessageItem = memo(function MessageItem({
     }
     return `/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(decoded)}`;
   }, [projectId, taskId]);
+
+  const chatCommentFilePath = activeChatId
+    ? `chat/${activeChatId}/message-${index + 1}`
+    : undefined;
+  const messageCommentDrafts = useMemo(
+    () => chatCommentFilePath
+      ? previewCommentDrafts.filter((draft) => draft.source === "chat" && draft.filePath === chatCommentFilePath)
+      : [],
+    [chatCommentFilePath, previewCommentDrafts],
+  );
+  const isCommentableAssistant = message.type === "assistant" && message.complete;
+  const markdownComments = useMemo(() => {
+    if (!chatCommentFilePath || !isCommentableAssistant) return undefined;
+    return {
+      previewId: `chat-markdown-${activeChatId}-${index}`,
+      markers: messageCommentDrafts.map((draft) => ({
+        id: draft.id,
+        label: previewCommentTaskLabel(previewCommentDrafts, draft),
+        selector: draft.locator.selector,
+        xpath: draft.locator.xpath,
+        extraBlocks: draft.locator.extraBlocks,
+        locator: draft.locator,
+        comment: draft.comment,
+      })),
+      onAdd: (locator: PreviewCommentLocator, comment: string) => {
+        onAddPreviewComment({
+          source: "chat",
+          projectId,
+          taskId,
+          filePath: chatCommentFilePath,
+          fileName: `Conversation · message ${index + 1}`,
+          rendererId: "chat-markdown",
+          locator,
+          comment,
+        });
+      },
+      onUpdate: (id: string, comment: string) => onUpdatePreviewComment(id, { comment }),
+      onDelete: onRemovePreviewComment,
+    };
+  }, [activeChatId, chatCommentFilePath, index, isCommentableAssistant, messageCommentDrafts, onAddPreviewComment, onRemovePreviewComment, onUpdatePreviewComment, previewCommentDrafts, projectId, taskId]);
 
   switch (message.type) {
     case "user":
@@ -9695,6 +9479,7 @@ const MessageItem = memo(function MessageItem({
               onImageClick={onImageClick}
               enableRunCommand
               sketchContext={sketchContext}
+              comments={markdownComments}
             />
             {!message.complete && isBusy && (
               <span className="inline-block w-1.5 h-4 ml-0.5 bg-[var(--color-text-muted)] animate-pulse rounded-sm" />

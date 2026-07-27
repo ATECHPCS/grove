@@ -1,7 +1,7 @@
 /* eslint-disable react-refresh/only-export-components */
 import { lazy, Suspense, useEffect, useRef, useMemo, useState, useId, type ReactNode } from 'react';
 import { MarkdownRenderer, MermaidBlock, D2Block } from '../ui/MarkdownRenderer';
-import { PreviewCommentHost } from './PreviewCommentHost';
+import { PreviewCommentHost, type MarkdownCommentConfig, type MarkdownCommentMarker } from './PreviewCommentHost';
 import { highlightCode as highlightLocal, detectLanguage as detectLanguageLocal } from './syntaxHighlight';
 import type { DiffFile } from '../../api/review';
 import type { DataTable } from './dataTableParsers';
@@ -39,13 +39,7 @@ function withCommentHost(
 // Preview Renderer Registry
 // ============================================================================
 
-export interface PreviewCommentMarker {
-  id: string;
-  label: string;
-  selector?: string;
-  xpath?: string;
-  extraBlocks?: Array<{ selector: string; xpath: string }>;
-}
+export type PreviewCommentMarker = MarkdownCommentMarker;
 
 export interface RenderFullProps {
   content: string;
@@ -56,11 +50,7 @@ export interface RenderFullProps {
   downloadUrl?: string;
   onImageClick?: (url: string) => void;
   onSvgClick?: (svg: string) => void;
-  previewComment?: {
-    enabled: boolean;
-    previewId: string;
-    markers?: PreviewCommentMarker[];
-  };
+  previewComment?: MarkdownCommentConfig;
   /** Scopes `sketch://<uuid>` references in markdown to a specific Studio
    *  task. When provided, the markdown renderer swaps such references for an
    *  inline image of the sketch's PNG render (lightbox on click; falls back
@@ -114,7 +104,7 @@ const markdownRenderer: PreviewRenderer = {
   label: 'Preview markdown',
   match: (path) => /\.(md|markdown)$/i.test(path),
   contentType: 'text',
-  renderFull: ({ content, onImageClick, onSvgClick, previewComment, sketchContext, location }) => withCommentHost(
+  renderFull: ({ content, onImageClick, onSvgClick, previewComment, sketchContext, location }) => (
     <MarkdownRenderer
       content={content}
       renderMode="document"
@@ -125,8 +115,8 @@ const markdownRenderer: PreviewRenderer = {
       sketchContext={sketchContext}
       sketchRenderMode="image"
       location={location}
-    />,
-    previewComment,
+      comments={previewComment}
+    />
   ),
   supportsDiffSegments: true,
 };

@@ -1,4 +1,5 @@
 import { useRef, useEffect, Fragment, useState, useMemo, useCallback, useId } from 'react';
+import { createPortal } from 'react-dom';
 import type { DiffFile, DiffHunk } from '../../api/review';
 import { getFileContent } from '../../api/review';
 import type { ReviewCommentEntry } from '../../api/tasks';
@@ -17,7 +18,7 @@ import { PreviewCommentHost } from './PreviewCommentHost';
 import { PreviewSearchBar } from './PreviewSearchBar';
 import { useDomSearch } from './useDomSearch';
 import { ImageLightbox } from '../ui/ImageLightbox';
-import { usePreviewComments, type PreviewCommentLocator } from '../../context';
+import { previewCommentTaskLabel, usePreviewComments, type PreviewCommentLocator } from '../../context';
 import { useCommand, useContextKey, useDefineCommand, useKeyboardScope } from '../../keyboard';
 
 // ============================================================================
@@ -735,11 +736,17 @@ export function DiffFileView({
     if (!projectId || !taskId) return '[]';
     const path = file.new_path;
     const entries: PreviewCommentMarker[] = [];
-    let n = 0;
     for (const d of previewCommentDrafts) {
       if (d.projectId !== projectId || d.taskId !== taskId || d.filePath !== path) continue;
-      n++;
-      entries.push({ id: d.id, label: String(n), selector: d.locator.selector, xpath: d.locator.xpath, extraBlocks: d.locator.extraBlocks });
+      entries.push({
+        id: d.id,
+        label: previewCommentTaskLabel(previewCommentDrafts, d),
+        selector: d.locator.selector,
+        xpath: d.locator.xpath,
+        extraBlocks: d.locator.extraBlocks,
+        locator: d.locator,
+        comment: d.comment,
+      });
     }
     return JSON.stringify(entries);
   }, [previewCommentDrafts, projectId, taskId, file.new_path]);
@@ -747,6 +754,30 @@ export function DiffFileView({
     () => JSON.parse(previewCommentMarkersKey),
     [previewCommentMarkersKey],
   );
+
+  const previewCommentConfig = useMemo(() => {
+    if (!projectId || !taskId || !previewRenderer || previewRenderer.supportsComments === false) return undefined;
+    return {
+      enabled: previewCommentMode,
+      previewId: previewCommentId,
+      markers: previewCommentMarkers,
+      onAdd: (locator: PreviewCommentLocator, comment: string) => {
+        addDraft({
+          source: 'review' as const,
+          projectId,
+          taskId,
+          filePath: file.new_path,
+          fileName: file.new_path.split('/').pop() || file.new_path,
+          rendererId: previewRenderer.id,
+          locator,
+          comment,
+        });
+        setPreviewCommentMode(false);
+      },
+      onUpdate: (id: string, comment: string) => updateDraft(id, { comment }),
+      onDelete: (id: string) => removeDraft(id),
+    };
+  }, [addDraft, file.new_path, previewCommentId, previewCommentMarkers, previewCommentMode, previewRenderer, projectId, removeDraft, taskId, updateDraft]);
 
   const closePreviewCommentModal = useCallback(() => {
     setPendingPreviewLocator(null);
@@ -1664,9 +1695,7 @@ export function DiffFileView({
                               fileName: file.new_path,
                               onImageClick: setLightboxUrl,
                               onSvgClick: setLightboxSvg,
-                              previewComment: previewRenderer.supportsComments !== false && projectId && taskId
-                                ? { enabled: previewCommentMode, previewId: previewCommentId, markers: previewCommentMarkers }
-                                : undefined,
+                              previewComment: previewCommentConfig,
                               location,
                             })
                           : <div className="preview-loading">No content to render</div>;
@@ -1681,9 +1710,7 @@ export function DiffFileView({
                               fileName: file.new_path,
                               onImageClick: setLightboxUrl,
                               onSvgClick: setLightboxSvg,
-                              previewComment: previewRenderer.supportsComments !== false && projectId && taskId
-                                ? { enabled: previewCommentMode, previewId: previewCommentId, markers: previewCommentMarkers }
-                                : undefined,
+                              previewComment: previewCommentConfig,
                               location: projectId && taskId ? {
                                 projectId,
                                 root: { kind: "task", taskId },
@@ -1738,11 +1765,7 @@ export function DiffFileView({
                         );
                         return previewRenderer && previewRenderer.supportsComments !== false && projectId && taskId ? (
                           <PreviewCommentHost
-                            previewComment={{
-                              enabled: previewCommentMode,
-                              previewId: previewCommentId,
-                              markers: previewCommentMarkers,
-                            }}
+                            previewComment={previewCommentConfig}
                           >
                             {segmentsContent}
                           </PreviewCommentHost>
@@ -1794,7 +1817,7 @@ export function DiffFileView({
         />
       )}
 
-      {pendingPreviewLocator && (
+      {pendingPreviewLocator && typeof document !== 'undefined' && createPortal(
         <>
           {pendingPreviewLocator.rect && (
             <div
@@ -1880,7 +1903,8 @@ export function DiffFileView({
                 </div>
               </div>
           </div>
-        </>
+        </>,
+        document.body,
       )}
 
       {/* Floating comment button on text selection */}
