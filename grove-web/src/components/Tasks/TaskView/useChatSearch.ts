@@ -181,12 +181,19 @@ export function useChatSearch<T>(opts: {
     const key = matchKey(m);
     if (key === lastScrolledKeyRef.current) return;
     lastScrolledKeyRef.current = key;
+    const mountedRow = scrollerRef.current?.querySelector<HTMLElement>(
+      `[data-item-index="${m.itemIndex}"]`,
+    );
+    if (mountedRow) {
+      mountedRow.scrollIntoView({ block: "center", behavior: "auto" });
+      return;
+    }
     virtuosoRef.current?.scrollToIndex({
       index: m.itemIndex,
       align: "center",
       behavior: "auto",
     });
-  }, [cur, matches, virtuosoRef]);
+  }, [cur, matches, scrollerRef, virtuosoRef]);
 
   // Apply highlights to whatever Virtuoso currently has rendered.
   // Re-runs when the rendered range changes (renderToken), the query

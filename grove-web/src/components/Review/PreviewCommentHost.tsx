@@ -162,6 +162,53 @@ function unionRect(rects: DOMRect[]): DOMRect | null {
   return new DOMRect(l, t, r - l, b - t);
 }
 
+const SELECTION_ACTION_WIDTH = 112;
+const SELECTION_ACTION_HEIGHT = 34;
+const SELECTION_ACTION_GAP = 8;
+const SELECTION_ACTION_EDGE = 8;
+
+function selectionActionPosition(selection: DOMRect, host: DOMRect): { left: number; top: number } {
+  const viewportLeft = Math.max(host.left + SELECTION_ACTION_EDGE, SELECTION_ACTION_EDGE);
+  const viewportRight = Math.min(host.right - SELECTION_ACTION_EDGE, window.innerWidth - SELECTION_ACTION_EDGE);
+  const viewportTop = Math.max(host.top + SELECTION_ACTION_EDGE, SELECTION_ACTION_EDGE);
+  const viewportBottom = Math.min(host.bottom - SELECTION_ACTION_EDGE, window.innerHeight - SELECTION_ACTION_EDGE);
+  const clampLeft = (left: number) => Math.max(viewportLeft, Math.min(left, viewportRight - SELECTION_ACTION_WIDTH));
+  const clampTop = (top: number) => Math.max(viewportTop, Math.min(top, viewportBottom - SELECTION_ACTION_HEIGHT));
+
+  // Prefer the ragged right-side whitespace common to multi-line selections.
+  if (selection.right + SELECTION_ACTION_GAP + SELECTION_ACTION_WIDTH <= viewportRight) {
+    return {
+      left: selection.right + SELECTION_ACTION_GAP - host.left,
+      top: clampTop(selection.bottom - SELECTION_ACTION_HEIGHT) - host.top,
+    };
+  }
+  if (selection.bottom + SELECTION_ACTION_GAP + SELECTION_ACTION_HEIGHT <= viewportBottom) {
+    return {
+      left: clampLeft(selection.right - SELECTION_ACTION_WIDTH) - host.left,
+      top: selection.bottom + SELECTION_ACTION_GAP - host.top,
+    };
+  }
+  if (selection.top - SELECTION_ACTION_GAP - SELECTION_ACTION_HEIGHT >= viewportTop) {
+    return {
+      left: clampLeft(selection.right - SELECTION_ACTION_WIDTH) - host.left,
+      top: selection.top - SELECTION_ACTION_GAP - SELECTION_ACTION_HEIGHT - host.top,
+    };
+  }
+  if (selection.left - SELECTION_ACTION_GAP - SELECTION_ACTION_WIDTH >= viewportLeft) {
+    return {
+      left: selection.left - SELECTION_ACTION_GAP - SELECTION_ACTION_WIDTH - host.left,
+      top: clampTop(selection.bottom - SELECTION_ACTION_HEIGHT) - host.top,
+    };
+  }
+
+  // Extremely constrained viewport: keep the action visible. This fallback
+  // should only be reachable when no non-overlapping side can fit it.
+  return {
+    left: clampLeft(selection.right - SELECTION_ACTION_WIDTH) - host.left,
+    top: clampTop(selection.bottom + SELECTION_ACTION_GAP) - host.top,
+  };
+}
+
 function describeBlocks(blocks: Element[], stop: Element): PreviewCommentLocator {
   const head = blocks[0];
   const r = head.getBoundingClientRect();
@@ -453,7 +500,7 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
       }
       const text = clean(selection.toString(), 1200);
       const clientRects = Array.from(range.getClientRects()).filter((item) => item.width > 0 && item.height > 0);
-      const rect = clientRects[clientRects.length - 1] ?? range.getBoundingClientRect();
+      const rect = unionRect(clientRects) ?? range.getBoundingClientRect();
       if (!text || rect.width <= 0 || rect.height <= 0) {
         setSelectionAction(null);
         return;
@@ -660,19 +707,17 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
           />
         );
       })()}
-      {selectionAction && hostRect && (
+      {selectionAction && hostRect && (() => {
+        const position = selectionActionPosition(selectionAction.rect, hostRect);
+        return (
         <button
           type="button"
           data-grove-comment-overlay="true"
           data-grove-selection-action="true"
-          className={`absolute z-[60] inline-flex -translate-x-1/2 items-center gap-1.5 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-xs font-medium text-[var(--color-text)] shadow-lg transition-colors hover:bg-[var(--color-bg-secondary)] ${
-            selectionAction.rect.top - hostRect.top >= 48 ? '-translate-y-full' : ''
-          }`}
+          className="absolute z-[60] inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-xs font-medium text-[var(--color-text)] shadow-lg transition-colors hover:bg-[var(--color-bg-secondary)]"
           style={{
-            left: selectionAction.rect.left - hostRect.left + selectionAction.rect.width / 2,
-            top: selectionAction.rect.top - hostRect.top >= 48
-              ? selectionAction.rect.top - hostRect.top - 8
-              : selectionAction.rect.bottom - hostRect.top + 8,
+            left: position.left,
+            top: position.top,
           }}
           onMouseDown={(event) => event.preventDefault()}
           onClick={() => {
@@ -691,7 +736,8 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
           <span aria-hidden="true">＋</span>
           Comment
         </button>
-      )}
+        );
+      })()}
       {hostRect && markerRects.map(({ id, label, rects, marker }) => {
         const u = unionRect(rects)!;
         const anchor = rects[rects.length - 1] ?? u;
