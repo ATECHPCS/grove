@@ -319,6 +319,7 @@ pub fn set_active_base_url(url: String) {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub fn get_active_base_url() -> String {
     if let Some(url) = ACTIVE_BASE_URL.get() {
         return url.clone();
