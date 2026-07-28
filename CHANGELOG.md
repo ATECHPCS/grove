@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.10] - 2026-07-28
+
+### Added
+
+- **Contextual comments across chat and previews** — Selected content in chat, Markdown, HTML, and diff previews can be carried into contextual comments, with clearer diagnostics when chat rendering fails.
+- **Native file actions** — Files can be dragged to native applications and revealed in the system file manager directly from task and review views.
+
+### Improved
+
+- **Document and HTML previews** — Markdown preserves document semantics while HTML previews fit their content more reliably, with consistent comment interactions across preview surfaces.
+- **Large chat and review performance** — Task chat and multi-file diffs virtualize long content while preserving search, scrolling, selection, and interaction stability.
+
+### Fixed
+
+- **Streaming chat and tool-call rendering** — Streamed messages, thought state, edit paths, tool details, and ACP updates render consistently as conversations evolve.
+- **Project selection on headless Linux** — When a native folder picker is unavailable, project selection falls back to the web picker.
+
 ## [0.11.9] - 2026-07-23
 
 ### Added
