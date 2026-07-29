@@ -6,10 +6,9 @@
 
 use std::path::Path;
 
-// ACP 0.11 migration shim — see src/acp/mod.rs for rationale.
-// adapter.rs only needs schema message types, no runtime traits.
+// Keep ACP v1 schema types behind a local namespace so adapter call sites stay concise.
 mod acp {
-    pub use agent_client_protocol::schema::*;
+    pub use agent_client_protocol::schema::v1::*;
 }
 
 use super::content_block_to_text;

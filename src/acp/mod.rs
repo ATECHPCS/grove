@@ -7,15 +7,12 @@
 
 pub mod adapter;
 
-// ACP 0.11 migration shim.
-//
-// 0.11 把消息类型搬进 `agent_client_protocol::schema`,运行时/角色类型
-// (Client、Agent、ConnectionTo、ByteStreams、Error、Result)留在 crate 根。
-// 这个本地模块把两边重新拍平到单一的 `acp::*` 命名空间,让本文件以及 adapter
-// 的大量调用点保持原写法(`acp::SessionNotification` 等)。
+// SDK 2.0 versions protocol schemas explicitly. Grove currently negotiates ACP v1,
+// so keep its schema and runtime types behind one local namespace.
 #[allow(clippy::module_inception)]
 mod acp {
-    pub use agent_client_protocol::schema::*;
+    pub use agent_client_protocol::schema::v1::*;
+    pub use agent_client_protocol::schema::ProtocolVersion;
     pub use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Error, Result};
 }
 use chrono::{DateTime, Utc};
@@ -83,9 +80,7 @@ pub struct AcpSessionHandle {
     /// Config option id for thought-level（agent 自定义，例如 "effort_level"）。
     /// 前端在下一条 `Prompt.config.thought_level_config_id` 里 echo 回来。
     thought_level_config_id: Mutex<Option<String>>,
-    /// Config option id for the model selector（claude-agent-acp ≥0.40 moves
-    /// model into configOptions; older agents expose session/set_model instead）.
-    /// None = use legacy SetSessionModelRequest; Some(id) = use SetSessionConfigOptionRequest.
+    /// Config option id for the ACP model selector.
     model_config_id: Mutex<Option<String>>,
     /// Task 工作目录（用于用户直接执行 terminal 命令）
     pub working_dir: String,
@@ -444,21 +439,12 @@ pub struct AuthMethodInfo {
 }
 
 /// Agent 的 Prompt 能力声明（从 ACP InitializeResponse 提取）
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PromptCapabilitiesData {
     pub image: bool,
     pub audio: bool,
     pub embedded_context: bool,
-}
-
-impl Default for PromptCapabilitiesData {
-    fn default() -> Self {
-        Self {
-            image: true,
-            audio: true,
-            embedded_context: true,
-        }
-    }
 }
 
 /// 前端→后端的内容块类型（用于多媒体 prompt）
@@ -2092,9 +2078,11 @@ pub async fn get_or_start_session(
                             "[ACP] session ended with error (key={} agent={} task={} chat={:?}): {}",
                             key_clone, session_agent_name, session_task_id, session_chat_id, e
                         );
-                        let _ = update_tx.send(AcpUpdate::Error {
-                            message: format!("ACP session error: {}", e),
-                        });
+                        let message = match e {
+                            crate::error::GroveError::Session(message) => message.clone(),
+                            other => other.to_string(),
+                        };
+                        let _ = update_tx.send(AcpUpdate::Error { message });
                     }
                 }
                 let _ = update_tx.send(AcpUpdate::SessionEnded);
@@ -2460,12 +2448,26 @@ async fn run_acp_session(
     // kill_on_drop 会清理子进程
     drop(child);
 
-    result.map_err(|e| crate::error::GroveError::Session(format!("ACP session error: {}", e)))
+    result.map_err(|e| crate::error::GroveError::Session(e.to_string()))
 }
 
 /// 在 `connect_with` 的 `main_fn` 里运行 ACP 会话生命周期:initialize → 创建/恢复
 /// session → 命令循环。与 handler 不同,这里运行在一个独立的"spawned task"上下文,
 /// 可以安全使用 `SentRequest::block_task()`。
+fn validate_v1_protocol_version(version: acp::ProtocolVersion) -> acp::Result<()> {
+    if version == acp::ProtocolVersion::V1 {
+        return Ok(());
+    }
+
+    Err(acp::Error::new(
+        -32099,
+        format!(
+            "Unable to connect to this agent. This agent uses ACP protocol version {}, but Grove currently supports version 1 only.",
+            version.as_u16()
+        ),
+    ))
+}
+
 async fn drive_session(
     handle: Arc<AcpSessionHandle>,
     config: AcpStartConfig,
@@ -2565,26 +2567,10 @@ async fn drive_session(
     }
 
     fn extract_models(
-        models: &Option<acp::SessionModelState>,
         config_options: &[acp::SessionConfigOption],
     ) -> (Vec<(String, String)>, Option<String>, Option<String>) {
-        // traex 0.200.8 advertises a top-level `models` field but leaves
-        // `availableModels` empty — the real list lives in
-        // `configOptions[id="model"]`. Only trust the top-level field when
-        // it actually carries entries; an empty list means "go look in
-        // configOptions" (same precedent as the modes extractor above and
-        // the claude-agent-acp ≥0.40 fallback below).
-        if let Some(state) = models.as_ref().filter(|s| !s.available_models.is_empty()) {
-            let available: Vec<(String, String)> = state
-                .available_models
-                .iter()
-                .map(|m| (m.model_id.to_string(), m.name.clone()))
-                .collect();
-            let current = Some(state.current_model_id.to_string());
-            return (available, current, None);
-        }
-        // claude-agent-acp ≥0.40 no longer returns a separate `models` field;
-        // model info is embedded in `configOptions` with category "model".
+        // Current ACP exposes model selection through a generic session config
+        // option with category "model".
         for opt in config_options {
             let is_model = matches!(opt.category, Some(acp::SessionConfigOptionCategory::Model));
             let is_model_other = matches!(
@@ -2651,6 +2637,8 @@ async fn drive_session(
         .block_task()
         .await?;
 
+    validate_v1_protocol_version(init_resp.protocol_version)?;
+
     // 缓存 agent 声明的登录方法 — 后续收到 -32000 AuthRequired 时取第一个走
     // authenticate。`unstable_auth_methods` feature 未启用,所以这里只会拿到
     // `AuthMethod::Agent` 变体(EnvVar / Terminal 在反序列化阶段已被过滤)。
@@ -2680,10 +2668,6 @@ async fn drive_session(
         .map(|i| i.version.clone())
         .unwrap_or_else(|| "0.0.0".to_string());
 
-    // 如果 agent 启动后未返回 agent_info（被识别为 "unknown"），就 fallback
-    // 到 `config.agent_command` — 用户配置的 agent id 字符串本身就是
-    // 一个合理的 canonical 名字。Pre-§8 这里 hard-coded `traecli` 字符串
-    // 探测（"如果是 trae 就写成 traecli"），§8 之后改用通用规则。
     if agent_name == "unknown" {
         agent_name = config.agent_command.clone();
     }
@@ -2918,10 +2902,8 @@ async fn drive_session(
                 &resp.modes,
                 resp.config_options.as_deref().unwrap_or(&[]),
             );
-            (available_models, current_model_id, model_config_id) = extract_models(
-                &resp.models,
-                resp.config_options.as_deref().unwrap_or(&[]),
-            );
+            (available_models, current_model_id, model_config_id) =
+                extract_models(resp.config_options.as_deref().unwrap_or(&[]));
             (
                 available_thought_levels,
                 current_thought_level_id,
@@ -2939,11 +2921,15 @@ async fn drive_session(
                 // Fuzzy match by lowercase id-or-name: exact first, then
                 // substring. No match → leave default.
                 if let Some(query) = p.model.as_deref() {
-                    if let Some(id) = fuzzy_pick_id(query, &available_models) {
+                    if let (Some(id), Some(config_id)) = (
+                        fuzzy_pick_id(query, &available_models),
+                        model_config_id.as_ref(),
+                    ) {
                         let _ = conn
-                            .send_request(acp::SetSessionModelRequest::new(
+                            .send_request(acp::SetSessionConfigOptionRequest::new(
                                 sid_arc.clone(),
-                                acp::ModelId::new(id),
+                                acp::SessionConfigId::new(config_id.clone()),
+                                acp::SessionConfigValueId::new(id),
                             ))
                             .block_task()
                             .await;
@@ -3019,7 +3005,7 @@ async fn drive_session(
                     (available_modes, current_mode_id) =
                         extract_modes(&resp.modes, resp.config_options.as_deref().unwrap_or(&[]));
                     (available_models, current_model_id, model_config_id) =
-                        extract_models(&resp.models, resp.config_options.as_deref().unwrap_or(&[]));
+                        extract_models(resp.config_options.as_deref().unwrap_or(&[]));
                     (
                         available_thought_levels,
                         current_thought_level_id,
@@ -3063,7 +3049,7 @@ async fn drive_session(
                     (available_modes, current_mode_id) =
                         extract_modes(&resp.modes, resp.config_options.as_deref().unwrap_or(&[]));
                     (available_models, current_model_id, model_config_id) =
-                        extract_models(&resp.models, resp.config_options.as_deref().unwrap_or(&[]));
+                        extract_models(resp.config_options.as_deref().unwrap_or(&[]));
                     (
                         available_thought_levels,
                         current_thought_level_id,
@@ -3130,7 +3116,7 @@ async fn drive_session(
         available_thought_levels,
         current_thought_level_id,
         thought_level_config_id,
-        prompt_capabilities,
+        prompt_capabilities: prompt_capabilities.clone(),
         fork_capable,
     });
 
@@ -3210,9 +3196,9 @@ async fn drive_session(
                             let current = handle.current_model_id.lock().unwrap().clone();
                             if current.as_deref() != Some(model_id.as_str()) {
                                 let model_cfg_id = handle.model_config_id.lock().unwrap().clone();
-                                let resp: Result<(), _> = if let Some(ref config_id) = model_cfg_id
+                                let resp: Result<(), String> = if let Some(ref config_id) =
+                                    model_cfg_id
                                 {
-                                    // claude-agent-acp ≥0.40: model via generic config option
                                     conn.send_request(acp::SetSessionConfigOptionRequest::new(
                                         session_id_arc.clone(),
                                         acp::SessionConfigId::new(config_id.clone()),
@@ -3221,15 +3207,9 @@ async fn drive_session(
                                     .block_task()
                                     .await
                                     .map(|_| ())
+                                    .map_err(|e| e.to_string())
                                 } else {
-                                    // Legacy: dedicated session/set_model method
-                                    conn.send_request(acp::SetSessionModelRequest::new(
-                                        session_id_arc.clone(),
-                                        acp::ModelId::new(model_id.clone()),
-                                    ))
-                                    .block_task()
-                                    .await
-                                    .map(|_| ())
+                                    Err("agent did not advertise a model config option".to_string())
                                 };
                                 match resp {
                                     Ok(_) => {
@@ -5711,6 +5691,33 @@ async fn drain_stderr_to_file(stderr: tokio::process::ChildStderr, path: PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initialization_rejects_non_v1_protocol_version() {
+        assert!(validate_v1_protocol_version(acp::ProtocolVersion::V1).is_ok());
+
+        let v2: acp::ProtocolVersion = serde_json::from_value(serde_json::json!(2)).unwrap();
+        let error = validate_v1_protocol_version(v2).unwrap_err();
+        assert_eq!(
+            error.message,
+            "Unable to connect to this agent. This agent uses ACP protocol version 2, but Grove currently supports version 1 only."
+        );
+    }
+
+    #[test]
+    fn initialization_omitted_prompt_capabilities_are_unsupported() {
+        let capabilities = PromptCapabilitiesData::default();
+
+        assert!(!capabilities.image);
+        assert!(!capabilities.audio);
+        assert!(!capabilities.embedded_context);
+
+        let partial: PromptCapabilitiesData =
+            serde_json::from_value(serde_json::json!({ "image": true })).unwrap();
+        assert!(partial.image);
+        assert!(!partial.audio);
+        assert!(!partial.embedded_context);
+    }
 
     #[test]
     fn merge_diff_locations_recovers_paths_from_tool_content() {
