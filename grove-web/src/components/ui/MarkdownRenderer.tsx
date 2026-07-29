@@ -1,9 +1,48 @@
-import { Children, isValidElement, useState, useEffect, useRef, useId, memo, useMemo } from "react";
+import { Children, isValidElement, useState, useEffect, useRef, useId, memo, useMemo, type IframeHTMLAttributes } from "react";
 import { Check, Code, Copy, FileText, Hash, Loader2, Play, Terminal, WrapText } from "lucide-react";
 import { renderD2 } from "../../api";
 import type { RenderD2Error } from "../../api";
 import ReactMarkdown, { type Components, defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
+
+// Default sandbox applied to `<iframe>` elements rendered from markdown when
+// the author didn't specify one. Mirrors PREVIEW_IFRAME_SANDBOX in
+// previewRenderers.tsx so markdown-embedded HTML and standalone HTML files
+// behave the same way: scripts + popups allowed, but no same-origin access.
+const IFRAME_DEFAULT_SANDBOX = "allow-scripts allow-popups allow-popups-to-escape-sandbox";
+
+// Sanitize schema used by rehype-sanitize when rendering markdown. Extends the
+// default schema (which already strips unknown tags, event handlers, and
+// dangerous protocols on `href`) with the `<iframe>` tag and the `style`
+// attribute on all elements. `src` is restricted to http(s) by the inherited
+// default protocols list; relative URLs (no scheme) are preserved as-is.
+const markdownSanitizeSchema = {
+  ...defaultSchema,
+  tagNames: [...(defaultSchema.tagNames ?? []), "iframe"],
+  attributes: {
+    ...(defaultSchema.attributes ?? {}),
+    "*": [...(defaultSchema.attributes?.["*"] ?? []), "style"],
+    iframe: [
+      "src",
+      "width",
+      "height",
+      "title",
+      "style",
+      "sandbox",
+      "allow",
+      "allowfullscreen",
+      "frameborder",
+      "loading",
+      "name",
+      "id",
+      "class",
+      "referrerpolicy",
+      "scrolling",
+    ],
+  },
+};
 import mermaid from "mermaid";
 import { VSCodeIcon } from "./VSCodeIcon";
 import { SketchChip } from "./SketchChip";
@@ -11,6 +50,11 @@ import { sketchThumbnailUrl } from "../../api/sketches";
 import { highlightLines, normalizeLanguage } from "../Review/syntaxHighlight";
 import { createSlugger } from "./headingSlug";
 import { useTheme } from "../../context/ThemeContext";
+import { isAbsoluteFileReference, resolveFileReference, type FileLocation } from "./fileLocation";
+import { normalizeStrongEmphasis } from "./markdownPreprocess";
+import { MarkdownCommentHost, type MarkdownCommentConfig } from "../Review/PreviewCommentHost";
+import { selectedMarkdownForRange } from "./markdownClipboard";
+import { previewCommentTaskLabel, useOptionalPreviewComments, type PreviewCommentLocator } from "../../context";
 
 /** Languages whose code blocks may be executed in the terminal. */
 const RUNNABLE_SHELL_LANGS = new Set(["bash", "sh", "shell", "zsh"]);
@@ -453,6 +497,7 @@ const LANG_META: Record<string, { label: string; Icon: typeof Code }> = {
   php: { label: "php", Icon: Code },
   sql: { label: "sql", Icon: Code },
   json: { label: "json", Icon: Code },
+  jsonl: { label: "jsonl", Icon: Code },
   yaml: { label: "yaml", Icon: Code },
   yml: { label: "yaml", Icon: Code },
   toml: { label: "toml", Icon: Code },
@@ -704,8 +749,11 @@ function CodeBlock({
   );
 }
 
-interface MarkdownRendererProps {
+export interface MarkdownRendererProps {
   content: string;
+  /** `document` is the relaxed, long-form typography used by file previews.
+   * Other surfaces (chat, comments, cards) retain the compact default. */
+  renderMode?: "compact" | "document";
   /** When provided, inline code matching file path patterns become clickable.
    *  Must return whether the navigation succeeded — `false` triggers the
    *  FileChip to fall back to its original markdown rendering (raw <code>
@@ -713,6 +761,9 @@ interface MarkdownRendererProps {
   onFileClick?: (filePath: string, line?: number) => Promise<boolean>;
   /** When provided, relative image src values are resolved via this function */
   resolveImageUrl?: (src: string) => string;
+  /** Storage namespace and path of the markdown file. Relative embedded
+   *  resources are resolved through the matching backend adapter. */
+  location?: FileLocation;
   /** When provided, clicking a rendered mermaid diagram triggers this callback with the SVG */
   onMermaidClick?: (svg: string) => void;
   /** When provided, clicking a rendered D2 diagram triggers this callback with the SVG */
@@ -738,6 +789,10 @@ interface MarkdownRendererProps {
    * heading ids would collide across messages. Opt in only on surfaces that
    * own their preview pane (file preview drawer, code review preview). */
   enableHeadingIds?: boolean;
+  /** Shared Markdown annotation capability used by chat, artifacts, and file previews. */
+  /** Explicit annotation config. Omit to auto-enable for task-scoped files;
+   * pass false only when a parent annotation host owns the whole document. */
+  comments?: MarkdownCommentConfig | false;
 }
 
 /** Extract filename from a full file path */
@@ -885,12 +940,173 @@ function parseFileHref(href: string): { filePath: string; line?: number } | null
   };
 }
 
-export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFileClick, resolveImageUrl, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode = "chip", enableHeadingIds }: MarkdownRendererProps) {
+function sourceForMarkdownNode(node: unknown, markdown: string): string | undefined {
+  const position = (node as { position?: { start?: { offset?: number }; end?: { offset?: number } } } | undefined)?.position;
+  const start = position?.start?.offset;
+  const end = position?.end?.offset;
+  if (typeof start !== "number" || typeof end !== "number" || start < 0 || end <= start) return undefined;
+  return markdown.slice(start, end);
+}
+
+function copySelectedMarkdown(event: React.ClipboardEvent<HTMLDivElement>, root: HTMLDivElement | null) {
+  const selection = window.getSelection();
+  if (!root || !selection || selection.isCollapsed || selection.rangeCount === 0) return;
+  const range = selection.getRangeAt(0);
+  if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return;
+  const markdown = selectedMarkdownForRange(root, range);
+  if (!markdown) return;
+  event.preventDefault();
+  event.clipboardData.setData("text/plain", markdown);
+  event.clipboardData.setData("text/markdown", markdown);
+}
+
+const EMBEDDED_HTML_FIT_MESSAGE = "grove:embedded-html-fit";
+
+function injectEmbeddedHtmlFitScript(html: string, frameId: string): string {
+  // Local architecture diagrams are commonly authored on a fixed-size canvas.
+  // An iframe cannot inspect cross-origin content, so put the measurement logic
+  // inside its already-sandboxed document and communicate only the final height
+  // to the parent. This keeps arbitrary HTML isolated while allowing the whole
+  // diagram to fit the markdown column instead of clipping its right edge.
+  const script = `<script>(function(){
+    var channel=${JSON.stringify(EMBEDDED_HTML_FIT_MESSAGE)};
+    var frameId=${JSON.stringify(frameId)};
+    function fit(){
+      var root=document.documentElement, body=document.body;
+      if(!body || !window.innerWidth) return;
+      body.style.transform='';
+      root.style.height='';
+      var width=Math.max(root.scrollWidth, body.scrollWidth, root.offsetWidth, body.offsetWidth);
+      var height=Math.max(root.scrollHeight, body.scrollHeight, root.offsetHeight, body.offsetHeight);
+      if(!width || !height) return;
+      var scale=Math.min(1, window.innerWidth / width);
+      body.style.transformOrigin='top left';
+      body.style.transform='scale('+scale+')';
+      var fittedHeight=Math.ceil(height * scale);
+      root.style.overflow='hidden';
+      root.style.height=fittedHeight+'px';
+      window.parent.postMessage({channel:channel, frameId:frameId, height:fittedHeight}, '*');
+    }
+    window.addEventListener('load', function(){ requestAnimationFrame(fit); });
+    window.addEventListener('resize', fit);
+    requestAnimationFrame(fit);
+  })();</script>`;
+  return /<\/head\s*>/i.test(html)
+    ? html.replace(/<\/head\s*>/i, `${script}</head>`)
+    : `${script}${html}`;
+}
+
+interface EmbeddedHtmlIframeProps extends IframeHTMLAttributes<HTMLIFrameElement> {
+  src: string;
+  fitLocalHtml: boolean;
+}
+
+function EmbeddedHtmlIframe({ src, fitLocalHtml, className, height, ...props }: EmbeddedHtmlIframeProps) {
+  const frameRef = useRef<HTMLIFrameElement>(null);
+  const frameId = useId();
+  const [loadedDocument, setLoadedDocument] = useState<{ src: string; html: string } | null>(null);
+  const [reportedHeight, setReportedHeight] = useState<{ src: string; height: number } | null>(null);
+  const srcDoc = fitLocalHtml && loadedDocument?.src === src ? loadedDocument.html : undefined;
+  const fittedHeight = reportedHeight?.src === src ? reportedHeight.height : undefined;
+
+  useEffect(() => {
+    if (!fitLocalHtml) return;
+    const controller = new AbortController();
+    fetch(src, { signal: controller.signal, credentials: "same-origin" })
+      .then((response) => response.ok ? response.text() : Promise.reject(new Error(`Unable to load embedded HTML: ${response.status}`)))
+      .then((html) => {
+        if (!controller.signal.aborted) setLoadedDocument({ src, html: injectEmbeddedHtmlFitScript(html, frameId) });
+      })
+      .catch(() => {
+        // Keep the normal iframe as a resilient fallback for unavailable files
+        // and documents that are not readable through the raw-file endpoint.
+      });
+    return () => controller.abort();
+  }, [fitLocalHtml, frameId, src]);
+
+  useEffect(() => {
+    const onMessage = (event: MessageEvent<unknown>) => {
+      if (event.source !== frameRef.current?.contentWindow || !event.data || typeof event.data !== "object") return;
+      const data = event.data as { channel?: string; frameId?: string; height?: unknown };
+      if (data.channel !== EMBEDDED_HTML_FIT_MESSAGE || data.frameId !== frameId || typeof data.height !== "number") return;
+      if (Number.isFinite(data.height) && data.height > 0) setReportedHeight({ src, height: data.height });
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [frameId, src]);
+
+  return (
+    <iframe
+      ref={frameRef}
+      src={srcDoc ? undefined : src}
+      srcDoc={srcDoc}
+      height={fittedHeight ?? height}
+      {...props}
+      className={`w-full my-2 border-0${className ? ` ${className}` : ""}`}
+    />
+  );
+}
+
+export const MarkdownRenderer = memo(function MarkdownRenderer({ content, renderMode = "compact", onFileClick, resolveImageUrl, location, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode = "chip", enableHeadingIds, comments }: MarkdownRendererProps) {
+  const markdownRootRef = useRef<HTMLDivElement>(null);
+  const previewComments = useOptionalPreviewComments();
+  const automaticCommentId = useId().replace(/:/g, "");
+  const automaticComments = useMemo<MarkdownCommentConfig | undefined>(() => {
+    if (!previewComments || !location || location.root.kind !== "task") return undefined;
+    const { projectId, path } = location;
+    const taskId = location.root.taskId;
+    const matchingDrafts = previewComments.drafts.filter(
+      (draft) => draft.projectId === projectId && draft.taskId === taskId && draft.filePath === path,
+    );
+    return {
+      previewId: `markdown-${automaticCommentId}`,
+      markers: matchingDrafts.map((draft) => ({
+        id: draft.id,
+        label: previewCommentTaskLabel(previewComments.drafts, draft),
+        selector: draft.locator.selector,
+        xpath: draft.locator.xpath,
+        extraBlocks: draft.locator.extraBlocks,
+        locator: draft.locator,
+        comment: draft.comment,
+      })),
+      onAdd: (locator: PreviewCommentLocator, comment: string) => {
+        previewComments.addDraft({
+          source: "review",
+          projectId,
+          taskId,
+          filePath: path,
+          fileName: path.split("/").pop() || path,
+          rendererId: "markdown",
+          locator,
+          comment,
+        });
+      },
+      onUpdate: (id: string, comment: string) => previewComments.updateDraft(id, { comment }),
+      onDelete: previewComments.removeDraft,
+    };
+  }, [automaticCommentId, location, previewComments]);
+  const effectiveComments = comments === false ? undefined : comments ?? automaticComments;
   const processedContent = useMemo(() => {
-    let out = preprocessInlineCodeUrls(content);
+    let out = normalizeStrongEmphasis(content);
+    out = preprocessInlineCodeUrls(out);
     if (sketchContext) out = preprocessSketchUrls(out);
     return out;
   }, [content, sketchContext]);
+  // Custom renderer function identities must stay stable while markdown is
+  // streaming. If `components` is rebuilt for every content chunk,
+  // react-markdown treats images, code blocks, diagrams, and iframes as new
+  // component types and remounts them, producing visible blank/full flashes.
+  // Source annotations still need the latest markdown, so read it through a
+  // render-time ref instead of closing over it in the component map.
+  const processedContentRef = useRef(processedContent);
+  // eslint-disable-next-line react-hooks/refs
+  processedContentRef.current = processedContent;
+  // Resolve file-relative resources through the adapter selected by location.
+  // Without a location, references retain the browser's default behavior.
+  const resourceSrcResolver = useMemo(
+    () => (src: string) => resolveFileReference(location, src),
+    [location],
+  );
   // Slugger must reset every render: react-markdown calls heading components
   // in document order, so a per-render slugger sees each heading once and
   // produces GitHub-style `-1`, `-2` suffixes for repeats. We hold it in a
@@ -900,24 +1116,26 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFile
   const sluggerRef = useRef<(text: string) => string>(createSlugger());
   // eslint-disable-next-line react-hooks/refs
   sluggerRef.current = createSlugger();
+  const isDocument = renderMode === "document";
   const components = useMemo((): Components => {
     const slug = (children: React.ReactNode, fallback: string | undefined) => {
       if (fallback) return fallback;
       if (!enableHeadingIds) return undefined;
       return sluggerRef.current(extractText(children));
     };
+    const source = (node: unknown) => sourceForMarkdownNode(node, processedContentRef.current);
     return ({
-        h1: ({ children, ...props }) => (
-          <h1 id={slug(children, props.id)} className="text-lg font-bold text-[var(--color-text)] mt-4 mb-2 first:mt-0 scroll-mt-4">{children}</h1>
+        h1: ({ children, node, ...props }) => (
+          <h1 data-grove-markdown-source={source(node)} id={slug(children, props.id)} className={isDocument ? "text-3xl leading-tight font-bold text-[var(--color-text)] mt-10 mb-4 first:mt-0 scroll-mt-6" : "text-xl font-bold text-[var(--color-text)] mt-4 mb-2 first:mt-0 scroll-mt-4"}>{children}</h1>
         ),
-        h2: ({ children, ...props }) => (
-          <h2 id={slug(children, props.id)} className="text-base font-semibold text-[var(--color-text)] mt-3 mb-2 scroll-mt-4">{children}</h2>
+        h2: ({ children, node, ...props }) => (
+          <h2 data-grove-markdown-source={source(node)} id={slug(children, props.id)} className={isDocument ? "text-[28px] leading-tight font-bold text-[var(--color-text)] mt-7 mb-3 first:mt-0 scroll-mt-6" : "text-lg font-semibold text-[var(--color-text)] mt-3 mb-2 scroll-mt-4"}>{children}</h2>
         ),
-        h3: ({ children, ...props }) => (
-          <h3 id={slug(children, props.id)} className="text-sm font-semibold text-[var(--color-text)] mt-3 mb-1 scroll-mt-4">{children}</h3>
+        h3: ({ children, node, ...props }) => (
+          <h3 data-grove-markdown-source={source(node)} id={slug(children, props.id)} className={isDocument ? "text-2xl leading-snug font-bold text-[var(--color-text)] mt-7 mb-2 scroll-mt-6" : "text-base font-semibold text-[var(--color-text)] mt-3 mb-1 scroll-mt-4"}>{children}</h3>
         ),
-        h4: ({ children, ...props }) => (
-          <h4 id={slug(children, props.id)} className="text-sm font-medium text-[var(--color-text)] mt-2 mb-1 scroll-mt-4">{children}</h4>
+        h4: ({ children, node, ...props }) => (
+          <h4 data-grove-markdown-source={source(node)} id={slug(children, props.id)} className={isDocument ? "text-xl leading-7 font-bold text-[var(--color-text)] mt-4 mb-2 scroll-mt-6" : "text-sm font-medium text-[var(--color-text)] mt-2 mb-1 scroll-mt-4"}>{children}</h4>
         ),
         h5: ({ children, ...props }) => (
           <h5 id={slug(children, props.id)} className="text-xs font-semibold text-[var(--color-text)] mt-2 mb-1 scroll-mt-4">{children}</h5>
@@ -925,17 +1143,17 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFile
         h6: ({ children, ...props }) => (
           <h6 id={slug(children, props.id)} className="text-xs font-medium text-[var(--color-text-muted)] mt-2 mb-1 scroll-mt-4">{children}</h6>
         ),
-        p: ({ children }) => (
-          <p className="text-sm text-[var(--color-text)] mb-2 last:mb-0 [li>&]:mb-0 break-words">{children}</p>
+        p: ({ children, node }) => (
+          <p data-grove-markdown-source={source(node)} className={isDocument ? "text-[17px] leading-7 text-[var(--color-text)] mb-4 last:mb-0 [li>&]:mb-0 [li>&:first-child]:inline break-words" : "text-sm text-[var(--color-text)] mb-2 last:mb-0 [li>&]:mb-0 [li>&:first-child]:inline break-words"}>{children}</p>
         ),
-        ul: ({ children }) => (
-          <ul className="list-disc list-inside text-sm text-[var(--color-text)] mb-2 ml-2 space-y-0.5">{children}</ul>
+        ul: ({ children, node }) => (
+          <ul data-grove-markdown-source={source(node)} className={isDocument ? "list-disc list-outside text-[17px] leading-7 text-[var(--color-text)] mb-4 ml-7 space-y-1" : "list-disc list-inside text-sm text-[var(--color-text)] mb-2 ml-2 space-y-0.5"}>{children}</ul>
         ),
-        ol: ({ children }) => (
-          <ol className="list-decimal list-inside text-sm text-[var(--color-text)] mb-2 ml-2 space-y-0.5">{children}</ol>
+        ol: ({ children, node }) => (
+          <ol data-grove-markdown-source={source(node)} className={isDocument ? "list-decimal list-outside text-[17px] leading-7 text-[var(--color-text)] mb-4 ml-7 space-y-1" : "list-decimal list-outside text-sm text-[var(--color-text)] mb-2 ml-2 space-y-0.5"}>{children}</ol>
         ),
         li: ({ children }) => (
-          <li className="text-sm text-[var(--color-text)] break-words">{children}</li>
+          <li className={isDocument ? "text-[17px] leading-8 text-[var(--color-text)] break-words" : "text-sm text-[var(--color-text)] break-words"}>{children}</li>
         ),
         a: ({ href, children }) => {
           // sketch:// chip — render first so bare sketch URLs never fall
@@ -974,7 +1192,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFile
               const finalLine = line ?? (textMatch?.[2] ? parseInt(textMatch[2], 10) : undefined);
               const fallback = (
                 <a
-                  href={href}
+                  href={location ? resourceSrcResolver(href) : href}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-[var(--color-highlight)] hover:underline break-words"
@@ -997,7 +1215,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFile
           // the Tauri-vs-browser split centrally.
           return (
             <a
-              href={href}
+              href={href && location ? resourceSrcResolver(href) : href}
               target="_blank"
               rel="noopener noreferrer"
               className="text-[var(--color-highlight)] hover:underline break-words"
@@ -1013,7 +1231,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFile
           <em className="italic">{children}</em>
         ),
         blockquote: ({ children }) => (
-          <blockquote className="border-l-2 border-[var(--color-highlight)] pl-3 my-2 text-sm text-[var(--color-text-muted)]">
+          <blockquote className={isDocument ? "border-l-2 border-[var(--color-highlight)] pl-4 my-6 text-[17px] leading-8 text-[var(--color-text-muted)]" : "border-l-2 border-[var(--color-highlight)] pl-3 my-2 text-sm text-[var(--color-text-muted)]"}>
             {children}
           </blockquote>
         ),
@@ -1080,7 +1298,14 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFile
         },
         img: ({ src, alt }) => {
           if (!src) return null;
-          const resolved = resolveImageUrl ? resolveImageUrl(src) : src;
+          // Caller-supplied resolver wins (e.g. TaskChat uses this to keep
+          // image rendering behavior stable across task scopes). When the
+          // caller doesn't provide one, resolve through the file's source.
+          const resolved = resolveImageUrl
+            ? resolveImageUrl(src)
+            : location
+            ? resourceSrcResolver(src)
+            : src;
           return (
             <img
               src={resolved}
@@ -1093,6 +1318,37 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFile
                 const placeholder = el.nextElementSibling as HTMLElement | null;
                 if (placeholder) placeholder.style.display = 'inline-flex';
               }}
+            />
+          );
+        },
+        iframe: ({ src, sandbox, referrerPolicy, ...props }) => {
+          // rehype-sanitize has already stripped non-allowlisted attributes and
+          // rejected non-http(s) src schemes. We only need to apply safe
+          // defaults for sandbox / referrer policy when the author omitted
+          // them, and resolve file-relative src values when a location is
+          // available.
+          const rawSrc = src?.trim() ?? "";
+          const resolvedSrc = location ? resourceSrcResolver(rawSrc) : rawSrc;
+          const unresolvedRelativeSrc =
+            !isAbsoluteFileReference(rawSrc) &&
+            (!location || resolvedSrc === rawSrc);
+          if (!rawSrc || unresolvedRelativeSrc) {
+            return (
+              <div
+                role="alert"
+                className="my-2 rounded-md border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-3 py-2 text-xs text-[var(--color-text-muted)]"
+              >
+                Embedded resource unavailable
+              </div>
+            );
+          }
+          return (
+            <EmbeddedHtmlIframe
+              src={resolvedSrc}
+              fitLocalHtml={Boolean(location && !isAbsoluteFileReference(rawSrc) && /\.html?(?:[?#]|$)/i.test(rawSrc))}
+              sandbox={sandbox ?? IFRAME_DEFAULT_SANDBOX}
+              referrerPolicy={referrerPolicy ?? "no-referrer"}
+              {...props}
             />
           );
         },
@@ -1130,11 +1386,17 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFile
           return <input {...props} />;
         },
     });
-  }, [onFileClick, resolveImageUrl, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode, enableHeadingIds]);
+  }, [onFileClick, resolveImageUrl, location, resourceSrcResolver, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode, enableHeadingIds, isDocument]);
 
-  return (
-    <ReactMarkdown
+  const rendered = (
+    <div
+      ref={markdownRootRef}
+      className={isDocument ? "markdown-document-preview mx-auto max-w-[78rem]" : undefined}
+      onCopy={(event) => copySelectedMarkdown(event, markdownRootRef.current)}
+    >
+      <ReactMarkdown
       remarkPlugins={[remarkGfm]}
+      rehypePlugins={[rehypeRaw, [rehypeSanitize, markdownSanitizeSchema]]}
       components={components}
       urlTransform={(url) => {
         if (url.startsWith("sketch://")) return url;
@@ -1142,8 +1404,12 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, onFile
         if (url.startsWith("file://")) return url;
         return defaultUrlTransform(url);
       }}
-    >
-      {processedContent}
-    </ReactMarkdown>
+      >
+        {processedContent}
+      </ReactMarkdown>
+    </div>
   );
+  return effectiveComments
+    ? <MarkdownCommentHost previewComment={effectiveComments}>{rendered}</MarkdownCommentHost>
+    : rendered;
 });

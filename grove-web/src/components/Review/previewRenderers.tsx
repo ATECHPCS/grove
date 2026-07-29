@@ -1,9 +1,31 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useEffect, useRef, useMemo, type ReactNode } from 'react';
+import { lazy, Suspense, useEffect, useRef, useMemo, useState, useId, type ReactNode } from 'react';
 import { MarkdownRenderer, MermaidBlock, D2Block } from '../ui/MarkdownRenderer';
-import { PreviewCommentHost } from './PreviewCommentHost';
+import { PreviewCommentHost, type MarkdownCommentConfig, type MarkdownCommentMarker } from './PreviewCommentHost';
 import { highlightCode as highlightLocal, detectLanguage as detectLanguageLocal } from './syntaxHighlight';
 import type { DiffFile } from '../../api/review';
+import type { DataTable } from './dataTableParsers';
+import type { FileLocation } from '../ui/fileLocation';
+
+// AG Grid Community + papaparse together weigh ~300 kB gzipped. The data-table
+// preview only renders when the user opens a .csv / .tsv / .jsonl artifact, so
+// lazy-load both the component and the parsers to keep them out of main.
+const DataTablePreview = lazy(() =>
+  import('./DataTablePreview').then((m) => ({ default: m.DataTablePreview })),
+);
+
+// SheetJS (xlsx) + the tab-switcher component — only loaded when an .xlsx /
+// .xlsm / .xls / .xlsb / .ods file is opened.
+const XlsxWorkbook = lazy(() =>
+  import('./XlsxWorkbook').then((m) => ({ default: m.XlsxWorkbook })),
+);
+
+type TableKind = 'csv' | 'tsv' | 'jsonl';
+
+async function parseTable(content: string, kind: TableKind): Promise<DataTable> {
+  const m = await import('./dataTableParsers');
+  return kind === 'csv' ? m.parseCSV(content) : kind === 'tsv' ? m.parseTSV(content) : m.parseJSONL(content);
+}
 
 function withCommentHost(
   node: ReactNode,
@@ -17,29 +39,25 @@ function withCommentHost(
 // Preview Renderer Registry
 // ============================================================================
 
-export interface PreviewCommentMarker {
-  id: string;
-  label: string;
-  selector?: string;
-  xpath?: string;
-  extraBlocks?: Array<{ selector: string; xpath: string }>;
-}
+export type PreviewCommentMarker = MarkdownCommentMarker;
 
 export interface RenderFullProps {
   content: string;
   fileName?: string;
+  /** Download URL for the source file. Set when `contentType` is `'url'` or
+   *  `'binary'`; the renderer can fetch it for anything that needs the raw
+   *  bytes (currently only the xlsx renderer does this). */
+  downloadUrl?: string;
   onImageClick?: (url: string) => void;
   onSvgClick?: (svg: string) => void;
-  previewComment?: {
-    enabled: boolean;
-    previewId: string;
-    markers?: PreviewCommentMarker[];
-  };
+  previewComment?: MarkdownCommentConfig;
   /** Scopes `sketch://<uuid>` references in markdown to a specific Studio
    *  task. When provided, the markdown renderer swaps such references for an
    *  inline image of the sketch's PNG render (lightbox on click; falls back
    *  to plain text if the render is missing). */
   sketchContext?: { projectId: string; taskId: string };
+  /** Storage namespace and path of the file currently being previewed. */
+  location?: FileLocation;
 }
 
 export interface PreviewRenderer {
@@ -50,13 +68,17 @@ export interface PreviewRenderer {
   /** Test whether this renderer handles the given file path */
   match: (path: string) => boolean;
   /**
-   * 'url'  — content passed to renderFull is a download URL (images, PDFs, etc.)
-   * 'text' — content passed to renderFull is the fetched file text
+   * 'url'    — `content` is a URL the renderer hands to <img>/<iframe>; the
+   *            browser fetches it.
+   * 'text'   — `content` is the fetched file text and is safe to render.
+   * 'binary' — `downloadUrl` is the raw file URL; the renderer fetches +
+   *            parses it itself (e.g. .xlsx via SheetJS).
    */
-  contentType: 'url' | 'text';
+  contentType: 'url' | 'text' | 'binary';
   /**
    * Render full-file preview content.
    * `content` is either a URL or file text depending on `contentType`.
+   * For `binary`, the renderer fetches `downloadUrl` itself.
    * Optional `onImageClick` / `onSvgClick` callbacks enable lightbox support.
    */
   renderFull: (props: RenderFullProps) => React.ReactNode;
@@ -82,17 +104,19 @@ const markdownRenderer: PreviewRenderer = {
   label: 'Preview markdown',
   match: (path) => /\.(md|markdown)$/i.test(path),
   contentType: 'text',
-  renderFull: ({ content, onImageClick, onSvgClick, previewComment, sketchContext }) => withCommentHost(
+  renderFull: ({ content, onImageClick, onSvgClick, previewComment, sketchContext, location }) => (
     <MarkdownRenderer
       content={content}
+      renderMode="document"
       onImageClick={onImageClick}
       onMermaidClick={onSvgClick}
       onD2Click={onSvgClick}
       enableHeadingIds
       sketchContext={sketchContext}
       sketchRenderMode="image"
-    />,
-    previewComment,
+      location={location}
+      comments={previewComment}
+    />
   ),
   supportsDiffSegments: true,
 };
@@ -159,64 +183,8 @@ const imageRenderer: PreviewRenderer = {
 };
 
 // ============================================================================
-// CSV Renderer
+// Tabular Renderers (CSV / TSV / JSONL) — share DataTablePreview (AG Grid)
 // ============================================================================
-
-function parseCSV(text: string): string[][] {
-  return text.split('\n').filter(line => line.trim()).map(line => {
-    const cells: string[] = [];
-    let cur = '';
-    let inQuote = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (ch === '"') {
-        if (inQuote && line[i + 1] === '"') { cur += '"'; i++; }
-        else { inQuote = !inQuote; }
-      } else if (ch === ',' && !inQuote) {
-        cells.push(cur); cur = '';
-      } else {
-        cur += ch;
-      }
-    }
-    cells.push(cur);
-    return cells;
-  });
-}
-
-function CsvTable({ content }: { content: string }) {
-  const rows = parseCSV(content);
-  if (rows.length === 0) return <p className="p-5 text-sm" style={{ color: "var(--color-text-muted)" }}>Empty file</p>;
-  const [header, ...body] = rows;
-  return (
-    <div className="overflow-auto h-full">
-      <table className="w-full text-xs border-collapse" style={{ borderColor: "var(--color-border)" }}>
-        <thead style={{ background: "var(--color-bg-secondary)", position: "sticky", top: 0 }}>
-          <tr>
-            {header.map((cell, i) => (
-              <th key={i} className="px-3 py-2 text-left font-semibold whitespace-nowrap"
-                style={{ border: "1px solid var(--color-border)", color: "var(--color-text)" }}>
-                {cell}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {body.map((row, ri) => (
-            <tr key={ri} style={{ background: ri % 2 === 0 ? "transparent" : "color-mix(in srgb, var(--color-bg-secondary) 50%, transparent)" }}>
-              {row.map((cell, ci) => (
-                <td key={ci} className="px-3 py-1.5 whitespace-nowrap max-w-[240px] overflow-hidden text-ellipsis"
-                  style={{ border: "1px solid var(--color-border)", color: "var(--color-text)" }}
-                  title={cell}>
-                  {cell}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
 
 const htmlRenderer: PreviewRenderer = {
   id: 'html',
@@ -229,16 +197,112 @@ const htmlRenderer: PreviewRenderer = {
   supportsDiffSegments: false,
 };
 
+function LazyDataTable({ data, kind }: { data: DataTable | null; kind: TableKind }) {
+  if (!data) {
+    return (
+      <div className="flex items-center justify-center h-full text-sm" style={{ color: 'var(--color-text-muted)' }}>
+        Parsing {kind.toUpperCase()}…
+      </div>
+    );
+  }
+  return (
+    <Suspense fallback={
+      <div className="flex items-center justify-center h-full text-sm" style={{ color: 'var(--color-text-muted)' }}>
+        Loading table renderer…
+      </div>
+    }>
+      <DataTablePreview {...data} />
+    </Suspense>
+  );
+}
+
+function LazyTable({ content, kind }: { content: string; kind: TableKind }) {
+  const [data, setData] = useState<DataTable | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    parseTable(content, kind).then((d) => {
+      if (!cancelled) setData(d);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [content, kind]);
+  return <LazyDataTable data={data} kind={kind} />;
+}
+
+// Block-level comments on a virtualized AG Grid aren't meaningful — the
+// user can't anchor a comment to a row that isn't currently rendered, and
+// the comment-mode crosshair ends up over the loading spinner for xlsx.
+// Disable the comment toolbar for all four tabular renderers; column-level
+// filtering + the existing text renderer's comment mode cover the same
+// use case more reliably.
+const TABLE_RENDERER_FLAGS = { supportsDiffSegments: false, supportsComments: false } as const;
+
 const csvRenderer: PreviewRenderer = {
   id: 'csv',
   label: 'Preview CSV',
   match: (path) => /\.csv$/i.test(path),
   contentType: 'text',
   renderFull: ({ content, previewComment }) => withCommentHost(
-    <CsvTable content={content} />,
+    <LazyTable content={content} kind="csv" />,
     previewComment,
   ),
+  ...TABLE_RENDERER_FLAGS,
+};
+
+const tsvRenderer: PreviewRenderer = {
+  id: 'tsv',
+  label: 'Preview TSV',
+  match: (path) => /\.tsv$/i.test(path),
+  contentType: 'text',
+  renderFull: ({ content, previewComment }) => withCommentHost(
+    <LazyTable content={content} kind="tsv" />,
+    previewComment,
+  ),
+  ...TABLE_RENDERER_FLAGS,
+};
+
+const jsonlRenderer: PreviewRenderer = {
+  id: 'jsonl',
+  label: 'Preview JSONL',
+  match: (path) => /\.jsonl$/i.test(path),
+  contentType: 'text',
+  renderFull: ({ content, previewComment }) => withCommentHost(
+    <LazyTable content={content} kind="jsonl" />,
+    previewComment,
+  ),
+  ...TABLE_RENDERER_FLAGS,
+};
+
+// ============================================================================
+// XLSX Renderer (binary; fetches + parses with SheetJS, multi-sheet tab UI)
+// ============================================================================
+
+const xlsxRenderer: PreviewRenderer = {
+  id: 'xlsx',
+  label: 'Preview Excel',
+  match: (path) => /\.(xlsx|xlsm|xlsb|xls|ods)$/i.test(path),
+  contentType: 'binary',
+  renderFull: ({ downloadUrl, previewComment }) => {
+    const node = downloadUrl ? (
+      <Suspense fallback={
+        <div className="h-full w-full flex items-center justify-center text-sm"
+          style={{ color: 'var(--color-text-muted)' }}>
+          Loading workbook…
+        </div>
+      }>
+        <XlsxWorkbook downloadUrl={downloadUrl} />
+      </Suspense>
+    ) : (
+      <div className="h-full w-full flex items-center justify-center text-sm"
+        style={{ color: 'var(--color-text-muted)' }}>
+        No download URL available
+      </div>
+    );
+    return withCommentHost(node, previewComment);
+  },
   supportsDiffSegments: false,
+  supportsComments: false,
 };
 
 // ============================================================================
@@ -260,36 +324,6 @@ const pdfRenderer: PreviewRenderer = {
   supportsDiffSegments: false,
   supportsComments: false,
 };
-
-// ============================================================================
-// JSX / TSX Renderer — Live preview via sandboxed iframe + Babel standalone
-// ============================================================================
-
-function autoWrapJsx(code: string): string {
-  if (/createRoot|ReactDOM\.render/.test(code)) {
-    return code.replace(/export\s+default\s+/g, '').replace(/\nexport\s+(?!default)/g, '\n');
-  }
-
-  const clean = code
-    .replace(/export\s+default\s+/g, '')
-    .replace(/\nexport\s+(?!default)/g, '\n');
-
-  const patterns: RegExp[] = [
-    /function\s+([A-Z]\w*)\s*[<(]/,
-    /const\s+([A-Z]\w*)\s*=\s*(?:\(\)|\([^)]*\))\s*=>/,
-    /const\s+([A-Z]\w*)\s*=\s*function/,
-    /class\s+([A-Z]\w*)\s+extends\s+\w*Component/,
-  ];
-
-  for (const pat of patterns) {
-    const m = clean.match(pat);
-    if (m) {
-      return `${clean}\n\nReactDOM.createRoot(document.getElementById('root')).render(<${m[1]} />);`;
-    }
-  }
-
-  return `${clean}\ntry { ReactDOM.createRoot(document.getElementById('root')).render(<App />); } catch(e) { document.getElementById('jsx-error').textContent = 'Could not detect component. Ensure it starts with a capital letter (e.g. function App).\\n\\n' + e.message; document.getElementById('jsx-error').style.display = 'block'; }`;
-}
 
 function resolveThemeHighlight(): string {
   if (typeof window === 'undefined') return '#f59e0b';
@@ -352,11 +386,26 @@ function HtmlPreviewFrame({
   previewComment?: RenderFullProps["previewComment"];
 }) {
   const frameRef = useRef<HTMLIFrameElement>(null);
+  const frameId = useId();
+  const [reportedHeight, setReportedHeight] = useState<{ content: string; height: number } | null>(null);
+  const fittedHeight = reportedHeight?.content === content ? reportedHeight.height : undefined;
   // srcDoc only depends on content + stable previewId — never on `enabled` or
   // markers. Toggling comment mode / editing markers must not remount iframe.
-  const srcDoc = previewComment
+  const previewSrcDoc = previewComment
     ? buildHtmlPreviewSrcdoc(content, previewComment.previewId)
-    : content;
+    : injectPreviewBase(content);
+  const srcDoc = injectHtmlPreviewFitBridge(previewSrcDoc, frameId);
+
+  useEffect(() => {
+    const onMessage = (event: MessageEvent<unknown>) => {
+      if (event.source !== frameRef.current?.contentWindow || !event.data || typeof event.data !== 'object') return;
+      const data = event.data as { type?: string; frameId?: string; height?: unknown };
+      if (data.type !== HTML_PREVIEW_FIT_MESSAGE || data.frameId !== frameId || typeof data.height !== 'number') return;
+      if (Number.isFinite(data.height) && data.height > 0) setReportedHeight({ content, height: data.height });
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [content, frameId]);
 
   useEffect(() => {
     postPreviewCommentTheme(frameRef.current, previewComment?.previewId);
@@ -371,43 +420,44 @@ function HtmlPreviewFrame({
     <iframe
       ref={frameRef}
       srcDoc={srcDoc}
-      sandbox="allow-scripts"
-      className="w-full h-full border-0 min-h-[200px]"
+      sandbox={PREVIEW_IFRAME_SANDBOX}
+      className="w-full shrink-0 border-0 min-h-[200px]"
+      style={{ height: fittedHeight ? `${fittedHeight}px` : '100%' }}
       title="HTML Preview"
       onLoad={() => syncPreviewCommentState(frameRef.current, previewComment)}
     />
   );
 }
 
-function JsxPreviewFrame({
-  content,
-  previewComment,
-}: {
-  content: string;
-  previewComment?: RenderFullProps["previewComment"];
-}) {
-  const frameRef = useRef<HTMLIFrameElement>(null);
-  const srcDoc = buildJsxIframeSrcdoc(content, previewComment?.previewId);
+const HTML_PREVIEW_FIT_MESSAGE = 'grove:html-preview-fit';
 
-  useEffect(() => {
-    postPreviewCommentTheme(frameRef.current, previewComment?.previewId);
-    postPreviewCommentMode(frameRef.current, previewComment?.previewId, previewComment?.enabled);
-  }, [previewComment?.enabled, previewComment?.previewId]);
-
-  useEffect(() => {
-    postPreviewCommentMarkers(frameRef.current, previewComment?.previewId, previewComment?.markers);
-  }, [previewComment?.markers, previewComment?.previewId]);
-
-  return (
-    <iframe
-      ref={frameRef}
-      srcDoc={srcDoc}
-      sandbox="allow-scripts"
-      className="w-full h-full border-0 min-h-[200px]"
-      title="JSX Preview"
-      onLoad={() => syncPreviewCommentState(frameRef.current, previewComment)}
-    />
-  );
+function injectHtmlPreviewFitBridge(html: string, frameId: string): string {
+  // HTML assets often use a fixed-size canvas. Fit that canvas to the preview
+  // width and report its scaled height so the surrounding Review pane owns the
+  // vertical scrollbar instead of clipping the lower part of the document.
+  const bridge = [
+    '<script>',
+    '(function(){',
+    `var frameId=${JSON.stringify(frameId)};`,
+    `var type=${JSON.stringify(HTML_PREVIEW_FIT_MESSAGE)};`,
+    'function fit(){',
+    'var root=document.documentElement,body=document.body;if(!body||!window.innerWidth)return;',
+    "body.style.transform='';root.style.height='';",
+    'var width=Math.max(root.scrollWidth,body.scrollWidth,root.offsetWidth,body.offsetWidth);',
+    'var height=Math.max(root.scrollHeight,body.scrollHeight,root.offsetHeight,body.offsetHeight);',
+    'if(!width||!height)return;',
+    'var scale=Math.min(1,window.innerWidth/width);',
+    "body.style.transformOrigin='top left';body.style.transform='scale('+scale+')';",
+    'var fittedHeight=Math.ceil(height*scale);root.style.overflow=\'hidden\';root.style.height=fittedHeight+\'px\';',
+    "window.parent.postMessage({type:type,frameId:frameId,height:fittedHeight},'*');",
+    '}',
+    "window.addEventListener('load',function(){requestAnimationFrame(fit);});window.addEventListener('resize',fit);requestAnimationFrame(fit);",
+    '})();',
+    '</script>',
+  ].join('');
+  return /<\/body\s*>/i.test(html)
+    ? html.replace(/<\/body\s*>/i, `${bridge}</body>`)
+    : `${html}${bridge}`;
 }
 
 function buildPreviewCommentBridge(previewId: string): string {
@@ -467,6 +517,32 @@ function buildPreviewCommentBridge(previewId: string): string {
   ].join('');
 }
 
+// Srcdoc iframes inherit the parent document's origin, so a relative link
+// like `<a href="/protofilo">` resolves to localhost:3001/protofilo. The
+// `sandbox="allow-scripts"` flag does not block top-level navigation under
+// user activation, so clicking the link would navigate the parent Grove
+// page — and any path that isn't a Grove route falls through to the SPA
+// landing. Injecting `<base target="_blank">` forces all links to open in a
+// new tab, keeping the Code Review session intact. The matching `allow-popups`
+// + `allow-popups-to-escape-sandbox` flags (see PREVIEW_IFRAME_SANDBOX) are
+// required so the new tab actually opens and runs at its real origin.
+const PREVIEW_BASE_TAG = '<base target="_blank">';
+const PREVIEW_IFRAME_SANDBOX =
+  'allow-scripts allow-popups allow-popups-to-escape-sandbox';
+
+function injectPreviewBase(html: string): string {
+  if (/<head[^>]*>/i.test(html)) {
+    return html.replace(/<head[^>]*>/i, (m) => `${m}${PREVIEW_BASE_TAG}`);
+  }
+  if (/<html[^>]*>/i.test(html)) {
+    return html.replace(
+      /<html[^>]*>/i,
+      (m) => `${m}<head>${PREVIEW_BASE_TAG}</head>`,
+    );
+  }
+  return `${PREVIEW_BASE_TAG}${html}`;
+}
+
 // Sandboxed iframes (`allow-scripts` only, no `allow-same-origin`) throw a
 // SecurityError on any `localStorage` / `sessionStorage` access. React 19 and
 // many libraries touch storage during render, which crashes the preview. This
@@ -501,71 +577,23 @@ const SANDBOX_STORAGE_SHIM = [
 function buildHtmlPreviewSrcdoc(html: string, previewId: string): string {
   const bridge = buildPreviewCommentBridge(previewId);
   if (/<head[^>]*>/i.test(html)) {
-    html = html.replace(/<head[^>]*>/i, (m) => `${m}${SANDBOX_STORAGE_SHIM}`);
+    html = html.replace(
+      /<head[^>]*>/i,
+      (m) => `${m}${PREVIEW_BASE_TAG}${SANDBOX_STORAGE_SHIM}`,
+    );
   } else if (/<html[^>]*>/i.test(html)) {
-    html = html.replace(/<html[^>]*>/i, (m) => `${m}<head>${SANDBOX_STORAGE_SHIM}</head>`);
+    html = html.replace(
+      /<html[^>]*>/i,
+      (m) => `${m}<head>${PREVIEW_BASE_TAG}${SANDBOX_STORAGE_SHIM}</head>`,
+    );
   } else {
-    html = `${SANDBOX_STORAGE_SHIM}${html}`;
+    html = `${PREVIEW_BASE_TAG}${SANDBOX_STORAGE_SHIM}${html}`;
   }
   if (/<\/body>/i.test(html)) {
     return html.replace(/<\/body>/i, `${bridge}</body>`);
   }
   return `${html}${bridge}`;
 }
-
-function buildJsxIframeSrcdoc(code: string, previewId?: string): string {
-  const wrapped = autoWrapJsx(code);
-  const codeJson = JSON.stringify(wrapped).replace(/<\//g, '<\\/');
-  const commentBridge = previewId ? buildPreviewCommentBridge(previewId) : '';
-
-  return [
-    '<!DOCTYPE html><html><head><meta charset="utf-8">',
-    SANDBOX_STORAGE_SHIM,
-    '<script crossorigin src="https://unpkg.com/react@19/umd/react.development.js"><\\/script>',
-    '<script crossorigin src="https://unpkg.com/react-dom@19/umd/react-dom.development.js"><\\/script>',
-    '<script crossorigin src="https://unpkg.com/@babel/standalone@7/babel.min.js"><\\/script>',
-    '<style>',
-    '*{box-sizing:border-box;margin:0;padding:0}',
-    'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:20px;background:#fff;color:#1a1a1a;-webkit-font-smoothing:antialiased}',
-    '#root{min-height:100%}',
-    '#jsx-error{display:none;color:#dc2626;padding:12px 16px;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;font-family:"SF Mono",Monaco,monospace;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;margin-top:8px}',
-    '</style></head><body>',
-    '<div id="root"></div>',
-    '<div id="jsx-error"></div>',
-    '<script>',
-    '(function(){',
-    'var errEl=document.getElementById("jsx-error");',
-    'window.onerror=function(msg,url,line,col,err){',
-    'errEl.textContent=(err&&err.message)||msg+(line?"\\nLine: "+line:"");',
-    'errEl.style.display="block";',
-    'return true;',
-    '};',
-    'try{',
-    'var result=Babel.transform(' + codeJson + ',{presets:["react","typescript"]});',
-    'var s=document.createElement("script");',
-    's.textContent=result.code;',
-    'document.head.appendChild(s);',
-    '}catch(e){',
-    'errEl.textContent="Syntax Error: "+e.message;',
-    'errEl.style.display="block";',
-    '}',
-    '})();',
-    '</script>',
-    commentBridge,
-    '</body></html>',
-  ].join('\n');
-}
-
-const jsxRenderer: PreviewRenderer = {
-  id: 'jsx',
-  label: 'Preview JSX',
-  match: (path) => /\.(jsx|tsx)$/i.test(path),
-  contentType: 'text',
-  renderFull: ({ content, previewComment }) => (
-    <JsxPreviewFrame content={content} previewComment={previewComment} />
-  ),
-  supportsDiffSegments: false,
-};
 
 // ============================================================================
 // Source Code Renderer (fallback — any text file, line-level comments)
@@ -658,7 +686,6 @@ const sourceCodeRenderer: PreviewRenderer = {
 };
 
 const renderers: PreviewRenderer[] = [
-  jsxRenderer,
   htmlRenderer,
   markdownRenderer,
   mermaidRenderer,
@@ -666,16 +693,42 @@ const renderers: PreviewRenderer[] = [
   svgRenderer,
   imageRenderer,
   csvRenderer,
+  tsvRenderer,
+  jsonlRenderer,
+  xlsxRenderer,
   pdfRenderer,
   sourceCodeRenderer,
 ];
 
 /**
- * Find the matching preview renderer for a file path.
- * Returns undefined if no renderer matches.
+ * Whether a renderer still means anything in Changes (diff) mode.
+ *
+ * Changes mode has no whole file to hand a renderer — a `text` renderer gets fed
+ * content stitched back together from the diff hunks, which is partial by
+ * construction and renders to garbage for anything with real syntax. Markdown is
+ * the sole renderer that handles that itself (`supportsDiffSegments`). Non-text
+ * renderers never look at the diff at all — `url` / `binary` fetch the file
+ * itself — so an image or a PDF previews just fine.
+ *
+ * Keeping the rule here, derived from fields every renderer already declares,
+ * means a new renderer lands on the right side of it by filling those in
+ * honestly, with no separate list to remember to update.
  */
-export function getPreviewRenderer(path: string): PreviewRenderer | undefined {
-  return renderers.find((r) => r.match(path));
+function previewableInDiffMode(r: PreviewRenderer): boolean {
+  return r.supportsDiffSegments || r.contentType !== 'text';
+}
+
+/**
+ * Find the matching preview renderer for a file path, for the given view mode.
+ * Returns undefined if no renderer matches, or if the match isn't trustworthy in
+ * Changes mode (see previewableInDiffMode) — callers use undefined to mean "no
+ * preview available", which also hides the preview toggle.
+ */
+export function getPreviewRenderer(path: string, viewMode: 'diff' | 'full'): PreviewRenderer | undefined {
+  const renderer = renderers.find((r) => r.match(path));
+  if (!renderer) return undefined;
+  if (viewMode === 'diff' && !previewableInDiffMode(renderer)) return undefined;
+  return renderer;
 }
 
 // ============================================================================
@@ -694,7 +747,7 @@ export function ImagePreview({ projectId, taskId, file, onImageClick }: ImagePre
     return <div className="preview-loading">Missing project context</div>;
   }
 
-  const imgUrl = `/api/v1/projects/${projectId}/tasks/${taskId}/file?path=${encodeURIComponent(file.new_path)}`;
+  const imgUrl = `/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(file.new_path)}`;
 
   return (
     <div className="flex flex-col items-center justify-center gap-3 p-4">

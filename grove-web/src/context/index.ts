@@ -14,7 +14,9 @@ export { CommandPaletteProvider, useCommandPalette } from "./CommandPaletteConte
 export {
   PreviewCommentProvider,
   usePreviewComments,
+  useOptionalPreviewComments,
   type PreviewCommentDraft,
   type PreviewCommentLocator,
   type NewPreviewCommentDraft,
 } from "./PreviewCommentContext";
+export { previewCommentTaskLabel } from "./previewCommentUtils";

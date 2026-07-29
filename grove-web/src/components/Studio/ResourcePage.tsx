@@ -6,12 +6,12 @@ import {
   FolderOpen, Save, FileText, RefreshCw, Sparkles,
   Search, ArrowRight, Files, ShieldCheck, Clock3, X, Brain,
   FolderPlus, ChevronRight, Pencil, Check, CornerLeftUp, Edit3,
-  Link as LinkIcon,
+  Link as LinkIcon, SquareArrowOutUpRight,
 } from "lucide-react";
 import { useProject } from "../../context";
 import {
   listResources, uploadResource, deleteResource,
-  previewResource, resourceDownloadUrl,
+  previewResource, resourceDownloadUrl, openResourceFile,
   createResourceFolder, moveResource, createResourceLink, updateResourceLink,
   getInstructions, updateInstructions,
   getMemory, updateMemory,
@@ -131,7 +131,7 @@ export function ResourcePage() {
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [isEditingInstructions, setIsEditingInstructions] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
-  const [previewFile, setPreviewFile] = useState<{ file: ResourceFile; content: string } | null>(null);
+  const [previewFile, setPreviewFile] = useState<{ file: ResourceFile; content: string; downloadUrl?: string } | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
 
   const hasUnsaved = instructions !== savedInstructions;
@@ -594,8 +594,14 @@ export function ResourcePage() {
 
   const handlePreview = async (file: ResourceFile) => {
     if (!projectId || file.is_dir) return;
-    if (getPreviewType(file.name) === "image") {
+    const previewType = getPreviewType(file.name);
+    if (previewType === "image") {
       setPreviewFile({ file, content: resourceDownloadUrl(projectId, file.path) });
+      return;
+    }
+    if (previewType === "binary") {
+      // Renderer (e.g. xlsx) fetches the URL itself.
+      setPreviewFile({ file, content: "", downloadUrl: resourceDownloadUrl(projectId, file.path) });
       return;
     }
     setPreviewLoading(true);
@@ -611,6 +617,11 @@ export function ResourcePage() {
   const handleDownload = (file: ResourceFile) => {
     if (!projectId || file.is_dir) return;
     downloadViaIframe(resourceDownloadUrl(projectId, file.path), file.name);
+  };
+
+  const handleOpenInApp = (file: ResourceFile) => {
+    if (!projectId || file.is_dir) return;
+    void openResourceFile(projectId, file.path);
   };
 
   const handleOpenLink = useCallback(async (file: ResourceFile) => {
@@ -932,6 +943,7 @@ export function ResourcePage() {
                     onPreview={handlePreview}
                     onDownload={handleDownload}
                     onDelete={handleDelete}
+                    onOpenInApp={handleOpenInApp}
                     onOpenLink={handleOpenLink}
                     onEditLink={handleEditLink}
                     onStartRename={() => { setRenamingPath(item.data.path); setRenameValue(item.data.name); }}
@@ -1317,9 +1329,15 @@ export function ResourcePage() {
           <FilePreviewDrawer
             fileName={previewFile.file.name}
             content={previewFile.content}
+            downloadUrl={previewFile.downloadUrl}
             loading={previewLoading}
             onClose={() => setPreviewFile(null)}
             onDownload={() => handleDownload(previewFile.file)}
+            location={projectId ? {
+              projectId,
+              root: { kind: "resource" },
+              path: previewFile.file.path,
+            } : undefined}
           />
         )}
       </AnimatePresence>
@@ -1714,7 +1732,7 @@ function ResourceFolderRow({
 
 function ResourceFileRow({
   file, isRenaming, renameValue, renameInputRef,
-  onPreview, onDownload, onDelete, onOpenLink, onEditLink,
+  onPreview, onDownload, onDelete, onOpenInApp, onOpenLink, onEditLink,
   onStartRename, onRenameChange, onRenameConfirm, onRenameCancel,
   onDragStart, onMoveToParent,
 }: {
@@ -1725,6 +1743,7 @@ function ResourceFileRow({
   onPreview: (f: ResourceFile) => void;
   onDownload: (f: ResourceFile) => void;
   onDelete: (f: ResourceFile) => void;
+  onOpenInApp?: (f: ResourceFile) => void;
   onOpenLink?: (f: ResourceFile) => void;
   onEditLink?: (f: ResourceFile) => void;
   onStartRename: () => void;
@@ -1901,6 +1920,15 @@ function ResourceFileRow({
               onMouseEnter={e => e.currentTarget.style.background = "var(--color-bg-secondary)"}
               onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
               <Download className="w-3.5 h-3.5" /> Download
+            </button>
+          )}
+          {!isLink && onOpenInApp && (
+            <button
+              onClick={(e) => { e.stopPropagation(); setShowMenu(false); onOpenInApp(file); }}
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors"
+              onMouseEnter={e => e.currentTarget.style.background = "var(--color-bg-secondary)"}
+              onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+              <SquareArrowOutUpRight className="w-3.5 h-3.5" /> Open
             </button>
           )}
           {!isLink && (

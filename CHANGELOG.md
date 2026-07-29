@@ -5,6 +5,135 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.10] - 2026-07-28
+
+### Added
+
+- **Contextual comments across chat and previews** — Selected content in chat, Markdown, HTML, and diff previews can be carried into contextual comments, with clearer diagnostics when chat rendering fails.
+- **Native file actions** — Files can be dragged to native applications and revealed in the system file manager directly from task and review views.
+
+### Improved
+
+- **Document and HTML previews** — Markdown preserves document semantics while HTML previews fit their content more reliably, with consistent comment interactions across preview surfaces.
+- **Large chat and review performance** — Task chat and multi-file diffs virtualize long content while preserving search, scrolling, selection, and interaction stability.
+
+### Fixed
+
+- **Streaming chat and tool-call rendering** — Streamed messages, thought state, edit paths, tool details, and ACP updates render consistently as conversations evolve.
+- **Project selection on headless Linux** — When a native folder picker is unavailable, project selection falls back to the web picker.
+
+## [0.11.9] - 2026-07-23
+
+### Added
+
+- **Richer completed-turn presentation** — Completed chat turns now have a clearer, more polished presentation, and notifications can be cleared all at once.
+- **Markdown worktree resources and HTML previews** — Markdown now resolves local file resources consistently, including raw HTML rendered with worktree-relative iframe sources.
+
+### Improved
+
+- **Reliable diagnostics and quota badges** — Web sourcemaps are emitted for crash diagnostics, while providers can customize their aggregate quota badge.
+
+### Fixed
+
+- **Chat and agent reliability** — Billion-token counts and voice-command IDs are formatted correctly, agent icons resolve from display names, onboarding installs automatically, and the app recovers from white-screen crashes.
+- **Code Review file and diff interactions** — Binary and image files render directly; preview availability is capability-aware; and split-diff selection, copying, hovering, and expand/collapse controls work correctly.
+
+## [0.11.8] - 2026-07-13
+
+### Added
+
+- **Conversation minimap** — A navigable minimap for long chats, with height capped and previously-invisible ticks now rendered.
+- **Compact queue send mode** — The message queue now pauses while editing a queued message, plus a new compact send mode for queuing.
+- **Drag file cards into chat from Artifacts** — File cards in the Artifacts tab can now be dragged into the chat composer as file chips, matching the existing behavior from the file tree.
+
+### Improved
+
+- **Folder mentions in chat search** — `@` mentions now match folders, search scoring is tuned, and the result limit is raised to 20.
+- **Island project switcher** — "Add Project" and "Manage Projects" are now reachable from the island sidebar's project switcher.
+
+### Fixed
+
+- **Code Review diff refresh** — The diff view now retriggers correctly after the cache is cleared.
+- **ACP WebSocket cleanup** — The chat WebSocket is now properly closed when an ACP session ends.
+- **Agent seeding race on fresh installs** — Boot-time registry refresh, curated-agent seeding, and the PATH-binary scan are now serialized, fixing a race where seeding could finish before the registry cache loaded and leave 0 agents seeded.
+
+## [0.11.7] - 2026-07-07
+
+### Added
+
+- **Dynamic Island sidebar** — A new macOS-style "island" sidebar mode bundles live-activity alerts, permission handling, and theme polish into a compact floating surface.
+- **Current-project tasks in the command palette** — `Cmd+K` now lists the active project's tasks as commands, so you can jump between them without leaving the palette.
+
+### Fixed
+
+- **Pasted file collisions in chat** — Simultaneous file pastes no longer collide; each gets a unique timestamp in the working tree. Sidebar dropdown clipping in the chat layout is also corrected.
+
+## [0.11.6] - 2026-07-01
+
+### Added
+
+- **Interactive table preview** — CSV/TSV/JSONL/XLSX artifacts opened from task Artifacts or Studio resource pages now render as a sortable, filterable data grid instead of raw text.
+
+### Improved
+
+- **Downloads view folder navigation** — The open-folder icon now respects the current subpath instead of always jumping to the root.
+- **Chat and editor polish** — Removed an arbitrary version limit, smoothed chat scrolling, and refined the task editor layout.
+
+## [0.11.5] - 2026-06-19
+
+### Added
+
+- **Voice control** — Push-to-talk voice input with a settings panel and a command catalog for hands-free task navigation.
+- **Resizable session rail in chat** — The session list sidebar can now be drag-resized; the resizer hit-area and bash chip label are corrected alongside it.
+- **JSONL file rendering** — Chat and Studio now syntax-highlight `.jsonl` files as newline-delimited JSON.
+
+### Fixed
+
+- **Artifact display names** — File display names in the artifacts panel no longer include the current subdirectory prefix.
+- **Blitz task tooltips** — Truncated task names in Blitz mode show a tooltip; project-type tag is now visible.
+- **Blitz / tray navigation** — Notification navigation in Blitz mode and "Open in app" from phone tray now route correctly.
+- **Plugin-development docs bundled** — `docs/plugin-development.md` is now included in the published crate.
+- **Terminal ESC no longer exits workspace** — Pressing Escape inside the terminal now reaches the PTY (vim, shell readline, etc.) instead of closing the workspace. The `task.close` command is suppressed while the terminal panel has focus.
+- **Chat scroll auto-stick** — Auto-stick re-arms correctly when new rows arrive; streamed thought chunks grow in place rather than emitting separate entries.
+- **Chat scroll flicker and project palette refresh** — Eliminated a scroll flicker during streaming; project palette now refreshes after a project rename.
+
+## [0.11.4] - 2026-06-11
+
+### Added
+
+- **Menubar tray sync to phone with reply + voice** — The menubar tray panel now mirrors to the mobile shell so notifications, replies, and push-to-talk voice work from a paired phone.
+- **Streaming speech-to-text** — Audio capture supports a streaming STT mode for lower-latency dictation in chat.
+- **Configurable push-to-talk hold delay** — Audio settings expose the hold-delay threshold so users can tune their PTT trigger.
+- **Editor / Studio "Open in default app"** — Right-click an asset to hand it to the OS's default application.
+- **Drag-to-resize sidebars in Editor and Code Review** — File-tree sidebar in the Editor panel and both Code Review sidebars are now drag-resizable.
+- **Per-project last-view memory** — The web shell remembers each project's most recent top-level view and restores it on re-entry.
+- **Agent-graph reply reminders** — Opt-in nudge for stalled allies; the underlying reply instruction is now more forceful and client-agnostic.
+
+### Improved
+
+- **Unified agent marketplace data flow** — Refactored ACP marketplace into a single data path with a v2.5 → v2.6 storage migration.
+- **Agent usage layer split** — `agent_usage` is now `providers/` (pure API) + `agents/` (auth + dispatch), clarifying responsibilities.
+- **Auto-update prompts translated to English** — Update prompts and client messages are now English-only; stray emojis removed.
+- **Editor refresh and image cache** — File preview now passes `fileName` through to enable syntax highlighting; editor refresh and image cache behavior are corrected.
+
+### Fixed
+
+- **Enter-to-send during ACP connect** — Chat no longer fires a send while the ACP session is still connecting; a connecting hint surfaces if Enter is pressed early, while typing remains allowed.
+- **Default agent reset on startup** — Web no longer resets the Claude/Codex default agent back to Gemini on startup.
+- **Global hotkeys after webview reload** — Hotkeys keep working after a webview reload.
+- **Hermes missing from default agent dropdown** — Added Hermes to `BUILTIN_ACP_AGENTS` so it appears in the picker.
+- **OpenCode mode detection** — ACP now extracts modes from `configOptions` as a fallback for OpenCode.
+- **Permission panel stale error** — Panel collapses on the "is no longer pending" stale error instead of getting stuck.
+- **Agent quota popover scroll** — Header and footer are pinned; only the body scrolls.
+- **Chat search viewport jump** — Search no longer yanks the viewport back to the current match while scrolling.
+- **ANSI colors in tool output** — Tool output chips and bash response now render ANSI colors.
+- **TaskChat scroll behavior** — Uses `auto` scroll behavior to prevent a blank viewport.
+- **Code Review search highlight in focus mode** — Cross-span search highlight and sidebar search work correctly in focus mode.
+- **Folder picker, audio errors, preview sandbox** — Folder-picker cancel handling, audio error UX, and preview iframe sandbox are all corrected.
+- **iOS PWA standalone polish** — Eliminated zoom and bottom-gap; safe-area insets are now respected.
+- **macOS traffic lights on mobile/web** — Conditionally avoided on mobile and web viewports.
+- **Code-review follow-ups for v0.11.3** — Addressed outstanding review findings from the prior release.
+
 ## [0.11.3] - 2026-06-04
 
 ### Added

@@ -1,38 +1,17 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type CSSProperties } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { X, Info, AlertTriangle, AlertCircle } from "lucide-react";
+import { X } from "lucide-react";
 import { useNotifications } from "../../context";
 import { useIsMobile } from "../../hooks";
 import type { HookEntryResponse } from "../../api/hooks";
+import { formatTimeAgo, getLevelIcon } from "../../utils/notificationFormat";
 
 interface NotificationPopoverProps {
   isOpen: boolean;
   onClose: () => void;
   onNavigate?: (page: string, data?: Record<string, unknown>) => void;
-}
-
-function formatTimeAgo(timestamp: string): string {
-  const seconds = Math.floor((Date.now() - new Date(timestamp).getTime()) / 1000);
-  if (seconds < 60) return "just now";
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days === 1) return "1d ago";
-  if (days < 14) return `${days}d ago`;
-  return `${Math.floor(days / 7)}w ago`;
-}
-
-function getLevelIcon(level: string) {
-  switch (level) {
-    case "critical":
-      return <AlertCircle className="w-4 h-4 flex-shrink-0" style={{ color: "var(--color-error)" }} />;
-    case "warn":
-      return <AlertTriangle className="w-4 h-4 flex-shrink-0" style={{ color: "var(--color-warning)" }} />;
-    default:
-      return <Info className="w-4 h-4 flex-shrink-0" style={{ color: "var(--color-info)" }} />;
-  }
+  /** Desktop anchor override — defaults to the bottom-left sidebar position. */
+  anchorStyle?: CSSProperties;
 }
 
 function NotificationItem({
@@ -81,8 +60,8 @@ function NotificationItem({
   );
 }
 
-export function NotificationPopover({ isOpen, onClose, onNavigate }: NotificationPopoverProps) {
-  const { notifications, dismissNotification } = useNotifications();
+export function NotificationPopover({ isOpen, onClose, onNavigate, anchorStyle }: NotificationPopoverProps) {
+  const { notifications, dismissNotification, clearAllNotifications } = useNotifications();
   const popoverRef = useRef<HTMLDivElement>(null);
   const { isMobile } = useIsMobile();
 
@@ -129,6 +108,7 @@ export function NotificationPopover({ isOpen, onClose, onNavigate }: Notificatio
               bottom: 80,
               width: 360,
               maxHeight: 480,
+              ...anchorStyle,
             }}
           >
           {/* Mobile drag indicator */}
@@ -143,9 +123,21 @@ export function NotificationPopover({ isOpen, onClose, onNavigate }: Notificatio
             <span className="text-sm font-semibold text-[var(--color-text)]">
               Notifications
             </span>
-            <span className="text-xs text-[var(--color-text-muted)]">
-              {notifications.length > 0 ? `${notifications.length} active` : ""}
-            </span>
+            <div className="flex items-center gap-3">
+              <span className="text-xs text-[var(--color-text-muted)]">
+                {notifications.length > 0 ? `${notifications.length} active` : ""}
+              </span>
+              {notifications.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => void clearAllNotifications()}
+                  className="text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
+                  aria-label="Clear all notifications"
+                >
+                  Clear all
+                </button>
+              )}
+            </div>
           </div>
 
           {/* List */}

@@ -1,16 +1,37 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import type { PreviewCommentMarker, RenderFullProps } from './previewRenderers';
+import { createPortal } from 'react-dom';
+import { Trash2 } from 'lucide-react';
 import type { PreviewCommentLocator } from '../../context';
 import { useDefineCommand, useKeyboardScope } from '../../keyboard';
+
+export interface MarkdownCommentMarker {
+  id: string;
+  label: string;
+  selector?: string;
+  xpath?: string;
+  extraBlocks?: Array<{ selector: string; xpath: string }>;
+  locator?: PreviewCommentLocator;
+  comment?: string;
+}
+
+export interface MarkdownCommentConfig {
+  enabled?: boolean;
+  previewId: string;
+  markers?: MarkdownCommentMarker[];
+  onAdd?: (locator: PreviewCommentLocator, comment: string) => void;
+  onUpdate?: (id: string, comment: string) => void;
+  onDelete?: (id: string) => void;
+}
 
 interface ResolvedMarker {
   id: string;
   label: string;
   rects: DOMRect[];
+  marker: MarkdownCommentMarker;
 }
 
 interface Props {
-  previewComment?: RenderFullProps['previewComment'];
+  previewComment?: MarkdownCommentConfig;
   children: ReactNode;
 }
 
@@ -141,6 +162,53 @@ function unionRect(rects: DOMRect[]): DOMRect | null {
   return new DOMRect(l, t, r - l, b - t);
 }
 
+const SELECTION_ACTION_WIDTH = 112;
+const SELECTION_ACTION_HEIGHT = 34;
+const SELECTION_ACTION_GAP = 8;
+const SELECTION_ACTION_EDGE = 8;
+
+function selectionActionPosition(selection: DOMRect, host: DOMRect): { left: number; top: number } {
+  const viewportLeft = Math.max(host.left + SELECTION_ACTION_EDGE, SELECTION_ACTION_EDGE);
+  const viewportRight = Math.min(host.right - SELECTION_ACTION_EDGE, window.innerWidth - SELECTION_ACTION_EDGE);
+  const viewportTop = Math.max(host.top + SELECTION_ACTION_EDGE, SELECTION_ACTION_EDGE);
+  const viewportBottom = Math.min(host.bottom - SELECTION_ACTION_EDGE, window.innerHeight - SELECTION_ACTION_EDGE);
+  const clampLeft = (left: number) => Math.max(viewportLeft, Math.min(left, viewportRight - SELECTION_ACTION_WIDTH));
+  const clampTop = (top: number) => Math.max(viewportTop, Math.min(top, viewportBottom - SELECTION_ACTION_HEIGHT));
+
+  // Prefer the ragged right-side whitespace common to multi-line selections.
+  if (selection.right + SELECTION_ACTION_GAP + SELECTION_ACTION_WIDTH <= viewportRight) {
+    return {
+      left: selection.right + SELECTION_ACTION_GAP - host.left,
+      top: clampTop(selection.bottom - SELECTION_ACTION_HEIGHT) - host.top,
+    };
+  }
+  if (selection.bottom + SELECTION_ACTION_GAP + SELECTION_ACTION_HEIGHT <= viewportBottom) {
+    return {
+      left: clampLeft(selection.right - SELECTION_ACTION_WIDTH) - host.left,
+      top: selection.bottom + SELECTION_ACTION_GAP - host.top,
+    };
+  }
+  if (selection.top - SELECTION_ACTION_GAP - SELECTION_ACTION_HEIGHT >= viewportTop) {
+    return {
+      left: clampLeft(selection.right - SELECTION_ACTION_WIDTH) - host.left,
+      top: selection.top - SELECTION_ACTION_GAP - SELECTION_ACTION_HEIGHT - host.top,
+    };
+  }
+  if (selection.left - SELECTION_ACTION_GAP - SELECTION_ACTION_WIDTH >= viewportLeft) {
+    return {
+      left: selection.left - SELECTION_ACTION_GAP - SELECTION_ACTION_WIDTH - host.left,
+      top: clampTop(selection.bottom - SELECTION_ACTION_HEIGHT) - host.top,
+    };
+  }
+
+  // Extremely constrained viewport: keep the action visible. This fallback
+  // should only be reachable when no non-overlapping side can fit it.
+  return {
+    left: clampLeft(selection.right - SELECTION_ACTION_WIDTH) - host.left,
+    top: clampTop(selection.bottom + SELECTION_ACTION_GAP) - host.top,
+  };
+}
+
 function describeBlocks(blocks: Element[], stop: Element): PreviewCommentLocator {
   const head = blocks[0];
   const r = head.getBoundingClientRect();
@@ -203,20 +271,83 @@ function pickBlock(el: Element | null, stop: Element): Element | null {
   return el;
 }
 
+function textRangeForOffsets(element: Element, start: number, end: number): Range | null {
+  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+  let offset = 0;
+  let startNode: Text | null = null;
+  let endNode: Text | null = null;
+  let startOffset = 0;
+  let endOffset = 0;
+  let node = walker.nextNode() as Text | null;
+  while (node) {
+    const next = offset + node.data.length;
+    if (!startNode && start >= offset && start <= next) {
+      startNode = node;
+      startOffset = start - offset;
+    }
+    if (end >= offset && end <= next) {
+      endNode = node;
+      endOffset = end - offset;
+      break;
+    }
+    offset = next;
+    node = walker.nextNode() as Text | null;
+  }
+  if (!startNode || !endNode) return null;
+  const range = document.createRange();
+  range.setStart(startNode, startOffset);
+  range.setEnd(endNode, endOffset);
+  return range;
+}
+
 export function PreviewCommentHost({ previewComment, children }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const [hoverRects, setHoverRects] = useState<DOMRect[]>([]);
   const [markerRects, setMarkerRects] = useState<ResolvedMarker[]>([]);
   const [hostRect, setHostRect] = useState<DOMRect | null>(null);
+  const [selectionAction, setSelectionAction] = useState<{
+    locator: PreviewCommentLocator;
+    rect: DOMRect;
+    range: Range;
+  } | null>(null);
+  const [editor, setEditor] = useState<{
+    locator: PreviewCommentLocator;
+    rect: DOMRect;
+    markerId?: string;
+    text: string;
+    range?: Range;
+  } | null>(null);
 
   const enabled = !!previewComment?.enabled;
   const previewId = previewComment?.previewId;
+  const onAdd = previewComment?.onAdd;
 
   const markersKey = useMemo(
     () => JSON.stringify(previewComment?.markers ?? []),
     [previewComment?.markers],
   );
+
+  // Keep an exact, independent highlight while focus moves into the editor.
+  // Native selection styling disappears as soon as the textarea receives
+  // focus, so it cannot communicate what the pending comment targets.
+  useEffect(() => {
+    if (!editor?.range || !("highlights" in CSS) || typeof Highlight === "undefined") return;
+    const highlightName = `grove-markdown-comment-pending-${previewId}`;
+    const styleId = `${highlightName}-style`;
+    let style = document.getElementById(styleId);
+    if (!style) {
+      style = document.createElement("style");
+      style.id = styleId;
+      style.textContent = `::highlight(${highlightName}){background:color-mix(in srgb,var(--color-highlight) 32%,transparent);color:inherit;}`;
+      document.head.appendChild(style);
+    }
+    try { CSS.highlights.set(highlightName, new Highlight(editor.range)); } catch { /* noop */ }
+    return () => {
+      try { CSS.highlights.delete(highlightName); } catch { /* noop */ }
+      style?.remove();
+    };
+  }, [editor?.range, previewId]);
 
   // Keep hostRect fresh (for absolute overlay positioning relative to host)
   useLayoutEffect(() => {
@@ -304,11 +435,16 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
       const payload = blocks.length === 1
         ? describe(blocks[0], content)
         : describeBlocks(blocks, content);
-      window.postMessage({
-        type: 'grove-preview-comment:selected',
-        previewId,
-        payload,
-      }, '*');
+      const rect = unionRect(blocks.map((block) => block.getBoundingClientRect()));
+      if (onAdd && rect) {
+        setEditor({ locator: payload, rect, text: '' });
+      } else {
+        window.postMessage({
+          type: 'grove-preview-comment:selected',
+          previewId,
+          payload,
+        }, '*');
+      }
     };
 
     const onMouseLeave = (e: MouseEvent) => {
@@ -337,6 +473,80 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
       window.removeEventListener('mouseup', onMouseUp, true);
       content.style.cursor = '';
       setHoverRects([]);
+    };
+  }, [enabled, previewId, onAdd]);
+
+  // Native text selection is available even when block comment mode is off.
+  // Keep the browser selection intact and offer a small contextual action;
+  // choosing it feeds the same draft flow as element comments.
+  useEffect(() => {
+    const content = contentRef.current;
+    if (!content || !previewId) return;
+
+    const updateSelectionAction = () => {
+      if (enabled) {
+        setSelectionAction(null);
+        return;
+      }
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+        setSelectionAction(null);
+        return;
+      }
+      const range = selection.getRangeAt(0);
+      if (!content.contains(range.startContainer) || !content.contains(range.endContainer)) {
+        setSelectionAction(null);
+        return;
+      }
+      const text = clean(selection.toString(), 1200);
+      const clientRects = Array.from(range.getClientRects()).filter((item) => item.width > 0 && item.height > 0);
+      const rect = unionRect(clientRects) ?? range.getBoundingClientRect();
+      if (!text || rect.width <= 0 || rect.height <= 0) {
+        setSelectionAction(null);
+        return;
+      }
+      const ancestor = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+        ? range.commonAncestorContainer as Element
+        : range.commonAncestorContainer.parentElement;
+      const block = pickBlock(ancestor, content);
+      if (!block) {
+        setSelectionAction(null);
+        return;
+      }
+      const prefix = document.createRange();
+      prefix.selectNodeContents(block);
+      prefix.setEnd(range.startContainer, range.startOffset);
+      const rawSelection = selection.toString();
+      const startOffset = prefix.toString().length;
+      setSelectionAction({
+        locator: {
+          ...describe(block, content),
+          text,
+          html: `[text selection] ${text}`,
+          rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+          textRange: {
+            start: startOffset,
+            end: startOffset + rawSelection.length,
+            quote: text,
+          },
+        },
+        rect,
+        range: range.cloneRange(),
+      });
+    };
+
+    const clearOnPointerDown = (event: MouseEvent) => {
+      if ((event.target as HTMLElement | null)?.closest('[data-grove-selection-action="true"]')) return;
+      setSelectionAction(null);
+    };
+
+    content.addEventListener('mouseup', updateSelectionAction);
+    content.addEventListener('keyup', updateSelectionAction);
+    document.addEventListener('mousedown', clearOnPointerDown, true);
+    return () => {
+      content.removeEventListener('mouseup', updateSelectionAction);
+      content.removeEventListener('keyup', updateSelectionAction);
+      document.removeEventListener('mousedown', clearOnPointerDown, true);
     };
   }, [enabled, previewId]);
 
@@ -367,7 +577,7 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
     const content = contentRef.current;
     const host = hostRef.current;
     if (!content || !host) return;
-    const markers = JSON.parse(markersKey) as PreviewCommentMarker[];
+    const markers = JSON.parse(markersKey) as MarkdownCommentMarker[];
 
     const lookupOne = (selector?: string, xp?: string): Element | null => {
       let el: Element | null = null;
@@ -383,7 +593,7 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
       return el;
     };
 
-    const resolveAll = (m: PreviewCommentMarker): Element[] => {
+    const resolveAll = (m: MarkdownCommentMarker): Element[] => {
       const head = lookupOne(m.selector, m.xpath);
       if (!head) return [];
       const out = [head];
@@ -399,11 +609,14 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
       for (const m of markers) {
         const els = resolveAll(m);
         if (els.length === 0) continue;
-        const rects = els
-          .map((el) => el.getBoundingClientRect())
-          .filter((r) => r.width > 0 && r.height > 0);
+        const exactRange = m.locator?.textRange && els[0]
+          ? textRangeForOffsets(els[0], m.locator.textRange.start, m.locator.textRange.end)
+          : null;
+        const rects = exactRange
+          ? Array.from(exactRange.getClientRects()).filter((r) => r.width > 0 && r.height > 0)
+          : els.map((el) => el.getBoundingClientRect()).filter((r) => r.width > 0 && r.height > 0);
         if (rects.length > 0) {
-          resolved.push({ id: m.id, label: m.label, rects });
+          resolved.push({ id: m.id, label: m.label, rects, marker: m });
         }
       }
       setMarkerRects(resolved);
@@ -471,8 +684,8 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
   }, [markersKey, previewId]);
 
   return (
-    <div ref={hostRef} className="relative w-full h-full">
-      <div ref={contentRef} className="w-full h-full">
+    <div ref={hostRef} className="relative w-full">
+      <div ref={contentRef} className="w-full">
         {children}
       </div>
       {enabled && hoverRects.length > 0 && hostRect && (() => {
@@ -494,28 +707,63 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
           />
         );
       })()}
-      {hostRect && markerRects.map(({ id, label, rects }) => {
+      {selectionAction && hostRect && (() => {
+        const position = selectionActionPosition(selectionAction.rect, hostRect);
+        return (
+        <button
+          type="button"
+          data-grove-comment-overlay="true"
+          data-grove-selection-action="true"
+          className="absolute z-[60] inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-1.5 text-xs font-medium text-[var(--color-text)] shadow-lg transition-colors hover:bg-[var(--color-bg-secondary)]"
+          style={{
+            left: position.left,
+            top: position.top,
+          }}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => {
+            if (previewComment?.onAdd) {
+              setEditor({ locator: selectionAction.locator, rect: selectionAction.rect, range: selectionAction.range, text: '' });
+            } else {
+              window.postMessage({
+                type: 'grove-preview-comment:selected',
+                previewId,
+                payload: selectionAction.locator,
+              }, '*');
+            }
+            setSelectionAction(null);
+          }}
+        >
+          <span aria-hidden="true">＋</span>
+          Comment
+        </button>
+        );
+      })()}
+      {hostRect && markerRects.map(({ id, label, rects, marker }) => {
         const u = unionRect(rects)!;
+        const anchor = rects[rects.length - 1] ?? u;
         return (
         <div key={id} data-grove-comment-overlay="true" className="pointer-events-none absolute" style={{ inset: 0, zIndex: 49 }}>
-          <div
-            className="absolute"
-            style={{
-              left: u.left - hostRect.left,
-              top: u.top - hostRect.top,
-              width: u.width,
-              height: u.height,
-              border: '1.5px dashed color-mix(in srgb, var(--color-highlight) 85%, transparent)',
-              background: 'color-mix(in srgb, var(--color-highlight) 8%, transparent)',
-              boxShadow: '0 0 0 1px rgba(255,255,255,.7)',
-              borderRadius: 3,
-            }}
-          />
+          {rects.map((rect, index) => (
+            <div
+              key={index}
+              className="absolute"
+              style={{
+                left: rect.left - hostRect.left,
+                top: rect.top - hostRect.top,
+                width: rect.width,
+                height: rect.height,
+                border: '1.5px dashed color-mix(in srgb, var(--color-highlight) 85%, transparent)',
+                background: 'color-mix(in srgb, var(--color-highlight) 12%, transparent)',
+                boxShadow: '0 0 0 1px rgba(255,255,255,.7)',
+                borderRadius: 3,
+              }}
+            />
+          ))}
           <div
             className="absolute flex items-center justify-center text-[11px] font-semibold text-white transition-transform hover:scale-110"
             style={{
-              left: u.left - hostRect.left - 6,
-              top: u.top - hostRect.top - 10,
+              left: anchor.right - hostRect.left + 4,
+              top: anchor.top - hostRect.top - 4,
               minWidth: 18,
               height: 18,
               padding: '0 5px',
@@ -530,7 +778,16 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
               e.preventDefault();
               e.stopPropagation();
               if (!previewId) return;
-              window.postMessage({ type: 'grove-preview-comment:marker-click', previewId, markerId: id }, '*');
+              if (previewComment?.onUpdate && marker.locator) {
+                setEditor({
+                  locator: marker.locator,
+                  rect: anchor,
+                  markerId: id,
+                  text: marker.comment ?? '',
+                });
+              } else {
+                window.postMessage({ type: 'grove-preview-comment:marker-click', previewId, markerId: id }, '*');
+              }
             }}
           >
             {label}
@@ -538,6 +795,66 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
         </div>
         );
       })}
+      {editor && typeof document !== 'undefined' && createPortal((() => {
+        const width = Math.min(280, window.innerWidth - 20);
+        const left = window.innerWidth - editor.rect.right >= width + 20
+          ? editor.rect.right + 12
+          : Math.max(10, editor.rect.left - width - 12);
+        const top = window.innerHeight - editor.rect.bottom >= 154
+          ? editor.rect.bottom + 8
+          : Math.max(10, editor.rect.top - 146);
+        const close = () => setEditor(null);
+        const save = () => {
+          const value = editor.text.trim();
+          if (!value) return;
+          if (editor.markerId) previewComment?.onUpdate?.(editor.markerId, value);
+          else previewComment?.onAdd?.(editor.locator, value);
+          close();
+        };
+        return (
+          <div
+            data-grove-comment-overlay="true"
+            data-hotkeys-dialog="true"
+            className="fixed z-[10000] rounded-xl border border-[var(--color-border)] bg-[var(--color-bg)] p-2.5 shadow-[0_12px_32px_rgba(0,0,0,0.2)]"
+            style={{ left, top, width }}
+          >
+            <textarea
+              autoFocus
+              rows={3}
+              value={editor.text}
+              onChange={(event) => setEditor((current) => current ? { ...current, text: event.target.value } : current)}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') { event.preventDefault(); close(); }
+                if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) { event.preventDefault(); save(); }
+              }}
+              placeholder="Add a comment…"
+              className="block w-full resize-none rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-2 py-1.5 text-xs leading-4 text-[var(--color-text)] outline-none focus:border-[var(--color-highlight)]"
+            />
+            <div className="mt-2 flex items-center justify-between gap-2">
+              <div>
+                {editor.markerId && previewComment?.onDelete && (
+                  <button
+                    type="button"
+                    onClick={() => { previewComment.onDelete?.(editor.markerId!); close(); }}
+                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[10px] font-medium text-[var(--color-error)] hover:bg-[color-mix(in_srgb,var(--color-error)_10%,transparent)]"
+                  >
+                    <Trash2 className="h-3 w-3" />
+                    Delete
+                  </button>
+                )}
+              </div>
+              <div className="flex items-center gap-1">
+                <button type="button" onClick={close} className="rounded-md px-2 py-1 text-[10px] font-medium text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]">Cancel</button>
+                <button type="button" disabled={!editor.text.trim()} onClick={save} className="rounded-md bg-[var(--color-highlight)] px-2.5 py-1 text-[10px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40">Save</button>
+              </div>
+            </div>
+          </div>
+        );
+      })(), document.body)}
     </div>
   );
 }
+
+// Public Markdown-facing name. PreviewCommentHost remains for non-Markdown
+// renderers that reuse the same DOM annotation layer.
+export const MarkdownCommentHost = PreviewCommentHost;

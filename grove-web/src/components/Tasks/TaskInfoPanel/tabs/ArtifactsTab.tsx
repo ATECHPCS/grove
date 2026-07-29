@@ -4,12 +4,12 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
   Download, Trash2, Eye,
   Loader2, Upload, MoreHorizontal, FolderOpen, RefreshCw, ArrowUpFromLine,
-  Link as LinkIcon, Edit3, Plus,
+  Link as LinkIcon, Edit3, Plus, SquareArrowOutUpRight,
 } from "lucide-react";
 import type { Task } from "../../../../data/types";
 import {
   listArtifacts, previewArtifact, artifactDownloadUrl, deleteArtifact,
-  uploadArtifacts, createArtifactLink, updateArtifactLink, syncArtifactToResource, listArtifactWorkdirs, addArtifactWorkdir, deleteArtifactWorkdir, openArtifactWorkdir,
+  uploadArtifacts, createArtifactLink, updateArtifactLink, syncArtifactToResource, listArtifactWorkdirs, addArtifactWorkdir, deleteArtifactWorkdir, openArtifactWorkdir, openArtifactFile,
   listResources,
   type ArtifactFile, type ArtifactWorkDirectoryEntry, type DisplayItem,
 } from "../../../../api";
@@ -30,7 +30,7 @@ import {
   parseLinkFile,
 } from "../../../ui";
 import { openExternalUrl } from "../../../../utils/openExternal";
-import { usePreviewComments, type PreviewCommentLocator } from "../../../../context";
+import { previewCommentTaskLabel, usePreviewComments, type PreviewCommentLocator } from "../../../../context";
 import { getPreviewRenderer, type PreviewCommentMarker } from "../../../Review/previewRenderers";
 
 interface ArtifactsTabProps {
@@ -73,7 +73,7 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
     existingNames: Set<string>;
   } | null>(null);
 
-  const [previewFile, setPreviewFile] = useState<{ file: ArtifactFile; content: string } | null>(null);
+  const [previewFile, setPreviewFile] = useState<{ file: ArtifactFile; content: string; downloadUrl?: string } | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
 
   const [isUploading, setIsUploading] = useState(false);
@@ -106,7 +106,11 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
   const [previewError, setPreviewError] = useState<string | null>(null);
 
   const refreshPreviewContent = useCallback((file: ArtifactFile, seq: number) => {
-    if (!projectId || getPreviewType(file.name) === "image") return;
+    if (!projectId) return;
+    const t = getPreviewType(file.name);
+    // Image previews use the URL as <img src>; binary previews fetch their
+    // own bytes — neither can be re-polled via the text endpoint.
+    if (t === "image" || t === "binary") return;
     previewArtifact(projectId, task.id, file.directory, file.path)
       .then((content) => {
         if (seq !== liveRefreshSeqRef.current) return;
@@ -199,7 +203,29 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
     setIsUploading(false);
   }, [projectId, task.id, loadFiles]);
 
+  /** True if the current drag carries a grove file path — i.e. it's an internal
+   *  drag from another FileCard or from FileTree, not an OS file upload. We use
+   *  this to suppress the "Drop files to upload" overlay (misleading when the
+   *  user is moving a chip to the chat composer) and to no-op the drop handler. */
+  const dragCarriesGrovePath = (dt: DataTransfer): boolean => {
+    const types = dt.types;
+    if (!types) return false;
+    for (let i = 0; i < types.length; i++) {
+      if (types[i] === "application/x-grove-file-path") return true;
+    }
+    return false;
+  };
+
   const handleDrop = useCallback((e: React.DragEvent) => {
+    // Internal file drag (from FileCard / FileTree) — let it propagate to other
+    // drop targets (e.g. the chat composer). Don't show the upload overlay or
+    // try to upload, since these aren't OS files.
+    if (dragCarriesGrovePath(e.dataTransfer)) {
+      e.preventDefault();
+      dragCountRef.current = 0;
+      setIsDragOver(false);
+      return;
+    }
     e.preventDefault();
     dragCountRef.current = 0;
     setIsDragOver(false);
@@ -255,10 +281,20 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
 
   const handlePreview = useCallback(async (file: ArtifactFile, force?: boolean) => {
     if (!projectId || file.is_dir) return;
-    if (getPreviewType(file.name) === "image") {
+    const previewType = getPreviewType(file.name);
+    if (previewType === "image") {
       const url = artifactDownloadUrl(projectId, task.id, file.directory, file.path);
       setPreviewFile({ file, content: url });
       lastGoodContentRef.current = url;
+      setPreviewError(null);
+      return;
+    }
+    if (previewType === "binary") {
+      // Renderer fetches the URL itself (e.g. xlsx via SheetJS). We just
+      // hand it the download URL; content is unused.
+      const url = artifactDownloadUrl(projectId, task.id, file.directory, file.path);
+      setPreviewFile({ file, content: "", downloadUrl: url });
+      lastGoodContentRef.current = "";
       setPreviewError(null);
       return;
     }
@@ -288,7 +324,7 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
         setPreviewFile({ file, content: safeContent });
       }
     } else {
-      const renderer = getPreviewRenderer(file.name);
+      const renderer = getPreviewRenderer(file.name, 'full');
       if (renderer && renderer.id === 'source') {
         downloadViaIframe(
           artifactDownloadUrl(projectId, task.id, file.directory, file.path),
@@ -411,6 +447,11 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
     );
   }, [projectId, task.id]);
 
+  const handleOpenInApp = useCallback((file: ArtifactFile) => {
+    if (!projectId || file.is_dir) return;
+    void openArtifactFile(projectId, task.id, file.directory, file.path);
+  }, [projectId, task.id]);
+
   const handleCreatePreviewComment = useCallback((file: ArtifactFile, locator: PreviewCommentLocator, comment: string, rendererId: string) => {
     if (!projectId) return;
     addDraft({
@@ -437,14 +478,14 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
     );
   }, [previewCommentDrafts, projectId, task.id, previewFilePath]);
   const currentFilePreviewMarkers = useMemo<PreviewCommentMarker[]>(
-    () => currentFilePreviewDrafts.map((d, idx) => ({
+    () => currentFilePreviewDrafts.map((d) => ({
       id: d.id,
-      label: String(idx + 1),
+      label: previewCommentTaskLabel(previewCommentDrafts, d),
       selector: d.locator.selector,
       xpath: d.locator.xpath,
       extraBlocks: d.locator.extraBlocks,
     })),
-    [currentFilePreviewDrafts],
+    [currentFilePreviewDrafts, previewCommentDrafts],
   );
 
   const handleUpdatePreviewComment = useCallback(
@@ -538,9 +579,10 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
     setError(err instanceof Error ? err.message : "Sync failed");
   }, [projectId, task.id]);
 
-  const handleOpenFolder = (dir: string) => {
+  const handleOpenFolder = (dir: string, subpath?: string) => {
     if (!projectId) return;
-    apiClient.post(`/api/v1/projects/${projectId}/tasks/${task.id}/open-folder?dir=${encodeURIComponent(dir)}&path=.`).catch(() => {});
+    const pathQuery = subpath ? encodeURIComponent(subpath) : ".";
+    apiClient.post(`/api/v1/projects/${projectId}/tasks/${task.id}/open-folder?dir=${encodeURIComponent(dir)}&path=${pathQuery}`).catch(() => {});
   };
 
   useEffect(() => {
@@ -635,6 +677,7 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
           <FilePreviewDrawer
             fileName={previewFile.file.name}
             content={previewFile.content}
+            downloadUrl={previewFile.downloadUrl}
             loading={previewLoading}
             error={previewError}
             isLive={!!isChatBusy}
@@ -650,6 +693,11 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
             previewCommentDrafts={currentFilePreviewDrafts}
             previewCommentMarkers={currentFilePreviewMarkers}
             sketchContext={projectId ? { projectId, taskId: task.id } : undefined}
+            location={projectId ? {
+              projectId,
+              root: { kind: "task", taskId: task.id },
+              path: `${previewFile.file.directory}/${previewFile.file.path}`,
+            } : undefined}
           />
         )}
       </AnimatePresence>
@@ -672,9 +720,25 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
         ref={containerRef}
         className="flex-1 flex flex-col min-h-0"
         onDrop={handleDrop}
-        onDragEnter={(e) => { e.preventDefault(); dragCountRef.current++; setIsDragOver(true); }}
-        onDragOver={(e) => { e.preventDefault(); }}
-        onDragLeave={(e) => { e.preventDefault(); dragCountRef.current--; if (dragCountRef.current === 0) setIsDragOver(false); }}
+        onDragEnter={(e) => {
+          // Internal file drags (FileCard / FileTree) should pass through to
+          // other drop targets like the chat composer — don't show the upload
+          // overlay or claim the drop.
+          if (dragCarriesGrovePath(e.dataTransfer)) return;
+          e.preventDefault();
+          dragCountRef.current++;
+          setIsDragOver(true);
+        }}
+        onDragOver={(e) => {
+          if (dragCarriesGrovePath(e.dataTransfer)) return;
+          e.preventDefault();
+        }}
+        onDragLeave={(e) => {
+          if (dragCarriesGrovePath(e.dataTransfer)) return;
+          e.preventDefault();
+          dragCountRef.current--;
+          if (dragCountRef.current === 0) setIsDragOver(false);
+        }}
       >
         {error && (
           <div className="text-xs px-4 py-2 shrink-0" style={{ color: "var(--color-error)" }}>{error}</div>
@@ -755,7 +819,7 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
                 ) : (
                   <FileCard key={`f-${item.data.directory}/${item.data.path}`} file={item.data} projectId={projectId} taskId={task.id}
                     onPreview={handlePreview} onDownload={handleDownload} onDelete={handleDelete} allowDelete
-                    onSyncToResource={handleSyncToResource} onOpenLink={handleOpenLink} onEditLink={handleEditLink} />
+                    onSyncToResource={handleSyncToResource} onOpenLink={handleOpenLink} onEditLink={handleEditLink} onOpenInApp={handleOpenInApp} />
                 )
               )
             )}
@@ -787,7 +851,7 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
             count={outputFileCount}
             isOpen={downloadsOpen}
             onToggle={() => setDownloadsOpen(!downloadsOpen)}
-            onOpenFolder={() => handleOpenFolder("output")}
+            onOpenFolder={() => handleOpenFolder("output", currentOutputPath)}
           />
           <div className="overflow-y-auto px-3 pb-3" style={{
             flex: downloadsOpen ? "1 1 0%" : "0 0 0px",
@@ -834,8 +898,9 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
                 />
               ) : (
                 <FileCard key={entry.path} file={entry} projectId={projectId} taskId={task.id}
+                  viewPath={currentOutputPath}
                   onPreview={handlePreview} onDownload={handleDownload}
-                  onSyncToResource={handleSyncToResource} onOpenLink={handleOpenLink} onEditLink={handleEditLink} />
+                  onSyncToResource={handleSyncToResource} onOpenLink={handleOpenLink} onEditLink={handleEditLink} onOpenInApp={handleOpenInApp} />
               )
             ))}
             {outputFileCount === 0 && (
@@ -1146,20 +1211,34 @@ function FolderEntryRow({
 /* ─── FileCard ─── */
 
 function FileCard({
-  file, projectId, taskId, onPreview, onDownload, onDelete, allowDelete, onSyncToResource, onOpenLink, onEditLink,
+  file, projectId, taskId, viewPath = "", onPreview, onDownload, onDelete, allowDelete, onSyncToResource, onOpenLink, onEditLink, onOpenInApp,
 }: {
   file: ArtifactFile; projectId?: string; taskId: string;
+  viewPath?: string;
   onPreview: (f: ArtifactFile) => void; onDownload: (f: ArtifactFile) => void;
   onDelete?: (f: ArtifactFile) => void; allowDelete?: boolean;
   onSyncToResource?: (f: ArtifactFile) => void;
   onOpenLink?: (f: ArtifactFile) => void;
   onEditLink?: (f: ArtifactFile) => void;
+  onOpenInApp?: (f: ArtifactFile) => void;
 }) {
+  // Mirror FileTree.tsx's drag protocol (`application/x-grove-file-path`) so the
+  // chat composer can pick this up via its existing handleDrop and convert it
+  // into an inline file chip. The path format `${directory}/${path}` matches
+  // what `buildStudioMentionItems` produces for `input/*` / `output/*` entries,
+  // so `insertFileChipAtPoint`'s `filteredFiles.find` lookup resolves and the
+  // chip gets the right displayName (e.g. link-stripped name), category and
+  // favicon without extra plumbing.
+  const draggablePath = `${file.directory}/${file.path}`;
   const isLink = isLinkFile(file.name);
   const canPreview = !isLink && canPreviewFile(file.name);
   const ext = getExtBadge(file.name);
   const isImage = !isLink && getPreviewType(file.name) === "image";
-  const displayName = isLink ? linkDisplayName(file.name) : (file.path.includes("/") ? file.path : file.name);
+  const displayName = isLink
+    ? linkDisplayName(file.name)
+    : viewPath && file.path.startsWith(viewPath + "/")
+      ? file.path.slice(viewPath.length + 1)
+      : file.name;
   const [showMenu, setShowMenu] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
@@ -1188,7 +1267,15 @@ function FileCard({
       className="group flex items-center gap-3 px-3 py-2 rounded-lg transition-all cursor-pointer"
       onClick={() => isLink ? onOpenLink?.(file) : canPreview ? onPreview(file) : onDownload(file)}
       onMouseEnter={e => e.currentTarget.style.background = "var(--color-bg-secondary)"}
-      onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+      onMouseLeave={e => e.currentTarget.style.background = "var(--color-bg)"}
+      draggable={!file.is_dir}
+      onDragStart={(e) => {
+        if (file.is_dir) return;
+        e.dataTransfer.effectAllowed = "copy";
+        e.dataTransfer.setData("application/x-grove-file-path", draggablePath);
+        e.dataTransfer.setData("application/x-grove-file-is-dir", "false");
+        e.dataTransfer.setData("text/plain", draggablePath);
+      }}
     >
       {isLink ? (
         <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0 overflow-hidden bg-[var(--color-bg-secondary)] border border-[var(--color-border)]">
@@ -1284,6 +1371,14 @@ function FileCard({
               onMouseEnter={e => e.currentTarget.style.background = "var(--color-bg-secondary)"}
               onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
               <Download className="w-3.5 h-3.5" /> Download
+            </button>
+          )}
+          {!isLink && onOpenInApp && (
+            <button onClick={(e) => { e.stopPropagation(); setShowMenu(false); onOpenInApp(file); }}
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors"
+              onMouseEnter={e => e.currentTarget.style.background = "var(--color-bg-secondary)"}
+              onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+              <SquareArrowOutUpRight className="w-3.5 h-3.5" /> Open
             </button>
           )}
           {onSyncToResource && (

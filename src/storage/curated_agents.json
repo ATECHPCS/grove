@@ -1,0 +1,10 @@
+{
+  "_comment": "Product-owned onboarding agent ids shipped with Grove. Package, version, args, and environment are resolved from the ACP registry; this file controls only which agents are reconciled automatically and recommended in Marketplace.",
+  "version": 2,
+  "agents": [
+    "claude-acp",
+    "codex-acp",
+    "github-copilot-cli",
+    "qwen-code"
+  ]
+}

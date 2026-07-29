@@ -62,6 +62,8 @@ pub struct AcpSessionHandle {
     pending_queue: Mutex<Vec<QueuedMessage>>,
     /// 队列暂停标志（用户正在编辑队列消息时暂停 auto-send）
     queue_paused: std::sync::atomic::AtomicBool,
+    /// 队列合并发送模式（Separate = 逐条发送；Compact = 合并成一条）
+    queue_mode: Mutex<QueueMode>,
     /// 当前 agent mode id（用于 PlanFileUpdate 检测和 QueuedConfig 快照）。
     /// 语义：last "intent" — 即上一次成功通过 SetSessionMode 推给 agent 的值。
     /// **不**保证 agent 真的拿这个 mode 处理了任何 prompt（partial apply 失败的
@@ -91,8 +93,13 @@ pub struct AcpSessionHandle {
     terminal_kill_tx: Mutex<Option<mpsc::Sender<()>>>,
     /// Agent 是否正在处理（busy=true 从 prompt 开始，到 complete 结束）
     pub is_busy: std::sync::atomic::AtomicBool,
-    /// 最近一轮 agent 回复的累积文本（用于 Complete 通知摘要）
+    /// 最近一轮 agent 回复的累积文本（用于 Complete 通知摘要 / 菜单栏 Tray 全文）
     last_assistant_text: Mutex<String>,
+    /// 当一段 agent 文本之后出现了 tool_call 时置位（前端 ACP Chat 会据此另起
+    /// 一个 assistant 气泡）。下一段 AgentMessageChunk 写入 last_assistant_text
+    /// 前补一个段落分隔，使累积文本的分段与聊天气泡边界一致，避免被工具调用
+    /// 切开的多段文本粘成一坨。
+    pending_text_separator: std::sync::atomic::AtomicBool,
     /// Latest user prompt text for this chat. Set when an `AcpCommand::Prompt`
     /// is dispatched; surfaced on the wire via `RadioEvent::ChatStatus.prompt`
     /// when the chat transitions to `busy` so passive listeners (menubar tray)
@@ -104,6 +111,13 @@ pub struct AcpSessionHandle {
     /// the menubar tray can render a real progress bar instead of the
     /// generic pulse strip. None for chats whose agent never emits a plan.
     last_plan: Mutex<Option<(u32, u32)>>,
+    /// Latest pending permission request details (description + options),
+    /// cached at `PermissionRequest` emit time so a one-shot snapshot
+    /// (`GET /api/v1/tray/chats`) can render the request — the `pending_permission`
+    /// field only holds `(id, tx)`, not the human-readable payload. Cleared in
+    /// `respond_permission`. Only meaningful while `has_pending_permission()`
+    /// is true; consumers must gate on that to avoid reading stale data.
+    last_permission_info: Mutex<Option<crate::api::handlers::walkie_talkie::PermissionInfo>>,
     /// agent 在 initialize 响应里声明的登录方法。空 = 未声明 / 不需要。
     /// 收到 `AuthRequired (-32000)` 时,client 用这里的第一个 id 走 `authenticate`。
     pub auth_methods: Mutex<Vec<AuthMethodInfo>>,
@@ -481,6 +495,16 @@ pub enum ContentBlockData {
         mime_type: Option<String>,
         text: Option<String>,
     },
+}
+
+/// 队列合并发送模式：Separate = 逐条按原队列顺序发送（默认）；
+/// Compact = 自动弹出时把队列中所有消息合并成一条发送。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueMode {
+    #[default]
+    Separate,
+    Compact,
 }
 
 /// Model / mode / thought-level 快照，随 QueuedMessage 一起存储，
@@ -1235,6 +1259,17 @@ async fn handle_session_notification(
         acp::SessionUpdate::AgentMessageChunk(chunk) => {
             let text = content_block_to_text(&chunk.content);
             if let Ok(mut buf) = state.handle.last_assistant_text.lock() {
+                // 若上一段文本之后夹过 tool_call，则在续写新文本前补段落分隔，
+                // 与前端「tool 边界另起气泡」的行为对齐。连续文本块（无 tool
+                // 间隔）仍直接拼接。
+                if state
+                    .handle
+                    .pending_text_separator
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                    && !buf.is_empty()
+                {
+                    buf.push_str("\n\n");
+                }
                 buf.push_str(&text);
             }
             state.handle.emit(AcpUpdate::MessageChunk { text });
@@ -1249,27 +1284,55 @@ async fn handle_session_notification(
             }
         }
         acp::SessionUpdate::ToolCall(tool_call) => {
-            let locations = tool_call
+            // 标记：此处出现了 tool_call，下一段 agent 文本应另起段落。
+            state
+                .handle
+                .pending_text_separator
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let explicit_locations = tool_call
                 .locations
                 .iter()
                 .map(|l| (l.path.display().to_string(), l.line))
                 .collect();
+            // Some ACP adapters (notably @agentclientprotocol/codex-acp 1.1.x)
+            // put edited file paths only in ToolCallContent::Diff and leave the
+            // top-level locations empty. Preserve those paths before the
+            // content-only start event is followed by a status-only update.
+            let locations = merge_diff_locations(explicit_locations, &tool_call.content);
             state.handle.emit(AcpUpdate::ToolCall {
                 id: tool_call.tool_call_id.to_string(),
                 title: tool_call.title.clone(),
-                locations,
+                locations: locations.clone(),
                 timestamp: Some(Utc::now()),
                 raw_input: tool_call.raw_input.clone(),
             });
 
+            // `tool_call` is already allowed to carry output. In particular,
+            // codex-acp reports completed file edits as a single ToolCall whose
+            // Diff entries never reappear in a ToolCallUpdate. Mirror that
+            // initial payload into Grove's update-shaped event instead of
+            // dropping it at the ACP boundary.
+            let initial_content = tool_contents_to_text(state.adapter.as_ref(), &tool_call.content)
+                .or_else(|| tool_raw_output_text(tool_call.raw_output.as_ref()));
+            if initial_content.is_some() {
+                state.handle.emit(AcpUpdate::ToolCallUpdate {
+                    id: tool_call.tool_call_id.to_string(),
+                    status: format!("{:?}", tool_call.status).to_lowercase(),
+                    content: initial_content,
+                    locations: locations.clone(),
+                    raw_input: tool_call.raw_input.clone(),
+                });
+            }
+
             // 记录 Write 工具的 tool_call_id → file_path(用于 PlanFileUpdate 检测)。
             // 路径可能在第二个 ToolCall 事件才出现,所以每次有 locations 时更新。
             if tool_call.title.starts_with("Write") {
-                if let Some(loc) = tool_call.locations.first() {
-                    state.write_tool_paths.lock().unwrap().insert(
-                        tool_call.tool_call_id.to_string(),
-                        loc.path.display().to_string(),
-                    );
+                if let Some((path, _)) = locations.first() {
+                    state
+                        .write_tool_paths
+                        .lock()
+                        .unwrap()
+                        .insert(tool_call.tool_call_id.to_string(), path.clone());
                 } else {
                     state
                         .write_tool_paths
@@ -1297,11 +1360,11 @@ async fn handle_session_notification(
             // 缓存 Write/Edit 文件快照(locations 在第二个 ToolCall 事件才有路径)
             let title = &tool_call.title;
             if title.starts_with("Write") || title.starts_with("Edit") {
-                if let Some(loc) = tool_call.locations.first() {
+                if let Some((path, _)) = locations.first() {
                     let id_str = tool_call.tool_call_id.to_string();
                     let mut snapshots = state.file_snapshots.lock().unwrap();
                     snapshots.entry(id_str).or_insert_with(|| {
-                        let abs_path = loc.path.clone();
+                        let abs_path = PathBuf::from(path);
                         let old_content = std::fs::read_to_string(&abs_path).ok();
                         (abs_path, old_content)
                     });
@@ -1312,16 +1375,16 @@ async fn handle_session_notification(
             let mut content = update
                 .fields
                 .content
-                .as_ref()
-                .and_then(|blocks| blocks.first())
-                .map(|tc| state.adapter.tool_call_content_to_text(tc));
+                .as_deref()
+                .and_then(|blocks| tool_contents_to_text(state.adapter.as_ref(), blocks))
+                .or_else(|| tool_raw_output_text(update.fields.raw_output.as_ref()));
             let status = update
                 .fields
                 .status
                 .as_ref()
                 .map(|s| format!("{:?}", s).to_lowercase())
                 .unwrap_or_default();
-            let locations: Vec<(String, Option<u32>)> = update
+            let explicit_locations: Vec<(String, Option<u32>)> = update
                 .fields
                 .locations
                 .as_ref()
@@ -1331,6 +1394,10 @@ async fn handle_session_notification(
                         .collect()
                 })
                 .unwrap_or_default();
+            let locations = merge_diff_locations(
+                explicit_locations,
+                update.fields.content.as_deref().unwrap_or_default(),
+            );
 
             // 如果 ACP 没提供 content 且状态为 completed,从文件快照生成 diff
             let is_completed = update
@@ -1508,6 +1575,69 @@ async fn handle_session_notification(
         _ => {}
     }
     Ok(())
+}
+
+fn merge_diff_locations(
+    mut locations: Vec<(String, Option<u32>)>,
+    content: &[acp::ToolCallContent],
+) -> Vec<(String, Option<u32>)> {
+    let mut seen: std::collections::HashSet<String> =
+        locations.iter().map(|(path, _)| path.clone()).collect();
+
+    for item in content {
+        if let acp::ToolCallContent::Diff(diff) = item {
+            let path = diff.path.display().to_string();
+            if seen.insert(path.clone()) {
+                locations.push((path, None));
+            }
+        }
+    }
+
+    locations
+}
+
+fn tool_contents_to_text(
+    adapter: &dyn adapter::AgentContentAdapter,
+    content: &[acp::ToolCallContent],
+) -> Option<String> {
+    let text = content
+        .iter()
+        .map(|item| adapter.tool_call_content_to_text(item))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn tool_raw_output_text(raw_output: Option<&serde_json::Value>) -> Option<String> {
+    let value = raw_output?;
+    if let Some(text) = value.as_str() {
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+
+    let object = value.as_object()?;
+    for key in ["formatted_output", "output", "content", "text"] {
+        if let Some(text) = object.get(key).and_then(serde_json::Value::as_str) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+
+    let stdout = object
+        .get("stdout")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let stderr = object
+        .get("stderr")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let combined = [stdout, stderr]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(if stdout.ends_with('\n') { "" } else { "\n" });
+    (!combined.is_empty()).then_some(combined)
 }
 
 /// Emit a synthetic `ThoughtLevelsUpdate` after a successful
@@ -1823,6 +1953,7 @@ pub async fn get_or_start_session(
                     suppress_emit: std::sync::atomic::AtomicBool::new(false),
                     pending_queue: Mutex::new(Vec::new()),
                     queue_paused: std::sync::atomic::AtomicBool::new(false),
+                    queue_mode: Mutex::new(QueueMode::default()),
                     current_mode_id: Mutex::new(None),
                     current_model_id: Mutex::new(None),
                     current_usage: Mutex::new(None),
@@ -1833,8 +1964,10 @@ pub async fn get_or_start_session(
                     terminal_kill_tx: Mutex::new(None),
                     is_busy: std::sync::atomic::AtomicBool::new(false),
                     last_assistant_text: Mutex::new(String::new()),
+                    pending_text_separator: std::sync::atomic::AtomicBool::new(false),
         last_user_prompt: Mutex::new(None),
         last_plan: Mutex::new(None),
+                    last_permission_info: Mutex::new(None),
                     auth_methods: Mutex::new(Vec::new()),
                     pending_auth_retry: Mutex::new(None),
                     pending_auth: Mutex::new(None),
@@ -1944,11 +2077,25 @@ pub async fn get_or_start_session(
                 let session_project_key = config.project_key.clone();
                 let session_task_id = config.task_id.clone();
                 let session_chat_id = config.chat_id.clone();
+                let session_agent_name = config.agent_name.clone();
 
-                if let Err(e) = run_acp_session(handle, config, cmd_rx).await {
-                    let _ = update_tx.send(AcpUpdate::Error {
-                        message: format!("ACP session error: {}", e),
-                    });
+                let session_result = run_acp_session(handle, config, cmd_rx).await;
+                match &session_result {
+                    Ok(()) => {
+                        eprintln!(
+                            "[ACP] session ended normally (key={} agent={} task={} chat={:?})",
+                            key_clone, session_agent_name, session_task_id, session_chat_id
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[ACP] session ended with error (key={} agent={} task={} chat={:?}): {}",
+                            key_clone, session_agent_name, session_task_id, session_chat_id, e
+                        );
+                        let _ = update_tx.send(AcpUpdate::Error {
+                            message: format!("ACP session error: {}", e),
+                        });
+                    }
                 }
                 let _ = update_tx.send(AcpUpdate::SessionEnded);
 
@@ -2005,6 +2152,10 @@ async fn run_acp_session(
     mut config: AcpStartConfig,
     cmd_rx: mpsc::Receiver<AcpCommand>,
 ) -> crate::error::Result<()> {
+    // Cloned up front since `config` is moved into the `connect_with` closure
+    // below; used only for the post-mortem exit-status log at the end.
+    let agent_name_for_log = config.agent_name.clone();
+
     // 提前生成 agent_graph MCP token —— 在 spawn 子进程之前注册并塞进 env。
     // 这样 `grove mcp-bridge`（agent 自己孩子的孩子，比如 Trae 不接受 ACP 注入
     // 的 MCP 时由用户在 Trae mcp 配置里指向我们）只要从 env 读 GROVE_MCP_TOKEN
@@ -2037,7 +2188,7 @@ async fn run_acp_session(
     let _early_token_guard = EarlyTokenGuard(agent_graph_token.clone());
 
     // 根据 agent_type 分支获取 reader/writer（使用 trait object 统一类型）
-    let child: Option<tokio::process::Child>;
+    let mut child: Option<tokio::process::Child>;
     // 0.11 ByteStreams 要求 Send + 'static;grove 的子进程 pipe 和 DuplexStream 都满足。
     let mut writer: Box<dyn futures::AsyncWrite + Send + Unpin>;
     let mut reader: Box<dyn futures::AsyncRead + Send + Unpin>;
@@ -2283,6 +2434,29 @@ async fn run_acp_session(
         })
         .await;
 
+    // Diagnostics: if the agent subprocess had already exited by the time
+    // the ACP I/O loop ended, that's very likely *why* it ended (crash /
+    // OOM-kill / unexpected quit) rather than a clean session close. Check
+    // with try_wait (non-blocking — returns None if still running) before
+    // `drop(child)` triggers kill_on_drop, which would otherwise mask this.
+    if let Some(ref mut c) = child {
+        match c.try_wait() {
+            Ok(Some(status)) => {
+                eprintln!(
+                    "[ACP] agent process had already exited when session I/O ended: {} (agent={})",
+                    status, agent_name_for_log
+                );
+            }
+            Ok(None) => { /* still running — we're the ones tearing it down below */ }
+            Err(e) => {
+                eprintln!(
+                    "[ACP] failed to check agent process status (agent={}): {}",
+                    agent_name_for_log, e
+                );
+            }
+        }
+    }
+
     // kill_on_drop 会清理子进程
     drop(child);
 
@@ -2302,7 +2476,12 @@ async fn drive_session(
         modes: &Option<acp::SessionModeState>,
         config_options: &[acp::SessionConfigOption],
     ) -> (Vec<(String, String)>, Option<String>) {
-        if let Some(state) = modes {
+        // If the agent declared a top-level `modes` field AND it has at least
+        // one available mode, trust it. An empty list (some agents advertise
+        // the field but populate it from configOptions instead — traex 0.200.8
+        // does this) is treated as "no info" so we fall through to the
+        // configOptions scan below.
+        if let Some(state) = modes.as_ref().filter(|s| !s.available_modes.is_empty()) {
             let available: Vec<(String, String)> = state
                 .available_modes
                 .iter()
@@ -2389,7 +2568,13 @@ async fn drive_session(
         models: &Option<acp::SessionModelState>,
         config_options: &[acp::SessionConfigOption],
     ) -> (Vec<(String, String)>, Option<String>, Option<String>) {
-        if let Some(state) = models {
+        // traex 0.200.8 advertises a top-level `models` field but leaves
+        // `availableModels` empty — the real list lives in
+        // `configOptions[id="model"]`. Only trust the top-level field when
+        // it actually carries entries; an empty list means "go look in
+        // configOptions" (same precedent as the modes extractor above and
+        // the claude-agent-acp ≥0.40 fallback below).
+        if let Some(state) = models.as_ref().filter(|s| !s.available_models.is_empty()) {
             let available: Vec<(String, String)> = state
                 .available_models
                 .iter()
@@ -2495,10 +2680,12 @@ async fn drive_session(
         .map(|i| i.version.clone())
         .unwrap_or_else(|| "0.0.0".to_string());
 
-    // 如果是 Trae 但其未返回 agent_info (导致被识别为 "unknown")，则修正为 "traecli"
-    let is_trae = config.agent_command.contains("trae");
-    if agent_name == "unknown" && is_trae {
-        agent_name = "traecli".to_string();
+    // 如果 agent 启动后未返回 agent_info（被识别为 "unknown"），就 fallback
+    // 到 `config.agent_command` — 用户配置的 agent id 字符串本身就是
+    // 一个合理的 canonical 名字。Pre-§8 这里 hard-coded `traecli` 字符串
+    // 探测（"如果是 trae 就写成 traecli"），§8 之后改用通用规则。
+    if agent_name == "unknown" {
+        agent_name = config.agent_command.clone();
     }
 
     // Trae 目前已在新版中正确声明支持 load_session，此处可直接使用其实际能力声明
@@ -2849,7 +3036,7 @@ async fn drive_session(
             }
         }
         // Load 路线:agent 不支持 resume 但支持 load_session。agent 会 replay 历史
-        // (Grove 统一从磁盘回放),所以抑制其回放 emit。关键:traecli 等 agent 的
+        // (Grove 统一从磁盘回放),所以抑制其回放 emit。关键:很多 agent 的
         // replay 在 LoadSessionResponse **之后**才异步流式发出,固定时间窗口抓不住
         // → suppress 保持 true,直到 cmd loop 收到首个用户 prompt 才解除(见 Prompt
         // arm)。恢复 session 后、用户发新消息前,agent 主动 emit 的只可能是 replay。
@@ -3119,6 +3306,9 @@ async fn drive_session(
                 if let Ok(mut buf) = handle.last_assistant_text.lock() {
                     buf.clear();
                 }
+                handle
+                    .pending_text_separator
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
 
                 let mut content_blocks: Vec<acp::ContentBlock> = Vec::new();
                 if !text.is_empty() {
@@ -3341,21 +3531,24 @@ async fn drive_session(
                     .queue_paused
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
-                    if let Some(next_msg) = handle.pop_queue_front() {
+                    if let Some((send_msg, original_msgs)) = handle.pop_queue_for_auto_send() {
                         // M5: emit QueueUpdate only after successful enqueue.
-                        // On failure, re-insert at front so the message isn't lost.
-                        let text = next_msg.text.clone();
-                        let attachments = next_msg.attachments.clone();
-                        let sender = next_msg.sender.clone();
-                        let terminal = next_msg.terminal;
-                        let config = next_msg.config.clone();
+                        // On failure, re-insert the original (pre-merge) messages at
+                        // front, preserving their order, so nothing is lost.
+                        let text = send_msg.text.clone();
+                        let attachments = send_msg.attachments.clone();
+                        let sender = send_msg.sender.clone();
+                        let terminal = send_msg.terminal;
+                        let config = send_msg.config.clone();
                         if handle.try_enqueue_prompt(text, attachments, sender, terminal, config) {
                             handle.emit(AcpUpdate::QueueUpdate {
                                 messages: handle.get_queue(),
                             });
                         } else {
                             let mut q = handle.pending_queue.lock().unwrap();
-                            q.insert(0, next_msg);
+                            for (i, msg) in original_msgs.into_iter().enumerate() {
+                                q.insert(i, msg);
+                            }
                         }
                     }
                 }
@@ -3620,6 +3813,10 @@ impl AcpSessionHandle {
         let Some((id, tx)) = self.pending_permission.lock().unwrap().take() else {
             return false;
         };
+        // Drop the cached snapshot payload — the request is no longer pending.
+        if let Ok(mut slot) = self.last_permission_info.lock() {
+            *slot = None;
+        }
         let _ = tx.send(option_id.clone());
         self.emit(AcpUpdate::PermissionResponse { id, option_id });
         // Permission gone — announce the post-take status so graph nodes can
@@ -3855,9 +4052,8 @@ impl AcpSessionHandle {
                         description,
                         options,
                         ..
-                    } => (
-                        Some("permission_required"),
-                        Some(PermissionInfo {
+                    } => {
+                        let info = PermissionInfo {
                             description: description.clone(),
                             options: options
                                 .iter()
@@ -3869,8 +4065,15 @@ impl AcpSessionHandle {
                                     }
                                 })
                                 .collect(),
-                        }),
-                    ),
+                        };
+                        // Cache for the one-shot snapshot endpoint; a freshly
+                        // connected phone has no event history to reconstruct
+                        // the pending request from.
+                        if let Ok(mut slot) = self.last_permission_info.lock() {
+                            *slot = Some(info.clone());
+                        }
+                        (Some("permission_required"), Some(info))
+                    }
                     AcpUpdate::SessionEnded => (Some("disconnected"), None),
                     // Plan progress changed — re-emit the chat's current
                     // status so the cached (todo_completed, todo_total) added
@@ -4202,6 +4405,54 @@ impl AcpSessionHandle {
         }
     }
 
+    /// 结束当前一轮任务后，按 `queue_mode` 取出待发送内容（auto-send 专用）。
+    ///
+    /// - `Separate`（默认）：取队首一条，行为与之前完全一致。
+    /// - `Compact`：把整条队列 drain 出来合并成一条消息 —— sender/config/terminal
+    ///   取队首那条的，text 用换行 join，attachments 依次 extend。队列为空或只有
+    ///   一条时退化为跟 `Separate` 相同的单条逻辑，不做特殊合并。
+    ///
+    /// 返回 `(合并/单条消息, 若发送失败需要原样放回队列的原始消息列表)`。
+    /// 调用方发送失败时，把第二个元素里的消息按原顺序插回队首。
+    fn pop_queue_for_auto_send(&self) -> Option<(QueuedMessage, Vec<QueuedMessage>)> {
+        let mode = *self.queue_mode.lock().unwrap();
+        match mode {
+            QueueMode::Separate => self.pop_queue_front().map(|m| (m.clone(), vec![m])),
+            QueueMode::Compact => {
+                let drained: Vec<QueuedMessage> = {
+                    let mut q = self.pending_queue.lock().unwrap();
+                    std::mem::take(&mut *q)
+                };
+                if drained.is_empty() {
+                    return None;
+                }
+                if drained.len() == 1 {
+                    let only = drained[0].clone();
+                    return Some((only, drained));
+                }
+                let first = &drained[0];
+                let merged_text = drained
+                    .iter()
+                    .map(|m| m.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let mut merged_attachments = Vec::new();
+                for m in &drained {
+                    merged_attachments.extend(m.attachments.clone());
+                }
+                let merged = QueuedMessage {
+                    id: default_queued_message_id(),
+                    text: merged_text,
+                    attachments: merged_attachments,
+                    sender: first.sender.clone(),
+                    config: first.config.clone(),
+                    terminal: first.terminal,
+                };
+                Some((merged, drained))
+            }
+        }
+    }
+
     /// 非阻塞发送 prompt 命令(队列 auto-send 使用)。
     /// config 直接 bundle 在 Prompt 内,cmd_loop 在发 prompt 前按需先发
     /// SetSessionMode/Model/ThoughtLevel ACP 请求。
@@ -4247,6 +4498,11 @@ impl AcpSessionHandle {
             thought_level: self.current_thought_level_id.lock().unwrap().clone(),
             thought_level_config_id: self.thought_level_config_id.lock().unwrap().clone(),
         }
+    }
+
+    /// 设置队列合并发送模式（Separate / Compact）
+    pub fn set_queue_mode(&self, mode: QueueMode) {
+        *self.queue_mode.lock().unwrap() = mode;
     }
 
     /// 暂停队列 auto-send（用户正在编辑队列消息）
@@ -4405,6 +4661,112 @@ pub fn session_exists(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// One-shot snapshot of every active chat's status, mirroring the fields a
+/// `RadioEvent::ChatStatus` carries. Used by the tray phone page
+/// (`GET /api/v1/tray/chats`) so a freshly connected phone sees the current
+/// state without waiting for the next live transition.
+///
+/// `message` / context usage are deliberately omitted — they are only
+/// meaningful in the live event stream and the tray panel does not render them.
+pub fn snapshot_active_chats() -> Vec<crate::api::handlers::walkie_talkie::ChatSnapshot> {
+    use crate::api::handlers::walkie_talkie::ChatSnapshot;
+    use std::collections::HashMap;
+
+    let handles: Vec<Arc<AcpSessionHandle>> = match ACP_SESSIONS.read() {
+        Ok(sessions) => sessions.values().cloned().collect(),
+        Err(_) => return Vec::new(),
+    };
+
+    // Lazily cache storage lookups so N sessions in the same project/task don't
+    // re-read the same tables N times.
+    let project_names: HashMap<String, String> = crate::storage::workspace::load_projects()
+        .map(|projs| {
+            projs
+                .into_iter()
+                .map(|p| (crate::storage::workspace::project_hash(&p.path), p.name))
+                .collect()
+        })
+        .unwrap_or_default();
+    // (project_key, task_id) -> task_name
+    let mut task_names: HashMap<(String, String), Option<String>> = HashMap::new();
+    // (project_key, task_id, chat_id) -> (title, agent)
+    let mut chat_info: HashMap<(String, String, String), (String, String)> = HashMap::new();
+    let mut chats_loaded: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+
+    let mut out = Vec::new();
+    for handle in handles {
+        let Some(chat_id) = handle.chat_id.clone() else {
+            continue;
+        };
+        let project_key = handle.project_key.clone();
+        let task_id = handle.task_id.clone();
+
+        let task_name = task_names
+            .entry((project_key.clone(), task_id.clone()))
+            .or_insert_with(|| {
+                crate::storage::tasks::load_tasks(&project_key)
+                    .ok()
+                    .and_then(|tasks| tasks.into_iter().find(|t| t.id == task_id).map(|t| t.name))
+            })
+            .clone();
+
+        if chats_loaded.insert((project_key.clone(), task_id.clone())) {
+            if let Ok(chats) = crate::storage::tasks::load_chat_sessions(&project_key, &task_id) {
+                for c in chats {
+                    chat_info.insert(
+                        (project_key.clone(), task_id.clone(), c.id.clone()),
+                        (c.title, c.agent),
+                    );
+                }
+            }
+        }
+        let (chat_title, agent) = chat_info
+            .get(&(project_key.clone(), task_id.clone(), chat_id.clone()))
+            .map(|(t, a)| (Some(t.clone()), Some(a.clone())))
+            .unwrap_or((None, None));
+
+        let status = handle.derive_node_status();
+        let permission = if status == "permission_required" {
+            handle
+                .last_permission_info
+                .lock()
+                .ok()
+                .and_then(|p| p.clone())
+        } else {
+            None
+        };
+        let prompt = if status == "busy" {
+            handle.last_user_prompt.lock().ok().and_then(|p| p.clone())
+        } else {
+            None
+        };
+        let (todo_completed, todo_total) = handle
+            .last_plan
+            .lock()
+            .ok()
+            .and_then(|p| *p)
+            .map(|(c, t)| (Some(c), Some(t)))
+            .unwrap_or((None, None));
+
+        out.push(ChatSnapshot {
+            chat_id,
+            project_id: project_key.clone(),
+            task_id: task_id.clone(),
+            project_name: project_names.get(&project_key).cloned(),
+            task_name,
+            chat_title,
+            agent,
+            status: status.to_string(),
+            permission,
+            prompt,
+            todo_completed,
+            todo_total,
+        });
+    }
+    out
+}
+
 /// Test helper: build an `AcpSessionHandle` wired to a minimal in-process mock
 /// cmd loop so agent_graph integration tests can exercise the real
 /// `send_prompt` / `queue_message` paths without spawning an ACP subprocess.
@@ -4450,6 +4812,7 @@ pub fn new_handle_for_test(
         suppress_emit: std::sync::atomic::AtomicBool::new(false),
         pending_queue: Mutex::new(Vec::new()),
         queue_paused: std::sync::atomic::AtomicBool::new(false),
+        queue_mode: Mutex::new(QueueMode::default()),
         current_mode_id: Mutex::new(None),
         current_model_id: Mutex::new(None),
         current_usage: Mutex::new(None),
@@ -4460,8 +4823,10 @@ pub fn new_handle_for_test(
         terminal_kill_tx: Mutex::new(None),
         is_busy: std::sync::atomic::AtomicBool::new(false),
         last_assistant_text: Mutex::new(String::new()),
+        pending_text_separator: std::sync::atomic::AtomicBool::new(false),
         last_user_prompt: Mutex::new(None),
         last_plan: Mutex::new(None),
+        last_permission_info: Mutex::new(None),
         auth_methods: Mutex::new(Vec::new()),
         pending_auth_retry: Mutex::new(None),
         pending_auth: Mutex::new(None),
@@ -4842,421 +5207,127 @@ pub struct ResolvedAgent {
     pub auth_header: Option<String>,
 }
 
-/// Built-in ACP agent metadata. This catalog is the source of truth for base
-/// agent discovery; runtime availability still comes from `resolve_agent`.
-#[derive(Debug, Clone, Copy)]
-pub struct BuiltinAcpAgent {
-    pub id: &'static str,
-    pub display_name: &'static str,
-    pub icon_id: &'static str,
-    pub aliases: &'static [&'static str],
-}
-
-#[derive(Debug, Clone)]
-pub struct BaseAcpAgentStatus {
-    pub agent: BuiltinAcpAgent,
-    pub available: bool,
-    pub unavailable_reason: Option<String>,
-}
-
-const BUILTIN_ACP_AGENTS: &[BuiltinAcpAgent] = &[
-    BuiltinAcpAgent {
-        id: "claude",
-        display_name: "Claude Code",
-        icon_id: "claude",
-        aliases: &[],
-    },
-    BuiltinAcpAgent {
-        id: "codex",
-        display_name: "Codex",
-        icon_id: "openai",
-        aliases: &[],
-    },
-    BuiltinAcpAgent {
-        id: "cursor",
-        display_name: "Cursor",
-        icon_id: "cursor",
-        aliases: &["cursor-agent"],
-    },
-    BuiltinAcpAgent {
-        id: "gemini",
-        display_name: "Gemini",
-        icon_id: "gemini",
-        aliases: &[],
-    },
-    BuiltinAcpAgent {
-        id: "copilot",
-        display_name: "GitHub Copilot",
-        icon_id: "copilot",
-        aliases: &["gh copilot", "gh-copilot"],
-    },
-    BuiltinAcpAgent {
-        id: "junie",
-        display_name: "Junie",
-        icon_id: "junie",
-        aliases: &[],
-    },
-    BuiltinAcpAgent {
-        id: "kimi",
-        display_name: "Kimi",
-        icon_id: "kimi",
-        aliases: &[],
-    },
-    BuiltinAcpAgent {
-        id: "opencode",
-        display_name: "OpenCode",
-        icon_id: "opencode",
-        aliases: &[],
-    },
-    BuiltinAcpAgent {
-        id: "qwen",
-        display_name: "Qwen",
-        icon_id: "qwen",
-        aliases: &[],
-    },
-    BuiltinAcpAgent {
-        id: "traecli",
-        display_name: "Trae",
-        icon_id: "trae",
-        aliases: &[],
-    },
-    BuiltinAcpAgent {
-        id: "hermes",
-        display_name: "Hermes",
-        icon_id: "hermes",
-        aliases: &[],
-    },
-];
-
-pub fn builtin_acp_agents() -> &'static [BuiltinAcpAgent] {
-    BUILTIN_ACP_AGENTS
-}
-
-pub fn available_base_acp_agents() -> Vec<BuiltinAcpAgent> {
-    base_acp_agent_statuses()
-        .into_iter()
-        .filter(|status| status.available)
-        .map(|status| status.agent)
-        .collect()
-}
-
-pub fn base_acp_agent_statuses() -> Vec<BaseAcpAgentStatus> {
-    builtin_acp_agents()
-        .iter()
-        .copied()
-        .map(|agent| {
-            let unavailable_reason = builtin_acp_unavailable_reason(agent.id);
-            BaseAcpAgentStatus {
-                agent,
-                available: unavailable_reason.is_none(),
-                unavailable_reason,
-            }
-        })
-        .collect()
-}
-
-fn canonical_builtin_acp_agent(agent_name: &str) -> Option<&'static str> {
-    let normalized = agent_name.to_lowercase();
-    builtin_acp_agents()
-        .iter()
-        .find(|agent| {
-            agent.id == normalized || agent.aliases.iter().any(|alias| *alias == normalized)
-        })
-        .map(|agent| agent.id)
-}
-
 /// Check if a command exists in PATH (cross-platform).
+#[allow(dead_code)]
 fn command_exists(cmd: &str) -> bool {
     crate::check::command_exists(cmd)
 }
 
-fn missing_command(cmd: &str) -> Option<String> {
-    if command_exists(cmd) {
-        None
-    } else {
-        Some(format!("{cmd} not found"))
-    }
-}
+// ============================================================================
+// Agent resolution
+//
+// `installed_agents` is the single source of truth. `resolve_agent` reads a
+// row, picks the active installation channel via `selected_install_method`,
+// and delegates to `installed_agents::spawn_for` for the spawn argv. Custom
+// agents (from `config.acp.custom_agents`) take precedence — they're
+// user-defined and may overlap with marketplace ids.
+//
+// No PATH probing here — `installed_agents` is the single source of truth.
+// Rows are kept in sync with PATH presence by
+// `installed_agents::auto_scan_path_binaries()`, which runs on every
+// marketplace render and uniformly handles every registry agent.
+// ============================================================================
 
-fn builtin_acp_unavailable_reason(agent_name: &str) -> Option<String> {
-    let canonical = canonical_builtin_acp_agent(agent_name)?;
-    match canonical {
-        "claude" => {
-            if !command_exists("claude") {
-                return Some("claude not found".to_string());
-            }
-            if command_exists("claude-agent-acp")
-                || command_exists("claude-code-acp")
-                || command_exists("npx")
-            {
-                None
-            } else {
-                Some("claude-agent-acp, claude-code-acp, or npx not found".to_string())
-            }
-        }
-        "codex" => {
-            if !command_exists("codex") {
-                return Some("codex not found".to_string());
-            }
-            if command_exists("codex-acp") || command_exists("npx") {
-                None
-            } else {
-                Some("codex-acp or npx not found".to_string())
-            }
-        }
-        "cursor" => {
-            if command_exists("cursor-agent") || command_exists("agent") {
-                None
-            } else {
-                Some("cursor-agent or agent not found".to_string())
-            }
-        }
-        "gemini" => missing_command("gemini"),
-        "copilot" => missing_command("copilot"),
-        "junie" => missing_command("junie"),
-        "kimi" => missing_command("kimi"),
-        "opencode" => missing_command("opencode"),
-        "qwen" => missing_command("qwen"),
-        "traecli" => missing_command("traecli"),
-        "hermes" => missing_command("hermes"),
-        _ => Some(format!("unsupported agent: {agent_name}")),
-    }
-}
-
-/// 解析 agent 名称到完整 agent 信息（支持 built-in + custom）
+/// Resolve an agent id into a runnable `ResolvedAgent`. Returns `None` when
+/// nothing matches — the caller surfaces "agent unavailable" in the UI.
+///
+/// Post-v2.6, every on-disk id (sessions, config, installed_agents) is
+/// canonical via the boot-time remap migration, so this function does
+/// exact-id matches only. Callers that might still carry a legacy id
+/// (e.g. inbound HTTP body) should call
+/// `installed_agents::canonicalize_agent_id` first.
+///
+/// Order:
+///   1. Custom agents (`config.acp.custom_agents`) — exact-id match.
+///   2. `installed_agents` row → `spawn_for` produces the (cmd, args)
+///      using the active installation channel + the registry document
+///      for args.
 pub fn resolve_agent(agent_name: &str) -> Option<ResolvedAgent> {
-    // 1. Built-in agents
-    match canonical_builtin_acp_agent(agent_name) {
-        Some("claude") => {
-            if !command_exists("claude") {
-                return None;
-            }
-            let (command, args): (&str, Vec<String>) = if command_exists("claude-agent-acp") {
-                ("claude-agent-acp", vec![])
-            } else if command_exists("claude-code-acp") {
-                ("claude-code-acp", vec![])
-            } else if command_exists("npx") {
-                (
-                    "npx",
-                    vec!["-y".into(), "@agentclientprotocol/claude-agent-acp".into()],
-                )
-            } else {
-                return None;
-            };
-            return Some(ResolvedAgent {
-                agent_type: "local".into(),
-                agent_name: "claude".into(),
-                command: command.into(),
-                args,
-                url: None,
-                auth_header: None,
-            });
-        }
-        Some("traecli") => {
-            if !command_exists("traecli") {
-                return None;
-            }
-            return Some(ResolvedAgent {
-                agent_type: "local".into(),
-                agent_name: "traecli".into(),
-                command: "traecli".into(),
-                args: vec!["acp".into(), "serve".into()],
-                url: None,
-                auth_header: None,
-            });
-        }
-        Some("codex") => {
-            if !command_exists("codex") {
-                return None;
-            }
-            let (command, args): (&str, Vec<String>) = if command_exists("codex-acp") {
-                ("codex-acp", vec![])
-            } else if command_exists("npx") {
-                ("npx", vec!["-y".into(), "@zed-industries/codex-acp".into()])
-            } else {
-                return None;
-            };
-            return Some(ResolvedAgent {
-                agent_type: "local".into(),
-                agent_name: "codex".into(),
-                command: command.into(),
-                args,
-                url: None,
-                auth_header: None,
-            });
-        }
-        Some("kimi") => {
-            if !command_exists("kimi") {
-                return None;
-            }
-            return Some(ResolvedAgent {
-                agent_type: "local".into(),
-                agent_name: "kimi".into(),
-                command: "kimi".into(),
-                args: vec!["acp".into()],
-                url: None,
-                auth_header: None,
-            });
-        }
-        Some("gemini") => {
-            if !command_exists("gemini") {
-                return None;
-            }
-            return Some(ResolvedAgent {
-                agent_type: "local".into(),
-                agent_name: "gemini".into(),
-                command: "gemini".into(),
-                args: vec!["--experimental-acp".into()],
-                url: None,
-                auth_header: None,
-            });
-        }
-        Some("qwen") => {
-            if !command_exists("qwen") {
-                return None;
-            }
-            return Some(ResolvedAgent {
-                agent_type: "local".into(),
-                agent_name: "qwen".into(),
-                command: "qwen".into(),
-                args: vec!["--experimental-acp".into()],
-                url: None,
-                auth_header: None,
-            });
-        }
-        Some("opencode") => {
-            if !command_exists("opencode") {
-                return None;
-            }
-            return Some(ResolvedAgent {
-                agent_type: "local".into(),
-                agent_name: "opencode".into(),
-                command: "opencode".into(),
-                args: vec!["acp".into()],
-                url: None,
-                auth_header: None,
-            });
-        }
-        Some("copilot") => {
-            if !command_exists("copilot") {
-                return None;
-            }
-            return Some(ResolvedAgent {
-                agent_type: "local".into(),
-                agent_name: "copilot".into(),
-                command: "copilot".into(),
-                args: vec!["--acp".into()],
-                url: None,
-                auth_header: None,
-            });
-        }
-        Some("junie") => {
-            if !command_exists("junie") {
-                return None;
-            }
-            return Some(ResolvedAgent {
-                agent_type: "local".into(),
-                agent_name: "junie".into(),
-                command: "junie".into(),
-                args: vec!["--acp".into(), "true".into()],
-                url: None,
-                auth_header: None,
-            });
-        }
-        Some("cursor") => {
-            let command = if command_exists("cursor-agent") {
-                "cursor-agent"
-            } else if command_exists("agent") {
-                "agent"
-            } else {
-                return None;
-            };
-            return Some(ResolvedAgent {
-                agent_type: "local".into(),
-                agent_name: "cursor".into(),
-                command: command.into(),
-                args: vec!["acp".into()],
-                url: None,
-                auth_header: None,
-            });
-        }
-        Some("hermes") => {
-            if !command_exists("hermes") {
-                return None;
-            }
-            return Some(ResolvedAgent {
-                agent_type: "local".into(),
-                agent_name: "hermes".into(),
-                command: "hermes".into(),
-                args: vec!["acp".into()],
-                url: None,
-                auth_header: None,
-            });
-        }
-        _ => {}
-    }
-    // 2. Custom agents from config
+    // 1. Custom agents from config.toml. Highest priority — user
+    // explicitly defined this id, so it overrides any same-id row in
+    // installed_agents.
     let config = crate::storage::config::load_config();
-    config
-        .acp
-        .custom_agents
-        .iter()
-        .find(|a| a.id == agent_name)
-        .map(|a| ResolvedAgent {
-            agent_type: a.agent_type.clone(),
-            agent_name: a.id.clone(),
-            command: a.command.clone().unwrap_or_default(),
-            args: a.args.clone(),
-            url: a.url.clone(),
-            auth_header: a.auth_header.clone(),
-        })
+    if let Some(custom) = config.acp.custom_agents.iter().find(|a| a.id == agent_name) {
+        return Some(ResolvedAgent {
+            agent_type: custom.agent_type.clone(),
+            agent_name: custom.id.clone(),
+            command: custom.command.clone().unwrap_or_default(),
+            args: custom.args.clone(),
+            url: custom.url.clone(),
+            auth_header: custom.auth_header.clone(),
+        });
+    }
+
+    // 2. installed_agents row → spawn_for produces the (cmd, args) using
+    // the active installation channel + registry distribution args. Post-
+    // v2.6, every on-disk id (sessions, config) is canonical, so we look
+    // up directly.
+    let installed = crate::storage::installed_agents::get(agent_name)
+        .ok()
+        .flatten()?;
+    let registry = crate::storage::agent_registry::get();
+    let reg_entry = registry.agents.iter().find(|a| a.id == installed.id);
+    let (command, args) = crate::storage::installed_agents::spawn_for(&installed, reg_entry)?;
+
+    Some(ResolvedAgent {
+        agent_type: "local".into(),
+        agent_name: installed.id.clone(),
+        command,
+        args,
+        url: None,
+        auth_header: None,
+    })
 }
 
-/// Priority order for auto-selecting a Terminal agent. Values are the `id`s
-/// used by `layout.agent_command`; the paired `&str` is the binary name to
-/// probe on PATH.
-const TERMINAL_AGENT_PRIORITY: &[(&str, &str)] = &[
-    ("claude", "claude"),
-    ("codex", "codex"),
-    ("cursor", "cursor-agent"),
-    ("gemini", "gemini"),
-    ("copilot", "copilot"),
-    ("junie", "junie"),
-    ("kimi", "kimi"),
-    ("opencode", "opencode"),
-    ("qwen", "qwen"),
-    ("traecli", "traecli"),
-];
-
-/// Pick the first ACP agent id whose binary is installed on PATH, preferring
-/// user-defined custom agents (which we trust to be runnable).
+/// Pick the first installed_agents row by `created_at` for default-agent
+/// selection. Custom agents (config.toml) take precedence — that's how
+/// users override the default. Hidden rows are skipped.
 pub fn pick_first_available_acp_agent() -> Option<String> {
     let config = crate::storage::config::load_config();
     if let Some(custom) = config.acp.custom_agents.first() {
         return Some(custom.id.clone());
     }
-    for agent in available_base_acp_agents() {
-        if resolve_agent(agent.id).is_some() {
-            return Some(agent.id.to_string());
-        }
-    }
-    None
+    crate::storage::installed_agents::list()
+        .ok()?
+        .into_iter()
+        .find(|a| !a.hidden && a.has_installed_channel())
+        .map(|a| a.id)
 }
 
-/// Pick the first Terminal agent id whose launcher binary is on PATH.
+/// Pick the first terminal-capable agent that's currently installed.
+///
+/// Terminal-capability is registry-data-driven: any agent whose
+/// `terminal_launch` field is set (via `inject_grove_supplements`) qualifies.
+/// Today that's just `claude-acp`, but the function doesn't know or care.
+///
+/// Ordering: registry document insertion order — upstream CDN order
+/// followed by `inject_trae_and_traex_entries` / `inject_grove_supplements`
+/// patches. Stable for the same registry document. TODO: once a second
+/// terminal-capable agent ships, switch to a deterministic
+/// alphabetic-by-id (or supplements-priority) order to avoid silent
+/// default flips when CDN order changes.
 pub fn pick_first_available_terminal_agent() -> Option<String> {
-    for (id, binary) in TERMINAL_AGENT_PRIORITY {
-        if command_exists(binary) {
-            return Some((*id).to_string());
+    let registry = crate::storage::agent_registry::get();
+    for reg in &registry.agents {
+        if reg.terminal_launch.is_none() {
+            continue;
+        }
+        if let Some(installed) = crate::storage::installed_agents::get(&reg.id)
+            .ok()
+            .flatten()
+        {
+            if !installed.hidden && installed.has_installed_channel() {
+                return Some(installed.id);
+            }
         }
     }
     None
 }
 
-/// Ensure `config.toml` has sensible `acp.agent_command` / `layout.agent_command`
-/// values given the currently-installed CLIs. Runs once at server startup so
-/// first-run users don't get "claude" as the default when Claude Code isn't
-/// installed. Silent no-op if the configured agents are already valid.
+/// Ensure `config.toml` has sensible `acp.agent_command` /
+/// `layout.agent_command` defaults given the currently-installed agents.
+/// Runs once at server startup. Silent no-op if the configured agents
+/// are already valid (resolve_agent returns Some for them).
 pub fn init_agent_defaults() {
     let mut config = crate::storage::config::load_config();
     let mut changed = false;
@@ -5274,12 +5345,23 @@ pub fn init_agent_defaults() {
         }
     }
 
+    // Terminal-mode validity: the configured id must match a registry
+    // entry that declares `terminal_launch`, AND have an installed,
+    // non-hidden row. Data-driven via the registry — no agent-specific
+    // code here.
     let terminal_valid = match &config.layout.agent_command {
-        Some(name) if !name.is_empty() => TERMINAL_AGENT_PRIORITY
-            .iter()
-            .find(|(id, _)| id == name)
-            .map(|(_, binary)| command_exists(binary))
-            .unwrap_or(true),
+        Some(name) if !name.is_empty() => {
+            let registry_supports = crate::storage::agent_registry::get()
+                .agents
+                .iter()
+                .any(|a| a.id == *name && a.terminal_launch.is_some());
+            registry_supports
+                && crate::storage::installed_agents::get(name)
+                    .ok()
+                    .flatten()
+                    .map(|a| !a.hidden && a.has_installed_channel())
+                    .unwrap_or(false)
+        }
         _ => false,
     };
     if !terminal_valid {
@@ -5629,6 +5711,75 @@ async fn drain_stderr_to_file(stderr: tokio::process::ChildStderr, path: PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_diff_locations_recovers_paths_from_tool_content() {
+        let content = vec![
+            acp::ToolCallContent::Diff(acp::Diff::new("/repo/model/config.go", "new config")),
+            acp::ToolCallContent::Diff(acp::Diff::new(
+                "/repo/dependency/fornax/client.go",
+                "new client",
+            )),
+        ];
+
+        assert_eq!(
+            merge_diff_locations(Vec::new(), &content),
+            vec![
+                ("/repo/model/config.go".to_string(), None),
+                ("/repo/dependency/fornax/client.go".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_diff_locations_preserves_lines_and_deduplicates_paths() {
+        let explicit = vec![("/repo/model/config.go".to_string(), Some(88))];
+        let content = vec![
+            acp::ToolCallContent::Diff(acp::Diff::new("/repo/model/config.go", "new config")),
+            acp::ToolCallContent::Content(acp::Content::new(acp::ContentBlock::Text(
+                acp::TextContent::new("not a file"),
+            ))),
+        ];
+
+        assert_eq!(merge_diff_locations(explicit.clone(), &content), explicit);
+    }
+
+    #[test]
+    fn tool_contents_to_text_preserves_every_content_block() {
+        let content = vec![
+            acp::ToolCallContent::Content(acp::Content::new(acp::ContentBlock::Text(
+                acp::TextContent::new("first"),
+            ))),
+            acp::ToolCallContent::Content(acp::Content::new(acp::ContentBlock::Text(
+                acp::TextContent::new("second"),
+            ))),
+        ];
+
+        assert_eq!(
+            tool_contents_to_text(&adapter::DefaultAdapter, &content).as_deref(),
+            Some("first\n\nsecond")
+        );
+    }
+
+    #[test]
+    fn tool_raw_output_text_reads_codex_formatted_output() {
+        let raw_output = serde_json::json!({
+            "formatted_output": "diff --git a/model/config.go b/model/config.go\n",
+            "exit_code": 0
+        });
+
+        assert_eq!(
+            tool_raw_output_text(Some(&raw_output)).as_deref(),
+            Some("diff --git a/model/config.go b/model/config.go\n")
+        );
+    }
+
+    #[test]
+    fn tool_raw_output_text_keeps_truly_empty_output_empty() {
+        let raw_output = serde_json::json!({ "formatted_output": "", "exit_code": 0 });
+
+        assert_eq!(tool_raw_output_text(Some(&raw_output)), None);
+    }
 
     #[test]
     fn socket_command_serde_roundtrip() {

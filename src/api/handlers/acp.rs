@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::acp::{
-    self, AcpStartConfig, AcpUpdate, ContentBlockData, PromptCapabilitiesData, QueuedConfig,
-    QueuedMessage,
+    self, AcpStartConfig, AcpUpdate, ContentBlockData, PromptCapabilitiesData, QueueMode,
+    QueuedConfig, QueuedMessage,
 };
 use crate::storage::{chat_attachments, chat_history, config, tasks, workspace};
 
@@ -76,6 +76,14 @@ enum ClientMessage {
     },
     /// Clear all pending messages
     ClearQueue,
+    /// 暂停队列 auto-send（用户正在编辑某条排队消息）
+    PauseQueue,
+    /// 恢复队列 auto-send（用户结束/取消编辑排队消息）
+    ResumeQueue,
+    /// 设置队列合并发送模式（Separate / Compact）
+    SetQueueMode {
+        mode: QueueMode,
+    },
     /// Execute a terminal command directly (Shell mode, bypasses AI)
     TerminalExecute {
         command: String,
@@ -576,10 +584,13 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
     // History is loaded by the frontend via HTTP GET /history (separate path).
     // WS only handles real-time events going forward.
 
-    // Snapshot fields we still need after config is moved into get_or_start_session.
+    // Snapshot fields we still need after config/session_key are moved into
+    // get_or_start_session — including for the diagnostic logging further
+    // down in this function.
     let history_project_key = config.project_key.clone();
     let history_task_id = config.task_id.clone();
     let history_chat_id = config.chat_id.clone();
+    let session_key_for_log = session_key.clone();
 
     // Get or start ACP session (thread managed by acp module)
     let (handle, mut update_rx) = match acp::get_or_start_session(session_key, config).await {
@@ -776,7 +787,9 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
     let handle_for_input = handle.clone();
 
     // Task: Forward ACP updates to WebSocket
-    let updates_to_ws = tokio::spawn(async move {
+    let updates_ws_log_key = session_key_for_log.clone();
+    let mut updates_to_ws = tokio::spawn(async move {
+        let mut end_reason = "update_rx closed unexpectedly";
         loop {
             match update_rx.recv().await {
                 Ok(update) => {
@@ -784,10 +797,12 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                     let msg: ServerMessage = update.into();
                     if let Ok(json) = serde_json::to_string(&msg) {
                         if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                            end_reason = "client write failed (browser likely already gone)";
                             break;
                         }
                     }
                     if is_ended {
+                        end_reason = "AcpUpdate::SessionEnded (agent session terminated)";
                         break;
                     }
                 }
@@ -795,11 +810,26 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             }
         }
+        // Always attempt a clean WS close so the browser's `onclose` fires
+        // and the frontend's auto-reconnect logic (TaskChat.tsx) kicks in.
+        // Without this, only this half (SplitSink) of the split socket goes
+        // away — the sibling `ws_to_acp` task still holds the SplitStream
+        // half and the underlying connection stays technically open, so the
+        // browser never learns the session is gone and sits on "Connecting…"
+        // forever until the user manually refreshes.
+        eprintln!(
+            "[ACP] chat ws: closing connection to client (key={}, reason={})",
+            updates_ws_log_key, end_reason
+        );
+        let _ = ws_sender.send(Message::Close(None)).await;
+        let _ = ws_sender.close().await;
     });
 
     // Task: Forward WebSocket messages to ACP
-    let ws_to_acp =
+    let ws_to_acp_log_key = session_key_for_log.clone();
+    let mut ws_to_acp =
         tokio::spawn(async move {
+            let mut end_reason = "ws_receiver stream ended (client socket closed)";
             while let Some(msg) = ws_receiver.next().await {
                 match msg {
                     Ok(Message::Text(text)) => {
@@ -817,6 +847,7 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                                         .await
                                     {
                                         eprintln!("Failed to send prompt: {}", e);
+                                        end_reason = "send_prompt failed";
                                         break;
                                     }
                                 }
@@ -825,6 +856,8 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                                 }
                                 ClientMessage::Kill => {
                                     let _ = handle_for_input.kill().await;
+                                    end_reason =
+                                        "ClientMessage::Kill (user explicitly killed session)";
                                     break;
                                 }
                                 ClientMessage::PermissionResponse { id, option_id } => {
@@ -880,6 +913,15 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                                     let messages = handle_for_input.clear_queue();
                                     handle_for_input.emit(AcpUpdate::QueueUpdate { messages });
                                 }
+                                ClientMessage::PauseQueue => {
+                                    handle_for_input.pause_queue();
+                                }
+                                ClientMessage::ResumeQueue => {
+                                    handle_for_input.resume_queue();
+                                }
+                                ClientMessage::SetQueueMode { mode } => {
+                                    handle_for_input.set_queue_mode(mode);
+                                }
                                 ClientMessage::TerminalExecute { command } => {
                                     handle_for_input.execute_terminal(command);
                                 }
@@ -896,20 +938,42 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                             }
                         }
                     }
-                    Ok(Message::Close(_)) => break,
-                    Err(_) => break,
+                    Ok(Message::Close(_)) => {
+                        end_reason = "client sent WS Close frame";
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[ACP] chat ws: read error from client (key={}): {}",
+                            ws_to_acp_log_key, e
+                        );
+                        end_reason = "read error from client socket";
+                        break;
+                    }
                     _ => {}
                 }
             }
+            eprintln!(
+                "[ACP] chat ws: ws-to-acp task ending (key={}, reason={})",
+                ws_to_acp_log_key, end_reason
+            );
         });
 
-    // Wait for either task to finish, detect panics
+    // Wait for either task to finish, then abort the other. Without the
+    // abort, the loser keeps running detached in the background (tokio::spawn
+    // JoinHandles aren't cancelled on drop) — in particular, if updates_to_ws
+    // exits first (e.g. AcpUpdate::SessionEnded), leaving ws_to_acp running
+    // meant the client's WebSocket was never fully torn down server-side,
+    // and the browser would sit on "Connecting…" forever since its `onclose`
+    // never fired. See TaskChat.tsx's reconnect logic, which depends on it.
     tokio::select! {
-        result = updates_to_ws => {
+        result = &mut updates_to_ws => {
             if let Err(ref e) = result { if e.is_panic() { eprintln!("[Grove] ACP updates-to-WS task panicked"); } }
+            ws_to_acp.abort();
         },
-        result = ws_to_acp => {
+        result = &mut ws_to_acp => {
             if let Err(ref e) = result { if e.is_panic() { eprintln!("[Grove] ACP WS-to-ACP task panicked"); } }
+            updates_to_ws.abort();
         },
     }
 
@@ -962,8 +1026,9 @@ pub struct CreateChatRequest {
     pub title: Option<String>,
     pub agent: Option<String>,
     /// Optional per-chat launch-mode override from the New-chat picker. When
-    /// absent the agent's configured default is used. Validated against the
-    /// agent's `supported_launch_modes` so we never persist an unlaunchable
+    /// absent the mode derived from the agent's selected install channel is
+    /// used. Validated below — "terminal" requires an External channel with a
+    /// registry `terminal_launch` entry — so we never persist an unlaunchable
     /// chat (e.g. "terminal" for an ACP-only agent).
     pub launch_mode: Option<String>,
 }
@@ -1064,33 +1129,66 @@ pub async fn create_chat(
         .ok_or(AcpError::NotFound("Task not found".to_string()))?;
 
     let cfg = config::load_config();
-    let agent = body.agent.unwrap_or_else(|| {
-        cfg.acp
-            .agent_command
-            .clone()
-            .unwrap_or_else(|| "claude".to_string())
-    });
-    // Snapshot launch_mode from the agent's installed_agents row at
-    // chat-creation time. Subsequent edits do not retroactively change
-    // existing chats — that contract is what makes ACP/terminal switching
-    // safe.
+    // Resolve to canonical id BEFORE any installed_agents / registry
+    // lookup. Legacy ids on disk (older chats / configs) and the
+    // hardcoded default below would otherwise miss post-v2.6 canonical
+    // rows (`claude` → `claude-acp` etc.). The chat row is also persisted
+    // with the canonical id so future reads stay consistent.
+    let agent =
+        crate::storage::installed_agents::canonicalize_agent_id(&body.agent.unwrap_or_else(|| {
+            cfg.acp
+                .agent_command
+                .clone()
+                .unwrap_or_else(|| "claude-acp".to_string())
+        }));
+    // Snapshot launch_mode from the agent's selected channel at chat-creation
+    // time. Subsequent edits do not retroactively change existing chats —
+    // that contract is what makes ACP/terminal switching safe.
     //
-    // Lookup is against the canonical id because the marketplace stores
-    // rows under canonical ids; `agent` here can still be a legacy id
-    // (claude) since the AgentPicker hasn't been migrated.
-    let canonical = crate::storage::agent_supplement::resolve_agent_id(&agent);
-    let default_mode = crate::storage::installed_agents::get(canonical.as_ref())
-        .ok()
-        .flatten()
-        .map(|r| r.launch_mode)
-        .unwrap_or_else(|| "acp".to_string());
-    // A per-chat override from the New-chat picker wins over the agent's
-    // configured default, but only if the agent actually supports it — every
-    // agent supports "acp", and the supplement gates "terminal".
+    // Derivation (post-v2.6 launch-mode merge):
+    //   selected_install_method == External
+    //     AND registry entry has `terminal_launch` set
+    //     → "terminal" (PTY launch, agent_pty.rs handles it)
+    //   else
+    //     → "acp" (stdio JSON-RPC)
+    //
+    // Unknown agent id (no row) → default to ACP.
+    //
+    // `agent` is already canonical (canonicalize_agent_id above), so no
+    // further id resolution is needed here — the pre-v2.6 supplement lookup
+    // this PR originally used went away with `agent_supplement`.
+    let supports_terminal = {
+        let installed = crate::storage::installed_agents::get(&agent).ok().flatten();
+        installed
+            .as_ref()
+            .filter(|r| {
+                matches!(
+                    r.selected_install_method,
+                    crate::storage::installed_agents::InstallMethod::External
+                )
+            })
+            .and_then(|_| {
+                crate::storage::agent_registry::get()
+                    .agents
+                    .iter()
+                    .find(|a| a.id == agent)
+                    .and_then(|a| a.terminal_launch.clone())
+            })
+            .is_some()
+    };
+    let default_mode = if supports_terminal { "terminal" } else { "acp" };
+    // A per-chat override from the New-chat picker wins over the derived
+    // default, but only if the agent actually supports it — every agent
+    // supports "acp"; "terminal" additionally requires the External channel
+    // with a registry `terminal_launch`, which is exactly what
+    // `supports_terminal` establishes above.
     let launch_mode = match body.launch_mode {
         Some(req) if req != default_mode => {
-            let supported =
-                crate::storage::agent_supplement::supported_launch_modes(canonical.as_ref());
+            let supported: &[&str] = if supports_terminal {
+                &["acp", "terminal"]
+            } else {
+                &["acp"]
+            };
             if supported.contains(&req.as_str()) {
                 req
             } else {
@@ -1100,7 +1198,7 @@ pub async fn create_chat(
                 )));
             }
         }
-        _ => default_mode,
+        _ => default_mode.to_string(),
     };
     let now = chrono::Utc::now();
     let title = body
@@ -1482,20 +1580,31 @@ pub async fn chat_ws_handler(
     // on install_method (pins npx/uvx version, uses binary install_path,
     // gracefully falls back when the row is External or the binary has
     // been deleted off disk).
-    let canonical_id =
-        crate::storage::agent_supplement::resolve_agent_id(&effective_agent).into_owned();
+    // Post-v2.6, `effective_agent` is canonical. Direct lookup.
+    let canonical_id = effective_agent.clone();
     let installed_record = crate::storage::installed_agents::get(&canonical_id)
         .ok()
         .flatten();
-    let supplement = crate::storage::agent_supplement::find_supplement(&canonical_id);
+
+    // Pull the effective registry + user override env for the channel that's
+    // actually going to spawn. `launch_env_for` also identifies which
+    // distribution produced an auto-detected External path.
+    let registry_agent = crate::storage::agent_registry::get()
+        .agents
+        .into_iter()
+        .find(|a| a.id == canonical_id);
+    if let (Some(reg), Some(rec)) = (registry_agent.as_ref(), installed_record.as_ref()) {
+        for (k, v) in crate::storage::installed_agents::launch_env_for(rec, reg) {
+            env_vars.insert(k, v);
+        }
+    }
+
     let (final_command, final_args) = if let Some(ref rec) = installed_record {
-        let (cmd, base_args) = crate::storage::installed_agents::spawn_for(rec, supplement)
-            .unwrap_or_else(|| (resolved.command.clone(), resolved.args.clone()));
+        let (cmd, base_args) =
+            crate::storage::installed_agents::spawn_for(rec, registry_agent.as_ref())
+                .unwrap_or_else(|| (resolved.command.clone(), resolved.args.clone()));
         let mut args = base_args;
         args.extend(rec.args_override.iter().cloned());
-        for (k, v) in &rec.env_override {
-            env_vars.insert(k.clone(), v.clone());
-        }
         (cmd, args)
     } else {
         (resolved.command, resolved.args)

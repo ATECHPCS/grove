@@ -180,21 +180,28 @@
   pointer-events: none;
 }
 
-/* Drag handle between a sidebar and the diff content.
-   Always present in the DOM (when sidebar is visible on desktop) so the
-   affordance is discoverable; visual cue only on hover/active. */
 .diff-resizer {
-  width: 6px;
-  min-width: 6px;
+  width: 0;
+  min-width: 0;
   height: 100%;
   cursor: col-resize;
   background: transparent;
   position: relative;
   flex-shrink: 0;
-  z-index: 2;
+  z-index: 10;
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
+}
+
+.diff-resizer::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -4px;
+  width: 9px;
+  background: transparent;
 }
 
 .diff-resizer::after {
@@ -202,7 +209,7 @@
   position: absolute;
   top: 0;
   bottom: 0;
-  left: 2px;
+  left: -1px;
   width: 2px;
   border-radius: 999px;
   background: transparent;
@@ -211,9 +218,15 @@
 
 .diff-resizer:hover::after,
 .diff-resizer:active::after {
-  left: 1px;
+  left: -2px;
   width: 4px;
   background: var(--color-highlight);
+}
+
+/* Disable transitions during drag resizing to prevent layout stutter/lag */
+body.grove-resizing .diff-sidebar,
+body.grove-resizing .conv-sidebar {
+  transition: none !important;
 }
 
 .diff-sidebar-list {
@@ -243,6 +256,11 @@
 .diff-sidebar-item.active {
   background: color-mix(in srgb, var(--color-highlight) 15%, var(--color-bg-secondary));
   color: var(--color-highlight);
+}
+
+.diff-sidebar-item.context-target:not(.active) {
+  background: color-mix(in srgb, var(--color-highlight) 10%, var(--color-bg-secondary));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-highlight) 40%, transparent);
 }
 
 /* Virtual file items (planned files) */
@@ -291,7 +309,7 @@
 
 /* When a preview drawer is open, make diff-content a flex column so the file section
    can stretch to fill all available height (avoiding both triple scrollbars and clipping) */
-.diff-content:has(.diff-file-body.with-preview) {
+.diff-content-focus:has(.diff-file-body.with-preview) {
   overflow-y: hidden;
   display: flex;
   flex-direction: column;
@@ -301,7 +319,7 @@
   padding-bottom: 0;
 }
 
-.diff-content:has(.diff-file-body.with-preview) .diff-file-section {
+.diff-content-focus:has(.diff-file-body.with-preview) .diff-file-section {
   flex: 1;
   min-height: 0;
   display: flex;
@@ -326,6 +344,19 @@
 .diff-file-section {
   margin-bottom: 2px;
   position: relative;
+}
+
+/* Keep expanded files at their natural height while skipping off-screen
+   rendering work. This supports variable-height diffs, previews and images
+   without losing stable scroll-to-file anchors. */
+.diff-content-all-files {
+  overflow: hidden;
+  padding-bottom: 0;
+}
+
+.diff-file-virtuoso {
+  height: 100%;
+  width: 100%;
 }
 
 .diff-file-header {
@@ -634,13 +665,20 @@ td.diff-code.diff-line-highlighted::before {
   overflow: hidden;
 }
 
-/* Split mode: constrain text selection to one panel */
-.diff-split.selecting-left td[data-side="ADD"] {
+/* Split mode: constrain text selection to one panel.
+   The descendant `*` is load-bearing: syntax highlighting wraps every line's text
+   in <span>s, and the baseline `.diff-code *` rule above sets user-select:text on
+   them. An element's own declaration always beats a value inherited from its
+   parent (!important doesn't cross inheritance), so locking only the cell leaves
+   its spans — i.e. all the actual text — selectable. Lock the subtree. */
+.diff-split.selecting-left td[data-side="ADD"],
+.diff-split.selecting-left td[data-side="ADD"] * {
   user-select: none !important;
   -webkit-user-select: none !important;
 }
 
-.diff-split.selecting-right td[data-side="DELETE"] {
+.diff-split.selecting-right td[data-side="DELETE"],
+.diff-split.selecting-right td[data-side="DELETE"] * {
   user-select: none !important;
   -webkit-user-select: none !important;
 }
@@ -901,6 +939,7 @@ td.diff-code.diff-line-highlighted::before {
 
 .diff-sidebar-search-input {
   flex: 1;
+  min-width: 0;
   background: var(--color-bg);
   border: 1px solid var(--color-border);
   border-radius: 4px;
@@ -1031,7 +1070,15 @@ td.diff-code.diff-line-highlighted::before {
   color: var(--color-text);
 }
 
-.diff-file-copy-btn {
+/* Hidden with visibility, not opacity alone. The header is position:sticky, so it gets
+   its own compositing layer, and an opacity *transition* promotes the button to one too
+   — under the constant reflow of the diff below, WebKit leaves those stale pixels on
+   screen after the button computes back to opacity:0, and it stays painted until some
+   unrelated repaint (a mouse move, seconds later) clears it. visibility:hidden takes the
+   element out of painting outright, which no stale layer survives; dropping the
+   transition keeps it from being promoted in the first place. */
+.diff-file-copy-btn,
+.diff-file-expand-all-btn {
   width: 20px;
   height: 20px;
   display: flex;
@@ -1043,16 +1090,19 @@ td.diff-code.diff-line-highlighted::before {
   cursor: pointer;
   border-radius: 4px;
   opacity: 0;
-  transition: opacity 0.15s;
+  visibility: hidden;
   flex-shrink: 0;
 }
 
-.diff-file-header:hover .diff-file-copy-btn {
+.diff-file-header:hover .diff-file-copy-btn,
+.diff-file-header:hover .diff-file-expand-all-btn {
   opacity: 0.6;
+  visibility: visible;
 }
 
-.diff-file-copy-btn:hover {
-  opacity: 1 !important;
+.diff-file-copy-btn:hover,
+.diff-file-expand-all-btn:hover {
+  opacity: 1;
   background: var(--color-bg-tertiary);
 }
 

@@ -34,8 +34,10 @@ import {
   createDirectory,
   deleteFileOrDir,
   moveFileOrDir,
+  openTaskFile,
+  revealTaskFile,
   lookupSymbol,
-  listTasks,
+  getTask,
   getConfig,
 } from "../../../api";
 import type { DirEntry } from "../../../api";
@@ -43,6 +45,7 @@ import { FileContextMenu, type ContextMenuPosition, type ContextMenuTarget } fro
 import { ConfirmDialog } from "../../Dialogs/ConfirmDialog";
 import { useCommand, useDefineCommand, useContextKey } from "../../../keyboard";
 import "./task-editor.css";
+import { motion, AnimatePresence } from "framer-motion";
 
 interface TaskEditorProps {
   projectId: string;
@@ -66,6 +69,7 @@ function getLanguage(filePath: string): string {
     js: 'javascript',
     jsx: 'javascriptreact',
     json: 'json',
+    jsonl: 'json',
     toml: 'ini',
     yaml: 'yaml',
     yml: 'yaml',
@@ -448,11 +452,33 @@ const registerMermaidLanguage = (monaco: any) => {
 };
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
+// 'image' and 'binary' previews must never write through Monaco — they're
+// either raster data or non-text formats (xlsx, etc.) that getFileContent()
+// would return as garbled text. Saving that text via writeFileContent
+// would corrupt the original file.
+const isReadOnlyPreview = (path: string) => {
+  const t = getPreviewType(path);
+  return t === 'image' || t === 'binary';
+};
+
 export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onToggleFullscreen, hideHeader = false }: TaskEditorProps) {
   const { isMobile } = useIsMobile();
   const { theme } = useTheme();
   const [fileNodes, setFileNodes] = useState<FileTreeNode[]>([]);
-  const [treeKey, setTreeKey] = useState(0);
+  // Bumped on every refresh/reload. Threaded into FileTree so expanded
+  // directories re-fetch their children IN PLACE (without remounting and
+  // losing expansion state), and appended to image URLs as a cache-buster so
+  // a Refresh shows the latest bytes instead of the browser-cached copy.
+  const [refreshSignal, setRefreshSignal] = useState(0);
+
+  // Cache-buster for image/media preview URLs. Bumped every time a file is
+  // opened and on Refresh, so the webview (WKWebView caches images
+  // aggressively, even with `no-cache`) always re-fetches the current bytes
+  // instead of serving a stale copy for the same path. `imageNonceFile` tracks
+  // the file the nonce was last bumped for, so the render-time adjustment only
+  // fires on an actual file switch.
+  const [imageNonce, setImageNonce] = useState(0);
+  const [imageNonceFile, setImageNonceFile] = useState<string | null>(null);
   const [monacoInstance, setMonacoInstance] = useState<Monaco | null>(null);
 
   // Dynamically adapt Monaco Editor background and text colors to match active theme
@@ -656,23 +682,18 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
 
   useEffect(() => {
     const ac = new AbortController();
-    const lookup = async () => {
-      for (const filter of ['active', 'archived'] as const) {
-        if (ac.signal.aborted) return;
-        try {
-          const tasks = await listTasks(projectId, filter, ac.signal);
-          if (ac.signal.aborted) return;
-          const match = tasks.find((t) => t.id === taskId);
-          if (match) {
-            setTaskPath(match.path);
-            return;
-          }
-        } catch {
-          // Aborted requests, transient network errors — both fine to swallow.
-        }
-      }
-    };
-    lookup();
+    // Fetch this task by id rather than scanning the task list: `listTasks`
+    // omits the Local Task (`_local`), so the old list-and-find approach left
+    // `taskPath` null for it and greyed out "Copy Full Path". `getTask`
+    // resolves both worktree-backed and local tasks.
+    getTask(projectId, taskId, ac.signal)
+      .then((task) => {
+        if (!ac.signal.aborted) setTaskPath(task.path);
+      })
+      .catch(() => {
+        // Aborted requests / transient errors — fine to swallow; the button
+        // simply stays disabled until a later mount retries.
+      });
     return () => ac.abort();
   }, [projectId, taskId]);
 
@@ -704,7 +725,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
     // Save any dirty content on the previously selected file BEFORE switching,
     // otherwise the ref-sync effect would capture {modified:false, content:newFile}
     // and the unmount auto-save would never save the old file's edits.
-    if (modified && selectedFile && getPreviewType(selectedFile) !== 'image') {
+    if (modified && selectedFile && !isReadOnlyPreview(selectedFile)) {
       try {
         await writeFileContent(projectId, taskId, selectedFile, editorContentRef.current);
       } catch (err) {
@@ -724,7 +745,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
     // On mobile, close file tree after selecting
     if (isMobile) setFileTreeVisible(false);
 
-    if (getPreviewType(path) === 'image') {
+    if (isReadOnlyPreview(path)) {
       setFileContent('');
       editorContentRef.current = '';
       setLoading(false);
@@ -791,7 +812,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
   // Save file
   const handleSave = useCallback(async () => {
     if (!selectedFile || saving || refreshing) return;
-    if (getPreviewType(selectedFile) === 'image') return;
+    if (isReadOnlyPreview(selectedFile)) return;
 
     setSaving(true);
     try {
@@ -853,7 +874,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
     return () => {
       const snap = unmountSaveRef.current;
       if (!snap.modified || !snap.selectedFile) return;
-      if (getPreviewType(snap.selectedFile) === 'image') return;
+      if (isReadOnlyPreview(snap.selectedFile)) return;
       writeFileContent(snap.projectId, snap.taskId, snap.selectedFile, snap.content).catch((err) => {
         console.warn('TaskEditor: failed to auto-save on unmount', snap.selectedFile, err);
       });
@@ -865,8 +886,8 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
     try {
       const res = await getTaskDirEntries(projectId, taskId, '');
       setFileNodes(dirEntriesToNodes(res.entries));
-      // Remount lazy tree items so expanded directories drop stale loaded children.
-      setTreeKey(k => k + 1);
+      // Re-fetch expanded directories in place; keeps expansion state.
+      setRefreshSignal(s => s + 1);
     } catch (err) {
       console.error('Failed to reload files:', err);
     }
@@ -878,11 +899,13 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
     try {
       const res = await getTaskDirEntries(projectId, taskId, '');
       setFileNodes(dirEntriesToNodes(res.entries));
-      // Increment treeKey to remount FileTree, resetting all expanded directory state
-      setTreeKey(k => k + 1);
+      // Re-fetch expanded directories in place (preserves which folders are
+      // open) and bust the image cache so previews show the latest bytes.
+      setRefreshSignal(s => s + 1);
+      setImageNonce(n => n + 1);
 
       if (selectedFile) {
-        if (getPreviewType(selectedFile) === 'image') {
+        if (isReadOnlyPreview(selectedFile)) {
           setFileContent('');
           editorContentRef.current = '';
           setModified(false);
@@ -904,6 +927,22 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
     const result = await getTaskDirEntries(projectId, taskId, dirPath);
     return result.entries;
   }, [projectId, taskId]);
+
+  // Raw-file URL for image/media preview. `_t=${imageNonce}` busts the cache so
+  // opening a file (or hitting Refresh) reloads the latest bytes for the same
+  // path (the backend also sends `Cache-Control: no-cache`).
+  const rawFileUrl = useCallback((path: string) => {
+    return `/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(path)}&_t=${imageNonce}`;
+  }, [projectId, taskId, imageNonce]);
+
+  // Bump the image cache-buster whenever the open file changes, so switching
+  // away and back to the same image shows its current bytes, not a cached copy.
+  // This render-time state adjustment is React's sanctioned alternative to a
+  // setState-in-effect (https://react.dev/learn/you-might-not-need-an-effect).
+  if (selectedFile !== imageNonceFile) {
+    setImageNonceFile(selectedFile);
+    setImageNonce((n) => n + 1);
+  }
 
   const handleContextMenu = useCallback((e: React.MouseEvent, path: string, isDir: boolean) => {
     setContextMenuPosition({ x: e.clientX, y: e.clientY });
@@ -931,6 +970,19 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
       console.error('Failed to copy full path:', err);
     });
   }, [taskPath]);
+
+  // Open with the OS default application (runs on the server host)
+  const handleOpenInApp = useCallback((path: string) => {
+    openTaskFile(projectId, taskId, path).catch((err) => {
+      setError(err instanceof Error ? err.message : 'Failed to open file');
+    });
+  }, [projectId, taskId]);
+
+  const handleRevealInFileManager = useCallback((path: string) => {
+    revealTaskFile(projectId, taskId, path).catch((err) => {
+      setError(err instanceof Error ? err.message : 'Failed to show file in Finder');
+    });
+  }, [projectId, taskId]);
 
   // Create file submit handler
   const handleCreateFile = useCallback(async (path: string) => {
@@ -1078,7 +1130,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
   // Breadcrumb from file path
   const breadcrumb = selectedFile ? selectedFile.split('/') : [];
 
-  const renderer = selectedFile ? getPreviewRenderer(selectedFile) : undefined;
+  const renderer = selectedFile ? getPreviewRenderer(selectedFile, 'full') : undefined;
   const isPreviewable = renderer && renderer.id !== 'source' && renderer.id !== 'image';
 
   // Calculate relative base path for HTML preview
@@ -1148,81 +1200,91 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
         )}
 
         {/* Collapsed sidebar strip — shown when file tree is hidden */}
-        {!fileTreeVisible && (
-          <div
-            className="flex-shrink-0 flex flex-col items-center pt-2 gap-1 bg-[var(--color-bg)] border-r border-[var(--color-border)]"
-            style={{ width: 36 }}
-          >
-            <button
-              onClick={() => setFileTreeVisible(true)}
-              className="flex items-center justify-center w-7 h-7 rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
-              title="Show file tree"
+        <AnimatePresence initial={false}>
+          {!fileTreeVisible && (
+            <motion.div
+              initial={{ width: 0, opacity: 0 }}
+              animate={{ width: 36, opacity: 1 }}
+              exit={{ width: 0, opacity: 0 }}
+              transition={{ type: "spring", damping: 25, stiffness: 200 }}
+              className="flex-shrink-0 flex flex-col items-center pt-2 gap-1 bg-[var(--color-bg)] border-r border-[var(--color-border)] overflow-hidden"
             >
-              <PanelLeftOpen className="w-4 h-4" />
-            </button>
-            <button
-              onClick={handleRefresh}
-              disabled={refreshing}
-              className="flex items-center justify-center w-7 h-7 rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              title="Refresh files"
-            >
-              <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
-            </button>
-          </div>
-        )}
+              <button
+                onClick={() => setFileTreeVisible(true)}
+                className="flex items-center justify-center w-7 h-7 rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
+                title="Show file tree"
+              >
+                <PanelLeftOpen className="w-4 h-4" />
+              </button>
+              <button
+                onClick={handleRefresh}
+                disabled={refreshing}
+                className="flex items-center justify-center w-7 h-7 rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                title="Refresh files"
+              >
+                <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* File tree sidebar */}
-        {fileTreeVisible && (
-          <div
-            className="flex-shrink-0 border-r border-[var(--color-border)] bg-[var(--color-bg)] overflow-hidden flex flex-col"
-            style={isMobile ? {
-              position: 'fixed',
-              top: 0,
-              left: 0,
-              height: '100%',
-              width: 280,
-              zIndex: 20,
-              boxShadow: '4px 0 16px rgba(0,0,0,0.25)',
-            } : {
-              width: fileTreeWidth,
-            }}
-          >
-            {/* Collapse button inside sidebar header */}
-            <div className="flex items-center justify-between px-2 h-[38px] bg-[var(--color-bg)] border-b border-[var(--color-border)] select-none">
-              <span className="text-xs font-medium text-[var(--color-text-muted)] uppercase tracking-wider pl-1">Files</span>
-              <div className="flex items-center gap-0.5">
-                <button
-                  onClick={handleRefresh}
-                  disabled={refreshing}
-                  className="flex items-center justify-center w-6 h-6 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                  title="Refresh files"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
-                </button>
-                <button
-                  onClick={() => setFileTreeVisible(false)}
-                  className="flex items-center justify-center w-6 h-6 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
-                  title="Hide file tree"
-                >
-                  <PanelLeftClose className="w-3.5 h-3.5" />
-                </button>
+        <AnimatePresence initial={false}>
+          {fileTreeVisible && (
+            <motion.div
+              initial={{ width: 0, opacity: 0 }}
+              animate={{ width: isMobile ? 280 : fileTreeWidth, opacity: 1 }}
+              exit={{ width: 0, opacity: 0 }}
+              transition={{ type: "spring", damping: 25, stiffness: 200 }}
+              className="flex-shrink-0 border-r border-[var(--color-border)] bg-[var(--color-bg)] overflow-hidden flex flex-col"
+              style={isMobile ? {
+                position: 'fixed',
+                top: 0,
+                left: 0,
+                height: '100%',
+                zIndex: 20,
+                boxShadow: '4px 0 16px rgba(0,0,0,0.25)',
+              } : undefined}
+            >
+              {/* Collapse button inside sidebar header */}
+              <div className="flex items-center justify-between px-2 h-[38px] bg-[var(--color-bg)] border-b border-[var(--color-border)] select-none">
+                <span className="text-xs font-medium text-[var(--color-text-muted)] uppercase tracking-wider pl-1">Files</span>
+                <div className="flex items-center gap-0.5">
+                  <button
+                    onClick={handleRefresh}
+                    disabled={refreshing}
+                    className="flex items-center justify-center w-6 h-6 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    title="Refresh files"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+                  </button>
+                  <button
+                    onClick={() => setFileTreeVisible(false)}
+                    className="flex items-center justify-center w-6 h-6 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
+                    title="Hide file tree"
+                  >
+                    <PanelLeftClose className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               </div>
-            </div>
-            <FileTree
-              key={treeKey}
-              nodes={fileNodes}
-              selectedFile={selectedFile}
-              onSelectFile={handleSelectFile}
-              onContextMenu={handleContextMenu}
-              creatingPath={creatingPath}
-              onSubmitPath={handleSubmitPath}
-              onCancelPath={handleCancelPath}
-              onExpandDir={handleExpandDir}
-              onMoveFile={handleMoveFile}
-              onUploadFile={handleUploadFile}
-            />
-          </div>
-        )}
+              <FileTree
+                nodes={fileNodes}
+                selectedFile={selectedFile}
+                contextMenuPath={contextMenuOpen ? contextMenuTarget?.path ?? null : null}
+                onSelectFile={handleSelectFile}
+                onContextMenu={handleContextMenu}
+                creatingPath={creatingPath}
+                onSubmitPath={handleSubmitPath}
+                onCancelPath={handleCancelPath}
+                onExpandDir={handleExpandDir}
+                onMoveFile={handleMoveFile}
+                onUploadFile={handleUploadFile}
+                refreshSignal={refreshSignal}
+                dragLocation={{ projectId, taskId }}
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* Resizer between file tree sidebar and editor area (desktop only) */}
         {!isMobile && fileTreeVisible && (
@@ -1322,7 +1384,7 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
               </div>
             </div>
           ) : selectedFile ? (
-            getPreviewType(selectedFile) === 'image' ? (
+            isReadOnlyPreview(selectedFile) ? (
               <div 
                 className="flex-1 flex flex-col items-center justify-center overflow-auto p-8 relative"
                 style={{
@@ -1334,10 +1396,10 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
                 <div className="max-w-full max-h-full flex flex-col items-center justify-center gap-3">
                   <div className="relative rounded-lg overflow-hidden border border-[var(--color-border)] shadow-md bg-[var(--color-bg)] transition-transform duration-200 hover:scale-[1.01]">
                     <img
-                      src={`/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(selectedFile)}`}
+                      src={rawFileUrl(selectedFile)}
                       alt={selectedFile}
                       className="max-w-full max-h-[70vh] object-contain block cursor-pointer hover:opacity-90 transition-opacity"
-                      onClick={() => setLightboxUrl(`/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(selectedFile)}`)}
+                      onClick={() => setLightboxUrl(rawFileUrl(selectedFile))}
                       onError={(e) => {
                         (e.target as HTMLImageElement).style.display = 'none';
                         (e.target as HTMLImageElement).nextElementSibling?.classList.remove('hidden');
@@ -1359,13 +1421,18 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
                 </div>
               </div>
             ) : viewMode === 'preview' && isPreviewable ? (
-              <div className="flex-1 overflow-auto bg-[var(--color-bg)] p-6">
+              <div className="flex-1 overflow-auto bg-[var(--color-bg)] p-6 editor-scroll-container">
                 {renderer?.renderFull({
                   content: renderer.contentType === 'url'
-                    ? `/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(selectedFile)}`
+                    ? rawFileUrl(selectedFile)
                     : (renderer.id === 'html' ? rewriteHtmlUrls(fileContent, projectId, taskId, parentDirPath) : fileContent),
                   fileName: selectedFile,
                   sketchContext: { projectId, taskId },
+                  location: {
+                    projectId,
+                    root: { kind: "task", taskId },
+                    path: selectedFile,
+                  },
                   onImageClick: (url) => setLightboxUrl(url),
                   onSvgClick: (svg) => setLightboxSvg(svg),
                 })}
@@ -1425,16 +1492,28 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
                       automaticLayout: true,
                       padding: { top: 8 },
                       renderWhitespace: 'selection',
+                      scrollbar: {
+                        verticalScrollbarSize: 6,
+                        horizontalScrollbarSize: 6,
+                        vertical: 'visible',
+                        horizontal: 'visible',
+                        useShadows: false,
+                      },
                     }}
                   />
                 </div>
-                <div className="flex-1 min-w-0 h-full overflow-auto bg-[var(--color-bg)] p-6">
+                <div className="flex-1 min-w-0 h-full overflow-auto bg-[var(--color-bg)] p-6 editor-scroll-container">
                   {renderer?.renderFull({
                     content: renderer.contentType === 'url'
-                      ? `/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(selectedFile)}`
+                      ? rawFileUrl(selectedFile)
                       : (renderer.id === 'html' ? rewriteHtmlUrls(fileContent, projectId, taskId, parentDirPath) : fileContent),
                     fileName: selectedFile,
                     sketchContext: { projectId, taskId },
+                    location: {
+                      projectId,
+                      root: { kind: "task", taskId },
+                      path: selectedFile,
+                    },
                     onImageClick: (url) => setLightboxUrl(url),
                     onSvgClick: (svg) => setLightboxSvg(svg),
                   })}
@@ -1498,6 +1577,13 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
                   automaticLayout: true,
                   padding: { top: 8 },
                   renderWhitespace: 'selection',
+                  scrollbar: {
+                    verticalScrollbarSize: 6,
+                    horizontalScrollbarSize: 6,
+                    vertical: 'visible',
+                    horizontal: 'visible',
+                    useShadows: false,
+                  },
                 }}
               />
             )
@@ -1523,6 +1609,8 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
         onDelete={handleDelete}
         onCopyRelativePath={handleCopyRelativePath}
         onCopyFullPath={handleCopyFullPath}
+        onOpenInApp={handleOpenInApp}
+        onRevealInFileManager={handleRevealInFileManager}
       />
 
       {/* Confirm Dialog for deletion */}

@@ -6,7 +6,9 @@ import {
   useMemo,
   useDeferredValue,
   memo,
+  Fragment,
   type CSSProperties,
+  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
@@ -79,6 +81,7 @@ import type { AskFormDefinition } from "./formPillTypes";
 import {
   agentIconComponent,
   agentIconUrl,
+  resolveAgentIcon,
   usePersonaRegistry,
 } from "../../../utils/agentIcon";
 import type { MentionItem, FilteredMentionItem } from "../../../utils/fileMention";
@@ -86,11 +89,32 @@ import { getMentionCandidates } from "../../../api";
 import { listExtensionTabs, getExtensionStatus } from "../../../api/extension";
 import { useProject } from "../../../context/ProjectContext";
 import { useConfig } from "../../../context/ConfigContext";
-import { usePreviewComments, type PreviewCommentDraft } from "../../../context";
+import { previewCommentTaskLabel, usePreviewComments, type PreviewCommentDraft, type PreviewCommentLocator } from "../../../context";
 import { PreviewSearchBar } from "../../Review/PreviewSearchBar";
-import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
+import {
+  Virtuoso,
+  type ContextProp,
+  type VirtuosoHandle,
+} from "react-virtuoso";
 import { useChatSearch } from "./useChatSearch";
 import { useChatPositioning } from "./useChatPositioning";
+import { ChatListErrorBoundary } from "./ChatListErrorBoundary";
+import { useDeferredVirtuosoRangeValue } from "./useDeferredVirtuosoRangeValue";
+import {
+  extractDiffForEditPath,
+  extractEditToolPaths,
+} from "./editToolPaths";
+import { nextExpandedToolDetail } from "./toolDetailExpansion";
+import { extractThoughtStatus } from "./thoughtStatus";
+import {
+  firstVisibleTaskChatRow,
+  scrollVirtuosoToBottom,
+  shouldVirtualizeTaskChat,
+  taskChatHeightEstimates,
+  taskChatLayoutTransitionTarget,
+  taskChatVirtualizationLayoutKey,
+  type TaskChatScrollAnchor,
+} from "./taskChatVirtualScroll";
 import { useACPAvailability } from "./useACPAvailability";
 import { useInitialChatLoad } from "./useInitialChatLoad";
 import { useActiveChatId } from "./useActiveChatId";
@@ -129,8 +153,35 @@ import {
 import type { ChatSessionResponse, CustomAgentServer } from "../../../api";
 import { listProjects, getProject, listResources, type ProjectListItem } from "../../../api/projects";
 import { openExternalUrl } from "../../../utils/openExternal";
-import { useCommand, useContextKey } from "../../../keyboard";
+import { ansiToHtml, stripAnsi } from "../../../utils/ansi";
+import { fuzzyFindByName } from "../../../utils/fuzzySearch";
+import { useCommand, useContextKey, useVoiceControlContext } from "../../../keyboard";
 import "./task-chat.css";
+
+// ─── Queue send mode persistence (localStorage) ───────────────────────────
+// Flat, global key (not per-project/per-chat) — the user picks one mode and
+// expects it to stick everywhere, matching the product decision.
+
+type QueueSendMode = "separate" | "compact";
+const QUEUE_MODE_STORAGE_KEY = "grove:queue-mode";
+
+function loadQueueMode(): QueueSendMode {
+  try {
+    return window.localStorage.getItem(QUEUE_MODE_STORAGE_KEY) === "compact"
+      ? "compact"
+      : "separate";
+  } catch {
+    return "separate";
+  }
+}
+
+function saveQueueMode(mode: QueueSendMode): void {
+  try {
+    window.localStorage.setItem(QUEUE_MODE_STORAGE_KEY, mode);
+  } catch {
+    // quota/denied — silently skip
+  }
+}
 
 // ─── Chat draft persistence (localStorage) ────────────────────────────────
 
@@ -501,12 +552,205 @@ function fileUrlToPath(uri: string | undefined): string | null {
 // ─── Render grouping types ───────────────────────────────────────────────────
 
 type ToolSectionItem = { message: ToolMessage; index: number };
+type WorkSummaryItem = {
+  message: Extract<ChatMessage, { type: "assistant" | "thinking" | "tool" }>;
+  index: number;
+};
 type RenderItem =
   | { kind: "single"; message: ChatMessage; index: number }
-  | { kind: "tool-section"; sectionId: string; tools: ToolSectionItem[] };
+  | { kind: "tool-section"; sectionId: string; tools: ToolSectionItem[] }
+  | {
+      kind: "work-summary";
+      sectionId: string;
+      items: WorkSummaryItem[];
+      durationSeconds?: number;
+    }
+  | { kind: "file-change-summary"; sectionId: string; tools: ToolSectionItem[] };
+
+function renderItemKey(item: RenderItem): string {
+  return item.kind === "single"
+    ? `m-${item.index}`
+    : item.kind === "tool-section"
+      ? `ts-${item.sectionId}`
+      : item.kind === "work-summary"
+        ? `ws-${item.sectionId}`
+        : `fs-${item.sectionId}`;
+}
+
+type TaskChatVirtuosoContext = {
+  hiddenMessageCount: number;
+  hotRows: ReactNode;
+  inputAreaHeight: number;
+  showThinking: boolean;
+};
+
+function TaskChatVirtuosoHeader({
+  context,
+}: ContextProp<TaskChatVirtuosoContext>) {
+  return context.hiddenMessageCount > 0 ? (
+    <div className="px-4 pt-4">
+      <div className="mx-auto max-w-[720px] rounded-md border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-3 py-2 text-center text-xs text-[var(--color-text-muted)]">
+        {context.hiddenMessageCount.toLocaleString()} earlier messages are
+        hidden from this view. Full history is still saved.
+      </div>
+    </div>
+  ) : (
+    <div className="h-4" />
+  );
+}
+
+function TaskChatVirtuosoFooter({
+  context,
+}: ContextProp<TaskChatVirtuosoContext>) {
+  return (
+    <div>
+      {context.hotRows}
+      {context.showThinking && (
+        <div className="mx-auto w-full max-w-[920px] px-4 py-2 sm:px-6">
+          <ThinkingStatus label="Thinking" active />
+        </div>
+      )}
+      <div style={{ height: context.inputAreaHeight + 16 }} />
+    </div>
+  );
+}
+
+const TASK_CHAT_VIRTUOSO_COMPONENTS = {
+  Header: TaskChatVirtuosoHeader,
+  Footer: TaskChatVirtuosoFooter,
+};
+
+const TASK_CHAT_RECENT_TURN_HOT_ZONE = 50;
+const TASK_CHAT_DEFAULT_ITEM_HEIGHT = 120;
+const TASK_CHAT_WINDOWED_VIEWPORT = { top: 1_600, bottom: 1_600 } as const;
+const TASK_CHAT_MIN_OVERSCAN_ITEMS = { top: 12, bottom: 12 } as const;
+
+const MeasuredTaskChatRow = memo(function MeasuredTaskChatRow({
+  className,
+  dataItemIndex,
+  dataRenderKey,
+  measureKey,
+  onObserve,
+  children,
+}: {
+  className: string;
+  dataItemIndex?: number;
+  dataRenderKey: string;
+  measureKey: string;
+  onObserve: (
+    element: HTMLDivElement,
+    key: string,
+    observing: boolean,
+  ) => void;
+  children: ReactNode;
+}) {
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const attachRow = useCallback((element: HTMLDivElement | null) => {
+    if (rowRef.current) onObserve(rowRef.current, measureKey, false);
+    rowRef.current = element;
+    if (element) onObserve(element, measureKey, true);
+  }, [measureKey, onObserve]);
+
+  return (
+    <div
+      ref={attachRow}
+      className={className}
+      data-item-index={dataItemIndex}
+      data-render-key={dataRenderKey}
+    >
+      {children}
+    </div>
+  );
+});
+
+/** A user prompt and the assistant material that follows it.  This is a
+ * presentation-only projection of `messages`: the full message history
+ * remains the source of truth and no extra history is persisted. */
+type ConversationTurn = {
+  messageIndex: number;
+  renderIndex: number;
+  user: string;
+  assistant: string;
+  isStreaming: boolean;
+  tools: { label: string; count: number }[];
+};
+
+function conversationToolLabel(tool: ToolMessage): string {
+  switch (normalizeToolVerb(tool.title)) {
+    case "read":
+    case "search":
+    case "list":
+    case "run":
+      return "Exploration";
+    case "edit":
+      return "Edit";
+    case "plan":
+    case "permission":
+    default:
+      return "Action";
+  }
+}
+
+function compactConversationText(value: string, limit = 220): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (!compact) return "";
+  return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
+}
+
+/**
+ * Builds the data for the chat's left-hand conversation minimap. Tool and
+ * thinking events remain part of their surrounding user → assistant turn;
+ * they do not create noisy standalone markers in the navigator.
+ */
+function buildConversationTurns(
+  messages: ChatMessage[],
+  renderItems: RenderItem[],
+): ConversationTurn[] {
+  const renderIndexByMessageIndex = new Map<number, number>();
+  renderItems.forEach((item, renderIndex) => {
+    if (item.kind === "single") renderIndexByMessageIndex.set(item.index, renderIndex);
+  });
+
+  const turns: ConversationTurn[] = [];
+  let current: ConversationTurn | null = null;
+  messages.forEach((message, messageIndex) => {
+    if (message.type === "user") {
+      const renderIndex = renderIndexByMessageIndex.get(messageIndex);
+      if (renderIndex === undefined) return;
+      current = {
+        messageIndex,
+        renderIndex,
+        user: compactConversationText(message.content) || "Attachment",
+        assistant: "",
+        isStreaming: false,
+        tools: [],
+      };
+      turns.push(current);
+      return;
+    }
+    if (!current) return;
+    if (message.type === "tool") {
+      const label = conversationToolLabel(message);
+      const existing = current.tools.find((tool) => tool.label === label);
+      if (existing) existing.count += 1;
+      else current.tools.push({ label, count: 1 });
+      return;
+    }
+    if (message.type !== "assistant") return;
+    const text = compactConversationText(message.content);
+    if (text) current.assistant = compactConversationText(
+      `${current.assistant}${current.assistant ? " " : ""}${text}`,
+    );
+    if (!message.complete) current.isStreaming = true;
+  });
+  return turns;
+}
 
 /** Group consecutive tool messages into sections; everything else is a single item */
-function buildRenderItems(messages: ChatMessage[]): RenderItem[] {
+function buildSequentialRenderItems(
+  messages: ChatMessage[],
+  startIndex = 0,
+): RenderItem[] {
   const items: RenderItem[] = [];
   let toolBuf: ToolSectionItem[] = [];
 
@@ -521,8 +765,12 @@ function buildRenderItems(messages: ChatMessage[]): RenderItem[] {
     }
   };
 
-  messages.forEach((msg, i) => {
-    if (msg.type === "tool") {
+  messages.forEach((msg, offset) => {
+    const i = startIndex + offset;
+    if (msg.type === "thinking" && msg.complete) {
+      // Keep completed reasoning in history but out of the transcript.
+      flush();
+    } else if (msg.type === "tool") {
       toolBuf.push({ message: msg, index: i });
     } else if (msg.type === "auth_required") {
       // 不进消息流 — 由 composer panel 统一渲染(同 PermissionRequest)。
@@ -534,6 +782,136 @@ function buildRenderItems(messages: ChatMessage[]): RenderItem[] {
     }
   });
   flush();
+  return items;
+}
+
+/**
+ * Keep the live turn chronological, then compact completed turns in the same
+ * way command-oriented agents do: everything through the final tool call is
+ * one expandable work record, while the answer emitted after that boundary
+ * remains fully visible.
+ */
+function buildRenderItems(messages: ChatMessage[], isBusy = false): RenderItem[] {
+  const items: RenderItem[] = [];
+  let cursor = 0;
+
+  while (cursor < messages.length) {
+    let userIndex = cursor;
+    while (userIndex < messages.length && messages[userIndex].type !== "user") {
+      userIndex += 1;
+    }
+    if (userIndex >= messages.length) {
+      items.push(...buildSequentialRenderItems(messages.slice(cursor), cursor));
+      break;
+    }
+
+    items.push(...buildSequentialRenderItems(messages.slice(cursor, userIndex), cursor));
+    items.push({ kind: "single", message: messages[userIndex], index: userIndex });
+
+    let nextUserIndex = userIndex + 1;
+    while (
+      nextUserIndex < messages.length &&
+      messages[nextUserIndex].type !== "user"
+    ) {
+      nextUserIndex += 1;
+    }
+    const isLatestTurn = nextUserIndex === messages.length;
+    const turnEntries = messages.slice(userIndex + 1, nextUserIndex);
+    const hasStreamingEntry = turnEntries.some(
+      (message) =>
+        (message.type === "assistant" || message.type === "thinking") &&
+        !message.complete,
+    );
+
+    if ((isLatestTurn && isBusy) || hasStreamingEntry) {
+      items.push(
+        ...buildSequentialRenderItems(turnEntries, userIndex + 1),
+      );
+      cursor = nextUserIndex;
+      continue;
+    }
+
+    let processEndOffset = -1;
+    for (let i = turnEntries.length - 1; i >= 0; i -= 1) {
+      if (turnEntries[i].type === "tool") {
+        processEndOffset = i;
+        break;
+      }
+    }
+    if (processEndOffset >= 0) {
+      const processItems: WorkSummaryItem[] = [];
+      for (let i = 0; i < turnEntries.length; i += 1) {
+        const message = turnEntries[i];
+        if (
+          (message.type === "assistant" && i <= processEndOffset) ||
+          message.type === "thinking" ||
+          message.type === "tool"
+        ) {
+          processItems.push({ message, index: userIndex + 1 + i });
+        }
+      }
+      if (processItems.length > 0) {
+        const timedAssistants = turnEntries.filter(
+          (message): message is Extract<ChatMessage, { type: "assistant" }> =>
+            message.type === "assistant",
+        );
+        const starts = timedAssistants
+          .map((message) => message.startTs)
+          .filter((value): value is number => typeof value === "number");
+        const ends = timedAssistants
+          .map((message) => message.endTs)
+          .filter((value): value is number => typeof value === "number");
+        items.push({
+          kind: "work-summary",
+          sectionId: `work-${userIndex}-${processItems.at(-1)!.index}`,
+          items: processItems,
+          durationSeconds:
+            starts.length > 0 && ends.length > 0
+              ? Math.max(0, Math.max(...ends) - Math.min(...starts))
+              : undefined,
+        });
+      }
+      // Preserve uncommon inline messages (permission/system/etc.) that are
+      // not part of the compactable agent process.
+      const passthrough = turnEntries
+        .slice(0, processEndOffset + 1)
+        .map((message, offset) => ({ message, index: userIndex + 1 + offset }))
+        .filter(
+          ({ message }) =>
+            message.type !== "assistant" &&
+            message.type !== "thinking" &&
+            message.type !== "tool",
+        );
+      passthrough.forEach(({ message, index }) =>
+        items.push({ kind: "single", message, index }),
+      );
+      const trailingStart = userIndex + processEndOffset + 2;
+      items.push(
+        ...buildSequentialRenderItems(
+          turnEntries.slice(processEndOffset + 1),
+          trailingStart,
+        ).filter(
+          (item) =>
+            item.kind !== "single" || item.message.type !== "thinking",
+        ),
+      );
+      const editedTools = processItems.flatMap(({ message, index }) =>
+        message.type === "tool" && isEditTool(message)
+          ? [{ message, index }]
+          : [],
+      );
+      if (editedTools.length > 0) {
+        items.push({
+          kind: "file-change-summary",
+          sectionId: `files-${userIndex}`,
+          tools: editedTools,
+        });
+      }
+    } else {
+      items.push(...buildSequentialRenderItems(turnEntries, userIndex + 1));
+    }
+    cursor = nextUserIndex;
+  }
   return items;
 }
 
@@ -571,11 +949,22 @@ function extractRenderItemText(item: RenderItem): string {
           .filter(Boolean)
           .join("\n");
     }
-  } else {
+  } else if (
+    item.kind === "tool-section" ||
+    item.kind === "file-change-summary"
+  ) {
     return item.tools
       .map((t) => [t.message.title, t.message.content ?? ""].filter(Boolean).join("\n"))
       .join("\n");
   }
+  return item.items
+    .filter(({ message }) => message.type !== "thinking")
+    .map(({ message }) =>
+      message.type === "tool"
+        ? [message.title, message.content ?? ""].filter(Boolean).join("\n")
+        : message.content,
+    )
+    .join("\n");
 }
 
 function getAutoScrollTailSignature(messages: ChatMessage[]): string {
@@ -637,7 +1026,7 @@ function previewCommentElementLabel(draft: PreviewCommentDraft): string {
 
 function previewCommentSystemPrompt(draft: PreviewCommentDraft, index: number, total: number): string {
   const lines = [
-    `Preview comment ${index} of ${total}: address this rendered preview feedback.`,
+    `Comment ${index} of ${total}: address this feedback on ${draft.source === "chat" ? "the conversation text" : "the rendered preview"}.`,
     `File: ${draft.filePath}`,
     `Source: ${draft.source}`,
     `Renderer: ${draft.rendererId}`,
@@ -1687,6 +2076,21 @@ export function TaskChat({
     setActiveChatId,
   } = useActiveChatId(null);
   useReportDebugId("chatId", activeChatId);
+
+  // Voice control context contribution for active chat sessions
+  useVoiceControlContext("active_chat", () => {
+    return {
+      selectedSessionId: activeChatId,
+      sessions: chats.map((c, idx) => ({
+        index: idx + 1,
+        id: c.id,
+        title: c.title,
+        agent: c.agent,
+        createdAt: c.created_at,
+        isSelected: activeChatId === c.id,
+      })),
+    };
+  });
   const [showChatMenu, setShowChatMenu] = useState(false);
   const [editingTitle, setEditingTitle] = useState<{
     chatId: string;
@@ -1715,6 +2119,54 @@ export function TaskChat({
       return window.localStorage.getItem(sessionModeStorageKey) !== "sidebar";
     },
   );
+
+  const DEFAULT_SESSION_RAIL_WIDTH = 228;
+  const MIN_SESSION_RAIL_WIDTH = 180;
+  const MAX_SESSION_RAIL_WIDTH = 450;
+
+  const [sessionRailWidth, setSessionRailWidth] = useState<number>(() => {
+    if (typeof window === "undefined") return DEFAULT_SESSION_RAIL_WIDTH;
+    try {
+      const saved = window.localStorage.getItem(`taskchat:session-rail-width:${projectId}`);
+      if (saved) {
+        const parsed = parseInt(saved, 10);
+        if (!isNaN(parsed) && parsed >= MIN_SESSION_RAIL_WIDTH && parsed <= MAX_SESSION_RAIL_WIDTH) {
+          return parsed;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return DEFAULT_SESSION_RAIL_WIDTH;
+  });
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(`taskchat:session-rail-width:${projectId}`, sessionRailWidth.toString());
+    } catch {
+      // ignore
+    }
+  }, [sessionRailWidth, projectId]);
+
+  const startSessionRailResize = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = sessionRailWidth;
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      const nextWidth = startWidth + (moveEvent.clientX - startX);
+      setSessionRailWidth(Math.max(MIN_SESSION_RAIL_WIDTH, Math.min(MAX_SESSION_RAIL_WIDTH, nextWidth)));
+    };
+    const handlePointerUp = () => {
+      document.body.classList.remove("grove-resizing");
+      document.removeEventListener("pointermove", handlePointerMove);
+      document.removeEventListener("pointerup", handlePointerUp);
+    };
+    document.body.classList.add("grove-resizing");
+    document.addEventListener("pointermove", handlePointerMove);
+    document.addEventListener("pointerup", handlePointerUp);
+  }, [sessionRailWidth]);
 
   // Per-chat state cache (preserved across chat switches)
   const perChatStateRef = useRef<Map<string, PerChatState>>(new Map());
@@ -1864,6 +2316,9 @@ export function TaskChat({
     editingPendingIdRef.current = editingPendingId;
   }, [editingPendingId]);
   const [editingPendingValue, setEditingPendingValue] = useState("");
+  // Compact/Separate queue send mode — global flat localStorage key, not
+  // scoped per-project/per-chat (product decision: one choice sticks everywhere).
+  const [queueMode, setQueueMode] = useState<QueueSendMode>(() => loadQueueMode());
   // Subscribe to persona registry — re-renders this tree (and the picker /
   // chip / icon descendants that read `agentIconComponent` / `resolveAgentIcon`)
   // whenever a persona is created / edited / deleted from any page.
@@ -1875,7 +2330,16 @@ export function TaskChat({
   }> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const messagesViewportRef = useRef<HTMLDivElement>(null);
+  const messagePaneRef = useRef<HTMLDivElement>(null);
+  const directListContentRef = useRef<HTMLDivElement>(null);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const [measuredRowHeights] = useState<Map<string, number>>(
+    () => new Map(),
+  );
+  // Row heights depend on the available message width because Markdown and
+  // code blocks reflow. A settled width change starts a fresh measurement
+  // generation instead of reusing sizes captured for another pane width.
+  const [measurementWidth, setMeasurementWidth] = useState(0);
   // Bumped whenever Virtuoso renders a different range of items. Drives
   // useChatSearch's "re-apply highlights to freshly mounted DOM" effect.
   const [renderToken, setRenderToken] = useState(0);
@@ -1899,7 +2363,13 @@ export function TaskChat({
   const taskFilesLoadingRef = useRef(false);
   const { selectedProject, projects } = useProject();
   const { config: appConfig } = useConfig();
-  const { drafts: previewCommentDrafts, removeDraft: removePreviewCommentDraft, clearDrafts: clearPreviewCommentDrafts } = usePreviewComments();
+  const {
+    drafts: previewCommentDrafts,
+    addDraft: addPreviewCommentDraft,
+    updateDraft: updatePreviewCommentDraft,
+    removeDraft: removePreviewCommentDraft,
+    clearDrafts: clearPreviewCommentDrafts,
+  } = usePreviewComments();
   // Resolve project from the task's own projectId, not the globally-selected
   // one — Blitz can open a task from a different project than the sidebar
   // selection (same pattern as TaskInfoPanel / FlexLayoutContainer).
@@ -2024,6 +2494,8 @@ export function TaskChat({
   const [isInputFocused, setIsInputFocused] = useState(false);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [showPreviewComments, setShowPreviewComments] = useState(false);
+  const [editingPreviewCommentId, setEditingPreviewCommentId] = useState<string | null>(null);
+  const [editingPreviewCommentText, setEditingPreviewCommentText] = useState("");
   const [chatSearchOpen, setChatSearchOpen] = useState(false);
   const [chatSearchQuery, setChatSearchQuery] = useState("");
   const planFilePathRef = useRef("");
@@ -2414,7 +2886,7 @@ export function TaskChat({
         sessionId: p.id,
       }));
       
-      return filterMentionItems(projectItems, deferredFileFilter, 15);
+      return filterMentionItems(projectItems, deferredFileFilter, 20);
     }
 
     // 3. Aggregated Search (activeCategory is null)
@@ -2435,9 +2907,9 @@ export function TaskChat({
 
     // Non-empty query: search across all categories (with limited files to avoid noise)
     const matchedSelectors = filterMentionItems(CATEGORY_SELECTORS, deferredFileFilter, 4);
-    const matchedConvs = filterMentionItems(conversationItems, deferredFileFilter, 10);
-    const matchedAgents = filterMentionItems(agentItems, deferredFileFilter, 10);
-    const matchedFiles = filterMentionItems(fileItems, deferredFileFilter, 5); // Limit files to 5 in aggregated search to avoid clutter!
+    const matchedConvs = filterMentionItems(conversationItems, deferredFileFilter, 20);
+    const matchedAgents = filterMentionItems(agentItems, deferredFileFilter, 20);
+    const matchedFiles = filterMentionItems(fileItems, deferredFileFilter, 20); // Limit files to 20 in aggregated search!
 
     // Combine them, sort by score descending
     const combined = [...matchedConvs, ...matchedAgents, ...matchedFiles];
@@ -2461,7 +2933,7 @@ export function TaskChat({
   // the chat-create flow isn't blank during the first fetch.
   const acpAgentOptions = useMemo(() => {
     if (!acpAvailabilityLoaded) {
-      return agentOptions.filter((opt) => opt.acpCheck);
+      return agentOptions;
     }
     return baseAgents
       .filter((base) => base.available)
@@ -2475,12 +2947,11 @@ export function TaskChat({
   // Agents that can launch as a raw tmux-backed terminal (the agent CLI under
   // a PTY, surviving disconnects) in addition to ACP. Drives the "Terminal"
   // section of the new-chat picker. Today only Claude qualifies; the backend
-  // gates this via each agent's supported_launch_modes.
+  // gates this on the registry entry declaring a `terminal_launch` contract,
+  // which the marketplace surfaces as `supports_terminal_launch`.
   const terminalAgentOptions = useMemo(() => {
     const terminalIds = new Set(
-      baseAgents
-        .filter((b) => b.supported_launch_modes?.includes("terminal"))
-        .map((b) => b.id),
+      baseAgents.filter((b) => b.supports_terminal_launch).map((b) => b.id),
     );
     return acpAgentOptions.filter(
       (opt) => !opt.disabled && terminalIds.has(opt.value),
@@ -2522,28 +2993,29 @@ export function TaskChat({
   // Resolve agent label and icon from active chat's agent
   useEffect(() => {
     const resolve = (cmd: string, customAgents?: CustomAgentServer[]) => {
-      const match = agentOptions.find((a) => a.value === cmd);
-      if (match) {
-        setAgentLabel(match.label);
-        if (match.icon) setAgentIcon(() => match.icon!);
-        return;
-      }
       // Check Custom Agents (personas) first — their id starts with "ca-"
+      // Persona has its own display name; icon falls through to the base.
       const persona = customAgentPersonas.find((p) => p.id === cmd);
       if (persona) {
         setAgentLabel(persona.name);
-        // Icon falls through to whatever the base agent's icon is. Look it up.
-        const base = agentOptions.find((a) => a.id === persona.base_agent);
-        if (base?.icon) setAgentIcon(() => base.icon!);
+        const baseInfo = resolveAgentIcon(persona.base_agent);
+        setAgentIcon(() => baseInfo.Component);
         return;
       }
       // Custom Agent Servers
       const custom = customAgents?.find((a) => a.id === cmd);
       if (custom) {
         setAgentLabel(custom.name);
-      } else {
-        setAgentLabel(cmd);
+        return;
       }
+      // Fall back to the unified icon util — handles every alias the
+      // bundled brand catalog knows (traex → Trae label/icon,
+      // claude-acp → Claude Code, etc.) AND the marketplace CDN map.
+      // resolveAgentIcon returns `cmd` itself as label only when truly
+      // unknown, matching the old "show raw id as fallback" behaviour.
+      const info = resolveAgentIcon(cmd);
+      setAgentLabel(info.label || cmd);
+      setAgentIcon(() => info.Component);
     };
 
     if (activeChat) {
@@ -2554,9 +3026,9 @@ export function TaskChat({
     } else {
       getConfig()
         .then((cfg) =>
-          resolve(cfg.layout.agent_command || "claude", cfg.acp?.custom_agents),
+          resolve(cfg.layout.agent_command || "", cfg.acp?.custom_agents),
         )
-        .catch(() => resolve("claude"));
+        .catch(() => resolve(""));
     }
   }, [activeChat, customAgentPersonas]);
 
@@ -2774,16 +3246,25 @@ export function TaskChat({
   const scrollMessagesToBottom = useCallback(
     (behavior: ScrollBehavior = "smooth") => {
       const handle = virtuosoRef.current;
-      if (!handle) return; // Virtuoso not mounted yet — no useful fallback.
       // Virtuoso accepts only "auto" | "smooth"; coerce "instant" → "auto".
       const vBehavior: "auto" | "smooth" =
         behavior === "smooth" ? "smooth" : "auto";
       markProgrammaticScroll();
-      handle.scrollToIndex({
-        index: "LAST",
-        align: "end",
-        behavior: vBehavior,
-      });
+      if (!handle) {
+        const viewport = messagesViewportRef.current;
+        if (!viewport) return;
+        viewport.scrollTo({
+          top: viewport.scrollHeight,
+          behavior: vBehavior,
+        });
+        return;
+      }
+      // Scroll the scroller itself, rather than aligning the last data item.
+      // The latter stops *before* Virtuoso's Footer, which contains both the
+      // live Thinking indicator and the spacer that keeps content above the
+      // floating composer. Browsers clamp this deliberately oversized offset
+      // to the real scroll extent, including that Footer.
+      scrollVirtuosoToBottom(handle, vBehavior);
     },
     [markProgrammaticScroll],
   );
@@ -2804,9 +3285,39 @@ export function TaskChat({
   // i.e. there's a live user-driven scroll in progress. Re-enabling
   // happens unconditionally when atBottom becomes true.
   const isUserScrollingRef = useRef(false);
+  // `isScrolling` alone cannot identify the source: Virtuoso sets it for
+  // both a wheel/drag from the user and our own scrollToIndex calls. Record
+  // a short-lived user gesture before the scroll begins so an upward scroll
+  // reliably opts out of follow-output before any height re-measure arrives.
+  const userScrollGestureUntilRef = useRef(0);
+  const disengageAutoStick = useCallback(() => {
+    autoStickToBottomRef.current = false;
+  }, []);
+  const handleChatWheelCapture = useCallback((event: React.WheelEvent) => {
+    // Negative delta means the user is heading into history. Detach
+    // immediately instead of waiting for Virtuoso's atBottom callback,
+    // whose ordering can be behind a height-change notification.
+    if (event.deltaY < 0) disengageAutoStick();
+  }, [disengageAutoStick]);
+  const handleChatPointerDownCapture = useCallback((event: React.PointerEvent) => {
+    if (event.button !== 0) return;
+    const viewport = messagesViewportRef.current;
+    if (!viewport) return;
+    const rect = viewport.getBoundingClientRect();
+    const isTouchGesture = event.pointerType === "touch";
+    const isScrollbarGesture =
+      event.target === viewport && event.clientX >= rect.right - 16;
+    if (!isTouchGesture && !isScrollbarGesture) return;
+    // Covers touch scrolling and scrollbar-thumb drags, neither of which is
+    // represented by a negative wheel delta.
+    userScrollGestureUntilRef.current = Date.now() + 1_000;
+  }, []);
   const handleIsScrolling = useCallback((scrolling: boolean) => {
     isUserScrollingRef.current = scrolling;
-  }, []);
+    if (scrolling && Date.now() < userScrollGestureUntilRef.current) {
+      disengageAutoStick();
+    }
+  }, [disengageAutoStick]);
 
   // The tail-signature autoscroll path used to fire scrollMessagesToBottom
   // on every streaming token. With Virtuoso, `followOutput` already
@@ -3150,6 +3661,37 @@ export function TaskChat({
     setChats,
     setActiveChatId,
   });
+
+  // Restore the composer draft on initial mount.
+  //
+  // `useInitialChatLoad` sets `activeChatId` directly, NOT through
+  // `switchChat`/`restoreChatState` — and `restoreChatState` is the only path
+  // that reads `loadChatDraft` back into the editor. So a freshly mounted
+  // TaskChat never restored its draft: it survived chat switches *within* a
+  // task (in-memory `perChatStateRef`) but vanished whenever the component
+  // remounted — switching task, or a page reload — where only localStorage is
+  // left. This one-shot effect closes that gap.
+  //
+  // Strictly one-shot: every later `activeChatId` change goes through
+  // `switchChat → restoreChatState`, which owns draft restoration and may
+  // intentionally restore an *empty* draft (user cleared it on a tab switch).
+  // Re-running here would resurrect a cleared draft — exactly what the
+  // restoreChatState comment warns against.
+  const didInitialDraftRestoreRef = useRef(false);
+  useEffect(() => {
+    if (didInitialDraftRestoreRef.current || !activeChatId) return;
+    didInitialDraftRestoreRef.current = true;
+    const el = editableRef.current;
+    if (!el) return;
+    // Never clobber content the user already typed while the chat connected.
+    const hasChips = el.querySelector("[data-command],[data-file]") !== null;
+    if ((el.textContent?.trim().length ?? 0) > 0 || hasChips) return;
+    const draftHtml = loadChatDraft(activeChatId);
+    if (!draftHtml) return;
+    el.innerHTML = draftHtml;
+    const text = el.textContent?.trim() || "";
+    setHasContent(text.length > 0 || el.querySelector("[data-command],[data-file]") !== null);
+  }, [activeChatId]);
 
   // Forward-declared ref for connectChatWs so handlers defined before its
   // useCallback (e.g. the ChatListChanged refetch handler) can call it
@@ -3513,6 +4055,11 @@ export function TaskChat({
                 });
               }
               setForkCapable(!!evt.fork_capable);
+              if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                wsRef.current.send(
+                  JSON.stringify({ type: "set_queue_mode", mode: loadQueueMode() }),
+                );
+              }
               break;
             case "thought_levels_update":
               setThoughtLevelOptions(
@@ -3790,6 +4337,11 @@ export function TaskChat({
             });
           }
           setForkCapable(!!msg.fork_capable);
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            wsRef.current.send(
+              JSON.stringify({ type: "set_queue_mode", mode: loadQueueMode() }),
+            );
+          }
           break;
         case "message_chunk":
           // Auto-close the current tool section (one-time)
@@ -3904,7 +4456,15 @@ export function TaskChat({
           }
           break;
         case "error": {
-          const isStalePermission = msg.message?.includes("No pending permission");
+          const msgText = msg.message ?? "";
+          // The backend surfaces a stale permission click in two flavors —
+          // `respond_permission` returning false ("No pending permission
+          // request") and the live-id mismatch ("Permission request X is no
+          // longer pending"). Both mean the panel we're rendering is gone
+          // server-side; collapse it locally so the user isn't stuck.
+          const isStalePermission =
+            msgText.includes("No pending permission") ||
+            msgText.includes("is no longer pending");
           if (isStalePermission) {
             // The permission we tried to respond to no longer exists on the backend.
             // Resolve all unresolved permissions as cancelled so the UI unblocks.
@@ -4135,6 +4695,14 @@ export function TaskChat({
             };
           }
           state.forkCapable = !!msg.fork_capable;
+          {
+            const bgWs = wsMapRef.current.get(chatId);
+            if (bgWs && bgWs.readyState === WebSocket.OPEN) {
+              bgWs.send(
+                JSON.stringify({ type: "set_queue_mode", mode: loadQueueMode() }),
+              );
+            }
+          }
           break;
         case "thought_levels_update":
           state.thoughtLevelOptions = (msg.available ?? []).map(
@@ -4347,17 +4915,25 @@ export function TaskChat({
   );
 
   // Listen for the two agent-related catalog dispatches:
-  //   agent.new.default    → spawn a session with whatever agent the
-  //                          user has flagged as default. TODO: read
-  //                          from a user-preference store; for now we
-  //                          fall back to the last session's agent and
-  //                          ultimately "claude".
+  //   agent.new.default    → spawn a session with the agent used by the
+  //                          most recent chat. No prior chat → open the
+  //                          picker so the user chooses, rather than
+  //                          guessing a hardcoded fallback.
   //   agent.picker.show    → just open the picker, user chooses.
   useEffect(() => {
     const onDefault = () => {
-      const fallback =
-        chats[chats.length - 1]?.agent || "claude";
-      void handleNewChatWithAgent(fallback);
+      // Prefer the agent used by the most recent chat. If no chats exist,
+      // open the picker rather than guessing — agent identity is the
+      // user's choice, not a hardcoded fallback.
+      const fallback = chats[chats.length - 1]?.agent;
+      if (fallback) {
+        void handleNewChatWithAgent(fallback);
+      } else {
+        const anchor =
+          headerAgentPickerRef.current ?? sidebarAgentPickerRef.current;
+        if (anchor) toggleAgentPicker(anchor);
+        else setShowAgentPicker(true);
+      }
     };
     const onPicker = () => {
       // Prefer the header button as anchor; fall back to the sidebar
@@ -4851,6 +5427,9 @@ export function TaskChat({
     // Guard activeChatId before consuming any UI state — if we return after
     // clearing the editable, the user's typed message is silently lost.
     if (!activeChatId) return;
+    // Same reason for the connecting phase: input is editable so users can
+    // pre-compose, but the session has nowhere to receive the prompt yet.
+    if (!isConnected) return;
     const prompt = getPromptFromEditable(el);
 
     // Terminal launch mode: chatbox forwards the typed text + any attachment
@@ -4939,12 +5518,19 @@ export function TaskChat({
       return;
     }
 
-    if (
-      (!prompt && attachments.length === 0) ||
-      !wsRef.current ||
-      wsRef.current.readyState !== WebSocket.OPEN
-    )
+    if (!prompt && attachments.length === 0) return;
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      // Not connected yet — keep the draft, surface a hint so the user
+      // doesn't think their Enter was eaten. appendSystemMessage dedupes
+      // repeated presses of the same message.
+      setMessages((prev) =>
+        appendSystemMessage(
+          prev,
+          "Waiting for the agent to connect. Your message will be sent once the session is ready — try again in a moment.",
+        ),
+      );
       return;
+    }
 
     // Shell mode → send terminal_execute directly (bypasses AI)
     if (isTerminalMode) {
@@ -5085,7 +5671,7 @@ export function TaskChat({
       onUserMessageSent?.();
       el.focus();
     }
-  }, [isTerminalMode, isBusy, attachments, activeChatId, projectId, task.id, enableAutoStickToBottom, onUserMessageSent, buildPromptConfig, isTerminalLaunchMode, agentPtyWsUrl]);
+  }, [isTerminalMode, isBusy, attachments, activeChatId, isConnected, projectId, task.id, enableAutoStickToBottom, onUserMessageSent, buildPromptConfig, isTerminalLaunchMode, agentPtyWsUrl]);
 
   const sendPreviewComments = useCallback((comments: PreviewCommentDraft[]) => {
     if (
@@ -5112,6 +5698,8 @@ export function TaskChat({
       }),
     );
     clearPreviewCommentDrafts(comments.map((comment) => comment.id));
+    setEditingPreviewCommentId(null);
+    setEditingPreviewCommentText("");
     setShowPreviewComments(false);
     setShowSlashMenu(false);
     setShowFileMenu(false);
@@ -5188,12 +5776,15 @@ export function TaskChat({
     wsRef.current.send(JSON.stringify({ type: "cancel" }));
   }, [isCancelling]);
 
-  // 不再发 pause_queue:后端不暂停队列,而是在 save/delete 时按 id 定位 —
-  // 找不到(已被 drain 走)就回一个 queue_message_gone 让前端关编辑态。
+  // 编辑排队消息期间暂停队列 auto-send,避免 agent 变 idle 时把队列里的旧文本
+  // 弹出发送,覆盖用户正在进行的编辑。save/cancel 都要 resume。
   const handleEditPending = useCallback(
     (msg: { id: string; text: string }) => {
       setEditingPendingId(msg.id);
       setEditingPendingValue(msg.text);
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "pause_queue" }));
+      }
     },
     [],
   );
@@ -5219,11 +5810,15 @@ export function TaskChat({
         }),
       );
     }
+    wsRef.current.send(JSON.stringify({ type: "resume_queue" }));
     setEditingPendingId(null);
     setEditingPendingValue("");
   }, [editingPendingId, editingPendingValue]);
 
   const handleCancelPendingEdit = useCallback(() => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "resume_queue" }));
+    }
     setEditingPendingId(null);
     setEditingPendingValue("");
   }, []);
@@ -5245,6 +5840,14 @@ export function TaskChat({
     wsRef.current.send(JSON.stringify({ type: "clear_queue" }));
     setEditingPendingId(null);
     setEditingPendingValue("");
+  }, []);
+
+  const handleSetQueueMode = useCallback((mode: QueueSendMode) => {
+    setQueueMode(mode);
+    saveQueueMode(mode);
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "set_queue_mode", mode }));
+    }
   }, []);
 
   // ── Chat command registrations (catalog: workspace scope) ─────────────
@@ -5342,6 +5945,30 @@ export function TaskChat({
   }, [activeChatId, switchChat]);
   useCommand("agent.switch.next", () => cycleChat(1), [cycleChat]);
   useCommand("agent.switch.previous", () => cycleChat(-1), [cycleChat]);
+  useCommand(
+    "chat.switchSession",
+    (args?: unknown) => {
+      const typedArgs = args as { sessionId?: string; sessionTitle?: string; sessionIndex?: number } | undefined;
+      if (typedArgs?.sessionId) {
+        void switchChat(typedArgs.sessionId);
+      } else if (typedArgs?.sessionIndex !== undefined) {
+        const idx = typedArgs.sessionIndex - 1;
+        if (idx >= 0 && idx < chatsRef.current.length) {
+          void switchChat(chatsRef.current[idx].id);
+        }
+      } else if (typedArgs?.sessionTitle) {
+        const found = fuzzyFindByName(
+          chatsRef.current.filter((c) => !!c.title),
+          (c) => c.title!,
+          typedArgs.sessionTitle
+        );
+        if (found) {
+          void switchChat(found.id);
+        }
+      }
+    },
+    [switchChat],
+  );
 
   /** Submit an ask_form response as a regular user prompt. Mirrors the queue /
    *  prompt branch in onSendPrompt — busy session gets queued, idle session
@@ -6004,11 +6631,29 @@ export function TaskChat({
     [checkContent],
   );
 
-  /** Strip HTML on paste — insert plain text or handle image paste */
+  /** Strip HTML on paste — upload copied files/images or insert plain text. */
   const handlePaste = useCallback(
     (e: React.ClipboardEvent) => {
-      // Check for image paste
       const items = Array.from(e.clipboardData.items);
+      // Finder/Explorer file copy commonly includes both a real File and a
+      // text/plain filename. Handle the file payload first so the browser's
+      // default paste does not leave only that filename in the composer.
+      const clipboardFiles = Array.from(e.clipboardData.files);
+      if (clipboardFiles.length === 0) {
+        for (const item of items) {
+          if (item.kind !== "file") continue;
+          const file = item.getAsFile();
+          if (file) clipboardFiles.push(file);
+        }
+      }
+      if (clipboardFiles.length > 0) {
+        e.preventDefault();
+        clipboardFiles.forEach((file) => void addFileAsAttachment(file));
+        return;
+      }
+
+      // Some screenshot clipboard payloads expose only a DataTransferItem,
+      // not clipboardData.files.
       const imageItem = items.find((i) => i.type.startsWith("image/"));
       if (imageItem && promptCaps.image) {
         e.preventDefault();
@@ -6022,7 +6667,7 @@ export function TaskChat({
       // Large text: convert to .txt attachment to avoid freezing contentEditable
       if (text.length > 10 * 1024) {
         const blob = new Blob([text], { type: "text/plain" });
-        const file = new File([blob], "pasted-text.txt", { type: "text/plain" });
+        const file = new File([blob], `pasted-text-${Date.now()}.txt`, { type: "text/plain" });
         void addFileAsAttachment(file);
         return;
       }
@@ -6422,17 +7067,257 @@ export function TaskChat({
     ],
   );
 
-  const toggleThinkingCollapse = useCallback((index: number) => {
-    setMessages((prev) =>
-      prev.map((m, i) =>
-        i === index && m.type === "thinking"
-          ? { ...m, collapsed: !m.collapsed }
-          : m,
-      ),
+  const renderItems = useMemo(
+    () => buildRenderItems(messages, isBusy),
+    [messages, isBusy],
+  );
+  // The minimap is deliberately derived from the same `messages` state that
+  // renders the chat. It is therefore immediately available for loaded
+  // history and updates as an assistant streams, with no second history API.
+  const conversationTurns = useMemo(
+    () => buildConversationTurns(messages, renderItems),
+    [messages, renderItems],
+  );
+  const shouldVirtualizeChat = shouldVirtualizeTaskChat(
+    conversationTurns.length,
+    TASK_CHAT_RECENT_TURN_HOT_ZONE,
+  );
+  const recentTurnStartRenderIndex =
+    conversationTurns[
+      Math.max(0, conversationTurns.length - TASK_CHAT_RECENT_TURN_HOT_ZONE)
+    ]?.renderIndex ?? 0;
+  const virtualizedRenderItems = shouldVirtualizeChat
+    ? renderItems.slice(0, recentTurnStartRenderIndex)
+    : renderItems;
+  const rowHeightCachePrefix = `${activeChatId ?? "none"}:${hiddenMessageCount}`;
+  const rowHeightCacheScope = `${rowHeightCachePrefix}:${measurementWidth}`;
+  const measuredHeightKey = useCallback(
+    (item: RenderItem) => `${rowHeightCacheScope}:${renderItemKey(item)}`,
+    [rowHeightCacheScope],
+  );
+  const recordMeasuredRowHeight = useCallback(
+    (key: string, height: number, width: number) => {
+      const scopedKey = `${rowHeightCachePrefix}:${width}:${key}`;
+      if (measuredRowHeights.get(scopedKey) === height) return;
+      measuredRowHeights.set(scopedKey, height);
+      // Keep the cache bounded across chat switches and width generations.
+      // Map iteration is insertion ordered, so discard the oldest samples.
+      while (measuredRowHeights.size > 5_000) {
+        const oldestKey = measuredRowHeights.keys().next().value;
+        if (oldestKey === undefined) break;
+        measuredRowHeights.delete(oldestKey);
+      }
+    },
+    [measuredRowHeights, rowHeightCachePrefix],
+  );
+  const recordMeasuredRowHeightRef = useRef(recordMeasuredRowHeight);
+  useEffect(() => {
+    recordMeasuredRowHeightRef.current = recordMeasuredRowHeight;
+  }, [recordMeasuredRowHeight]);
+  const measuredElementKeysRef = useRef(new WeakMap<Element, string>());
+  const rowResizeObserverRef = useRef<ResizeObserver | null>(null);
+  const observeMeasuredRow = useCallback(
+    (element: HTMLDivElement, key: string, observing: boolean) => {
+      if (!observing) {
+        rowResizeObserverRef.current?.unobserve(element);
+        measuredElementKeysRef.current.delete(element);
+        return;
+      }
+      measuredElementKeysRef.current.set(element, key);
+      const measure = (target: Element) => {
+        const measuredKey = measuredElementKeysRef.current.get(target);
+        if (!measuredKey) return;
+        const rect = target.getBoundingClientRect();
+        const height = Math.ceil(rect.height);
+        const width = Math.round(rect.width);
+        if (height > 0 && width > 0) {
+          recordMeasuredRowHeightRef.current(measuredKey, height, width);
+        }
+      };
+      measure(element);
+      if (typeof ResizeObserver === "undefined") return;
+      if (!rowResizeObserverRef.current) {
+        rowResizeObserverRef.current = new ResizeObserver((entries) => {
+          for (const entry of entries) measure(entry.target);
+        });
+      }
+      rowResizeObserverRef.current.observe(element);
+    },
+    [],
+  );
+  useEffect(
+    () => () => {
+      rowResizeObserverRef.current?.disconnect();
+      rowResizeObserverRef.current = null;
+    },
+    [],
+  );
+  const virtualizedHeightEstimates = taskChatHeightEstimates(
+    virtualizedRenderItems,
+    measuredHeightKey,
+    measuredRowHeights,
+    TASK_CHAT_DEFAULT_ITEM_HEIGHT,
+  );
+  // Virtuoso only consumes heightEstimates while constructing an empty size
+  // tree. Remount whenever the cold/hot boundary advances, or after the pane
+  // settles at a new width, so a turn leaving the hot zone enters the cold
+  // zone with the real height already measured for this generation.
+  const virtualizationLayoutKey = taskChatVirtualizationLayoutKey({
+    chatId: activeChatId ?? "none",
+    hiddenMessageCount,
+    measurementWidth,
+    virtualized: shouldVirtualizeChat,
+    coldBoundaryIndex: recentTurnStartRenderIndex,
+  });
+  const resolveActiveConversationTurnMessageIndex = useCallback((range: { startIndex: number }) => {
+    let active = conversationTurns[0];
+    for (const turn of conversationTurns) {
+      if (turn.renderIndex > range.startIndex) break;
+      active = turn;
+    }
+    return active?.messageIndex ?? null;
+  }, [conversationTurns]);
+  // Virtuoso can synchronously replay range events while measuring streaming
+  // rows. Defer those notifications and only re-render when the active turn
+  // actually changes; row-level range jitter within one turn is UI noise.
+  const [activeConversationTurnMessageIndex, handleConversationRangeChanged] =
+    useDeferredVirtuosoRangeValue(
+      resolveActiveConversationTurnMessageIndex,
+      conversationTurns[0]?.messageIndex ?? null,
     );
+  const viewportAnchorRef = useRef<TaskChatScrollAnchor | null>(null);
+  const navigateToConversationTurn = useCallback((turn: ConversationTurn) => {
+    // User navigation should detach follow-output, otherwise a running agent
+    // would immediately pull the viewport back to the newest response.
+    autoStickToBottomRef.current = false;
+    const mountedRow = messagesViewportRef.current?.querySelector<HTMLElement>(
+      `[data-item-index="${turn.renderIndex}"]`,
+    );
+    if (mountedRow) {
+      mountedRow.scrollIntoView({ block: "start", behavior: "smooth" });
+      return;
+    }
+    const handle = virtuosoRef.current;
+    if (handle) {
+      handle.scrollToIndex({
+        index: turn.renderIndex,
+        align: "start",
+        behavior: "smooth",
+      });
+      return;
+    }
+    messagesViewportRef.current
+      ?.querySelector<HTMLElement>(`[data-item-index="${turn.renderIndex}"]`)
+      ?.scrollIntoView({ block: "start", behavior: "smooth" });
+  }, []);
+  const visibleConversationRangeRafRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (visibleConversationRangeRafRef.current !== null) {
+        cancelAnimationFrame(visibleConversationRangeRafRef.current);
+        visibleConversationRangeRafRef.current = null;
+      }
+    };
+  }, [activeChatId]);
+  const captureViewportAnchor = useCallback(() => {
+    const viewport = messagesViewportRef.current;
+    if (!viewport) return null;
+    const viewportTop = viewport.getBoundingClientRect().top;
+    const elements = viewport.querySelectorAll<HTMLElement>(
+      "[data-item-index][data-render-key]",
+    );
+    // Rows are in document order, so binary-search their bounds. The previous
+    // implementation measured every mounted row on every animation frame.
+    const visibleRow = firstVisibleTaskChatRow(
+      elements.length,
+      (index) => {
+        const row = elements[index];
+        const rect = row.getBoundingClientRect();
+        return {
+          key: row.dataset.renderKey ?? "",
+          index: Number(row.dataset.itemIndex ?? 0),
+          top: rect.top,
+          bottom: rect.bottom,
+        };
+      },
+      viewportTop,
+    );
+    if (!visibleRow || !visibleRow.key) return null;
+    const anchor = {
+      key: visibleRow.key,
+      index: visibleRow.index,
+      offset: visibleRow.top - viewportTop,
+    };
+    viewportAnchorRef.current = anchor;
+    handleConversationRangeChanged({ startIndex: visibleRow.index });
+    return anchor;
+  }, [handleConversationRangeChanged]);
+  const captureViewportAnchorRef = useRef(captureViewportAnchor);
+  useEffect(() => {
+    captureViewportAnchorRef.current = captureViewportAnchor;
+  }, [captureViewportAnchor]);
+  const scheduleVisibleConversationRangeUpdate = useCallback(() => {
+    if (visibleConversationRangeRafRef.current !== null) return;
+    visibleConversationRangeRafRef.current = requestAnimationFrame(() => {
+      visibleConversationRangeRafRef.current = null;
+      captureViewportAnchorRef.current();
+    });
   }, []);
 
-  const renderItems = useMemo(() => buildRenderItems(messages), [messages]);
+  useEffect(() => {
+    const pane = messagePaneRef.current;
+    if (!pane || typeof ResizeObserver === "undefined") return;
+    let initialized = false;
+    let timer: number | null = null;
+    const commitWidth = () => {
+      captureViewportAnchorRef.current();
+      const width = Math.round(pane.getBoundingClientRect().width);
+      if (width > 0) {
+        setMeasurementWidth((current) =>
+          current === width ? current : width,
+        );
+      }
+    };
+    const observer = new ResizeObserver(() => {
+      if (!initialized) {
+        initialized = true;
+        commitWidth();
+        return;
+      }
+      if (timer !== null) window.clearTimeout(timer);
+      // Panel resizing can emit dozens of widths. Let the mounted rows reflow
+      // during the gesture, then rebuild the size tree once at the settled
+      // width instead of remounting Virtuoso on every pixel.
+      timer = window.setTimeout(commitWidth, 120);
+    });
+    observer.observe(pane);
+    return () => {
+      observer.disconnect();
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [activeChatId]);
+  const handleDirectListScroll = useCallback(() => {
+    const viewport = messagesViewportRef.current;
+    if (!viewport) return;
+    if (
+      !programmaticScrollRef.current &&
+      Date.now() < userScrollGestureUntilRef.current
+    ) {
+      disengageAutoStick();
+    }
+    const distanceFromBottom =
+      viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+    handleAtBottomStateChange(distanceFromBottom <= 48);
+
+    scheduleVisibleConversationRangeUpdate();
+  }, [
+    disengageAutoStick,
+    handleAtBottomStateChange,
+    scheduleVisibleConversationRangeUpdate,
+  ]);
+  const handleVirtualizedListScroll = useCallback(() => {
+    scheduleVisibleConversationRangeUpdate();
+  }, [scheduleVisibleConversationRangeUpdate]);
   const lastMessageType = messages[messages.length - 1]?.type;
 
   // Data-layer chat search — works across the full conversation, not just
@@ -6448,55 +7333,6 @@ export function TaskChat({
     scrollerRef: messagesViewportRef,
     renderToken,
   });
-
-  // ─── Memoized Virtuoso plumbing ──────────────────────────────────────
-  // Virtuoso treats the `components` prop as render config — when its
-  // identity changes, Header/Footer subtrees are unmounted and remounted.
-  // During streaming the parent re-renders many times per second, so we
-  // memoize Header/Footer/components on the only inputs that actually
-  // affect their rendered output.
-
-  const VirtuosoHeader = useMemo(() => {
-    const Header = () =>
-      hiddenMessageCount > 0 ? (
-        <div className="px-4 pt-4">
-          <div className="mx-auto max-w-[720px] rounded-md border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-3 py-2 text-center text-xs text-[var(--color-text-muted)]">
-            {hiddenMessageCount.toLocaleString()} earlier messages are hidden
-            from this view. Full history is still saved.
-          </div>
-        </div>
-      ) : (
-        <div className="h-4" />
-      );
-    return Header;
-  }, [hiddenMessageCount]);
-
-  const VirtuosoFooter = useMemo(() => {
-    const showThinking =
-      isBusy &&
-      lastMessageType !== "assistant" &&
-      lastMessageType !== "terminal_output";
-    const spacerHeight = inputAreaHeight + 16;
-    const Footer = () => (
-      <div>
-        {showThinking && (
-          <div className="flex items-center gap-2 px-4 py-2 text-sm text-[var(--color-text-muted)]">
-            <Loader2 className="w-4 h-4 animate-spin" />
-            <span>Thinking...</span>
-          </div>
-        )}
-        {/* Spacer: keeps the last row above the floating composer. Sized
-            from the live ResizeObserver on inputAreaRef. */}
-        <div style={{ height: spacerHeight }} />
-      </div>
-    );
-    return Footer;
-  }, [isBusy, lastMessageType, inputAreaHeight]);
-
-  const virtuosoComponents = useMemo(
-    () => ({ Header: VirtuosoHeader, Footer: VirtuosoFooter }),
-    [VirtuosoHeader, VirtuosoFooter],
-  );
 
   // Only bump renderToken (which forces useChatSearch to re-apply
   // highlights to freshly mounted DOM) when search is open. Otherwise
@@ -6537,31 +7373,165 @@ export function TaskChat({
     return isAtBottom ? ("auto" as const) : (false as const);
   }, []);
 
-  // Typewriter reveals text via setState INSIDE MessageItem — the
-  // `messages` array reference doesn't change, so Virtuoso's
-  // followOutput never fires. We watch totalListHeightChanged
-  // (which DOES fire when the streaming row grows) and re-anchor to
-  // bottom while auto-stick is on. Use behavior: "auto" to prevent
-  // blank viewport rendering glitches during rapid streaming.
-  const handleTotalListHeightChanged = useCallback(() => {
-    if (!autoStickToBottomRef.current) return;
-    if (isUserScrollingRef.current) return;
-    virtuosoRef.current?.scrollToIndex({
-      index: "LAST",
-      align: "end",
-      behavior: "auto",
-    });
-  }, []);
+  // Typewriter reveals text inside MessageItem, so the data array does not
+  // change and followOutput alone cannot observe the growth. Re-anchor the
+  // scroller's real end (including the Footer), rather than the last data row.
+  const heightChangeReanchorRafRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (heightChangeReanchorRafRef.current !== null) {
+        cancelAnimationFrame(heightChangeReanchorRafRef.current);
+        heightChangeReanchorRafRef.current = null;
+      }
+    };
+  }, [activeChatId]);
 
-  // Track the message index where the current busy turn started
-  const turnStartIndexRef = useRef(0);
+  const handleTotalListHeightChanged = useCallback(() => {
+    if (!isBusy || !autoStickToBottomRef.current) return;
+    if (heightChangeReanchorRafRef.current !== null) return;
+
+    heightChangeReanchorRafRef.current = requestAnimationFrame(() => {
+      heightChangeReanchorRafRef.current = null;
+      if (!autoStickToBottomRef.current) return;
+      markProgrammaticScroll();
+      const handle = virtuosoRef.current;
+      if (handle) scrollVirtuosoToBottom(handle, "auto");
+    });
+  }, [isBusy, markProgrammaticScroll]);
+
+  // Up to 50 turns use a normal scroll container, so keep its tail anchored
+  // while the active turn is growing. Idle/manual layout changes are excluded;
+  // the busy -> idle compaction has its own intent-preserving effect below.
+  useEffect(() => {
+    if (shouldVirtualizeChat || typeof ResizeObserver === "undefined") return;
+    const content = directListContentRef.current;
+    if (!content) return;
+    let rafId: number | null = null;
+    const observer = new ResizeObserver(() => {
+      if (!isBusy) return;
+      if (!autoStickToBottomRef.current || rafId !== null) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        if (autoStickToBottomRef.current) scrollMessagesToBottom("auto");
+      });
+    });
+    observer.observe(content);
+    return () => {
+      observer.disconnect();
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
+  }, [activeChatId, isBusy, scrollMessagesToBottom, shouldVirtualizeChat]);
+
   const wasBusyRef = useRef(false);
   useEffect(() => {
-    if (isBusy && !wasBusyRef.current) {
-      turnStartIndexRef.current = messages.length;
-    }
+    let firstFrame: number | null = null;
+    let secondFrame: number | null = null;
+    const turnJustCompleted = !isBusy && wasBusyRef.current;
     wasBusyRef.current = isBusy;
-  }, [isBusy, messages.length]);
+    // Completing a turn automatically replaces its live sequential rows with
+    // a compact WorkSummary. That can remove a large amount of height in one
+    // commit. Preserve the tail only for readers who were already following
+    // it; someone who intentionally scrolled into history remains detached.
+    if (turnJustCompleted && autoStickToBottomRef.current) {
+      firstFrame = requestAnimationFrame(() => {
+        secondFrame = requestAnimationFrame(() => {
+          if (autoStickToBottomRef.current) {
+            scrollMessagesToBottom("auto");
+          }
+        });
+      });
+    }
+    return () => {
+      if (firstFrame !== null) cancelAnimationFrame(firstFrame);
+      if (secondFrame !== null) cancelAnimationFrame(secondFrame);
+    };
+  }, [isBusy, scrollMessagesToBottom]);
+
+  // A layout generation changes when the direct/virtual renderer swaps, when
+  // the 50-turn boundary advances, or when the pane settles at a new width.
+  // All three rebuild Virtuoso's size tree. Preserve either the complete tail
+  // or an exact row + pixel-offset anchor across that rebuild.
+  const previousVirtualizationLayoutRef = useRef({
+    chatId: activeChatId,
+    key: virtualizationLayoutKey,
+  });
+  useEffect(() => {
+    const previous = previousVirtualizationLayoutRef.current;
+    previousVirtualizationLayoutRef.current = {
+      chatId: activeChatId,
+      key: virtualizationLayoutKey,
+    };
+    // Chat switches have their own scroll-to-bottom orchestration in
+    // useChatPositioning. This effect only owns renderer changes within the
+    // same chat, notably the 50 -> 51 turn boundary.
+    if (previous.chatId !== activeChatId) {
+      viewportAnchorRef.current = null;
+      return;
+    }
+    const target = taskChatLayoutTransitionTarget(
+      previous.key,
+      virtualizationLayoutKey,
+      autoStickToBottomRef.current,
+      viewportAnchorRef.current,
+    );
+    if (target.kind === "none") return;
+
+    const frameIds: number[] = [];
+    const scheduleFrame = (callback: () => void) => {
+      frameIds.push(requestAnimationFrame(callback));
+    };
+    const findAnchorRow = (key: string) =>
+      Array.from(
+        messagesViewportRef.current?.querySelectorAll<HTMLElement>(
+          "[data-render-key]",
+        ) ?? [],
+      ).find((row) => row.dataset.renderKey === key) ?? null;
+    const restoreAnchorOffset = (attempt: number): void => {
+      if (target.kind !== "anchor" || autoStickToBottomRef.current) return;
+      const viewport = messagesViewportRef.current;
+      if (!viewport) return;
+      const row = findAnchorRow(target.anchor.key);
+      if (!row) {
+        if (attempt === 0) {
+          markProgrammaticScroll();
+          virtuosoRef.current?.scrollToIndex({
+            index: target.anchor.index,
+            align: "start",
+            behavior: "auto",
+          });
+        }
+        if (attempt < 4) {
+          scheduleFrame(() => restoreAnchorOffset(attempt + 1));
+        }
+        return;
+      }
+      const viewportTop = viewport.getBoundingClientRect().top;
+      const currentOffset = row.getBoundingClientRect().top - viewportTop;
+      const correction = currentOffset - target.anchor.offset;
+      if (Math.abs(correction) > 0.5) {
+        markProgrammaticScroll();
+        viewport.scrollTop += correction;
+      }
+      viewportAnchorRef.current = target.anchor;
+    };
+    scheduleFrame(() => {
+      scheduleFrame(() => {
+        if (target.kind === "bottom") {
+          if (autoStickToBottomRef.current) scrollMessagesToBottom("auto");
+          return;
+        }
+        restoreAnchorOffset(0);
+      });
+    });
+    return () => {
+      for (const frameId of frameIds) cancelAnimationFrame(frameId);
+    };
+  }, [
+    activeChatId,
+    markProgrammaticScroll,
+    scrollMessagesToBottom,
+    virtualizationLayoutKey,
+  ]);
 
   const toggleSection = useCallback((sectionId: string) => {
     setExpandedSections((prev) => {
@@ -6574,6 +7544,129 @@ export function TaskChat({
       return next;
     });
   }, []);
+
+  const renderChatItem = (idx: number, item: RenderItem) => {
+    const rowClassName = `mx-auto flow-root w-full max-w-[920px] px-4 pt-3 sm:px-6 ${
+      idx >= recentTurnStartRenderIndex ? "task-chat-hot-row" : ""
+    }`;
+    const dataItemIndex = idx;
+    const measureKey = renderItemKey(item);
+    if (item.kind === "single") {
+      return (
+        <MeasuredTaskChatRow
+          className={rowClassName}
+          dataItemIndex={dataItemIndex}
+          dataRenderKey={measureKey}
+          measureKey={measureKey}
+          onObserve={observeMeasuredRow}
+        >
+          <MessageItem
+            message={item.message}
+            index={item.index}
+            isBusy={isBusy}
+            agentLabel={agentLabel}
+            projectId={projectId}
+            taskId={task.id}
+            activeChatId={activeChatId ?? undefined}
+            previewCommentDrafts={taskPreviewCommentDrafts}
+            onAddPreviewComment={addPreviewCommentDraft}
+            onUpdatePreviewComment={updatePreviewCommentDraft}
+            onRemovePreviewComment={removePreviewCommentDraft}
+            isStudio={isStudioProject}
+            resolveSender={resolveSender}
+            onPermissionResponse={handlePermissionResponse}
+            onFileClick={onNavigateToFile}
+            onImageClick={setLightboxUrl}
+            onMermaidClick={setLightboxSvg}
+            onD2Click={setLightboxSvg}
+            onInsertReference={insertAttachmentReference}
+          />
+        </MeasuredTaskChatRow>
+      );
+    }
+    if (item.kind === "tool-section") {
+      return (
+        <MeasuredTaskChatRow
+          className={rowClassName}
+          dataItemIndex={dataItemIndex}
+          dataRenderKey={measureKey}
+          measureKey={measureKey}
+          onObserve={observeMeasuredRow}
+        >
+          <ToolSectionView
+            sectionId={item.sectionId}
+            tools={item.tools}
+            expanded={expandedSections.has(item.sectionId)}
+            forceExpanded={false}
+            sectionFinished={idx < renderItems.length - 1 || !isBusy}
+            onToggleSection={toggleSection}
+            onFileClick={onNavigateToFile}
+          />
+        </MeasuredTaskChatRow>
+      );
+    }
+    if (item.kind === "work-summary") {
+      return (
+        <MeasuredTaskChatRow
+          className={rowClassName}
+          dataItemIndex={dataItemIndex}
+          dataRenderKey={measureKey}
+          measureKey={measureKey}
+          onObserve={observeMeasuredRow}
+        >
+          <WorkSummaryView
+            sectionId={item.sectionId}
+            items={item.items}
+            durationSeconds={item.durationSeconds}
+            expanded={expandedSections.has(item.sectionId)}
+            onToggleSection={toggleSection}
+            onFileClick={onNavigateToFile}
+          />
+        </MeasuredTaskChatRow>
+      );
+    }
+    return (
+      <MeasuredTaskChatRow
+        className={rowClassName}
+        dataItemIndex={dataItemIndex}
+        dataRenderKey={measureKey}
+        measureKey={measureKey}
+        onObserve={observeMeasuredRow}
+      >
+        <FileChangeSummaryView
+          tools={item.tools}
+          onFileClick={onNavigateToFile}
+        />
+      </MeasuredTaskChatRow>
+    );
+  };
+
+  // In long chats, only turns older than the recent hot zone are Virtuoso
+  // data items. The latest 50 turns live in the stable Footer and therefore
+  // stay mounted with real browser-measured heights while old history remains
+  // windowed. In short chats the normal scroll container renders everything.
+  const hotRows = shouldVirtualizeChat
+    ? renderItems.slice(recentTurnStartRenderIndex).map((item, offset) => {
+        const idx = recentTurnStartRenderIndex + offset;
+        return (
+          <Fragment key={renderItemKey(item)}>
+            {renderChatItem(idx, item)}
+          </Fragment>
+        );
+      })
+    : null;
+  // Keep the Header/Footer component types stable. Updating context changes
+  // their content without unmounting Virtuoso's measured boundary elements.
+  const virtuosoContext: TaskChatVirtuosoContext = {
+    hiddenMessageCount,
+    hotRows,
+    inputAreaHeight,
+    showThinking:
+      isBusy &&
+      lastMessageType !== "assistant" &&
+      lastMessageType !== "thinking" &&
+      lastMessageType !== "terminal_output",
+  };
 
   // ─── Collapsed mode ──────────────────────────────────────────────────────
 
@@ -6838,7 +7931,8 @@ export function TaskChat({
 
       <div className="flex min-h-0 flex-1">
         <div
-          className={`shrink-0 border-r border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_20%,transparent)] transition-all duration-200 ${sessionRailCollapsed ? "w-0 overflow-hidden border-r-transparent" : "w-[228px] overflow-hidden"}`}
+          className={`taskchat-session-rail shrink-0 border-r border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_20%,transparent)] transition-all duration-200 ${sessionRailCollapsed ? "w-0 overflow-hidden border-r-transparent" : "overflow-hidden"}`}
+          style={{ width: sessionRailCollapsed ? 0 : sessionRailWidth }}
         >
           <div className="flex h-full flex-col">
             <div className="border-b border-[color-mix(in_srgb,var(--color-border)_68%,transparent)] p-2 space-y-1.5">
@@ -7015,7 +8109,29 @@ export function TaskChat({
           </div>
         </div>
 
-        <div className="relative min-h-0 min-w-0 flex-1">
+        {/* Drag handle */}
+        {!sessionRailCollapsed && (
+          <div
+            className="diff-resizer"
+            onPointerDown={startSessionRailResize}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize session sidebar"
+            title="Drag to resize"
+          />
+        )}
+
+        <div
+          ref={messagePaneRef}
+          className="task-chat-message-pane relative min-h-0 min-w-0 flex-1"
+          onWheelCapture={handleChatWheelCapture}
+          onPointerDownCapture={handleChatPointerDownCapture}
+        >
+          <ConversationMinimap
+            turns={conversationTurns}
+            activeMessageIndex={activeConversationTurnMessageIndex}
+            onNavigate={navigateToConversationTurn}
+          />
           {/* Terminal launch mode: agent CLI runs in xterm.js (PTY).
               Chatbox input still writes lines to PTY stdin via handleSend. */}
           {isTerminalLaunchMode && agentPtyWsUrl ? (
@@ -7042,6 +8158,12 @@ export function TaskChat({
               message conversations stay snappy. Virtuoso owns the scroll
               container; we hand it the renderItems array and let it
               mount/unmount rows as the viewport moves. */
+          <ChatListErrorBoundary
+            resetKey={activeChatId}
+            projectId={projectId}
+            taskId={task.id}
+          >
+          {shouldVirtualizeChat ? (
           <Virtuoso
             // Force-remount per chat so each chat starts with a clean
             // scroll position (no carry-over from the previous chat).
@@ -7049,9 +8171,11 @@ export function TaskChat({
             // the activeChatId/renderItems.length effect — Virtuoso's
             // initialTopMostItemIndex is unreliable when data loads
             // async after mount.
-            key={activeChatId}
+            key={virtualizationLayoutKey}
             ref={virtuosoRef}
-            data={renderItems}
+            data={virtualizedRenderItems}
+            heightEstimates={virtualizedHeightEstimates}
+            context={virtuosoContext}
             scrollerRef={(ref) => {
               messagesViewportRef.current = ref as HTMLDivElement | null;
             }}
@@ -7063,55 +8187,58 @@ export function TaskChat({
               opacity: chatPositioning ? 0 : 1,
               transition: chatPositioning ? "none" : "opacity 120ms ease-out",
             }}
-            increaseViewportBy={{ top: 600, bottom: 1200 }}
+            // Do not let an unusually tall first chat row (for example, a
+            // pasted source file) become the estimate for every unmeasured
+            // row. A stable baseline prevents multi-pass fill/jump cycles.
+            defaultItemHeight={TASK_CHAT_DEFAULT_ITEM_HEIGHT}
+            increaseViewportBy={TASK_CHAT_WINDOWED_VIEWPORT}
+            // The latest 50 turns are rendered directly in the Footer. This
+            // overscan applies only to the older, genuinely virtualized rows.
+            minOverscanItemCount={TASK_CHAT_MIN_OVERSCAN_ITEMS}
+            // Commit dynamic row measurements in the ResizeObserver callback
+            // instead of one frame later. A very tall row can otherwise leave
+            // the render window before its real height reaches the size tree,
+            // causing the same scroll correction to repeat on every visit.
+            skipAnimationFrameInResizeObserver
             followOutput={handleFollowOutput}
             atBottomStateChange={handleAtBottomStateChange}
             atBottomThreshold={48}
             isScrolling={handleIsScrolling}
             totalListHeightChanged={handleTotalListHeightChanged}
-            itemContent={(idx, item) =>
-              item.kind === "single" ? (
-                <div className="px-4 pt-3">
-                  <MessageItem
-                    message={item.message}
-                    index={item.index}
-                    isBusy={isBusy}
-                    agentLabel={agentLabel}
-                    projectId={projectId}
-                    taskId={task.id}
-                    isStudio={isStudioProject}
-                    resolveSender={resolveSender}
-                    onToggleThinkingCollapse={toggleThinkingCollapse}
-                    onPermissionResponse={handlePermissionResponse}
-                    onFileClick={onNavigateToFile}
-                    onImageClick={setLightboxUrl}
-                    onMermaidClick={setLightboxSvg}
-                    onD2Click={setLightboxSvg}
-                    onInsertReference={insertAttachmentReference}
-                  />
-                </div>
-              ) : (
-                <div className="px-4 pt-3">
-                  <ToolSectionView
-                    sectionId={item.sectionId}
-                    tools={item.tools}
-                    expanded={expandedSections.has(item.sectionId)}
-                    forceExpanded={false}
-                    sectionFinished={idx < renderItems.length - 1 || !isBusy}
-                    onToggleSection={toggleSection}
-                    onFileClick={onNavigateToFile}
-                  />
-                </div>
-              )
-            }
-            computeItemKey={(_idx, item) =>
-              item.kind === "single"
-                ? `m-${item.index}`
-                : `ts-${item.sectionId}`
-            }
+            itemContent={renderChatItem}
+            computeItemKey={(_idx, item) => renderItemKey(item)}
             itemsRendered={handleItemsRendered}
-            components={virtuosoComponents}
+            rangeChanged={handleConversationRangeChanged}
+            onScroll={handleVirtualizedListScroll}
+            components={TASK_CHAT_VIRTUOSO_COMPONENTS}
           />
+          ) : (
+            <div
+              key={virtualizationLayoutKey}
+              ref={(element) => {
+                messagesViewportRef.current = element;
+              }}
+              className="relative z-0 h-full min-h-0 overflow-y-auto overflow-x-hidden overscroll-none"
+              style={{
+                opacity: chatPositioning ? 0 : 1,
+                transition: chatPositioning
+                  ? "none"
+                  : "opacity 120ms ease-out",
+              }}
+              onScroll={handleDirectListScroll}
+            >
+              <div ref={directListContentRef} className="min-h-full">
+                <TaskChatVirtuosoHeader context={virtuosoContext} />
+                {renderItems.map((item, idx) => (
+                  <Fragment key={renderItemKey(item)}>
+                    {renderChatItem(idx, item)}
+                  </Fragment>
+                ))}
+                <TaskChatVirtuosoFooter context={virtuosoContext} />
+              </div>
+            </div>
+          )}
+          </ChatListErrorBoundary>
           )}
 
           {/* Input */}
@@ -7150,9 +8277,13 @@ export function TaskChat({
                     animate={{ opacity: 1, y: 0, height: "auto" }}
                     exit={{ opacity: 0, y: 8, height: 0 }}
                     transition={{ duration: 0.2, ease: "easeOut" }}
-                    className="mb-3 overflow-hidden rounded-[26px] border border-[color-mix(in_srgb,var(--color-border)_62%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_82%,transparent)] shadow-[0_16px_40px_rgba(0,0,0,0.14)] backdrop-blur-md"
+                    className={
+                      activeComposerPanel === "pending"
+                        ? "mb-2 overflow-hidden rounded-xl border border-[color-mix(in_srgb,var(--color-border)_38%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_48%,transparent)]"
+                        : "mb-3 overflow-hidden rounded-2xl border border-[color-mix(in_srgb,var(--color-border)_62%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_92%,transparent)] shadow-[0_12px_32px_rgba(0,0,0,0.14)] backdrop-blur-md"
+                    }
                   >
-                    <div className="max-h-72 overflow-y-auto px-3 py-3">
+                    <div className={`max-h-[min(360px,48vh)] overflow-y-auto overscroll-contain ${activeComposerPanel === "previewComments" ? "" : activeComposerPanel === "pending" ? "px-2.5 py-1.5" : "px-3 py-3"}`}>
                       {activeComposerPanel === "todo" && (
                         <div className="space-y-1">
                           {planEntries.map((entry, i) => (
@@ -7215,11 +8346,45 @@ export function TaskChat({
                       )}
 
                       {activeComposerPanel === "pending" && (
-                        <div className="space-y-1">
+                        <div>
+                          <div className="flex h-5 items-center gap-2 px-0.5">
+                            <div className="text-[9px] font-medium uppercase tracking-[0.08em] text-[var(--color-text-muted)] opacity-55">
+                              Queued · {pendingMessages.length}
+                            </div>
+                            <div className="ml-auto inline-flex items-center gap-2 text-[9px]">
+                              {(
+                                [
+                                  {
+                                    id: "separate" as const,
+                                    label: "Separate",
+                                    title: "Send queued messages one at a time",
+                                  },
+                                  {
+                                    id: "compact" as const,
+                                    label: "Compact",
+                                    title: "Merge all queued messages into one when auto-sent",
+                                  },
+                                ]
+                              ).map((opt) => (
+                                <button
+                                  key={opt.id}
+                                  onClick={() => handleSetQueueMode(opt.id)}
+                                  title={opt.title}
+                                  className={`rounded px-1 py-0.5 transition-colors ${
+                                    queueMode === opt.id
+                                      ? "text-[var(--color-highlight)]"
+                                      : "text-[var(--color-text-muted)] opacity-60 hover:opacity-100"
+                                  }`}
+                                >
+                                  {opt.label}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
                           {pendingMessages.map((msg, i) => (
                             <div
                               key={pendingMessageKeys[i] ?? `idx-${i}`}
-                              className="flex items-center gap-2 py-1 text-sm"
+                              className="flex min-h-7 items-center gap-2 rounded-lg px-0.5 text-sm transition-colors hover:bg-[color-mix(in_srgb,var(--color-text)_3%,transparent)]"
                             >
                               <span className="w-4 shrink-0 text-right text-xs text-[var(--color-text-muted)]">
                                 {i + 1}
@@ -7291,12 +8456,12 @@ export function TaskChat({
                       )}
 
                       {activeComposerPanel === "previewComments" && (
-                        <div className="space-y-2.5">
-                          <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <div className="sticky top-0 z-20 flex items-center justify-between gap-2 border-b border-[color-mix(in_srgb,var(--color-border)_55%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_94%,transparent)] px-3 py-2.5 backdrop-blur-md">
                             <div className="flex items-center gap-1.5">
                               <MessageSquarePlus className="h-3.5 w-3.5 text-[var(--color-highlight)]" />
                               <span className="text-[11px] font-medium uppercase tracking-[0.1em] text-[var(--color-text-muted)]">
-                                Preview comments
+                                Comments
                               </span>
                               <span className="rounded-full bg-[color-mix(in_srgb,var(--color-highlight)_14%,transparent)] px-1.5 py-px text-[10px] font-medium leading-none text-[var(--color-highlight)]">
                                 {taskPreviewCommentDrafts.length}
@@ -7311,11 +8476,19 @@ export function TaskChat({
                               Send all
                             </button>
                           </div>
-                          <div className="space-y-1.5">
+                          <div className="space-y-1.5 px-2.5 py-2.5">
                             {taskPreviewCommentDrafts.map((draft, idx) => {
-                              const fileLabel = draft.fileName || draft.filePath.split("/").pop() || draft.filePath;
-                              const dir = draft.filePath.slice(0, Math.max(0, draft.filePath.length - fileLabel.length - 1));
-                              const crumb = draft.locator.selector || draft.locator.tagName;
+                              const fileLabel = draft.source === "chat"
+                                ? `Conversation · message ${draft.filePath.split("-").pop()}`
+                                : draft.fileName || draft.filePath.split("/").pop() || draft.filePath;
+                              const dir = draft.source === "chat"
+                                ? ""
+                                : draft.filePath.slice(0, Math.max(0, draft.filePath.length - fileLabel.length - 1));
+                              const selectedText = draft.locator.text?.trim();
+                              const contextLabel = selectedText
+                                ? `“${selectedText}”`
+                                : draft.locator.selector || draft.locator.tagName;
+                              const isEditing = editingPreviewCommentId === draft.id;
                               return (
                                 <div
                                   key={draft.id}
@@ -7329,9 +8502,32 @@ export function TaskChat({
                                     {idx + 1}
                                   </div>
                                   <div className="min-w-0 flex-1">
-                                    <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12px] leading-snug text-[var(--color-text)]">
-                                      {draft.comment}
-                                    </div>
+                                    {isEditing ? (
+                                      <textarea
+                                        autoFocus
+                                        rows={3}
+                                        value={editingPreviewCommentText}
+                                        onChange={(event) => setEditingPreviewCommentText(event.target.value)}
+                                        onKeyDown={(event) => {
+                                          if (event.key === "Escape") {
+                                            event.preventDefault();
+                                            setEditingPreviewCommentId(null);
+                                            setEditingPreviewCommentText("");
+                                          }
+                                          if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && editingPreviewCommentText.trim()) {
+                                            event.preventDefault();
+                                            updatePreviewCommentDraft(draft.id, { comment: editingPreviewCommentText.trim() });
+                                            setEditingPreviewCommentId(null);
+                                            setEditingPreviewCommentText("");
+                                          }
+                                        }}
+                                        className="w-full resize-none rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-2 py-1.5 text-[12px] leading-snug text-[var(--color-text)] outline-none focus:border-[var(--color-highlight)]"
+                                      />
+                                    ) : (
+                                      <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12px] leading-snug text-[var(--color-text)]">
+                                        {draft.comment}
+                                      </div>
+                                    )}
                                     <div className="mt-1 flex items-center gap-1 text-[10px] text-[var(--color-text-muted)]">
                                       <span className="truncate font-medium text-[var(--color-text)]" title={draft.filePath}>
                                         {fileLabel}
@@ -7342,11 +8538,62 @@ export function TaskChat({
                                         </span>
                                       )}
                                     </div>
-                                    <div className="mt-0.5 truncate font-mono text-[10px] text-[var(--color-text-muted)] opacity-80" title={crumb}>
-                                      {crumb}
+                                    <div
+                                      className={`mt-1 line-clamp-2 text-[10px] leading-4 text-[var(--color-text-muted)] opacity-80 ${selectedText ? "" : "font-mono"}`}
+                                      title={contextLabel}
+                                    >
+                                      {contextLabel}
                                     </div>
+                                    {isEditing && (
+                                      <div className="mt-2 flex items-center justify-end gap-1.5">
+                                        <button
+                                          onClick={() => {
+                                            setEditingPreviewCommentId(null);
+                                            setEditingPreviewCommentText("");
+                                          }}
+                                          className="rounded-md px-2 py-1 text-[10px] font-medium text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+                                        >
+                                          Cancel
+                                        </button>
+                                        <button
+                                          disabled={!editingPreviewCommentText.trim()}
+                                          onClick={() => {
+                                            updatePreviewCommentDraft(draft.id, { comment: editingPreviewCommentText.trim() });
+                                            setEditingPreviewCommentId(null);
+                                            setEditingPreviewCommentText("");
+                                          }}
+                                          className="rounded-md px-2 py-1 text-[10px] font-semibold text-[var(--color-highlight)] hover:bg-[color-mix(in_srgb,var(--color-highlight)_12%,transparent)] disabled:cursor-not-allowed disabled:opacity-40"
+                                        >
+                                          Save
+                                        </button>
+                                        <button
+                                          disabled={!editingPreviewCommentText.trim()}
+                                          onClick={() => {
+                                            const comment = editingPreviewCommentText.trim();
+                                            if (!comment) return;
+                                            setEditingPreviewCommentId(null);
+                                            setEditingPreviewCommentText("");
+                                            sendPreviewComments([{ ...draft, comment }]);
+                                          }}
+                                          className="inline-flex items-center gap-1 rounded-md bg-[var(--color-highlight)] px-2 py-1 text-[10px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40"
+                                        >
+                                          <Send className="h-3 w-3" />
+                                          Send
+                                        </button>
+                                      </div>
+                                    )}
                                   </div>
-                                  <div className="flex shrink-0 items-start gap-1 opacity-70 transition-opacity group-hover:opacity-100">
+                                  {!isEditing && <div className="flex shrink-0 items-start gap-1 opacity-70 transition-opacity group-hover:opacity-100">
+                                    <button
+                                      onClick={() => {
+                                        setEditingPreviewCommentId(draft.id);
+                                        setEditingPreviewCommentText(draft.comment);
+                                      }}
+                                      className="rounded-md p-1 text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+                                      title="Edit comment"
+                                    >
+                                      <Pencil className="h-3 w-3" />
+                                    </button>
                                     <button
                                       onClick={() => sendPreviewComments([draft])}
                                       className="rounded-md p-1 text-[var(--color-text-muted)] transition-colors hover:bg-[color-mix(in_srgb,var(--color-highlight)_12%,transparent)] hover:text-[var(--color-highlight)]"
@@ -7361,7 +8608,7 @@ export function TaskChat({
                                     >
                                       <X className="h-3 w-3" />
                                     </button>
-                                  </div>
+                                  </div>}
                                 </div>
                               );
                             })}
@@ -7440,24 +8687,22 @@ export function TaskChat({
               <AnimatePresence>
                 {showScrollToBottom && (
                   <motion.div
-                    initial={{ opacity: 0, y: 10 }}
+                    initial={{ opacity: 0, y: 8, scale: 0.98 }}
                     animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: 8 }}
-                    transition={{ duration: 0.18, ease: "easeOut" }}
-                    className="absolute inset-x-0 top-0 z-20 -translate-y-[118%]"
+                    exit={{ opacity: 0, y: 6, scale: 0.98 }}
+                    transition={{ duration: 0.16, ease: "easeOut" }}
+                    className="pointer-events-none absolute inset-x-0 top-0 z-20 -translate-y-[132%] flex justify-center"
                   >
                     <button
+                      type="button"
                       onClick={() => {
                         enableAutoStickToBottom("smooth");
                         setShowScrollToBottom(false);
                       }}
-                      className="group relative mx-auto flex items-center gap-2 rounded-full px-3 py-2 text-[15px] font-medium tracking-[0.01em] text-[color-mix(in_srgb,var(--color-highlight)_80%,white_4%)] transition-all duration-200 hover:text-[color-mix(in_srgb,var(--color-highlight)_96%,white_8%)] select-none"
+                      className="pointer-events-auto group inline-flex h-8 items-center gap-1.5 rounded-full border border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[color-mix(in_srgb,var(--color-bg)_86%,transparent)] px-3 text-xs font-medium text-[var(--color-text-muted)] shadow-[0_1px_2px_rgba(0,0,0,0.08),0_6px_20px_rgba(0,0,0,0.10)] backdrop-blur-xl transition-[color,background-color,border-color,box-shadow,transform] duration-150 hover:-translate-y-px hover:border-[color-mix(in_srgb,var(--color-highlight)_24%,var(--color-border))] hover:bg-[var(--color-bg)] hover:text-[var(--color-text)] hover:shadow-[0_2px_4px_rgba(0,0,0,0.10),0_8px_24px_rgba(0,0,0,0.14)] active:translate-y-0 select-none"
                     >
-                      <span className="pointer-events-none absolute inset-0 rounded-full bg-[color-mix(in_srgb,var(--color-highlight)_8%,transparent)] opacity-0 blur-md transition-all duration-200 group-hover:opacity-100" />
-                      <span className="relative flex items-center gap-2">
-                        <ArrowDown className="h-4 w-4" />
-                        <span>Scroll to bottom</span>
-                      </span>
+                      <ArrowDown className="h-3.5 w-3.5 text-[var(--color-highlight)] transition-transform duration-150 group-hover:translate-y-0.5" />
+                      <span>Scroll to bottom</span>
                     </button>
                   </motion.div>
                 )}
@@ -7772,7 +9017,7 @@ export function TaskChat({
                         }`}
                       >
                         <MessageSquarePlus className="h-3 w-3" />
-                        <span>Preview</span>
+                        <span>Comments</span>
                         <span className="opacity-70">{taskPreviewCommentDrafts.length}</span>
                       </button>
                     )}
@@ -7874,9 +9119,7 @@ export function TaskChat({
                     <div
                       ref={editableRef}
                       contentEditable={
-                        isConnected &&
-                        !isRemoteSession &&
-                        !activePermissionMessage
+                        !isRemoteSession && !activePermissionMessage
                       }
                       suppressContentEditableWarning
                       onInput={handleInput}
@@ -7898,7 +9141,7 @@ export function TaskChat({
                         isInputExpanded
                           ? "min-h-[32vh] max-h-[56vh]"
                           : "min-h-[56px] max-h-32"
-                      } ${!isConnected || isRemoteSession || activePermissionMessage ? "opacity-50 cursor-not-allowed" : ""} ${
+                      } ${isRemoteSession || activePermissionMessage ? "opacity-50 cursor-not-allowed" : ""} ${
                         isTerminalMode ? "font-mono" : ""
                       }`}
                       style={{
@@ -8305,6 +9548,196 @@ function UserMessageBody({ content }: { content: string }) {
   return <>{nodes}</>;
 }
 
+/**
+ * A compact, session-local table of contents for the conversation. It mirrors
+ * the affordance in document editors: hover a tick to preview the user prompt
+ * and response, click to jump to that turn in the virtualized chat list.
+ */
+function ConversationMinimap({
+  turns,
+  activeMessageIndex,
+  onNavigate,
+}: {
+  turns: ConversationTurn[];
+  activeMessageIndex: number | null;
+  onNavigate: (turn: ConversationTurn) => void;
+}) {
+  const [preview, setPreview] = useState<{
+    turn: ConversationTurn;
+    rect: DOMRect;
+  } | null>(null);
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const hideTimerRef = useRef<number | null>(null);
+  const navRef = useRef<HTMLElement | null>(null);
+  const [isScrollable, setIsScrollable] = useState(false);
+
+  const clearScheduledHide = useCallback(() => {
+    if (hideTimerRef.current !== null) {
+      window.clearTimeout(hideTimerRef.current);
+      hideTimerRef.current = null;
+    }
+  }, []);
+  const showPreview = useCallback((turn: ConversationTurn, anchor: HTMLElement) => {
+    clearScheduledHide();
+    setPreview({ turn, rect: anchor.getBoundingClientRect() });
+  }, [clearScheduledHide]);
+  const schedulePreviewHide = useCallback(() => {
+    clearScheduledHide();
+    hideTimerRef.current = window.setTimeout(() => {
+      setPreview(null);
+      hideTimerRef.current = null;
+    }, 220);
+  }, [clearScheduledHide]);
+  useEffect(() => () => clearScheduledHide(), [clearScheduledHide]);
+
+  // The top/bottom fade only makes sense once the rail is actually clipped
+  // by max-height — applying it unconditionally blanks out short lists,
+  // since the fade's percentage-based stops invert when the box is shorter
+  // than the fade itself.
+  useEffect(() => {
+    const el = navRef.current;
+    if (!el) return;
+    setIsScrollable(el.scrollHeight > el.clientHeight + 1);
+  }, [turns.length]);
+
+  // Keep the rail's scroll position following the turn the reader is
+  // currently on — without this it stays pinned wherever it was first
+  // rendered (usually the top) instead of tracking the active tick as
+  // the user scrolls through a long conversation.
+  useEffect(() => {
+    const el = navRef.current;
+    if (!el || activeMessageIndex === null) return;
+    const active = el.querySelector<HTMLElement>('[data-active="true"]');
+    if (!active) return;
+    const activeTop = active.offsetTop;
+    const activeBottom = activeTop + active.offsetHeight;
+    if (activeTop < el.scrollTop) {
+      el.scrollTop = activeTop;
+    } else if (activeBottom > el.scrollTop + el.clientHeight) {
+      el.scrollTop = activeBottom - el.clientHeight;
+    }
+  }, [activeMessageIndex]);
+
+  // A single prompt does not need a navigation aid, and hiding it also keeps
+  // a newly-created chat visually quiet until there is actual history.
+  if (turns.length < 2) return null;
+
+  const previewTop = preview
+    ? Math.max(12, Math.min(preview.rect.top - 18, window.innerHeight - 188))
+    : 0;
+
+  return (
+    <>
+      <nav
+        ref={navRef}
+        aria-label="Conversation history"
+        className={`conversation-minimap conversation-minimap-scroll absolute left-0.5 top-1/2 z-20 flex max-h-[min(60vh,420px)] -translate-y-1/2 flex-col items-start gap-2 overflow-y-auto py-4 opacity-70 transition-opacity hover:opacity-100 focus-within:opacity-100 ${
+          isScrollable ? "conversation-minimap-fade" : ""
+        }`}
+        onMouseLeave={() => setHoveredIndex(null)}
+      >
+        {turns.map((turn, index) => {
+          const hasReply = Boolean(turn.assistant);
+          const isActive = turn.messageIndex === activeMessageIndex;
+          // Dock-style magnification: neighbors within 3 turns of the
+          // hovered tick swell too, tapering off with distance, so hovering
+          // reads as a small "hill" rather than a single bar snapping wide.
+          const baseWidth = isActive ? 16 : 10;
+          const distance = hoveredIndex === null ? Infinity : Math.abs(index - hoveredIndex);
+          const falloff = Math.max(0, 1 - distance / 3);
+          const width = baseWidth + 12 * Math.pow(falloff, 1.5);
+          return (
+            <button
+              key={turn.messageIndex}
+              type="button"
+              data-active={isActive || undefined}
+              aria-label={`Conversation turn ${index + 1}: ${turn.user}`}
+              title={`Turn ${index + 1}`}
+              onMouseEnter={(event) => {
+                showPreview(turn, event.currentTarget);
+                setHoveredIndex(index);
+              }}
+              onFocus={(event) => {
+                showPreview(turn, event.currentTarget);
+                setHoveredIndex(index);
+              }}
+              onMouseLeave={schedulePreviewHide}
+              onBlur={() => {
+                schedulePreviewHide();
+                setHoveredIndex(null);
+              }}
+              onClick={() => {
+                clearScheduledHide();
+                setPreview(null);
+                onNavigate(turn);
+              }}
+              style={{ width }}
+              className={`relative h-[2px] shrink-0 rounded-full transition-[width,background-color,opacity] duration-150 ease-out before:absolute before:-inset-x-2 before:-inset-y-2 before:content-[''] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-highlight)] ${
+                turn.isStreaming
+                  ? "animate-pulse bg-[var(--color-warning)]"
+                  : isActive
+                    ? "bg-[var(--color-highlight)] opacity-100"
+                  : hasReply
+                    ? "bg-[color-mix(in_srgb,var(--color-text-muted)_75%,transparent)] hover:bg-[var(--color-highlight)]"
+                    : "bg-[color-mix(in_srgb,var(--color-warning)_75%,transparent)]"
+              }`}
+            />
+          );
+        })}
+      </nav>
+      {preview && typeof document !== "undefined" &&
+        createPortal(
+          <div
+            role="tooltip"
+            className="pointer-events-none fixed z-[120] w-[min(360px,calc(100vw-32px))] rounded-2xl border border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[color-mix(in_srgb,var(--color-bg)_94%,transparent)] p-3 shadow-[0_18px_48px_rgba(0,0,0,0.18)] backdrop-blur-md"
+            style={{
+              left: Math.min(preview.rect.right + 10, window.innerWidth - 372),
+              top: previewTop,
+            }}
+          >
+            <p className="line-clamp-2 text-sm font-medium leading-5 text-[var(--color-text)]">
+              {preview.turn.user}
+            </p>
+            <p className="mt-2 line-clamp-3 text-[13px] leading-5 text-[var(--color-text-muted)]">
+              {preview.turn.assistant || (preview.turn.isStreaming ? "Responding…" : "No response yet")}
+            </p>
+            {preview.turn.tools.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-1.5 border-t border-[color-mix(in_srgb,var(--color-border)_56%,transparent)] pt-2.5">
+                {preview.turn.tools.map((tool) => (
+                  <span
+                    key={tool.label}
+                    className="inline-flex items-center gap-1 rounded-md bg-[var(--color-bg-tertiary)] px-1.5 py-1 text-[10px] font-medium text-[var(--color-text-muted)]"
+                  >
+                    <Wrench className="h-2.5 w-2.5 text-[var(--color-highlight)]" />
+                    {tool.count} {tool.label}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>,
+          document.body,
+        )}
+    </>
+  );
+}
+
+function ThinkingStatus({ label, active }: { label: string; active: boolean }) {
+  return (
+    <div
+      className="flex min-w-0 items-center py-0.5 text-sm font-medium italic"
+      data-grove-search-skip="true"
+      aria-live={active ? "polite" : undefined}
+      title={label}
+    >
+      <span
+        className={`truncate ${active ? "thought-status-shimmer" : "text-[var(--color-text-muted)]"}`}
+      >
+        {label}
+      </span>
+    </div>
+  );
+}
+
 /** Individual message rendering */
 const MessageItem = memo(function MessageItem({
   message,
@@ -8313,8 +9746,12 @@ const MessageItem = memo(function MessageItem({
   agentLabel,
   projectId,
   taskId,
+  activeChatId,
+  previewCommentDrafts,
+  onAddPreviewComment,
+  onUpdatePreviewComment,
+  onRemovePreviewComment,
   isStudio,
-  onToggleThinkingCollapse,
   onPermissionResponse,
   onFileClick,
   onImageClick,
@@ -8329,8 +9766,12 @@ const MessageItem = memo(function MessageItem({
   agentLabel?: string;
   projectId: string;
   taskId: string;
+  activeChatId?: string;
+  previewCommentDrafts: PreviewCommentDraft[];
+  onAddPreviewComment: ReturnType<typeof usePreviewComments>["addDraft"];
+  onUpdatePreviewComment: ReturnType<typeof usePreviewComments>["updateDraft"];
+  onRemovePreviewComment: ReturnType<typeof usePreviewComments>["removeDraft"];
   isStudio: boolean;
-  onToggleThinkingCollapse: (index: number) => void;
   onPermissionResponse?: (optionId: string, requestId: string) => void;
   onFileClick?: (filePath: string, line?: number) => Promise<boolean>;
   onImageClick?: (url: string) => void;
@@ -8342,13 +9783,15 @@ const MessageItem = memo(function MessageItem({
     Icon: React.ComponentType<{ size?: number; className?: string }>;
   };
 }) {
-  const sketchContext = isStudio ? { projectId, taskId } : undefined;
-  // Typewriter reveal for streaming assistant/thinking text. Hook must
+  const sketchContext = useMemo(
+    () => (isStudio ? { projectId, taskId } : undefined),
+    [isStudio, projectId, taskId],
+  );
+  // Typewriter reveal for streaming assistant text. Hook must
   // be called unconditionally; for other message types (or any
   // non-busy chat — i.e. history loads) we feed instant=true so it's
   // effectively a no-op and the full content shows immediately.
-  const isTextStream =
-    message.type === "assistant" || message.type === "thinking";
+  const isTextStream = message.type === "assistant";
   const streamRaw = isTextStream ? message.content : "";
   const streamInstant =
     !isTextStream || message.complete || !isBusy;
@@ -8369,6 +9812,46 @@ const MessageItem = memo(function MessageItem({
     }
     return `/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(decoded)}`;
   }, [projectId, taskId]);
+
+  const chatCommentFilePath = activeChatId
+    ? `chat/${activeChatId}/message-${index + 1}`
+    : undefined;
+  const messageCommentDrafts = useMemo(
+    () => chatCommentFilePath
+      ? previewCommentDrafts.filter((draft) => draft.source === "chat" && draft.filePath === chatCommentFilePath)
+      : [],
+    [chatCommentFilePath, previewCommentDrafts],
+  );
+  const isCommentableAssistant = message.type === "assistant" && message.complete;
+  const markdownComments = useMemo(() => {
+    if (!chatCommentFilePath || !isCommentableAssistant) return undefined;
+    return {
+      previewId: `chat-markdown-${activeChatId}-${index}`,
+      markers: messageCommentDrafts.map((draft) => ({
+        id: draft.id,
+        label: previewCommentTaskLabel(previewCommentDrafts, draft),
+        selector: draft.locator.selector,
+        xpath: draft.locator.xpath,
+        extraBlocks: draft.locator.extraBlocks,
+        locator: draft.locator,
+        comment: draft.comment,
+      })),
+      onAdd: (locator: PreviewCommentLocator, comment: string) => {
+        onAddPreviewComment({
+          source: "chat",
+          projectId,
+          taskId,
+          filePath: chatCommentFilePath,
+          fileName: `Conversation · message ${index + 1}`,
+          rendererId: "chat-markdown",
+          locator,
+          comment,
+        });
+      },
+      onUpdate: (id: string, comment: string) => onUpdatePreviewComment(id, { comment }),
+      onDelete: onRemovePreviewComment,
+    };
+  }, [activeChatId, chatCommentFilePath, index, isCommentableAssistant, messageCommentDrafts, onAddPreviewComment, onRemovePreviewComment, onUpdatePreviewComment, previewCommentDrafts, projectId, taskId]);
 
   switch (message.type) {
     case "user":
@@ -8508,7 +9991,11 @@ const MessageItem = memo(function MessageItem({
       if (!shown.trim()) return null;
       return (
         <div className="flex justify-start">
-          <div className="max-w-[82%] min-w-0 text-sm text-[var(--color-text)]">
+          <div
+            className="w-full min-w-0 text-sm text-[var(--color-text)]"
+            data-grove-commentable-message="true"
+            data-grove-message-index={index}
+          >
             <MarkdownRenderer
               content={shown}
               onFileClick={onFileClick}
@@ -8518,10 +10005,8 @@ const MessageItem = memo(function MessageItem({
               onImageClick={onImageClick}
               enableRunCommand
               sketchContext={sketchContext}
+              comments={markdownComments}
             />
-            {!message.complete && isBusy && (
-              <span className="inline-block w-1.5 h-4 ml-0.5 bg-[var(--color-text-muted)] animate-pulse rounded-sm" />
-            )}
             {message.complete && message.usage && (
               <TurnUsageMeta
                 inputTokens={message.usage.inputTokens}
@@ -8536,30 +10021,12 @@ const MessageItem = memo(function MessageItem({
       );
     }
     case "thinking":
+      if (message.complete) return null;
       return (
-        <div className="flex justify-start" data-grove-search-skip="true">
-          <div className="max-w-[82%] w-full">
-            <button
-              onClick={() => onToggleThinkingCollapse(index)}
-              className="flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors mb-1"
-            >
-              <Brain className="w-3 h-3" />
-              {message.collapsed ? (
-                <ChevronRight className="w-3 h-3" />
-              ) : (
-                <ChevronDown className="w-3 h-3" />
-              )}
-              <span className="italic">
-                {message.complete ? "Thought" : "Thinking"}
-              </span>
-            </button>
-            {!message.collapsed && (
-              <div className="ml-5 rounded-lg px-3 py-2 bg-[var(--color-bg-tertiary)] text-xs text-[var(--color-text-muted)] italic whitespace-pre-wrap max-h-40 overflow-y-auto">
-                {message.complete ? message.content : streamDisplay}
-              </div>
-            )}
-          </div>
-        </div>
+        <ThinkingStatus
+          label={extractThoughtStatus(message.content)}
+          active={!message.complete && isBusy}
+        />
       );
     case "permission":
       return message.resolved ? (
@@ -8589,7 +10056,7 @@ const MessageItem = memo(function MessageItem({
     case "terminal_output": {
       const hasExited = message.exitCode !== undefined;
       const isError = hasExited && message.exitCode !== 0;
-      const output = message.chunks.join("");
+      const output = ansiToHtml(message.chunks.join(""));
       return (
         <div className="flex justify-start">
           <div className="max-w-[90%] w-full">
@@ -8601,9 +10068,10 @@ const MessageItem = memo(function MessageItem({
               } bg-[var(--color-bg-secondary)]`}
             >
               {output && (
-                <pre className="px-3 py-2 text-[12px] font-mono text-[var(--color-text-secondary)] whitespace-pre-wrap overflow-x-auto max-h-[300px] overflow-y-auto">
-                  {output}
-                </pre>
+                <pre
+                  className="px-3 py-2 text-[12px] font-mono text-[var(--color-text-secondary)] whitespace-pre-wrap overflow-x-auto max-h-[300px] overflow-y-auto"
+                  dangerouslySetInnerHTML={{ __html: output }}
+                />
               )}
               {hasExited && (
                 <div
@@ -8922,15 +10390,32 @@ function extractActionChipLabel(
   switch (kind) {
     case "bash":
     case "bash_output": {
-      // Content typically starts with the command or its output.
+      // 1. Try to extract command from rawInput first if available.
+      if (message.rawInput) {
+        if (typeof message.rawInput === "string") {
+          const firstCmd = firstNonEmptyLine(message.rawInput);
+          if (firstCmd) return firstCmd;
+        } else if (typeof message.rawInput === "object" && message.rawInput !== null) {
+          const obj = message.rawInput as Record<string, unknown>;
+          if (typeof obj.command === "string") {
+            const firstCmd = firstNonEmptyLine(obj.command);
+            if (firstCmd) return firstCmd;
+          }
+        }
+      }
+
+      // 2. Fallback to content typically starts with the command or its output.
       // If it looks like a shell command (starts with a letter and no obvious
       // error/usage prefix), surface its first line. Otherwise fall back to
       // the tool title so we at least say "bash".
       const first = firstNonEmptyLine(content);
       if (!first) return extractRawActionLabel(message);
-      // Heuristic: if first line starts with a known error/usage marker, it's
-      // output not the command — fall back to title so we don't mislabel.
-      if (/^(error|usage|traceback|panic|command not found)/i.test(first)) {
+      // Heuristic: if first line starts with a known error/usage marker, or doesn't look like a command
+      // (e.g., starts with JSON opening curly/bracket), fall back to title so we don't mislabel.
+      if (
+        /^(error|usage|traceback|panic|command not found)/i.test(first) ||
+        /^[{[]/.test(first)
+      ) {
         return extractRawActionLabel(message);
       }
       return first;
@@ -9268,32 +10753,57 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
 
   // Merge edits on the same file: accumulate +/- and keep the latest tool id/status
   const editItems = (() => {
-    const merged = new Map<string, { key: string; toolId: string; label: string; fullPath: string; additions: number; deletions: number; status: string }>();
+    const merged = new Map<string, {
+      key: string;
+      toolId: string;
+      label: string;
+      fullPath: string;
+      diff: string;
+      additions: number;
+      deletions: number;
+      status: string;
+    }>();
     for (const tool of edits) {
-      const loc = tool.message.locations?.[0];
-      const fullPath = loc?.path ?? "";
-      const label =
-        fullPath.split("/").pop() ||
-        tool.message.title.replace(/^(Edit|Write)\s+/i, "");
-      const stat = parseDiffStat(tool.message.content);
-      const existing = merged.get(label);
-      if (existing) {
-        existing.additions += stat?.additions ?? 0;
-        existing.deletions += stat?.deletions ?? 0;
-        existing.toolId = tool.message.id;
-        existing.status = tool.message.status;
-        // Use the longest (most specific) full path
-        if (fullPath.length > existing.fullPath.length) existing.fullPath = fullPath;
-      } else {
-        merged.set(label, {
-          key: `${tool.message.id}:${label}`,
-          toolId: tool.message.id,
-          label,
+      const editPaths = extractEditToolPaths({
+        locations: tool.message.locations,
+        rawInput: tool.message.rawInput,
+        content: tool.message.content,
+      });
+      const targets = editPaths.length > 0 ? editPaths : [""];
+      for (const fullPath of targets) {
+        const diff = extractDiffForEditPath(
+          tool.message.content,
           fullPath,
-          additions: stat?.additions ?? 0,
-          deletions: stat?.deletions ?? 0,
-          status: tool.message.status,
-        });
+          targets,
+        );
+        const stat = parseDiffStat(diff);
+        const label =
+          fullPath.split("/").pop() ||
+          tool.message.title.replace(/^(Edit|Write)\s+/i, "");
+        const mergeKey = fullPath || label;
+        const existing = merged.get(mergeKey);
+        if (existing) {
+          existing.additions += stat?.additions ?? 0;
+          existing.deletions += stat?.deletions ?? 0;
+          if (diff && !existing.diff.includes(diff)) {
+            existing.diff = existing.diff
+              ? `${existing.diff}\n\n${diff}`
+              : diff;
+          }
+          existing.toolId = tool.message.id;
+          existing.status = tool.message.status;
+        } else {
+          merged.set(mergeKey, {
+            key: `${tool.message.id}:${mergeKey}`,
+            toolId: tool.message.id,
+            label,
+            fullPath,
+            diff,
+            additions: stat?.additions ?? 0,
+            deletions: stat?.deletions ?? 0,
+            status: tool.message.status,
+          });
+        }
       }
     }
     return Array.from(merged.values());
@@ -9305,7 +10815,7 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
     return {
       key: tool.message.id,
       kind,
-      label: truncateChipLabel(derived),
+      label: truncateChipLabel(stripAnsi(derived)),
       rawTitle: tool.message.title,
       content: tool.message.content ?? "",
       locations: tool.message.locations ?? [],
@@ -9485,36 +10995,42 @@ function ActionChip({
   ) => Promise<boolean>;
 }) {
   const hasContent = item.content.trim().length > 0;
+  const requestText = formatRawInput(item.rawInput, item.kind);
+  const hasDetails = hasContent || requestText !== null;
   const hasLocation = item.locations.length > 0;
-  // Click priority: navigate to first location if one exists; otherwise
-  // toggle inline expand. If neither exists, the chip is still a button
-  // (keeps UI consistent) but click is a no-op.
+  // Prefer details when the tool exposes a request or response. Running tools
+  // often have rawInput before they have output; treating those as expandable
+  // lets the user inspect the complete command while it is still executing.
+  // Location-only chips retain their direct file navigation behavior.
   const handleClick = (e: React.MouseEvent) => {
     e.stopPropagation();
+    if (hasDetails) {
+      onToggleExpand();
+      return;
+    }
     if (hasLocation) {
       const loc = item.locations[0];
       onFileClick?.(loc.path, loc.line, "full");
-      return;
     }
-    if (hasContent) onToggleExpand();
   };
-  const isInteractive = hasLocation || hasContent;
-  // chip 尾部提示：有 location → 箭头出链（可跳文件）；有 content → Chevron
-  // 指示可展开/已展开；无交互 → 不显示，避免骗点击。
-  const trailingHint = hasLocation ? (
-    <ExternalLink className="h-3 w-3 shrink-0 text-[var(--color-text-muted)] opacity-70" />
-  ) : hasContent ? (
+  const isInteractive = hasLocation || hasDetails;
+  // Details take precedence over navigation so long commands are never hidden
+  // behind truncation. Location-only chips keep the external-link affordance.
+  const trailingHint = hasDetails ? (
     expanded ? (
       <ChevronUp className="h-3 w-3 shrink-0 text-[var(--color-text-muted)]" />
     ) : (
       <ChevronDown className="h-3 w-3 shrink-0 text-[var(--color-text-muted)] opacity-70" />
     )
+  ) : hasLocation ? (
+    <ExternalLink className="h-3 w-3 shrink-0 text-[var(--color-text-muted)] opacity-70" />
   ) : null;
   return (
     <button
       type="button"
       onClick={handleClick}
       disabled={!isInteractive}
+      title={requestText ?? item.rawTitle}
       className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] transition-colors max-w-[320px] ${
         isInteractive
           ? "cursor-pointer hover:brightness-110"
@@ -9545,14 +11061,14 @@ function ActionChipList({
   items,
   overflowCount,
   onShowMore,
-  expandedKeys,
+  expandedKey,
   onToggleExpand,
   onFileClick,
 }: {
   items: ActionChipItem[];
   overflowCount: number;
   onShowMore: () => void;
-  expandedKeys: Set<string>;
+  expandedKey: string | null;
   onToggleExpand: (key: string) => void;
   onFileClick?: (
     filePath: string,
@@ -9560,7 +11076,7 @@ function ActionChipList({
     mode?: "diff" | "full",
   ) => Promise<boolean>;
 }) {
-  const expandedItems = items.filter((it) => expandedKeys.has(it.key));
+  const expandedItem = items.find((item) => item.key === expandedKey);
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap gap-1.5">
@@ -9568,7 +11084,7 @@ function ActionChipList({
           <ActionChip
             key={item.key}
             item={item}
-            expanded={expandedKeys.has(item.key)}
+            expanded={expandedKey === item.key}
             onToggleExpand={() => onToggleExpand(item.key)}
             onFileClick={onFileClick}
           />
@@ -9586,9 +11102,9 @@ function ActionChipList({
           </button>
         )}
       </div>
-      {expandedItems.length > 0 && (
-        <div className="space-y-2">
-          {expandedItems.map((item) => {
+      {expandedItem && (
+        <div>
+          {[expandedItem].map((item) => {
             const renderMarkdown =
               item.kind === "skill" ||
               item.kind === "todo" ||
@@ -9599,9 +11115,12 @@ function ActionChipList({
                 className="rounded-lg border border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_58%,transparent)] px-3 py-2"
               >
                 <div className="flex items-center gap-2 mb-1.5">
-                  <span className="text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
-                    {item.rawTitle || "action"}
-                  </span>
+                  <span
+                    className="text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]"
+                    dangerouslySetInnerHTML={{
+                      __html: ansiToHtml(item.rawTitle) || "action",
+                    }}
+                  />
                   <button
                     type="button"
                     onClick={(e) => {
@@ -9620,9 +11139,12 @@ function ActionChipList({
                       <MarkdownRenderer content={item.content} />
                     </div>
                   ) : (
-                    <pre className="text-[11px] leading-[1.45] font-mono whitespace-pre-wrap break-all text-[var(--color-text)] m-0">
-                      {item.content || "(no output)"}
-                    </pre>
+                    <pre
+                      className="text-[11px] leading-[1.45] font-mono whitespace-pre-wrap break-all text-[var(--color-text)] m-0"
+                      dangerouslySetInnerHTML={{
+                        __html: ansiToHtml(item.content) || "(no output)",
+                      }}
+                    />
                   );
                   return (
                     <div className="space-y-2">
@@ -9764,15 +11286,12 @@ const ToolSectionView = memo(function ToolSectionView({
   const [actionExpanded, setActionExpanded] = useState(false);
   const [actionItemsExpanded, setActionItemsExpanded] = useState(false);
   const [inspectionItemsExpanded, setInspectionItemsExpanded] = useState(false);
-  const [expandedActionKeys, setExpandedActionKeys] = useState<Set<string>>(
-    () => new Set(),
-  );
-  const [expandedInspectionKeys, setExpandedInspectionKeys] = useState<
-    Set<string>
-  >(() => new Set());
-  const [expandedEditKeys, setExpandedEditKeys] = useState<Set<string>>(
-    () => new Set(),
-  );
+  // This state intentionally lives inside ToolSectionView: each action block
+  // owns its own accordion, while all tool detail kinds within that block are
+  // mutually exclusive.
+  const [expandedDetailKey, setExpandedDetailKey] = useState<string | null>(null);
+  const toggleDetail = (key: string) =>
+    setExpandedDetailKey((current) => nextExpandedToolDetail(current, key));
   const hasDetails =
     summary.inspectionEntries.length > 0 ||
     summary.inspectionActionItems.length > 0 ||
@@ -9907,15 +11426,8 @@ const ToolSectionView = memo(function ToolSectionView({
                           : summary.inspectionItemOverflow
                       }
                       onShowMore={() => setInspectionItemsExpanded(true)}
-                      expandedKeys={expandedInspectionKeys}
-                      onToggleExpand={(key) =>
-                        setExpandedInspectionKeys((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(key)) next.delete(key);
-                          else next.add(key);
-                          return next;
-                        })
-                      }
+                      expandedKey={expandedDetailKey}
+                      onToggleExpand={toggleDetail}
                       onFileClick={onFileClick}
                     />
                   )}
@@ -9929,12 +11441,12 @@ const ToolSectionView = memo(function ToolSectionView({
                   </div>
                   <div className="flex flex-wrap gap-1.5">
                     {summary.editItems.map((item) => {
-                      const isExpanded = expandedEditKeys.has(item.key);
+                      const isExpanded = expandedDetailKey === item.key;
                       const tool = tools.find(
                         (t) => t.message.id === item.toolId,
                       )?.message;
                       const path = item.fullPath || tool?.locations?.[0]?.path;
-                      const hasDiff = (tool?.content?.trim()?.length ?? 0) > 0;
+                      const hasDiff = item.diff.trim().length > 0;
                       return (
                         <div
                           key={item.key}
@@ -9948,12 +11460,7 @@ const ToolSectionView = memo(function ToolSectionView({
                             type="button"
                             onClick={() => {
                               if (!hasDiff) return;
-                              setExpandedEditKeys((prev) => {
-                                const next = new Set(prev);
-                                if (next.has(item.key)) next.delete(item.key);
-                                else next.add(item.key);
-                                return next;
-                              });
+                              toggleDetail(item.key);
                             }}
                             disabled={!hasDiff}
                             className={`inline-flex items-center gap-1.5 ${hasDiff ? "cursor-pointer" : "cursor-default"} max-w-[320px]`}
@@ -10004,12 +11511,8 @@ const ToolSectionView = memo(function ToolSectionView({
                     })}
                   </div>
                   {summary.editItems
-                    .filter((item) => expandedEditKeys.has(item.key))
+                    .filter((item) => expandedDetailKey === item.key)
                     .map((item) => {
-                      const tool = tools.find(
-                        (t) => t.message.id === item.toolId,
-                      )?.message;
-                      const diff = tool?.content ?? "";
                       return (
                         <div
                           key={`${item.key}:diff`}
@@ -10022,19 +11525,13 @@ const ToolSectionView = memo(function ToolSectionView({
                             </span>
                             <button
                               type="button"
-                              onClick={() =>
-                                setExpandedEditKeys((prev) => {
-                                  const next = new Set(prev);
-                                  next.delete(item.key);
-                                  return next;
-                                })
-                              }
+                              onClick={() => toggleDetail(item.key)}
                               className="ml-auto text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] cursor-pointer transition-colors"
                             >
                               collapse
                             </button>
                           </div>
-                          <DiffPreview diff={diff || "(empty diff)"} />
+                          <DiffPreview diff={item.diff} />
                         </div>
                       );
                     })}
@@ -10068,15 +11565,8 @@ const ToolSectionView = memo(function ToolSectionView({
                         actionItemsExpanded ? 0 : summary.actionItemOverflow
                       }
                       onShowMore={() => setActionItemsExpanded(true)}
-                      expandedKeys={expandedActionKeys}
-                      onToggleExpand={(key) =>
-                        setExpandedActionKeys((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(key)) next.delete(key);
-                          else next.add(key);
-                          return next;
-                        })
-                      }
+                      expandedKey={expandedDetailKey}
+                      onToggleExpand={toggleDetail}
                       onFileClick={onFileClick}
                     />
                   )}
@@ -10087,5 +11577,229 @@ const ToolSectionView = memo(function ToolSectionView({
         )}
       </AnimatePresence>
     </motion.div>
+  );
+});
+
+function formatWorkDuration(durationSeconds?: number): string | null {
+  if (durationSeconds === undefined) return null;
+  const seconds = Math.max(0, Math.round(durationSeconds));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder > 0 ? `${minutes}m ${remainder}s` : `${minutes}m`;
+}
+
+/** A completed turn's compact process row. The original messages remain in
+ * state and are available here on demand; only their default presentation is
+ * collapsed. */
+const WorkSummaryView = memo(function WorkSummaryView({
+  sectionId,
+  items,
+  durationSeconds,
+  expanded,
+  onToggleSection,
+  onFileClick,
+}: {
+  sectionId: string;
+  items: WorkSummaryItem[];
+  durationSeconds?: number;
+  expanded: boolean;
+  onToggleSection: (sectionId: string) => void;
+  onFileClick?: (
+    filePath: string,
+    line?: number,
+    mode?: "diff" | "full",
+  ) => Promise<boolean>;
+}) {
+  const [expandedToolIds, setExpandedToolIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const tools = useMemo<ToolSectionItem[]>(
+    () =>
+      items.flatMap(({ message, index }) =>
+        message.type === "tool" ? [{ message, index }] : [],
+      ),
+    [items],
+  );
+  const toolSummary = useMemo(
+    () => (tools.length > 0 ? summarizeToolSection(tools, true) : null),
+    [tools],
+  );
+  const detailItems = useMemo(() => {
+    const result: Array<
+      | { kind: "text"; item: WorkSummaryItem }
+      | { kind: "tools"; tools: ToolSectionItem[] }
+    > = [];
+    for (const item of items) {
+      if (item.message.type === "thinking") continue;
+      if (item.message.type !== "tool") {
+        result.push({ kind: "text", item });
+        continue;
+      }
+      const previous = result.at(-1);
+      if (previous?.kind === "tools") {
+        previous.tools.push({ message: item.message, index: item.index });
+      } else {
+        result.push({
+          kind: "tools",
+          tools: [{ message: item.message, index: item.index }],
+        });
+      }
+    }
+    return result;
+  }, [items]);
+  const duration = formatWorkDuration(durationSeconds);
+  const hasEdits = toolSummary?.editItems.length;
+  const onlyExploration =
+    tools.length > 0 && tools.every(({ message }) => isBackgroundAction(message));
+  const verb = hasEdits
+    ? "Worked"
+    : onlyExploration
+      ? "Explored"
+      : "Worked";
+  const title = duration ? `${verb} for ${duration}` : verb;
+
+  return (
+    <motion.div layout className="text-[var(--color-text)]">
+      <button
+        type="button"
+        onClick={() => onToggleSection(sectionId)}
+        className="group flex w-fit items-center gap-1.5 rounded-md py-1 text-left text-[var(--color-text-muted)] transition-colors hover:text-[var(--color-text)]"
+        aria-expanded={expanded}
+      >
+        {onlyExploration ? (
+          <Eye className="h-3 w-3 shrink-0" />
+        ) : tools.length === 0 ? (
+          <Brain className="h-3 w-3 shrink-0" />
+        ) : (
+          <CheckCircle2 className="h-3 w-3 shrink-0 text-[var(--color-success)]" />
+        )}
+        <span className="text-xs font-medium text-[var(--color-text-muted)]">{title}</span>
+        <ChevronRight
+          className={`h-3 w-3 shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`}
+        />
+      </button>
+
+      <AnimatePresence initial={false}>
+        {expanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="overflow-hidden"
+          >
+            <div className="ml-1 mt-1 space-y-2 border-l border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] pl-4">
+              {detailItems.map((detailItem) => {
+                if (detailItem.kind === "tools") {
+                  const toolSectionId = detailItem.tools[0].message.id;
+                  return (
+                  <ToolSectionView
+                    key={`work-tool-${toolSectionId}`}
+                    sectionId={`${sectionId}-${toolSectionId}`}
+                    tools={detailItem.tools}
+                    expanded={expandedToolIds.has(toolSectionId)}
+                    forceExpanded={false}
+                    sectionFinished
+                    onToggleSection={() =>
+                      setExpandedToolIds((previous) => {
+                        const next = new Set(previous);
+                        if (next.has(toolSectionId)) next.delete(toolSectionId);
+                        else next.add(toolSectionId);
+                        return next;
+                      })
+                    }
+                    onFileClick={onFileClick}
+                  />
+                  );
+                }
+                const { message, index } = detailItem.item;
+                return (
+                  <div key={`work-commentary-${index}`} className="text-sm">
+                    <MarkdownRenderer
+                      content={message.content ?? ""}
+                      onFileClick={onFileClick}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.div>
+  );
+});
+
+const FileChangeSummaryView = memo(function FileChangeSummaryView({
+  tools,
+  onFileClick,
+}: {
+  tools: ToolSectionItem[];
+  onFileClick?: (
+    filePath: string,
+    line?: number,
+    mode?: "diff" | "full",
+  ) => Promise<boolean>;
+}) {
+  const summary = useMemo(() => summarizeToolSection(tools, true), [tools]);
+  const additions = summary.editItems.reduce(
+    (total, item) => total + item.additions,
+    0,
+  );
+  const deletions = summary.editItems.reduce(
+    (total, item) => total + item.deletions,
+    0,
+  );
+  if (summary.editItems.length === 0) return null;
+
+  return (
+    <div className="rounded-xl border border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_62%,transparent)] px-3 py-2.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <Pencil className="h-3.5 w-3.5 shrink-0 text-[var(--color-success)]" />
+        <span className="text-xs font-medium text-[var(--color-text)]">
+          {summary.editItems.length} file
+          {summary.editItems.length === 1 ? "" : "s"} changed
+        </span>
+        {(additions > 0 || deletions > 0) && (
+          <span className="text-[11px] tabular-nums">
+            <span className="text-[var(--color-success)]">+{additions}</span>
+            <span className="mx-1 text-[var(--color-text-muted)]">/</span>
+            <span className="text-[var(--color-error)]">−{deletions}</span>
+          </span>
+        )}
+      </div>
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {summary.editItems.map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            disabled={!item.fullPath}
+            onClick={() =>
+              item.fullPath && onFileClick?.(item.fullPath, undefined, "diff")
+            }
+            title={item.fullPath || item.label}
+            className={`inline-flex max-w-[320px] items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] ${
+              item.fullPath
+                ? `${getStatusChipClasses(item.status)} cursor-pointer hover:brightness-110`
+                : `${getStatusChipClasses(item.status)} cursor-default`
+            }`}
+          >
+            <VSCodeIcon filename={item.label} size={13} />
+            <span className="truncate">{item.label}</span>
+            {(item.additions > 0 || item.deletions > 0) && (
+              <span className="shrink-0 text-[10px] tabular-nums">
+                <span className="text-[var(--color-success)]">
+                  +{item.additions}
+                </span>
+                <span className="mx-0.5 text-[var(--color-text-muted)]">/</span>
+                <span className="text-[var(--color-error)]">
+                  −{item.deletions}
+                </span>
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
+    </div>
   );
 });

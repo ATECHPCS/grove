@@ -18,6 +18,7 @@ import {
 import { PreviewCommentHost } from "../Review/PreviewCommentHost";
 import type { PreviewCommentLocator, PreviewCommentDraft } from "../../context";
 import { useKeyboardScope, useCommand, useContextKey } from "../../keyboard";
+import type { FileLocation } from "./fileLocation";
 
 
 export function getExtBadge(name: string): string {
@@ -107,10 +108,14 @@ function inferNameFromUrl(url: string): string {
   }
 }
 
-export function getPreviewType(fileName: string): "image" | "text" | null {
-  const renderer = getPreviewRenderer(fileName);
+export function getPreviewType(fileName: string): "image" | "text" | "binary" | null {
+  const renderer = getPreviewRenderer(fileName, 'full');
   if (!renderer) return null;
-  return renderer.contentType === 'url' ? "image" : "text";
+  // Map contentType to the "preview kind" the parent uses to decide how to
+  // fetch. 'url' renderers hand the URL to <img>/<iframe> (no fetch needed),
+  // so we surface that as 'image' for the parent; text/binary pass through.
+  if (renderer.contentType === 'url') return 'image';
+  return renderer.contentType;
 }
 
 /** Use this in Resource/Artifacts contexts where plain text files should also be previewable. */
@@ -121,6 +126,10 @@ export function canPreviewFile(fileName: string): boolean {
 interface FilePreviewDrawerProps {
   fileName: string;
   content: string;
+  /** Download URL for the source file. Required for binary previews (xlsx);
+   *  for text/image previews the renderer either doesn't need it (text) or
+   *  uses `content` directly (image/pdf iframes). */
+  downloadUrl?: string;
   loading?: boolean;
   error?: string | null;
   isLive?: boolean;
@@ -138,11 +147,14 @@ interface FilePreviewDrawerProps {
    *  surfaces that aren't task-scoped (e.g. project-level shared resources)
    *  — those refs then stay as plain text. */
   sketchContext?: { projectId: string; taskId: string };
+  /** Storage namespace and path of the previewed file. */
+  location?: FileLocation;
 }
 
 export function FilePreviewDrawer({
   fileName,
   content,
+  downloadUrl,
   loading = false,
   error,
   isLive,
@@ -156,9 +168,10 @@ export function FilePreviewDrawer({
   previewCommentMarkers,
   previewCommentDrafts,
   sketchContext,
+  location,
 }: FilePreviewDrawerProps) {
-  const renderer = getPreviewRenderer(fileName);
-  const wide = renderer?.id === 'jsx' || renderer?.id === 'html';
+  const renderer = getPreviewRenderer(fileName, 'full');
+  const wide = renderer?.id === 'html';
   const canToggleSource = renderer?.contentType === 'text';
   const commentable = !!onCreatePreviewComment && !!renderer && renderer.supportsComments !== false;
   const previewId = useId().replace(/:/g, "");
@@ -211,12 +224,20 @@ export function FilePreviewDrawer({
   const [searchQuery, setSearchQuery] = useState("");
   // Iframe (HTML/JSX) renderers route search through the bridge; for those
   // we rely on bridge-reported counts instead of running TreeWalker locally.
-  const isIframeRenderer = renderer?.id === "html" || renderer?.id === "jsx";
+  const isIframeRenderer = renderer?.id === "html";
+  // AG Grid virtualizes rows — only ~30 rows live in the DOM at a time, so
+  // a TreeWalker-based search sees only the visible window. AG Grid exposes
+  // quickFilterText but routing it would mean a second search backend; the
+  // simplest correct fix is to disable Cmd+F for tabular previews and let
+  // users use the in-table column filter instead.
+  const isTableRenderer =
+    renderer?.id === "csv" || renderer?.id === "tsv" ||
+    renderer?.id === "jsonl" || renderer?.id === "xlsx";
   // Three mutually-exclusive search backends. Virtualized markdown runs
   // search over its pre-parsed plaintext index (DOM-free), iframe renderers
   // forward via postMessage, and everything else uses the TreeWalker-based
   // useDomSearch hook.
-  const searchEnabled = searchOpen && !isIframeRenderer && !isLargeMarkdown;
+  const searchEnabled = searchOpen && !isIframeRenderer && !isLargeMarkdown && !isTableRenderer;
   const dom = useDomSearch(searchRootRef, searchEnabled ? searchQuery : "", searchEnabled);
   const [iframeTotal, setIframeTotal] = useState(0);
   const [iframeCurrent, setIframeCurrent] = useState(0);
@@ -652,7 +673,7 @@ export function FilePreviewDrawer({
                 {content}
               </pre>
             );
-          })() : isLargeMarkdown ? (
+          })(          ) : isLargeMarkdown ? (
             <PreviewCommentHost
               previewComment={
                 commentable
@@ -668,6 +689,8 @@ export function FilePreviewDrawer({
                 onD2Click={setLightboxSvg}
                 sketchContext={sketchContext}
                 sketchRenderMode="image"
+                location={location}
+                renderMode="document"
                 onHeadingsChange={setVirtHeadings}
                 onSearchStateChange={(t, c) => {
                   setVirtTotal(t);
@@ -680,14 +703,16 @@ export function FilePreviewDrawer({
               />
             </PreviewCommentHost>
           ) : renderer ? (
-            <div className={renderer.id === 'image' || renderer.id === 'jsx' || renderer.id === 'html' ? 'h-full' : 'p-5'}>
+            <div className={renderer.id === 'image' || renderer.id === 'html' || renderer.id === 'csv' || renderer.id === 'tsv' || renderer.id === 'jsonl' || renderer.id === 'xlsx' ? 'h-full relative' : 'p-5'}>
               {renderer.renderFull({
                 content,
                 fileName,
+                downloadUrl,
                 onImageClick: setLightboxUrl,
                 onSvgClick: setLightboxSvg,
                 previewComment: commentable ? { enabled: commentMode && !pendingLocator, previewId, markers: stableMarkers } : undefined,
                 sketchContext,
+                location,
               })}
             </div>
           ) : (() => {
@@ -728,55 +753,49 @@ export function FilePreviewDrawer({
         </div>
       </motion.div>
       {pendingLocator && (
-        <div
-          className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/40 backdrop-blur-[2px] animate-in fade-in duration-150"
-          data-hotkeys-dialog="true"
-          onMouseDown={(e) => { if (e.target === e.currentTarget) closeCommentModal(); }}
-        >
+        <>
+          {pendingLocator.rect && (
+            <div
+              className="pointer-events-none fixed z-[9998] rounded-[3px] border-[1.5px] border-blue-500/70 bg-blue-500/20"
+              style={{
+                left: pendingLocator.rect.x,
+                top: pendingLocator.rect.y,
+                width: pendingLocator.rect.width,
+                height: pendingLocator.rect.height,
+              }}
+            />
+          )}
           <div
-            className="w-[min(92vw,460px)] overflow-hidden rounded-xl border shadow-2xl"
-            style={{ background: "var(--color-bg)", borderColor: "var(--color-border)" }}
+            className="fixed z-[9999] w-[min(260px,calc(100vw-20px))] rounded-xl border p-2 shadow-[0_10px_28px_rgba(0,0,0,.18)]"
+            data-hotkeys-dialog="true"
+            style={{
+              background: "var(--color-bg)",
+              borderColor: "var(--color-border)",
+              left: pendingLocator.rect
+                ? (window.innerWidth - (pendingLocator.rect.x + pendingLocator.rect.width) >= 280
+                    ? pendingLocator.rect.x + pendingLocator.rect.width + 12
+                    : Math.max(10, pendingLocator.rect.x - 272))
+                : Math.max(10, window.innerWidth - 270),
+              top: pendingLocator.rect
+                ? (window.innerHeight - (pendingLocator.rect.y + pendingLocator.rect.height) >= 140
+                    ? pendingLocator.rect.y + pendingLocator.rect.height + 8
+                    : Math.max(10, pendingLocator.rect.y - 132))
+                : 24,
+            }}
           >
-            <div className="flex items-center justify-between gap-2 px-4 py-2.5" style={{ borderBottom: "1px solid var(--color-border)", background: "var(--color-bg-secondary)" }}>
-              <div className="flex min-w-0 items-center gap-1.5">
-                <MessageSquarePlus className="h-3.5 w-3.5 shrink-0" style={{ color: "var(--color-highlight)" }} />
-                <span className="text-[13px] font-semibold text-[var(--color-text)]">
-                  {editingDraftId ? "Edit preview comment" : "New preview comment"}
-                </span>
-              </div>
-              <button
-                onClick={closeCommentModal}
-                className="rounded-md p-1 text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
-                title="Close (Esc)"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            </div>
-            <div className="px-4 pt-3">
-              <div className="truncate font-mono text-[10.5px] text-[var(--color-text-muted)]" title={pendingLocator.selector || pendingLocator.tagName}>
-                {pendingLocator.selector || pendingLocator.tagName}
-              </div>
-              {pendingLocator.text && (
-                <div className="mt-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded-md border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-2.5 py-1.5 text-[11px] leading-snug text-[var(--color-text-muted)]">
-                  {pendingLocator.text}
-                </div>
-              )}
-            </div>
-            <div className="px-4 py-3">
               <textarea
                 value={commentText}
                 onChange={(e) => setCommentText(e.target.value)}
-                autoFocus
                 rows={3}
-                className="w-full resize-none rounded-lg border bg-[var(--color-bg-secondary)] px-2.5 py-2 text-[13px] leading-snug outline-none transition-colors focus:border-[var(--color-highlight)]"
-                style={{ borderColor: "var(--color-border)", color: "var(--color-text)" }}
-                placeholder="What should change about this area?"
+                className="block w-full resize-none border-0 bg-transparent px-1.5 py-1 text-xs leading-4 outline-none"
+                style={{ color: "var(--color-text)" }}
+                placeholder="Add a comment…"
                 onKeyDown={(e) => {
                   if (e.key === "Escape") { e.preventDefault(); closeCommentModal(); }
                   if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submitPreviewComment();
                 }}
               />
-              <div className="mt-2.5 flex items-center justify-between gap-2">
+              <div className="mt-1 flex items-center justify-between gap-1">
                 <div className="flex items-center gap-2">
                   {editingDraftId && onDeletePreviewComment && (
                     <button
@@ -788,30 +807,26 @@ export function FilePreviewDrawer({
                       Delete
                     </button>
                   )}
-                  <span className="text-[10px] text-[var(--color-text-muted)]">
-                    <kbd className="rounded border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-1 py-px font-mono text-[10px]">⌘↵</kbd> to submit
-                  </span>
                 </div>
-                <div className="flex gap-2">
+                <div className="flex gap-1">
                   <button
                     onClick={closeCommentModal}
-                    className="rounded-md px-2.5 py-1 text-[11px] text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+                    className="rounded-md px-2 py-1 text-[10px] text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
                   >
                     Cancel
                   </button>
                   <button
                     onClick={submitPreviewComment}
                     disabled={!commentText.trim()}
-                    className="rounded-md px-3 py-1 text-[11px] font-semibold text-white shadow-sm transition-opacity disabled:opacity-40"
+                    className="rounded-md px-2 py-1 text-[10px] font-semibold text-white shadow-sm transition-opacity disabled:opacity-40"
                     style={{ background: "var(--color-highlight)" }}
                   >
                     {editingDraftId ? "Save" : "Add comment"}
                   </button>
                 </div>
               </div>
-            </div>
           </div>
-        </div>
+        </>
       )}
       <ImageLightbox
         imageUrl={lightboxUrl}

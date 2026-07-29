@@ -1,10 +1,11 @@
 import { useRef, useEffect, Fragment, useState, useMemo, useCallback, useId } from 'react';
+import { createPortal } from 'react-dom';
 import type { DiffFile, DiffHunk } from '../../api/review';
 import { getFileContent } from '../../api/review';
 import type { ReviewCommentEntry } from '../../api/tasks';
 import type { CommentAnchor } from './DiffReviewPage';
 import { CommentCard, CommentForm, ReplyForm } from './InlineComment';
-import { ChevronRight, ChevronDown, ChevronUp, Copy, Check, List, MessageSquare, MessageSquarePlus, ChevronsUpDown, Eye, Maximize2, Minimize2, Trash2, X } from 'lucide-react';
+import { ChevronRight, ChevronDown, ChevronUp, Copy, Check, List, MessageSquare, MessageSquarePlus, ChevronsUpDown, ChevronsDownUp, Eye, Maximize2, Minimize2, Trash2, X } from 'lucide-react';
 import { detectLanguage, highlightLines } from './syntaxHighlight';
 import { GutterAvatar } from './AgentAvatar';
 import { useFileMention } from '../../hooks';
@@ -17,7 +18,7 @@ import { PreviewCommentHost } from './PreviewCommentHost';
 import { PreviewSearchBar } from './PreviewSearchBar';
 import { useDomSearch } from './useDomSearch';
 import { ImageLightbox } from '../ui/ImageLightbox';
-import { usePreviewComments, type PreviewCommentLocator } from '../../context';
+import { previewCommentTaskLabel, usePreviewComments, type PreviewCommentLocator } from '../../context';
 import { useCommand, useContextKey, useDefineCommand, useKeyboardScope } from '../../keyboard';
 
 // ============================================================================
@@ -61,6 +62,15 @@ const _matchCounter = { current: 0 };
 // eslint-disable-next-line react-refresh/only-export-components
 export function resetGlobalMatchIndex() {
   _matchCounter.current = 0;
+}
+
+// Fallback for files where the backend's `is_binary` flag wasn't propagated
+// (e.g. all-files view defaults it to false). Keeps us from showing a scary
+// red "Failed to load" message for things like .DS_Store when the real story
+// is just "this is a binary asset, no meaningful diff".
+const BINARY_PATH_RE = /\.(png|jpe?g|gif|webp|bmp|ico|svg|pdf|zip|tar|gz|7z|rar|exe|dll|so|dylib|bin|class|jar|wasm|psd|ai|sketch|fig|DS_Store|lnk)$/i;
+function looksLikeBinaryPath(path: string): boolean {
+  return BINARY_PATH_RE.test(path);
 }
 
 function highlightSearchMatches(
@@ -344,15 +354,21 @@ export function DiffFileView({
     centerX: number;
   } | null>(null);
 
-  // Split mode: constrain selection to one panel by disabling user-select on the other
+  // Split mode: constrain selection to one panel by disabling user-select on the other.
+  // Remembers the mousedown point so mouseup can re-hit-test the exact pixel the drag
+  // started at, instead of trusting native Range boundaries (see handleMouseUp).
+  const mouseDownPosRef = useRef<{ x: number; y: number } | null>(null);
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    mouseDownPosRef.current = { x: e.clientX, y: e.clientY };
+
     const splitTable = ref.current?.querySelector('.diff-split');
     if (!splitTable) return;
 
     // Clear previous containment
     splitTable.classList.remove('selecting-left', 'selecting-right');
 
-    // Walk up from click target to find a data-side cell
+    // Walk up from click target to find a data-side cell (now present on gutters too,
+    // so starting a drag on the narrow line-number column still locks the right panel)
     let el = e.target as HTMLElement | null;
     while (el && el !== ref.current) {
       if (el.hasAttribute('data-side')) {
@@ -363,31 +379,57 @@ export function DiffFileView({
     }
   }, []);
 
-  const handleMouseUp = useCallback(() => {
+  // Hit-test the actual pixel under a point, rather than walking a DOM Range's
+  // start/endContainer. Range boundaries snap to the nearest text node, which skips
+  // right over empty/blank diff-code cells (no text to anchor to) and lands the
+  // boundary on whatever row happens to have text next — pixel hit-testing always
+  // finds the real cell under the cursor, blank or not.
+  const findLineCellAtPoint = useCallback((x: number, y: number): HTMLElement | null => {
+    if (!ref.current) return null;
+    let el = document.elementFromPoint(x, y) as HTMLElement | null;
+    while (el && ref.current.contains(el)) {
+      if (el.hasAttribute('data-line')) {
+        return el;
+      }
+      el = el.parentElement;
+    }
+    return null;
+  }, []);
+
+  // A collapsed/undexpanded hunk boundary renders a `.diff-hunk-header` divider
+  // row (the "@@ ... @@" line, or a "N lines hidden" fold marker). If one of those
+  // sits physically between the drag's two endpoints, the line numbers on either
+  // side aren't actually adjacent — treat the selection as invalid rather than
+  // reporting a range that silently jumps over the gap.
+  const hasHunkBoundaryBetween = useCallback((a: HTMLElement, b: HTMLElement): boolean => {
+    if (!ref.current) return false;
+    const aBeforeB = !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    const [first, second] = aBeforeB ? [a, b] : [b, a];
+    const headers = ref.current.querySelectorAll('.diff-hunk-header');
+    for (const header of Array.from(headers)) {
+      const afterFirst = !!(first.compareDocumentPosition(header) & Node.DOCUMENT_POSITION_FOLLOWING);
+      const beforeSecond = !!(second.compareDocumentPosition(header) & Node.DOCUMENT_POSITION_PRECEDING);
+      if (afterFirst && beforeSecond) return true;
+    }
+    return false;
+  }, []);
+
+  const handleMouseUp = useCallback((e: React.MouseEvent) => {
     const selection = window.getSelection();
-    if (!selection || selection.isCollapsed || !ref.current) {
+    if (!selection || selection.isCollapsed || !ref.current || !mouseDownPosRef.current) {
       setSelectionAnchor(null);
       return;
     }
 
-    const range = selection.getRangeAt(0);
-
-    // Find nearest element (TR or TD) with data-line within this file section
-    const findLineCell = (node: Node): HTMLElement | null => {
-      let el = node instanceof HTMLElement ? node : node.parentElement;
-      while (el && el !== ref.current) {
-        if (el.hasAttribute('data-line')) {
-          return el;
-        }
-        el = el.parentElement;
-      }
-      return null;
-    };
-
-    const startCell = findLineCell(range.startContainer);
-    const endCell = findLineCell(range.endContainer);
+    const startCell = findLineCellAtPoint(mouseDownPosRef.current.x, mouseDownPosRef.current.y);
+    const endCell = findLineCellAtPoint(e.clientX, e.clientY);
 
     if (!startCell || !endCell) {
+      setSelectionAnchor(null);
+      return;
+    }
+
+    if (startCell !== endCell && hasHunkBoundaryBetween(startCell, endCell)) {
       setSelectionAnchor(null);
       return;
     }
@@ -426,7 +468,21 @@ export function DiffFileView({
       top: endRect.bottom - sectionRect.top + 4,
       centerX,
     });
-  }, [viewType]);
+  }, [viewType, findLineCellAtPoint, hasHunkBoundaryBetween]);
+
+  // Selections inside the diff table serialize as a full <table> HTML fragment by
+  // default (Range boundaries land inside <td>s, so the browser wraps the clipboard
+  // payload in ancestor table markup to stay valid HTML) — pasting into anything
+  // that honors text/html then shows a literal table instead of just the code text.
+  // Force a plain-text-only clipboard payload so paste matches what's visually selected.
+  const handleCopy = useCallback((e: React.ClipboardEvent) => {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed) return;
+    const text = selection.toString();
+    if (!text) return;
+    e.preventDefault();
+    e.clipboardData.setData('text/plain', text);
+  }, []);
 
   // Clear selection anchor when selection changes elsewhere
   useEffect(() => {
@@ -489,7 +545,7 @@ export function DiffFileView({
   const searchRootRef = useRef<HTMLDivElement>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const isIframePreview = previewRenderer?.id === 'html' || previewRenderer?.id === 'jsx';
+  const isIframePreview = previewRenderer?.id === 'html';
   const dom = useDomSearch(searchRootRef, searchOpen && !isIframePreview ? searchQuery : '', searchOpen && !isIframePreview);
   const [iframeTotal, setIframeTotal] = useState(0);
   const [iframeCurrent, setIframeCurrent] = useState(0);
@@ -680,11 +736,17 @@ export function DiffFileView({
     if (!projectId || !taskId) return '[]';
     const path = file.new_path;
     const entries: PreviewCommentMarker[] = [];
-    let n = 0;
     for (const d of previewCommentDrafts) {
       if (d.projectId !== projectId || d.taskId !== taskId || d.filePath !== path) continue;
-      n++;
-      entries.push({ id: d.id, label: String(n), selector: d.locator.selector, xpath: d.locator.xpath, extraBlocks: d.locator.extraBlocks });
+      entries.push({
+        id: d.id,
+        label: previewCommentTaskLabel(previewCommentDrafts, d),
+        selector: d.locator.selector,
+        xpath: d.locator.xpath,
+        extraBlocks: d.locator.extraBlocks,
+        locator: d.locator,
+        comment: d.comment,
+      });
     }
     return JSON.stringify(entries);
   }, [previewCommentDrafts, projectId, taskId, file.new_path]);
@@ -692,6 +754,30 @@ export function DiffFileView({
     () => JSON.parse(previewCommentMarkersKey),
     [previewCommentMarkersKey],
   );
+
+  const previewCommentConfig = useMemo(() => {
+    if (!projectId || !taskId || !previewRenderer || previewRenderer.supportsComments === false) return undefined;
+    return {
+      enabled: previewCommentMode,
+      previewId: previewCommentId,
+      markers: previewCommentMarkers,
+      onAdd: (locator: PreviewCommentLocator, comment: string) => {
+        addDraft({
+          source: 'review' as const,
+          projectId,
+          taskId,
+          filePath: file.new_path,
+          fileName: file.new_path.split('/').pop() || file.new_path,
+          rendererId: previewRenderer.id,
+          locator,
+          comment,
+        });
+        setPreviewCommentMode(false);
+      },
+      onUpdate: (id: string, comment: string) => updateDraft(id, { comment }),
+      onDelete: (id: string) => removeDraft(id),
+    };
+  }, [addDraft, file.new_path, previewCommentId, previewCommentMarkers, previewCommentMode, previewRenderer, projectId, removeDraft, taskId, updateDraft]);
 
   const closePreviewCommentModal = useCallback(() => {
     setPendingPreviewLocator(null);
@@ -1092,6 +1178,37 @@ export function DiffFileView({
     });
   }, [ensureFileLines]);
 
+  // Expand every collapsed region in this file at once. Marks all *potential* gap
+  // indices (0..hunks.length, the trailing gap being the last) rather than iterating
+  // `gaps` — the trailing gap only materializes once fileLines resolves, and this
+  // click is what kicks that fetch off. Marking a non-existent index is inert.
+  const handleExpandAllGaps = useCallback(() => {
+    ensureFileLines();
+    setExpansions(() => {
+      const next = new Map<number, GapExpansion>();
+      for (let i = 0; i <= file.hunks.length; i++) {
+        next.set(i, { fromTop: 0, fromBottom: 0, full: true });
+      }
+      return next;
+    });
+  }, [ensureFileLines, file.hunks.length]);
+
+  // Collapse every expanded region back to the default folded diff. An empty map is
+  // the pristine state, so this also drops any partial 20-line expansions.
+  const handleCollapseAllGaps = useCallback(() => {
+    setExpansions(new Map());
+  }, []);
+
+  const hasCollapsedGaps = useMemo(
+    () => gaps.some((g) => !isGapFullyExpanded(g, expansions.get(g.gapIndex))),
+    [gaps, expansions],
+  );
+
+  const handleExpandAllClick = useCallback(() => {
+    if (hasCollapsedGaps) handleExpandAllGaps();
+    else handleCollapseAllGaps();
+  }, [hasCollapsedGaps, handleExpandAllGaps, handleCollapseAllGaps]);
+
   const expandProps: ExpandProps = {
     gapsByHunkIndex,
     expansions,
@@ -1178,7 +1295,7 @@ export function DiffFileView({
   };
 
   return (
-    <div ref={ref} className="diff-file-section" id={`diff-file-${encodeURIComponent(file.new_path)}`} onMouseDown={handleMouseDown} onMouseUp={handleMouseUp}>
+    <div ref={ref} className="diff-file-section" id={`diff-file-${encodeURIComponent(file.new_path)}`} onMouseDown={handleMouseDown} onMouseUp={handleMouseUp} onCopy={handleCopy}>
       <div className={`diff-file-header ${isActive ? 'ring-1 ring-[var(--color-highlight)]' : ''}`}>
         <div className="diff-file-header-top">
           {onToggleCollapse && (
@@ -1214,6 +1331,19 @@ export function DiffFileView({
               <Copy style={{ width: 12, height: 12 }} />
             )}
           </button>
+          {viewMode === 'diff' && !isCollapsed && gaps.length > 0 && (
+            <button
+              className="diff-file-expand-all-btn"
+              onClick={handleExpandAllClick}
+              title={`${hasCollapsedGaps ? 'Expand' : 'Collapse'} all lines: ${file.new_path}`}
+            >
+              {hasCollapsedGaps ? (
+                <ChevronsUpDown style={{ width: 12, height: 12 }} />
+              ) : (
+                <ChevronsDownUp style={{ width: 12, height: 12 }} />
+              )}
+            </button>
+          )}
           <span className="diff-file-header-right">
             {onAddFileComment && (
               <button
@@ -1401,6 +1531,8 @@ export function DiffFileView({
                     <p>This file is planned to be created but doesn't exist yet in the current branch.</p>
                   </div>
                 </div>
+              ) : previewRenderer?.id === 'image' && projectId && taskId ? (
+                <ImagePreview projectId={projectId} taskId={taskId} file={file} onImageClick={setLightboxUrl} />
               ) : file.is_binary ? (
                 <div className="diff-binary">
                   {viewMode === 'full'
@@ -1418,13 +1550,24 @@ export function DiffFileView({
                     viewType={viewType}
                     {...commonCommentProps}
                   />
+                ) : looksLikeBinaryPath(file.new_path) ? (
+                  <div className="diff-binary">Binary file — cannot display in Full Files mode</div>
                 ) : (
                   <div className="diff-error">Failed to load file content</div>
                 )
               ) : file.is_unsupported ? (
                 <div className="diff-binary">Diff not supported for this file type</div>
               ) : file.load_error ? (
-                <div className="diff-error">Failed to load file content</div>
+                // If the diff API errored out but the path looks like a binary
+                // asset (image, archive, native lib, common macOS/Windows
+                // metadata), don't surface the error in red — the diff just
+                // isn't meaningful for these. Real text-file fetch failures
+                // still render as the diff-error style below.
+                looksLikeBinaryPath(file.new_path) ? (
+                  <div className="diff-binary">Binary file changed</div>
+                ) : (
+                  <div className="diff-error">Failed to load file content</div>
+                )
               ) : file.hunks.length === 0 && (file.additions > 0 || file.deletions > 0) ? (
                 <div className="diff-binary" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <div className="spinner" style={{ width: 14, height: 14 }} />
@@ -1541,15 +1684,19 @@ export function DiffFileView({
                         const content = viewMode === 'full' && fullFileContent != null
                           ? fullFileContent
                           : file.hunks.flatMap(h => h.lines.filter(l => l.line_type !== 'delete').map(l => l.content)).join('\n');
+                        const location = projectId && taskId ? {
+                          projectId,
+                          root: { kind: "task" as const, taskId },
+                          path: file.new_path,
+                        } : undefined;
                         return content.trim()
                           ? previewRenderer.renderFull({
                               content,
                               fileName: file.new_path,
                               onImageClick: setLightboxUrl,
                               onSvgClick: setLightboxSvg,
-                              previewComment: previewRenderer.supportsComments !== false && projectId && taskId
-                                ? { enabled: previewCommentMode, previewId: previewCommentId, markers: previewCommentMarkers }
-                                : undefined,
+                              previewComment: previewCommentConfig,
+                              location,
                             })
                           : <div className="preview-loading">No content to render</div>;
                       })()
@@ -1563,11 +1710,23 @@ export function DiffFileView({
                               fileName: file.new_path,
                               onImageClick: setLightboxUrl,
                               onSvgClick: setLightboxSvg,
-                              previewComment: previewRenderer.supportsComments !== false && projectId && taskId
-                                ? { enabled: previewCommentMode, previewId: previewCommentId, markers: previewCommentMarkers }
-                                : undefined,
+                              previewComment: previewCommentConfig,
+                              location: projectId && taskId ? {
+                                projectId,
+                                root: { kind: "task", taskId },
+                                path: file.new_path,
+                              } : undefined,
                             })
-                          : <MarkdownRenderer content={fullFileContent} onImageClick={setLightboxUrl} onMermaidClick={setLightboxSvg} />
+                          : <MarkdownRenderer
+                              content={fullFileContent}
+                              onImageClick={setLightboxUrl}
+                              onMermaidClick={setLightboxSvg}
+                              location={projectId && taskId ? {
+                                projectId,
+                                root: { kind: "task", taskId },
+                                path: file.new_path,
+                              } : undefined}
+                            />
                       ) : (
                         <div className="preview-loading">Failed to load file content</div>
                       )
@@ -1576,7 +1735,16 @@ export function DiffFileView({
                         const segmentsContent = previewSegments.map((seg) =>
                           seg.type === 'markdown' ? (
                             <div key={seg.id} className={`preview-block-${seg.kind}`}>
-                              <MarkdownRenderer content={seg.content} onImageClick={setLightboxUrl} onMermaidClick={setLightboxSvg} />
+                              <MarkdownRenderer
+                                content={seg.content}
+                                onImageClick={setLightboxUrl}
+                                onMermaidClick={setLightboxSvg}
+                                location={projectId && taskId ? {
+                                  projectId,
+                                  root: { kind: "task", taskId },
+                                  path: file.new_path,
+                                } : undefined}
+                              />
                             </div>
                           ) : seg.language === 'mermaid' ? (
                             <MermaidBlock key={seg.id} code={seg.lines.map(l => l.content).join('\n')} onPreviewClick={setLightboxSvg} />
@@ -1597,11 +1765,7 @@ export function DiffFileView({
                         );
                         return previewRenderer && previewRenderer.supportsComments !== false && projectId && taskId ? (
                           <PreviewCommentHost
-                            previewComment={{
-                              enabled: previewCommentMode,
-                              previewId: previewCommentId,
-                              markers: previewCommentMarkers,
-                            }}
+                            previewComment={previewCommentConfig}
                           >
                             {segmentsContent}
                           </PreviewCommentHost>
@@ -1653,57 +1817,59 @@ export function DiffFileView({
         />
       )}
 
-      {pendingPreviewLocator && (
-        <div
-          data-hotkeys-dialog="true"
-          onMouseDown={(e) => { if (e.target === e.currentTarget) closePreviewCommentModal(); }}
-          style={{ position: 'fixed', inset: 0, zIndex: 1001, background: 'rgba(0,0,0,.4)', backdropFilter: 'blur(2px)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-        >
-          <div style={{ width: 'min(92vw,460px)', background: 'var(--color-bg)', border: '1px solid var(--color-border)', borderRadius: 12, boxShadow: '0 18px 50px rgba(0,0,0,.28)', overflow: 'hidden' }}>
-            <div style={{ padding: '8px 12px', borderBottom: '1px solid var(--color-border)', background: 'var(--color-bg-secondary)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
-                <MessageSquarePlus style={{ width: 13, height: 13, color: 'var(--color-highlight)', flexShrink: 0 }} />
-                <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text)' }}>
-                  {editingPreviewDraftId ? 'Edit preview comment' : 'New preview comment'}
-                </span>
-              </div>
-              <button
-                onClick={closePreviewCommentModal}
-                title="Close (Esc)"
-                style={{ display: 'inline-flex', padding: 4, border: 'none', background: 'transparent', borderRadius: 4, color: 'var(--color-text-muted)', cursor: 'pointer' }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--color-bg-tertiary)'; e.currentTarget.style.color = 'var(--color-text)'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--color-text-muted)'; }}
-              >
-                <X style={{ width: 13, height: 13 }} />
-              </button>
-            </div>
-            <div style={{ padding: '12px 16px 0' }}>
-              <div
-                title={pendingPreviewLocator.selector || pendingPreviewLocator.tagName}
-                style={{ fontFamily: 'ui-monospace,SFMono-Regular,Menlo,monospace', fontSize: 10.5, color: 'var(--color-text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-              >
-                {pendingPreviewLocator.selector || pendingPreviewLocator.tagName}
-              </div>
-              {pendingPreviewLocator.text && (
-                <div style={{ marginTop: 8, padding: '6px 10px', border: '1px solid var(--color-border)', borderRadius: 6, background: 'var(--color-bg-secondary)', color: 'var(--color-text-muted)', fontSize: 11, lineHeight: 1.4, maxHeight: 160, overflowY: 'auto', whiteSpace: 'pre-wrap' }}>
-                  {pendingPreviewLocator.text}
-                </div>
-              )}
-            </div>
-            <div style={{ padding: '12px 16px' }}>
+      {pendingPreviewLocator && typeof document !== 'undefined' && createPortal(
+        <>
+          {pendingPreviewLocator.rect && (
+            <div
+              style={{
+                position: 'fixed',
+                zIndex: 1000,
+                pointerEvents: 'none',
+                left: pendingPreviewLocator.rect.x,
+                top: pendingPreviewLocator.rect.y,
+                width: pendingPreviewLocator.rect.width,
+                height: pendingPreviewLocator.rect.height,
+                border: '1.5px solid rgba(59,130,246,.7)',
+                background: 'rgba(59,130,246,.2)',
+                borderRadius: 3,
+              }}
+            />
+          )}
+          <div
+            data-hotkeys-dialog="true"
+            style={{
+              position: 'fixed',
+              zIndex: 1001,
+              width: 'min(260px, calc(100vw - 20px))',
+              left: pendingPreviewLocator.rect
+                ? (window.innerWidth - (pendingPreviewLocator.rect.x + pendingPreviewLocator.rect.width) >= 280
+                    ? pendingPreviewLocator.rect.x + pendingPreviewLocator.rect.width + 12
+                    : Math.max(10, pendingPreviewLocator.rect.x - 272))
+                : Math.max(10, window.innerWidth - 270),
+              top: pendingPreviewLocator.rect
+                ? (window.innerHeight - (pendingPreviewLocator.rect.y + pendingPreviewLocator.rect.height) >= 140
+                    ? pendingPreviewLocator.rect.y + pendingPreviewLocator.rect.height + 8
+                    : Math.max(10, pendingPreviewLocator.rect.y - 132))
+                : 24,
+              padding: 8,
+              background: 'var(--color-bg)',
+              border: '1px solid var(--color-border)',
+              borderRadius: 12,
+              boxShadow: '0 10px 28px rgba(0,0,0,.18)',
+            }}
+          >
               <textarea
                 value={previewCommentText}
                 onChange={(e) => setPreviewCommentText(e.target.value)}
-                autoFocus
                 rows={3}
-                placeholder="What should change about this area?"
+                placeholder="Add a comment…"
                 onKeyDown={(e) => {
                   if (e.key === 'Escape') { e.preventDefault(); closePreviewCommentModal(); }
                   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submitReviewPreviewComment();
                 }}
-                style={{ width: '100%', resize: 'none', border: '1px solid var(--color-border)', borderRadius: 8, background: 'var(--color-bg-secondary)', color: 'var(--color-text)', padding: '8px 10px', outline: 'none', fontSize: 13, lineHeight: 1.4 }}
+                style={{ display: 'block', width: '100%', resize: 'none', border: 'none', background: 'transparent', color: 'var(--color-text)', padding: '4px 6px', outline: 'none', fontSize: 12, lineHeight: 1.4 }}
               />
-              <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+              <div style={{ marginTop: 4, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   {editingPreviewDraftId && (
                     <button
@@ -1717,9 +1883,6 @@ export function DiffFileView({
                       Delete
                     </button>
                   )}
-                  <span style={{ fontSize: 10, color: 'var(--color-text-muted)' }}>
-                    <kbd style={{ border: '1px solid var(--color-border)', background: 'var(--color-bg-secondary)', borderRadius: 3, padding: '0 4px', fontFamily: 'ui-monospace,SFMono-Regular,Menlo,monospace', fontSize: 10 }}>⌘↵</kbd> to submit
-                  </span>
                 </div>
                 <div style={{ display: 'flex', gap: 8 }}>
                   <button
@@ -1735,13 +1898,13 @@ export function DiffFileView({
                     onClick={submitReviewPreviewComment}
                     style={{ border: 'none', borderRadius: 6, padding: '4px 12px', background: 'var(--color-highlight)', color: 'white', fontSize: 11, fontWeight: 600, opacity: previewCommentText.trim() ? 1 : .4, boxShadow: '0 1px 2px rgba(0,0,0,.12)', cursor: previewCommentText.trim() ? 'pointer' : 'not-allowed' }}
                   >
-                    {editingPreviewDraftId ? 'Save' : 'Add comment'}
+                    Save
                   </button>
                 </div>
               </div>
-            </div>
           </div>
-        </div>
+        </>,
+        document.body,
       )}
 
       {/* Floating comment button on text selection */}
@@ -2048,6 +2211,7 @@ function ExpandedContextRows({
               <tr className="diff-line-expanded" data-line={newLine}>
                 <td
                   className={`diff-gutter ${leftHighlighted ? 'diff-line-highlighted' : ''} ${collapsedLeftCount > 0 ? 'has-collapsed-comment' : ''}`}
+                  data-side="DELETE"
                   onClick={(e) => {
                     if (collapsedLeftCount > 0 && onExpandComment) {
                       leftComments.filter((c) => collapsedCommentIds?.has(c.id)).forEach((c) => onExpandComment(c.id));
@@ -2069,6 +2233,7 @@ function ExpandedContextRows({
                 <td className={`diff-code ${leftHighlighted ? 'diff-line-highlighted' : ''}`} data-line={oldLine} data-side="DELETE">{content}</td>
                 <td
                   className={`diff-gutter diff-gutter-split-middle ${rightHighlighted ? 'diff-line-highlighted' : ''} ${collapsedRightCount > 0 ? 'has-collapsed-comment' : ''}`}
+                  data-side="ADD"
                   onClick={(e) => {
                     if (collapsedRightCount > 0 && onExpandComment) {
                       rightComments.filter((c) => collapsedCommentIds?.has(c.id)).forEach((c) => onExpandComment(c.id));
@@ -2963,6 +3128,7 @@ function SplitHunkRows({
             <tr>
               <td
                 className={`diff-gutter ${pair.left?.line_type === 'delete' ? 'diff-line-delete' : ''} ${leftHighlighted ? 'diff-line-highlighted' : ''} ${collapsedLeftCount > 0 ? 'has-collapsed-comment' : ''}`}
+                data-side="DELETE"
                 onClick={(e) => {
                   if (collapsedLeftCount > 0 && onExpandComment) {
                     leftComments.filter((c) => collapsedCommentIds?.has(c.id)).forEach((c) => onExpandComment(c.id));
@@ -3004,6 +3170,7 @@ function SplitHunkRows({
               </td>
               <td
                 className={`diff-gutter diff-gutter-split-middle ${pair.right?.line_type === 'insert' ? 'diff-line-insert' : ''} ${rightHighlighted ? 'diff-line-highlighted' : ''} ${collapsedRightCount > 0 ? 'has-collapsed-comment' : ''}`}
+                data-side="ADD"
                 onClick={(e) => {
                   if (collapsedRightCount > 0 && onExpandComment) {
                     rightComments.filter((c) => collapsedCommentIds?.has(c.id)).forEach((c) => onExpandComment(c.id));

@@ -283,6 +283,12 @@ pub struct Config {
     #[serde(default)]
     pub browser_control: BrowserControlConfig,
 
+    #[serde(default)]
+    pub audio: AudioConfig,
+
+    #[serde(default)]
+    pub voice_control: VoiceControlConfig,
+
     /// Storage layout version (None = legacy, "1.0" = task-centric layout)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_version: Option<String>,
@@ -342,6 +348,38 @@ pub struct NotificationsConfig {
     /// Stored in display form (e.g. "Cmd+Shift+M"); empty/None disables.
     #[serde(default)]
     pub menubar_shortcut: Option<String>,
+
+    /// Retention policy for tray "Done" chats. `Forever` keeps them until the
+    /// user dismisses; `Expire` drops any done chat whose `entered_state_at`
+    /// is older than `value` of `unit`. Running/permission chats are never
+    /// dropped by this policy — only done ones.
+    #[serde(default = "default_tray_done_retention")]
+    pub tray_done_retention: RetentionPolicy,
+}
+
+/// How long a tray "Done" chat is kept before automatic cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RetentionUnit {
+    Hours,
+    Days,
+}
+
+/// Externally-tagged enum on the wire:
+///   `{ "forever": null }`              — never auto-prune
+///   `{ "expire": { "value": 3, "unit": "days" } }` — prune after N hours/days
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RetentionPolicy {
+    Forever,
+    Expire { value: u32, unit: RetentionUnit },
+}
+
+fn default_tray_done_retention() -> RetentionPolicy {
+    RetentionPolicy::Expire {
+        value: 3,
+        unit: RetentionUnit::Days,
+    }
 }
 
 impl Default for NotificationsConfig {
@@ -356,6 +394,7 @@ impl Default for NotificationsConfig {
             notification_show_done: true,
             notification_show_running: false,
             menubar_shortcut: None,
+            tray_done_retention: default_tray_done_retention(),
         }
     }
 }
@@ -382,6 +421,128 @@ impl Default for BrowserControlConfig {
         Self {
             enabled: true,
             auto_groups: true,
+        }
+    }
+}
+
+/// Global Audio Config
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub transcribe_provider: String,
+    #[serde(default)]
+    pub preferred_languages: Vec<String>,
+    #[serde(default)]
+    pub toggle_shortcut: String,
+    #[serde(default)]
+    pub push_to_talk_key: String,
+    #[serde(default = "default_ptt_activation_delay_ms")]
+    pub ptt_activation_delay_ms: u32,
+    #[serde(default = "default_max_duration")]
+    pub max_duration: u32,
+    #[serde(default = "default_min_duration")]
+    pub min_duration: u32,
+    #[serde(default)]
+    pub revise_enabled: bool,
+    #[serde(default)]
+    pub revise_provider: String,
+    #[serde(default)]
+    pub revise_prompt_global: String,
+    #[serde(default = "default_transcribe_mode")]
+    pub transcribe_mode: String,
+    #[serde(default)]
+    pub global_mode_enabled: bool,
+}
+
+fn default_ptt_activation_delay_ms() -> u32 {
+    500
+}
+fn default_max_duration() -> u32 {
+    60
+}
+fn default_min_duration() -> u32 {
+    2
+}
+fn default_transcribe_mode() -> String {
+    "batch".to_string()
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            transcribe_provider: String::new(),
+            preferred_languages: Vec::new(),
+            toggle_shortcut: String::new(),
+            push_to_talk_key: String::new(),
+            ptt_activation_delay_ms: default_ptt_activation_delay_ms(),
+            max_duration: default_max_duration(),
+            min_duration: default_min_duration(),
+            revise_enabled: false,
+            revise_provider: String::new(),
+            revise_prompt_global: String::new(),
+            transcribe_mode: default_transcribe_mode(),
+            global_mode_enabled: false,
+        }
+    }
+}
+
+/// Global Voice Control Config
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceControlConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub stt_provider_id: String,
+    #[serde(default)]
+    pub stt_model: String,
+    #[serde(default)]
+    pub llm_provider_id: String,
+    #[serde(default)]
+    pub llm_model: String,
+    #[serde(default)]
+    pub toggle_shortcut: String,
+    #[serde(default)]
+    pub push_to_talk_key: String,
+    #[serde(default = "default_ptt_activation_delay_ms")]
+    pub ptt_activation_delay_ms: u32,
+    #[serde(default = "default_voice_control_max_duration")]
+    pub max_duration: u32,
+    #[serde(default = "default_voice_control_min_duration")]
+    pub min_duration: u32,
+    #[serde(default)]
+    pub preferred_languages: Vec<String>,
+    #[serde(default)]
+    pub disabled_actions: Vec<String>,
+    #[serde(default)]
+    pub has_initialized_actions: bool,
+}
+
+fn default_voice_control_max_duration() -> u32 {
+    10
+}
+fn default_voice_control_min_duration() -> u32 {
+    1
+}
+
+impl Default for VoiceControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stt_provider_id: String::new(),
+            stt_model: String::new(),
+            llm_provider_id: String::new(),
+            llm_model: String::new(),
+            toggle_shortcut: String::new(),
+            push_to_talk_key: String::new(),
+            ptt_activation_delay_ms: default_ptt_activation_delay_ms(),
+            max_duration: default_voice_control_max_duration(),
+            min_duration: default_voice_control_min_duration(),
+            preferred_languages: Vec::new(),
+            disabled_actions: Vec::new(),
+            has_initialized_actions: false,
         }
     }
 }

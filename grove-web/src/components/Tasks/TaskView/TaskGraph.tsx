@@ -21,25 +21,15 @@ import {
   updateGraphEdgePurpose,
   deleteGraphEdge,
   remindGraphEdge,
-  checkCommands,
   getConfig,
   deleteChat,
-  listCustomAgents,
 } from "../../../api";
-import type { CustomAgentServer, CustomAgentPersona } from "../../../api";
 import type { NodeStatus } from "../../../api/walkieTalkie";
 import { useRadioEvents } from "../../../hooks/useRadioEvents";
 import { AgentPicker } from "../../ui/AgentPicker";
-import {
-  agentOptions,
-  applyAcpAvailability,
-  getAcpAvailabilityCommands,
-} from "../../../data/agents";
-import {
-  agentIconUrl,
-  loadCustomAgentPersonas as loadCustomAgentPersonasIcon,
-  usePersonaRegistry,
-} from "../../../utils/agentIcon";
+import { agentOptions } from "../../../data/agents";
+import { agentIconUrl, usePersonaRegistry } from "../../../utils/agentIcon";
+import { useACPAvailability } from "./useACPAvailability";
 import { GraphContextToolbar, type ToolbarModeShape } from "./GraphContextToolbar";
 import {
   STATUS_COLORS,
@@ -254,10 +244,12 @@ export function TaskGraph({ projectId, taskId }: TaskGraphProps) {
   // refresh of newly-added topology.
   const fetchSeqRef = useRef(0);
   const discardFetchUpToRef = useRef(0);
-  const [acpAgentAvailability, setAcpAgentAvailability] = useState<Record<string, boolean>>({});
-  const [acpAvailabilityLoaded, setAcpAvailabilityLoaded] = useState(false);
-  const [customAgents, setCustomAgents] = useState<CustomAgentServer[]>([]);
-  const [customAgentPersonas, setCustomAgentPersonas] = useState<CustomAgentPersona[]>([]);
+  const {
+    baseAgents,
+    customAgents,
+    customAgentPersonas,
+    acpAvailabilityLoaded,
+  } = useACPAvailability();
   // Re-render on persona registry mutations so node icons & spawn pill labels
   // pick up adds/edits/deletes from any other page without manual refetch.
   usePersonaRegistry();
@@ -266,40 +258,36 @@ export function TaskGraph({ projectId, taskId }: TaskGraphProps) {
   // pick from scratch every time.
   const [defaultAgent, setDefaultAgent] = useState<string>("");
 
-  // Mirror TaskChat's filter: only show agents whose ACP CLI is actually
-  // installed. Avoids letting users spawn a node that will fail on launch.
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      try {
-        const [cmdResults, cfg, personas] = await Promise.all([
-          checkCommands(getAcpAvailabilityCommands()),
-          getConfig(),
-          loadCustomAgentPersonasIcon(() =>
-            listCustomAgents().catch(() => [] as CustomAgentPersona[]),
-          ),
-        ]);
-        if (cancelled) return;
-        setAcpAgentAvailability(cmdResults);
-        setCustomAgents(cfg.acp?.custom_agents ?? []);
-        setCustomAgentPersonas(personas);
-        if (cfg.acp?.agent_command) setDefaultAgent(cfg.acp.agent_command);
-      } catch {
+    getConfig()
+      .then((cfg) => {
+        if (!cancelled && cfg.acp?.agent_command)
+          setDefaultAgent(cfg.acp.agent_command);
+      })
+      .catch(() => {
         /* fail-open */
-      }
-      if (!cancelled) setAcpAvailabilityLoaded(true);
-    })();
+      });
     return () => {
       cancelled = true;
     };
   }, []);
 
+  // Build the spawn picker option list from launchable marketplace rows.
+  // While the marketplace probe is still in flight, fall back to the static
+  // catalog so the picker has something to show.
   const acpAgentOptions = useMemo(() => {
-    return agentOptions
-      .filter((opt) => opt.acpCheck)
-      .map((opt) => applyAcpAvailability(opt, acpAgentAvailability, acpAvailabilityLoaded))
-      .filter((opt) => !opt.disabled);
-  }, [acpAgentAvailability, acpAvailabilityLoaded]);
+    if (!acpAvailabilityLoaded) return agentOptions;
+    return baseAgents
+      .filter((b) => b.available)
+      .map((b) => {
+        const local = agentOptions.find(
+          (a) => a.value === b.id || a.id === b.id,
+        );
+        const opt = local ?? { id: b.id, label: b.display_name, value: b.id };
+        return { ...opt, label: b.display_name, value: b.id };
+      });
+  }, [baseAgents, acpAvailabilityLoaded]);
   const [toast, setToast] = useState<{ message: string; type: "error" | "success" } | null>(null);
 
   useEffect(() => {

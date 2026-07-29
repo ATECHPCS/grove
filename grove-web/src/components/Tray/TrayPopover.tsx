@@ -21,28 +21,26 @@
  *   RECENT (done)          — single-line rows, sticky collapsible header
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { createElement, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion, LayoutGroup, AnimatePresence } from "framer-motion";
-import { Settings, ExternalLink, ChevronDown, X, Zap, Pin, PinOff, GripVertical } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { Settings, ExternalLink, ChevronDown, ChevronLeft, X, Zap, Pin, PinOff, GripVertical, Smartphone } from "lucide-react";
 import { useRadioEvents } from "../../hooks/useRadioEvents";
+import { TrayComposer } from "./TrayComposer";
 import { agentOptions } from "../../data/agents";
+import { agentIconComponent } from "../../utils/agentIcon";
 import type { RadioEvent } from "../../api/walkieTalkie";
 import { apiClient } from "../../api/client";
+import { MarkdownRenderer } from "../ui/MarkdownRenderer";
+import type { RetentionPolicyWire } from "../../api/config";
+import { labelFor, orderOptions } from "../../utils/permissionOptions";
+import type { PermissionOption } from "../../utils/permissionOptions";
+export type { PermissionOption } from "../../utils/permissionOptions";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
-interface PermissionOption {
-  option_id: string;
-  name: string;
-  /** "allow_once" | "allow_always" | "reject_once" | "reject_always" */
-  kind: string;
-}
-
 type ChatStatusKind = "running" | "permission" | "done";
 
-interface ChatItem {
+export interface ChatItem {
   chat_id: string;
   project_id: string;
   task_id: string;
@@ -64,6 +62,49 @@ interface ChatItem {
 
 type ChatStatusEvent = Extract<RadioEvent, { type: "chat_status" }>;
 
+// ─── Retention + persistence ────────────────────────────────────────────────
+
+const TRAY_CHATS_LS_KEY = "grove.tray.chats.v1";
+const LS_WRITE_DEBOUNCE_MS = 200;
+
+/** Returns the retention window in ms, or `null` for "forever". */
+function retentionMs(policy: RetentionPolicyWire | null | undefined): number | null {
+  if (!policy) return null;
+  // Externally-tagged union: the JSON wire shape is
+  //   { "forever": null }  or  { "expire": { ... } }
+  // Both variants are objects with a single tagged key. Reading the
+  // tagged key directly (instead of `in`) sidesteps TS's
+  // "both variants may overlap" union narrow issue.
+  const obj = policy as Record<string, unknown>;
+  if ("forever" in obj) return null;
+  const e = obj.expire as { value?: number; unit?: "hours" | "days" } | undefined;
+  if (!e) return null;
+  const value = Math.max(1, Math.floor(e.value ?? 3));
+  const unitMs = e.unit === "hours" ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+  return value * unitMs;
+}
+
+/** Drop done chats whose `entered_state_at + retentionMs` is in the past.
+ *  Running / permission chats are always kept — they're live. */
+function pruneChatsByRetention(
+  chats: Map<string, ChatItem>,
+  policy: RetentionPolicyWire | null | undefined,
+  now: number,
+): Map<string, ChatItem> {
+  const ms = retentionMs(policy);
+  if (ms == null) return chats;
+  let removed = false;
+  const next = new Map(chats);
+  for (const [id, c] of next) {
+    if (c.status !== "done") continue;
+    if (now - c.entered_state_at > ms) {
+      next.delete(id);
+      removed = true;
+    }
+  }
+  return removed ? next : chats;
+}
+
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
 function formatDuration(ms: number): string {
@@ -83,9 +124,7 @@ function resolveAgent(agent: string | null) {
     agentOptions.find((a) => {
       const id = a.id.toLowerCase();
       const value = a.value.toLowerCase();
-      const tc = a.terminalCheck?.toLowerCase();
-      const ac = a.acpCheck?.toLowerCase();
-      return id === lower || value === lower || tc === lower || ac === lower;
+      return id === lower || value === lower;
     }) ?? null
   );
 }
@@ -94,32 +133,6 @@ function resolveAgent(agent: string | null) {
  *  function-call dumps (e.g. `Always Allow all mcp__grove__grove_reply_review`)
  *  which look terrible as button labels. Falls back to `name` for unknown
  *  kinds. */
-function labelFor(opt: PermissionOption): string {
-  switch (opt.kind) {
-    case "allow_once":
-      return "Allow";
-    case "allow_always":
-      return "Always allow";
-    case "reject_once":
-      return "Reject";
-    case "reject_always":
-      return "Always reject";
-    default:
-      return opt.name.replace(/\s+/g, " ").trim();
-  }
-}
-
-function orderOptions(opts: PermissionOption[]): PermissionOption[] {
-  const rank = (k: string): number => {
-    if (k === "allow_once") return 0;
-    if (k.startsWith("allow")) return 1;
-    if (k === "reject_once") return 2;
-    if (k.startsWith("reject")) return 3;
-    return 4;
-  };
-  return [...opts].sort((a, b) => rank(a.kind) - rank(b.kind));
-}
-
 /** Build the provenance line shown under the title.
  *  - When the task name equals the project name (the project's own
  *    "local task"), `project · project` is just visual noise — replace
@@ -144,6 +157,47 @@ function oneLine(s: string | null, max = 120): string | null {
   return flat.slice(0, max - 1) + "…";
 }
 
+/** Convert a snapshot row into a renderable ChatItem. Only `busy` and
+ *  `permission_required` chats surface in the tray (idle ones aren't shown
+ *  unless they just transitioned), so anything else returns null. The snapshot
+ *  carries no real start timestamp, so elapsed counts from connect time. */
+function chatItemFromSnapshot(s: ChatSnapshot, now: number): ChatItem | null {
+  const base = {
+    chat_id: s.chat_id,
+    project_id: s.project_id,
+    task_id: s.task_id,
+    project_name: s.project_name ?? s.project_id,
+    task_name: s.task_name ?? s.task_id,
+    chat_title: s.chat_title ?? null,
+    agent: s.agent ?? null,
+    running_started_at: now,
+    entered_state_at: now,
+    done_duration_ms: null,
+    message: null,
+    todo_completed: s.todo_completed ?? null,
+    todo_total: s.todo_total ?? null,
+  };
+  if (s.status === "busy") {
+    return {
+      ...base,
+      status: "running",
+      pending_options: null,
+      pending_description: null,
+      prompt: s.prompt ?? null,
+    };
+  }
+  if (s.status === "permission_required") {
+    return {
+      ...base,
+      status: "permission",
+      pending_options: s.permission?.options ?? null,
+      pending_description: s.permission?.description ?? null,
+      prompt: s.prompt ?? null,
+    };
+  }
+  return null;
+}
+
 interface TrayShowConfig {
   permission: boolean;
   running: boolean;
@@ -152,13 +206,106 @@ interface TrayShowConfig {
 
 const DEFAULT_SHOW: TrayShowConfig = { permission: true, running: true, done: true };
 
+// ─── Platform abstraction ─────────────────────────────────────────────────
+// TrayPopover is pure presentation + the chat-status reducer. Where its actions
+// land differs by host: the desktop popover drives Tauri commands / window
+// controls; the phone page drives HTTP endpoints on the radio server. Each host
+// supplies a `platform` so this component stays free of host-specific imports.
+
+/** One active chat as returned by `GET /api/v1/tray/chats` (snapshot seed). */
+export interface ChatSnapshot {
+  chat_id: string;
+  project_id: string;
+  task_id: string;
+  project_name?: string | null;
+  task_name?: string | null;
+  chat_title?: string | null;
+  agent?: string | null;
+  status: "idle" | "busy" | "permission_required";
+  permission?: { description: string; options: PermissionOption[] } | null;
+  prompt?: string | null;
+  todo_completed?: number | null;
+  todo_total?: number | null;
+}
+
+export interface TrayPlatform {
+  /** Approve / deny a pending permission request. */
+  resolvePermission: (item: ChatItem, opt: PermissionOption) => void;
+  /** Send a follow-up prompt to a Done chat. Resolves on success; rejects so
+   *  the composer can surface the failure (e.g. the session already exited). */
+  sendPrompt?: (item: ChatItem, text: string) => Promise<void>;
+  /** Enable the hold-to-record microphone in the composer (phone only). When
+   *  set, the composer records audio and transcribes via `/api/v1/ai/transcribe`. */
+  enableVoice?: boolean;
+  /** Open a specific chat in the full app. Omit to make cards non-clickable. */
+  openTask?: (item: ChatItem) => void;
+  /** Surface the main Grove window. Omit to hide the header button. */
+  openMain?: () => void;
+  /** Open settings. Omit to hide the header button. */
+  openSettings?: () => void;
+  /** Start a "sync to phone" flow. Omit to hide the header button. */
+  syncToPhone?: () => void;
+  /** Desktop window controls (pin / drag / resize). Omit on phone. */
+  pinning?: {
+    isPinned: () => Promise<boolean>;
+    setPinned: (v: boolean) => void;
+    startDragging: () => void;
+    startResize: () => void;
+  };
+  /** Fetch `GET /api/v1/tray/chats` once on mount to seed state. The desktop
+   *  popover relies on its long-lived webview accumulating live events, so it
+   *  leaves this off; a phone connects fresh and needs the snapshot. */
+  seedFromSnapshot?: boolean;
+}
+
 // ─── Component ──────────────────────────────────────────────────────────────
 
-export function TrayPopover() {
-  const [chats, setChats] = useState<Map<string, ChatItem>>(() => new Map());
+export function TrayPopover({ platform }: { platform: TrayPlatform }) {
+  const [chats, setChats] = useState<Map<string, ChatItem>>(() => {
+    // Only the desktop tray accumulates across launches; the phone page
+    // seeds from the backend snapshot and should start empty.
+    if (typeof window === "undefined") return new Map();
+    if (platform.seedFromSnapshot) return new Map();
+    try {
+      const raw = window.localStorage.getItem(TRAY_CHATS_LS_KEY);
+      if (!raw) return new Map();
+      const parsed = JSON.parse(raw) as { chats?: ChatItem[] };
+      if (!parsed.chats || !Array.isArray(parsed.chats)) return new Map();
+      const map = new Map<string, ChatItem>();
+      for (const c of parsed.chats) {
+        if (c && typeof c.chat_id === "string") map.set(c.chat_id, c);
+      }
+      return map;
+    } catch {
+      return new Map();
+    }
+  });
   const [now, setNow] = useState(() => Date.now());
   const [show, setShow] = useState<TrayShowConfig>(DEFAULT_SHOW);
   const [recentOpen, setRecentOpen] = useState(true);
+  // The Done chat being replied to — opens a focused reply view (full response
+  // + composer) overlaying the list. Null = list view.
+  const [replyTarget, setReplyTarget] = useState<ChatItem | null>(null);
+  // Retention policy for done chats. Loaded from /api/v1/config on mount;
+  // stored in a ref (not state) because no UI subscribes to it — prune runs
+  // inside `setChatsPruned` on every state transition, and the ref is the
+  // source of truth. Null = "not yet loaded" → no pruning (conservative).
+  const retentionRef = useRef<RetentionPolicyWire | null>(null);
+
+  // Wrapper around setChats that runs the retention prune at every state
+  // transition. Done in the updater (not a separate effect) so we don't
+  // trigger React's "setState in effect" lint and avoid a cascading render
+  // for every fresh event. The retention policy is read from a ref so the
+  // wrapper's identity stays stable across policy changes.
+  const setChatsPruned = useCallback(
+    (updater: (prev: Map<string, ChatItem>) => Map<string, ChatItem>) => {
+      setChats((prev) => {
+        const next = updater(prev);
+        return pruneChatsByRetention(next, retentionRef.current, Date.now());
+      });
+    },
+    [],
+  );
 
   const hasLiveCard = useMemo(
     () =>
@@ -174,10 +321,14 @@ export function TrayPopover() {
   }, [hasLiveCard]);
 
   useEffect(() => {
+    // Phone shows every section regardless of the desktop's tray_show_* prefs,
+    // so it skips this fetch and keeps DEFAULT_SHOW. (Theme still syncs — that's
+    // a separate /api/v1/config fetch inside ThemeProvider.)
+    if (platform.seedFromSnapshot) return;
     let cancelled = false;
     const reload = async () => {
       // apiClient signs requests with HMAC in mobile mode; raw fetch would 401.
-      let cfg: { notifications?: { tray_show_permission?: unknown; tray_show_running?: unknown; tray_show_done?: unknown } };
+      let cfg: { notifications?: { tray_show_permission?: unknown; tray_show_running?: unknown; tray_show_done?: unknown; tray_done_retention?: RetentionPolicyWire } };
       try {
         cfg = await apiClient.get("/api/v1/config");
       } catch (e) {
@@ -192,6 +343,9 @@ export function TrayPopover() {
         running: !!notif.tray_show_running,
         done: !!notif.tray_show_done,
       });
+      if (notif.tray_done_retention) {
+        retentionRef.current = notif.tray_done_retention;
+      }
     };
     reload();
     const onFocus = () => reload();
@@ -205,7 +359,95 @@ export function TrayPopover() {
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, []);
+  }, [platform.seedFromSnapshot]);
+
+  // Seed state on connect (phone only). Preferred source is the desktop tray's
+  // mirrored panel (full Running / NEEDS YOU / Done with durations + responses),
+  // shaped as ready ChatItems; the backend falls back to a lossy ACP snapshot
+  // (idle/busy/permission_required) when no desktop is mirroring. Live events
+  // take precedence — we only fill chats not already tracked.
+  useEffect(() => {
+    if (!platform.seedFromSnapshot) return;
+    let cancelled = false;
+    (async () => {
+      let resp: { chats?: Array<ChatItem | ChatSnapshot>; now?: number };
+      try {
+        resp = await apiClient.get("/api/v1/tray/chats");
+      } catch (e) {
+        console.error("[TrayPopover] seed fetch failed:", e);
+        return;
+      }
+      if (cancelled || !resp.chats) return;
+      const ts = Date.now();
+      // Desktop-clock → phone-clock offset. Mirrored timestamps are stamped on
+      // the desktop; rebasing by this skew keeps the live elapsed timer correct
+      // regardless of clock drift between the two devices.
+      const skew = typeof resp.now === "number" ? ts - resp.now : 0;
+      setChatsPruned((prev) => {
+        const next = new Map(prev);
+        for (const s of resp.chats!) {
+          if (next.has(s.chat_id)) continue;
+          const st = (s as { status?: string }).status;
+          if (st === "running" || st === "permission" || st === "done") {
+            // Already a ChatItem (desktop mirror) — load it, rebasing the live
+            // timestamps to the phone clock. `done_duration_ms` is absolute and
+            // left untouched.
+            const item = s as ChatItem;
+            next.set(s.chat_id, {
+              ...item,
+              running_started_at:
+                item.running_started_at != null ? item.running_started_at + skew : null,
+              entered_state_at: item.entered_state_at + skew,
+            });
+          } else {
+            const item = chatItemFromSnapshot(s as ChatSnapshot, ts);
+            if (item) next.set(s.chat_id, item);
+          }
+        }
+        return next;
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [platform.seedFromSnapshot, setChatsPruned]);
+
+  // Desktop mirror: the tray webview is the only surface that watches the event
+  // stream continuously, so it pushes its accumulated state to the backend
+  // (debounced) for a later phone connect to seed from. Phones don't mirror.
+  useEffect(() => {
+    if (platform.seedFromSnapshot) return;
+    const id = window.setTimeout(() => {
+      // Include the desktop clock so the phone can rebase live timestamps and
+      // avoid cross-device clock skew in the running/permission elapsed timer.
+      apiClient
+        .post("/api/v1/tray/state", { chats: Array.from(chats.values()), now: Date.now() })
+        .catch(() => {});
+    }, 400);
+    return () => window.clearTimeout(id);
+  }, [chats, platform.seedFromSnapshot]);
+
+  // LocalStorage persistence: write the (already-pruned) chats to LS on every
+  // change so the desktop tray recovers after a reload. Phone is excluded —
+  // it seeds from the backend snapshot, and its webview is short-lived.
+  // Pruning happens inside `setChatsPruned` above, not here, so we never
+  // call setState inside an effect.
+  useEffect(() => {
+    if (platform.seedFromSnapshot) return;
+    const id = window.setTimeout(() => {
+      try {
+        window.localStorage.setItem(
+          TRAY_CHATS_LS_KEY,
+          JSON.stringify({ chats: Array.from(chats.values()) }),
+        );
+      } catch {
+        // Quota exceeded / private mode — silently skip. In-memory state is
+        // still authoritative; the next mount will re-seed from the backend
+        // mirror or an empty Map.
+      }
+    }, LS_WRITE_DEBOUNCE_MS);
+    return () => window.clearTimeout(id);
+  }, [chats, platform.seedFromSnapshot]);
 
   useRadioEvents({
     onChatStatus: (
@@ -215,7 +457,7 @@ export function TrayPopover() {
       status,
       payload?: ChatStatusEvent,
     ) => {
-      setChats((prev) => {
+      setChatsPruned((prev) => {
         const ts = Date.now();
         const originalExisting = prev.get(chatId);
         const next = new Map(prev);
@@ -379,7 +621,7 @@ export function TrayPopover() {
   const totalAll = totalRunning + totalPending + totalDone;
 
   const dismiss = (chatId: string) =>
-    setChats((prev) => {
+    setChatsPruned((prev) => {
       if (!prev.has(chatId)) return prev;
       const next = new Map(prev);
       next.delete(chatId);
@@ -387,7 +629,7 @@ export function TrayPopover() {
     });
 
   const clearDone = () =>
-    setChats((prev) => {
+    setChatsPruned((prev) => {
       const next = new Map(prev);
       for (const [k, v] of prev) {
         if (v.status === "done") next.delete(k);
@@ -395,77 +637,55 @@ export function TrayPopover() {
       return next;
     });
 
-  const handleResolve = async (item: ChatItem, opt: PermissionOption) => {
-    try {
-      await invoke("tray_resolve_permission", {
-        projectId: item.project_id,
-        taskId: item.task_id,
-        chatId: item.chat_id,
-        optionId: opt.option_id,
-      });
-    } catch (e) {
-      console.error("[tray] resolve failed", e);
-    }
+  const handleResolve = (item: ChatItem, opt: PermissionOption) => {
+    platform.resolvePermission(item, opt);
   };
 
-  const handleOpenMain = () => {
-    invoke("tray_open_main").catch((e) => console.error("[tray] open_main failed", e));
-  };
+  const handleOpenMain = platform.openMain;
+  const pinning = platform.pinning;
   const [pinned, setPinned] = useState(false);
   useEffect(() => {
+    if (!pinning) return;
     // Pin state isn't persisted across launches, but the popover webview
     // can outlive a single show/hide cycle — so we still ask the backend
     // for the current state on mount in case React re-mounts mid-session.
-    invoke<boolean>("tray_is_pinned")
+    pinning
+      .isPinned()
       .then((v) => setPinned(!!v))
       .catch(() => {});
-  }, []);
+  }, [pinning]);
   const handleTogglePin = () => {
+    if (!pinning) return;
     const next = !pinned;
     setPinned(next);
-    invoke("tray_set_pinned", { pinned: next }).catch((e) => {
-      console.error("[tray] set_pinned failed", e);
-      setPinned(!next);
-    });
+    pinning.setPinned(next);
   };
   // Imperative drag — `data-tauri-drag-region` doesn't fire reliably in this
   // webview, so we explicitly start a window drag on mousedown when pinned.
   // Buttons inside the header stop propagation via their own onClick, so the
   // drag handler only triggers on the empty / handle areas.
   const handleHeaderMouseDown = (e: React.MouseEvent<HTMLElement>) => {
-    if (!pinned) return;
+    if (!pinning || !pinned) return;
     if (e.button !== 0) return;
     const target = e.target as HTMLElement;
     if (target.closest("button, a, input")) return;
     e.preventDefault();
-    getCurrentWindow()
-      .startDragging()
-      .catch((err) => console.error("[tray] startDragging failed", err));
+    pinning.startDragging();
   };
   // Bottom-right resize grip — `decorations(false)` strips the system edge
   // handles, so we synthesize a corner grip and call into Tauri's
   // startResizeDragging("South-East") on mousedown.
   const handleResizeMouseDown = (e: React.MouseEvent<HTMLElement>) => {
-    if (!pinned) return;
+    if (!pinning || !pinned) return;
     if (e.button !== 0) return;
     e.preventDefault();
     e.stopPropagation();
-    getCurrentWindow()
-      .startResizeDragging("SouthEast")
-      .catch((err) => console.error("[tray] startResizeDragging failed", err));
+    pinning.startResize();
   };
-  const handleOpenSettings = () => {
-    invoke("tray_open_settings").catch((e) =>
-      console.error("[tray] open_settings failed", e),
-    );
-  };
-  const handleOpenTask = (item: ChatItem) => {
-    invoke("tray_open_task", {
-      projectId: item.project_id,
-      taskId: item.task_id,
-      chatId: item.chat_id,
-    }).catch((e) => console.error("[tray] open_task failed", e));
-  };
+  const handleOpenSettings = platform.openSettings;
+  // Always callable so the cards don't need per-call guards; a no-op on hosts
+  // (the phone page) that can't open a task in a full window.
+  const handleOpenTask = (item: ChatItem) => platform.openTask?.(item);
 
   return (
     <div
@@ -517,27 +737,42 @@ export function TrayPopover() {
             )}
           </div>
         </div>
-        <button
-          onClick={handleTogglePin}
-          className={`flex h-7 w-7 items-center justify-center transition-colors hover:bg-[var(--color-bg-tertiary)] ${pinned ? "text-[var(--color-highlight)]" : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]"}`}
-          title={pinned ? "Unpin widget" : "Pin as widget (always on top)"}
-        >
-          {pinned ? <PinOff size={14} /> : <Pin size={14} />}
-        </button>
-        <button
-          onClick={handleOpenMain}
-          className="flex h-7 w-7 items-center justify-center text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
-          title="Open Grove"
-        >
-          <ExternalLink size={14} />
-        </button>
-        <button
-          onClick={handleOpenSettings}
-          className="flex h-7 w-7 items-center justify-center text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
-          title="Settings"
-        >
-          <Settings size={14} />
-        </button>
+        {platform.syncToPhone ? (
+          <button
+            onClick={platform.syncToPhone}
+            className="flex h-7 w-7 items-center justify-center text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+            title="Sync to phone"
+          >
+            <Smartphone size={14} />
+          </button>
+        ) : null}
+        {pinning ? (
+          <button
+            onClick={handleTogglePin}
+            className={`flex h-7 w-7 items-center justify-center transition-colors hover:bg-[var(--color-bg-tertiary)] ${pinned ? "text-[var(--color-highlight)]" : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]"}`}
+            title={pinned ? "Unpin widget" : "Pin as widget (always on top)"}
+          >
+            {pinned ? <PinOff size={14} /> : <Pin size={14} />}
+          </button>
+        ) : null}
+        {handleOpenMain ? (
+          <button
+            onClick={handleOpenMain}
+            className="flex h-7 w-7 items-center justify-center text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+            title="Open Grove"
+          >
+            <ExternalLink size={14} />
+          </button>
+        ) : null}
+        {handleOpenSettings ? (
+          <button
+            onClick={handleOpenSettings}
+            className="flex h-7 w-7 items-center justify-center text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+            title="Settings"
+          >
+            <Settings size={14} />
+          </button>
+        ) : null}
       </header>
 
       {/* Stream — single vertical scroll, no horizontal, no nested scrolls.
@@ -640,8 +875,9 @@ export function TrayPopover() {
                             <DoneRow
                               key={c.chat_id}
                               item={c}
-                              onOpen={() => handleOpenTask(c)}
+                              onOpen={platform.openTask ? () => handleOpenTask(c) : undefined}
                               onDismiss={() => dismiss(c.chat_id)}
+                              onReply={platform.sendPrompt ? () => setReplyTarget(c) : undefined}
                             />
                           ))}
                         </div>
@@ -666,6 +902,115 @@ export function TrayPopover() {
           }}
         />
       ) : null}
+
+      {(() => {
+        // Render-derived so a dropped chat (disconnected / dismissed) closes the
+        // view without a set-state-in-effect. Show the live entry so a new
+        // response updates it, keeping the last non-null response while the chat
+        // is busy (running → message null).
+        if (!replyTarget || !platform.sendPrompt) return null;
+        const live = chats.get(replyTarget.chat_id);
+        if (!live) return null;
+        const item = { ...live, message: live.message ?? replyTarget.message };
+        return (
+          <ReplyView
+            item={item}
+            enableVoice={platform.enableVoice}
+            onSend={(text) => platform.sendPrompt!(item, text)}
+            onClose={() => setReplyTarget(null)}
+            onOpen={platform.openTask ? () => platform.openTask!(item) : undefined}
+            onHeaderMouseDown={handleHeaderMouseDown}
+            headerDragCursor={pinned ? "cursor-grab active:cursor-grabbing select-none" : ""}
+            headerDragRegion={pinned}
+          />
+        );
+      })()}
+    </div>
+  );
+}
+
+// ─── Reply view (focused follow-up for a Done chat) ───────────────────────────
+// Overlays the list with one scroll region (the full agent response) and a
+// pinned composer, so the input is always reachable — unlike the old inline
+// expansion that nested a scroll area inside the capped Done list.
+
+function ReplyView({
+  item,
+  enableVoice,
+  onSend,
+  onClose,
+  onOpen,
+  onHeaderMouseDown,
+  headerDragCursor,
+  headerDragRegion,
+}: {
+  item: ChatItem;
+  enableVoice?: boolean;
+  onSend: (text: string) => Promise<void>;
+  onClose: () => void;
+  onOpen?: () => void;
+  onHeaderMouseDown?: (e: React.MouseEvent<HTMLElement>) => void;
+  headerDragCursor?: string;
+  headerDragRegion?: boolean;
+}) {
+  const title = item.chat_title || item.task_name;
+  const provenance = provenanceOf(item);
+  return (
+    <div className="absolute inset-0 z-20 flex flex-col bg-[var(--color-bg-secondary)]">
+      <header
+        className={`flex shrink-0 items-center gap-2 border-b border-[color-mix(in_srgb,var(--color-border)_35%,transparent)] px-2 py-2 ${headerDragCursor ?? ""}`}
+        onMouseDown={onHeaderMouseDown}
+        data-tauri-drag-region={headerDragRegion ? "" : undefined}
+      >
+        <button
+          onClick={onClose}
+          title="Back"
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+        >
+          <ChevronLeft size={16} />
+        </button>
+        <AgentBadge agent={item.agent} tone="muted" size={20} />
+        <div className="min-w-0 flex-1">
+          <div
+            className="overflow-hidden text-ellipsis whitespace-nowrap text-[12.5px] font-semibold text-[var(--color-text)]"
+            title={title}
+          >
+            {title}
+          </div>
+          <div
+            className="overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[10px] text-[var(--color-text-muted)]"
+            title={provenance}
+          >
+            {provenance}
+          </div>
+        </div>
+        {onOpen ? (
+          <button
+            onClick={onOpen}
+            title="Open in app"
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+          >
+            <ExternalLink size={14} />
+          </button>
+        ) : null}
+      </header>
+      <div className="flex-1 overflow-y-auto px-3 py-2.5 text-[12.5px] leading-relaxed text-[var(--color-text)]">
+        {item.message ? (
+          <MarkdownRenderer content={item.message} />
+        ) : (
+          <span className="italic text-[var(--color-text-muted)]">
+            No text response captured for this turn.
+          </span>
+        )}
+      </div>
+      <div className="shrink-0 border-t border-[color-mix(in_srgb,var(--color-border)_35%,transparent)]">
+        <TrayComposer
+          projectId={item.project_id}
+          enableVoice={enableVoice}
+          onSend={onSend}
+          autoFocus
+        />
+      </div>
     </div>
   );
 }
@@ -789,6 +1134,13 @@ function AgentBadge({
     >
       {Icon ? (
         <Icon size={Math.round(size * 0.62)} />
+      ) : agent ? (
+        // Fall back to the unified util when the static catalog row is
+        // absent (e.g. traex, openclaw, synthetic marketplace agents).
+        // createElement avoids `react-hooks/static-components` flagging
+        // the dynamically-resolved component; agentIconComponent returns
+        // stable refs (bundled icons + per-url-cached image wrappers).
+        createElement(agentIconComponent(agent), { size: Math.round(size * 0.62) })
       ) : (
         <span className="text-[10px] text-[var(--color-text-muted)]">
           {(Array.from(agent || "?")[0] ?? "?").toUpperCase()}
@@ -1035,52 +1387,91 @@ function DoneRow({
   item,
   onOpen,
   onDismiss,
+  onReply,
 }: {
   item: ChatItem;
-  onOpen: () => void;
+  onOpen?: () => void;
   onDismiss: () => void;
+  /** Open the focused reply view. When set, tapping the row replies; else opens. */
+  onReply?: () => void;
 }) {
   const title = item.chat_title || item.task_name;
   const provenance = provenanceOf(item);
   const dur = item.done_duration_ms != null ? formatDuration(item.done_duration_ms) : null;
+  // The agent's final reply for this turn (carried on the idle ChatStatus
+  // event). Shown as the secondary line so the user can see what the model
+  // said without opening the task; falls back to provenance when absent.
+  const respPreview = oneLine(item.message, 90);
+
+  // Tapping replies (focused view) when this host can send prompts; otherwise
+  // it falls back to opening the task in the full app (desktop without reply).
+  const handleRowClick = () => {
+    if (onReply) onReply();
+    else onOpen?.();
+  };
 
   return (
     <motion.div
       layout
       transition={CARD_MORPH}
-      onClick={onOpen}
-      className="group relative flex h-[40px] cursor-pointer items-center gap-2.5 px-3 transition-colors hover:bg-[color-mix(in_srgb,var(--color-text)_4%,transparent)]"
+      className="group relative flex flex-col"
     >
-      <AgentBadge agent={item.agent} tone="muted" size={18} />
-      <div className="min-w-0 flex-1">
-        <div
-          className="overflow-hidden text-ellipsis whitespace-nowrap text-[12.5px] text-[var(--color-text)]"
-          title={title}
-        >
-          {title}
-        </div>
-        <div
-          className="overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[10px] text-[var(--color-text-muted)]"
-          title={provenance}
-        >
-          {provenance}
-        </div>
-      </div>
-      {dur ? (
-        <span className="shrink-0 font-mono text-[10.5px] text-[var(--color-text-muted)] group-hover:hidden">
-          {dur}
-        </span>
-      ) : null}
-      <button
-        onClick={(e) => {
-          e.stopPropagation();
-          onDismiss();
-        }}
-        className="hidden h-5 w-5 shrink-0 items-center justify-center text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)] group-hover:flex"
-        title="Dismiss"
+      <div
+        onClick={handleRowClick}
+        className="flex h-[40px] cursor-pointer items-center gap-2.5 px-3 transition-colors hover:bg-[color-mix(in_srgb,var(--color-text)_4%,transparent)]"
       >
-        <X size={12} />
-      </button>
+        <AgentBadge agent={item.agent} tone="muted" size={18} />
+        <div className="min-w-0 flex-1">
+          <div
+            className="overflow-hidden text-ellipsis whitespace-nowrap text-[12.5px] text-[var(--color-text)]"
+            title={title}
+          >
+            {title}
+          </div>
+          {respPreview ? (
+            <div
+              className="overflow-hidden text-ellipsis whitespace-nowrap text-[11px] text-[var(--color-text-muted)]"
+              title={item.message ?? undefined}
+            >
+              {respPreview}
+            </div>
+          ) : (
+            <div
+              className="overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[10px] text-[var(--color-text-muted)]"
+              title={provenance}
+            >
+              {provenance}
+            </div>
+          )}
+        </div>
+        {dur ? (
+          <span className="shrink-0 font-mono text-[10.5px] text-[var(--color-text-muted)] group-hover:hidden">
+            {dur}
+          </span>
+        ) : null}
+        {onOpen ? (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpen();
+            }}
+            className="hidden h-5 w-5 shrink-0 items-center justify-center text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)] group-hover:flex"
+            title="Open in app"
+          >
+            <ExternalLink size={12} />
+          </button>
+        ) : null}
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onDismiss();
+          }}
+          className="hidden h-5 w-5 shrink-0 items-center justify-center text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)] group-hover:flex"
+          title="Dismiss"
+        >
+          <X size={12} />
+        </button>
+      </div>
     </motion.div>
   );
 }

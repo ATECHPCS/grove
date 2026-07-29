@@ -17,8 +17,9 @@ import {
   usePostMergeArchive,
   useTaskOperations,
   buildCommands,
+  useChatDeepLink,
 } from "../../hooks";
-import { useCommand, useDefineCommand, useKeyboardScope, useHelpKeyDisplay, contextKeyService } from "../../keyboard";
+import { useCommand, useDefineCommand, useKeyboardScope, useHelpKeyDisplay, contextKeyService, useVoiceControlContext } from "../../keyboard";
 import {
   createTask as apiCreateTask,
   recoverTask as apiRecoverTask,
@@ -27,6 +28,7 @@ import {
 } from "../../api";
 import type { Task, TaskFilter } from "../../data/types";
 import { convertTaskResponse } from "../../utils/taskConvert";
+import { fuzzyFindByName } from "../../utils/fuzzySearch";
 import type { PendingArchiveConfirm } from "../../utils/archiveHelpers";
 import { buildContextMenuItems, type TaskOperationHandlers } from "../../utils/taskOperationUtils";
 import type { PanelType } from "./PanelSystem/types";
@@ -35,9 +37,8 @@ interface TasksPageProps {
   /** Initial task ID to select (from navigation) */
   initialTaskId?: string;
   /** Initial chat ID to focus inside the selected task (from navigation —
-   *  e.g. tray popover Open with a specific chat). TaskView consumption
-   *  is a TODO: chat selection lives several layers below in the
-   *  flex/IDE layout, not yet wired through this prop. */
+   *  e.g. tray popover Open with a specific chat). Dispatched via
+   *  `useChatDeepLink`, consumed by TaskChat's `useInitialChatLoad`. */
   initialChatId?: string;
   /** Initial view mode to use (from navigation, e.g. "terminal") */
   initialViewMode?: string;
@@ -183,29 +184,19 @@ export function TasksPage({ initialTaskId, initialChatId, initialViewMode, onNav
       pageHandlers.setInWorkspace(true);
     }
 
-    // Navigate to the specific chat session if provided (tray deep-link).
-    // Uses the same __grove_pending_chat + grove:switch-chat pattern as
-    // BlitzPage so both the "workspace just mounted" and "already mounted"
-    // cases are handled.
-    if (initialChatId && selectedProject) {
-      const projectId = selectedProject.id;
-      const taskId = initialTaskId;
-      const chatId = initialChatId;
-      (window as unknown as Record<string, unknown>).__grove_pending_chat = {
-        projectId,
-        taskId,
-        chatId,
-      };
-      window.dispatchEvent(
-        new CustomEvent("grove:switch-chat", {
-          detail: { projectId, taskId, chatId },
-        }),
-      );
-    }
-
     // Consume the navigation data so it doesn't re-trigger
     onNavigationConsumed?.();
-  }, [initialTaskId, initialChatId, initialViewMode, activeTasks, pageState.selectedTask?.id, onNavigationConsumed, pageHandlers, selectedProject]);
+  }, [initialTaskId, initialViewMode, activeTasks, pageState.selectedTask?.id, onNavigationConsumed, pageHandlers]);
+
+  // Navigate to the specific chat session if provided (deep-link — tray,
+  // notifications, the Dynamic Island live-activity alert, ...). Separate
+  // from the task-selection effect above since it only needs to re-fire
+  // when the chat id itself changes, not on every task-selection dep.
+  useChatDeepLink({
+    chatId: initialChatId,
+    projectId: selectedProject?.id,
+    taskId: initialTaskId,
+  });
 
   // Exit workspace when Tasks tab is re-clicked (signal from App.tsx).
   // Use a ref for inWorkspace so the effect only fires on signal changes but
@@ -296,6 +287,20 @@ export function TasksPage({ initialTaskId, initialChatId, initialViewMode, onNav
       pageHandlers.setSelectedTask(filteredTasks[0]);
     }
   }, [pageState.selectedTask, initialTaskId, filteredTasks, pageHandlers]);
+
+  // Voice control context contribution for tasks list
+  useVoiceControlContext("tasks_list", () => {
+    return {
+      selectedTaskId: pageState.selectedTask?.id ?? null,
+      visible_items: filteredTasks.map((task, idx) => ({
+        index: idx + 1,
+        id: task.id,
+        name: task.name,
+        status: task.status,
+        isSelected: pageState.selectedTask?.id === task.id,
+      })),
+    };
+  });
 
   // Wrap page handlers to handle auto-start state
   const handleSelectTask = useCallback((task: Task) => {
@@ -469,21 +474,59 @@ export function TasksPage({ initialTaskId, initialChatId, initialViewMode, onNav
   // Navigation / task-list commands (catalog: tasks scope)
   const enabledTask = useCallback(() => hasTask, [hasTask]);
   const enabledOpenWorkspace = useCallback(
-    () => !!pageState.selectedTask && pageState.selectedTask.status !== "archived",
-    [pageState.selectedTask],
+    () => !pageState.inWorkspace && !!pageState.selectedTask && pageState.selectedTask.status !== "archived",
+    [pageState.inWorkspace, pageState.selectedTask],
   );
 
   useCommand("task.selectNext", navHandlers.selectNextTask, [navHandlers]);
   useCommand("task.selectPrevious", navHandlers.selectPreviousTask, [navHandlers]);
   useCommand(
     "task.open",
-    () => {
-      if (!pageState.inWorkspace && pageState.selectedTask && pageState.selectedTask.status !== "archived") {
-        pageHandlers.handleEnterWorkspace();
+    (args?: unknown) => {
+      const typedArgs = args as { taskId?: string; taskName?: string; taskIndex?: number } | undefined;
+      if (typedArgs?.taskId) {
+        const found = tasks.find((t) => t.id === typedArgs.taskId);
+        if (found) {
+          handleSelectTask(found);
+          if (!pageState.inWorkspace && found.status !== "archived") {
+            pageHandlers.handleEnterWorkspace();
+          }
+        }
+      } else if (typedArgs?.taskIndex !== undefined) {
+        const idx = typedArgs.taskIndex - 1;
+        if (idx >= 0 && idx < tasks.length) {
+          const found = tasks[idx];
+          handleSelectTask(found);
+          if (!pageState.inWorkspace && found.status !== "archived") {
+            pageHandlers.handleEnterWorkspace();
+          }
+        }
+      } else if (typedArgs?.taskName) {
+        const found = fuzzyFindByName(tasks, (t) => t.name, typedArgs.taskName);
+        if (found) {
+          handleSelectTask(found);
+          if (!pageState.inWorkspace && found.status !== "archived") {
+            pageHandlers.handleEnterWorkspace();
+          }
+        }
+      } else {
+        if (!pageState.inWorkspace && pageState.selectedTask && pageState.selectedTask.status !== "archived") {
+          pageHandlers.handleEnterWorkspace();
+        }
       }
     },
-    { enabled: enabledOpenWorkspace },
-    [pageState.inWorkspace, pageState.selectedTask, pageHandlers.handleEnterWorkspace, enabledOpenWorkspace],
+    // Gate on pageVisible: TasksPage is always-mounted (display:none) in Blitz mode,
+    // so without this guard it would register alongside BlitzPage's handler for the same id.
+    { enabled: () => pageVisible && enabledOpenWorkspace() },
+    [
+      pageVisible,
+      pageState.inWorkspace,
+      pageState.selectedTask,
+      pageHandlers.handleEnterWorkspace,
+      tasks,
+      handleSelectTask,
+      enabledOpenWorkspace,
+    ],
   );
   useCommand("task.new", () => setShowNewTaskDialog(true), []);
 

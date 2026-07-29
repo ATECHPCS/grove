@@ -74,8 +74,6 @@ pub fn create_api_router() -> Router {
             "/config/applications/icon",
             get(handlers::config::get_app_icon),
         )
-        // Agent discovery API
-        .route("/agents/base", get(handlers::agents::list_base_agents))
         // Custom Agent (Persona) API
         .route(
             "/custom-agents",
@@ -342,6 +340,20 @@ pub fn create_api_router() -> Router {
         .route("/projects/{id}", patch(handlers::projects::rename_project))
         .route("/projects/{id}", delete(handlers::projects::delete_project))
         .route("/projects/{id}/stats", get(handlers::projects::get_stats))
+        // Unified read-only file API. Project, Resource and Task routes share
+        // the same resolver, access policy and streaming response builder.
+        .route(
+            "/projects/{id}/files/raw",
+            get(handlers::files::project_file),
+        )
+        .route(
+            "/projects/{id}/resource/files/raw",
+            get(handlers::files::resource_file),
+        )
+        .route(
+            "/projects/{id}/tasks/{taskId}/files/raw",
+            get(handlers::files::task_file),
+        )
         // Studio Resource API
         .route(
             "/projects/{id}/resource",
@@ -370,6 +382,10 @@ pub fn create_api_router() -> Router {
         .route(
             "/projects/{id}/resource/download",
             get(handlers::projects::download_resource),
+        )
+        .route(
+            "/projects/{id}/resource/open",
+            post(handlers::projects::open_resource),
         )
         .route(
             "/projects/{id}/resource/folder",
@@ -597,6 +613,10 @@ pub fn create_api_router() -> Router {
             post(handlers::tasks::open_artifact_workdir),
         )
         .route(
+            "/projects/{id}/tasks/{taskId}/artifacts/open",
+            post(handlers::tasks::open_artifact),
+        )
+        .route(
             "/projects/{id}/tasks/{taskId}/artifacts/sync-to-resource",
             post(handlers::tasks::sync_artifact_to_resource),
         )
@@ -629,6 +649,14 @@ pub fn create_api_router() -> Router {
         .route(
             "/projects/{id}/tasks/{taskId}/fs/move",
             post(handlers::tasks::move_file),
+        )
+        .route(
+            "/projects/{id}/tasks/{taskId}/fs/open",
+            post(handlers::tasks::open_file),
+        )
+        .route(
+            "/projects/{id}/tasks/{taskId}/fs/reveal",
+            post(handlers::tasks::reveal_file),
         )
         // Task Stats API
         .route(
@@ -678,7 +706,10 @@ pub fn create_api_router() -> Router {
             post(handlers::tasks::bulk_delete_review_comments),
         )
         // Hooks API
-        .route("/hooks", get(handlers::hooks::list_all_hooks))
+        .route(
+            "/hooks",
+            get(handlers::hooks::list_all_hooks).delete(handlers::hooks::clear_all_hooks),
+        )
         .route("/hooks/preview", post(handlers::hooks::preview_sound))
         .route(
             "/projects/{id}/hooks/{taskId}",
@@ -734,6 +765,15 @@ pub fn create_api_router() -> Router {
         .route(
             "/ai/audio",
             get(handlers::ai::get_audio).put(handlers::ai::save_audio_global),
+        )
+        .route(
+            "/ai/voice-control",
+            get(handlers::ai::get_voice_control).put(handlers::ai::save_voice_control),
+        )
+        .route(
+            "/ai/voice-control/execute",
+            post(handlers::ai::execute_voice_control)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route(
             "/projects/{id}/ai/audio",
@@ -852,6 +892,27 @@ pub fn create_api_router() -> Router {
         .route(
             "/radio/events/ws",
             get(handlers::walkie_talkie::radio_events_ws_handler),
+        )
+        // Tray composer: send a follow-up prompt to a chat. The phone hits the
+        // same path on the radio server; the desktop tray webview hits it here.
+        .route(
+            "/tray/send-prompt",
+            post(handlers::walkie_talkie::tray_send_prompt),
+        )
+        // Approve/deny a pending permission over HTTP — used by the phone
+        // tray page (no Tauri bridge) and the main app's Dynamic Island
+        // live-activity alert. The desktop tray popover itself goes through
+        // the `tray_resolve_permission` Tauri command instead, so this was
+        // never wired up until now.
+        .route(
+            "/tray/resolve-permission",
+            post(handlers::walkie_talkie::tray_resolve_permission),
+        )
+        // Desktop tray mirrors its accumulated panel state here so a phone that
+        // connects later seeds the full Running / NEEDS YOU / Done view.
+        .route(
+            "/tray/state",
+            post(handlers::walkie_talkie::post_tray_state),
         );
 
     #[cfg(feature = "perf-monitor")]
@@ -1464,11 +1525,6 @@ pub async fn start_server(
     // subscribes; safe to start unconditionally.
     crate::plugins::radio_bridge::spawn();
 
-    // Auto-correct agent defaults based on what's actually installed on PATH.
-    // Runs every server start because the user's environment can change between
-    // sessions (e.g. they install a new CLI).
-    crate::acp::init_agent_defaults();
-
     // Recover any installed_agents row stuck in `installing` — happens when
     // grove was killed mid-download. Marking them failed lets the user
     // retry from Marketplace instead of staring at a perpetual spinner.
@@ -1479,15 +1535,38 @@ pub async fn start_server(
         );
     }
 
-    // Long-running ACP registry refresher. First tick happens immediately
-    // so the cache gets populated on startup (Marketplace then opens fast
-    // with full data). Subsequent ticks run every hour and call
-    // refresh_if_stale, which respects the 24h freshness window — so we
-    // hit the CDN at most once per stale-window in steady state, but stay
-    // responsive when grove runs for days/weeks.
+    // Agent onboarding is a startup prerequisite, not a fire-and-forget task:
+    //   1. resolve a complete registry snapshot (cache first, network fallback)
+    //   2. reconcile the four product-owned Npx channels
+    //   3. scan every registry agent for local PATH installations
+    //   4. only then choose valid defaults and expose the server
+    let startup_registry = crate::storage::agent_registry::get_for_auto_install()
+        .await
+        .map_err(|e| {
+            std::io::Error::other(format!("agent registry initialization failed: {}", e))
+        })?;
+    let seeded = tokio::task::spawn_blocking(move || -> crate::error::Result<usize> {
+        crate::storage::installed_agents::reconcile_registry_state(&startup_registry)
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("agent onboarding task failed: {}", e)))?
+    .map_err(|e| std::io::Error::other(format!("agent onboarding reconciliation failed: {}", e)))?;
+    eprintln!(
+        "[startup] onboarding agents reconciled ({} Npx channel(s) added)",
+        seeded
+    );
+
+    // Defaults are derived only after both managed and PATH channels have
+    // converged, so first-run config cannot observe an empty database.
+    crate::acp::init_agent_defaults();
+
+    // Keep the registry fresh for long-running servers. Startup already has a
+    // usable cache-backed snapshot, so these refreshes are non-blocking.
     tokio::spawn(async {
+        crate::storage::agent_registry::refresh_if_stale().await;
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
         loop {
             ticker.tick().await;
             crate::storage::agent_registry::refresh_if_stale().await;

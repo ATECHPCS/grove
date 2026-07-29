@@ -3,7 +3,6 @@
 use axum::{
     extract::{Path, Query},
     http::StatusCode,
-    response::IntoResponse,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -447,63 +446,24 @@ pub async fn get_file(
 /// file extension. Unlike `get_file`, this serves binary assets (images,
 /// PDFs, etc.) for embedding via `<img src>` and similar.
 ///
-/// Path resolution: relative paths resolve against the task's worktree
-/// directory; absolute paths are used as-is. No containment check is
-/// performed — Grove is a local desktop tool and the user explicitly
-/// opted in to unrestricted local file access for embedded media.
+/// Compatibility route backed by the unified file service. Relative paths
+/// resolve against the task root; canonical paths must remain within the
+/// task/project/registered-workdir roots selected by that service.
 pub async fn get_file_raw(
     Path((id, task_id)): Path<(String, String)>,
     Query(params): Query<FilePathQuery>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ApiError>)> {
-    let (_project, project_key) = find_project_by_id(&id).map_err(|s| {
-        (
-            s,
-            Json(ApiError {
-                error: "Project not found".to_string(),
-            }),
-        )
-    })?;
-
-    let task = tasks::get_task(&project_key, &task_id)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: format!("Failed to load task: {}", e),
-                }),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ApiError {
-                    error: "Task not found".to_string(),
-                }),
-            )
-        })?;
-
-    let requested = PathBuf::from(&params.path);
-    let abs_path = if requested.is_absolute() {
-        requested
-    } else {
-        PathBuf::from(&task.worktree_path).join(&requested)
-    };
-
-    let bytes = std::fs::read(&abs_path).map_err(|e| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ApiError {
-                error: format!("Failed to read {}: {}", abs_path.display(), e),
-            }),
-        )
-    })?;
-
-    let mime = mime_guess::from_path(&abs_path)
-        .first_or_octet_stream()
-        .essence_str()
-        .to_string();
-
-    Ok(([("content-type", mime)], bytes))
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, Json<ApiError>)> {
+    crate::api::handlers::files::serve(
+        id,
+        crate::api::handlers::files::FileRoot::Task(task_id),
+        crate::api::handlers::files::RawFileQuery {
+            path: params.path,
+            disposition: crate::api::handlers::files::Disposition::Inline,
+        },
+        headers,
+    )
+    .await
 }
 
 /// PUT /api/v1/projects/{id}/tasks/{taskId}/file?path=src/main.rs
@@ -748,6 +708,126 @@ pub async fn delete_path(
     Ok(Json(FsOperationResponse {
         success: true,
         message: format!("Deleted: {}", params.path),
+    }))
+}
+
+/// POST /api/v1/projects/{id}/tasks/{taskId}/fs/open?path=src/main.rs
+///
+/// Open a worktree file with the OS-configured default application. Used by
+/// the Review and Editor file trees. The `open` runs on the Grove server host
+/// (the user's machine in GUI/local-web mode), mirroring the existing folder
+/// `open` endpoints.
+pub async fn open_file(
+    Path((id, task_id)): Path<(String, String)>,
+    Query(params): Query<FilePathQuery>,
+) -> Result<Json<FsOperationResponse>, (StatusCode, Json<ApiError>)> {
+    let (_project, project_key) = find_project_by_id(&id).map_err(|s| {
+        (
+            s,
+            Json(ApiError {
+                error: "Project not found".to_string(),
+            }),
+        )
+    })?;
+
+    let task = tasks::get_task(&project_key, &task_id)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: format!("Failed to load task: {}", e),
+                }),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: "Task not found".to_string(),
+                }),
+            )
+        })?;
+
+    let full_path = resolve_safe_path(&task.worktree_path, &params.path)?;
+
+    if !full_path.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("Path not found: {}", params.path),
+            }),
+        ));
+    }
+
+    crate::api::handlers::studio_common::open_with_default_app(&full_path);
+
+    Ok(Json(FsOperationResponse {
+        success: true,
+        message: format!("Opened: {}", params.path),
+    }))
+}
+
+/// POST /api/v1/projects/{id}/tasks/{taskId}/fs/reveal?path=src/main.rs
+///
+/// Reveal a worktree entry in the host's file manager. On macOS this selects
+/// the file in Finder rather than opening it in its default application.
+pub async fn reveal_file(
+    Path((id, task_id)): Path<(String, String)>,
+    Query(params): Query<FilePathQuery>,
+) -> Result<Json<FsOperationResponse>, (StatusCode, Json<ApiError>)> {
+    let (_project, project_key) = find_project_by_id(&id).map_err(|s| {
+        (
+            s,
+            Json(ApiError {
+                error: "Project not found".to_string(),
+            }),
+        )
+    })?;
+    let task = tasks::get_task(&project_key, &task_id)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: format!("Failed to load task: {e}"),
+                }),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: "Task not found".to_string(),
+                }),
+            )
+        })?;
+    let full_path = resolve_safe_path(&task.worktree_path, &params.path)?;
+
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open")
+        .arg("-R")
+        .arg(&full_path)
+        .spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", full_path.display()))
+        .spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open")
+        .arg(full_path.parent().unwrap_or(&full_path))
+        .spawn();
+
+    result.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("Failed to reveal path: {e}"),
+            }),
+        )
+    })?;
+
+    Ok(Json(FsOperationResponse {
+        success: true,
+        message: format!("Revealed: {}", params.path),
     }))
 }
 

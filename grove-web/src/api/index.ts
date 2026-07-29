@@ -5,9 +5,6 @@ export type { ApiError } from './client';
 export { getConfig, patchConfig, listApplications, getAppIconUrl, previewHookSound } from './config';
 export type { AppInfo, CustomAgentServer, CustomThemeConfig } from './config';
 
-export { listBaseAgents } from './agents';
-export type { BaseAgent } from './agents';
-
 export {
   listCustomAgents,
   createCustomAgent,
@@ -22,7 +19,7 @@ export type {
 
 export { checkAllDependencies, checkCommands } from './env';
 
-export { listProjects, getProject, addProject, deleteProject, renameProject, getProjectStats, getBranches, getRemotes, openIDE, openTerminal, initGitRepo, createNewProject, cloneProject, listResources, uploadResource, deleteResource, previewResource, resourceDownloadUrl, getInstructions, updateInstructions, getMemory, updateMemory, listResourceWorkdirs, addResourceWorkdir, deleteResourceWorkdir, openResourceWorkdir, createResourceFolder, moveResource, createResourceLink, updateResourceLink } from './projects';
+export { listProjects, getProject, addProject, deleteProject, renameProject, getProjectStats, getBranches, getRemotes, openIDE, openTerminal, initGitRepo, createNewProject, cloneProject, listResources, uploadResource, deleteResource, previewResource, resourceDownloadUrl, openResourceFile, getInstructions, updateInstructions, getMemory, updateMemory, listResourceWorkdirs, addResourceWorkdir, deleteResourceWorkdir, openResourceWorkdir, createResourceFolder, moveResource, createResourceLink, updateResourceLink } from './projects';
 export type {
   ProjectListItem,
   ProjectResponse,
@@ -33,6 +30,7 @@ export type {
 
 export {
   listTasks,
+  getTask,
   createTask,
   renameTask,
   activateTask,
@@ -82,6 +80,9 @@ export {
   previewArtifact,
   artifactDownloadUrl,
   deleteArtifact,
+  openArtifactFile,
+  openTaskFile,
+  revealTaskFile,
   uploadArtifacts,
   createArtifactLink,
   updateArtifactLink,
@@ -149,8 +150,11 @@ export {
   saveAudioGlobal,
   saveAudioProject,
   transcribeAudio,
+  getVoiceControlSettings,
+  saveVoiceControlSettings,
+  executeVoiceControl,
 } from './ai';
-export type { ProviderResponse, TranscribeResult } from './ai';
+export type { ProviderResponse, TranscribeResult, VoiceControlExecuteResult, VoiceControlToolCall } from './ai';
 
 export {
   getAgentDefs,
