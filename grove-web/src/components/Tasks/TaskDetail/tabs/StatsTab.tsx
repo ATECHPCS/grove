@@ -1,9 +1,25 @@
 import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
-import { Calendar, GitCommit, FileCode, Clock, Activity, Loader2, GitBranch, Info } from "lucide-react";
-import { getTaskStats, getDiff, getCommits, type TaskStatsResponse, type DiffResponse, type CommitsResponse } from "../../../../api";
+import { Calendar, GitCommit, FileCode, Clock, Activity, Loader2, GitBranch, Info, Link2, X } from "lucide-react";
+import {
+  getTaskStats,
+  getDiff,
+  getCommits,
+  getLinkedProjects,
+  updateLinkedProjects,
+  listProjects,
+  type TaskStatsResponse,
+  type DiffResponse,
+  type CommitsResponse,
+  type LinkedProjectItem,
+  type ProjectListItem,
+} from "../../../../api";
 import type { Task } from "../../../../data/types";
+import { useTheme } from "../../../../context";
 import { compactPath } from "../../../../utils/pathUtils";
+import { getProjectStyle } from "../../../../utils/projectStyle";
+import { ProjectTypeBadge } from "../../../ui/ProjectTypeBadge";
+import { LinkedProjectPicker } from "./LinkedProjectPicker";
 
 interface StatsTabProps {
   projectId: string;
@@ -114,11 +130,17 @@ function formatRelativeTime(isoString: string): string {
 
 
 export function StatsTab({ projectId, task }: StatsTabProps) {
+  const { theme } = useTheme();
   const [stats, setStats] = useState<TaskStatsResponse | null>(null);
   const [diffData, setDiffData] = useState<DiffResponse | null>(null);
   const [commitsData, setCommitsData] = useState<CommitsResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [linkedProjects, setLinkedProjects] = useState<LinkedProjectItem[]>([]);
+  const [availableProjects, setAvailableProjects] = useState<ProjectListItem[]>([]);
+  const [linksLoading, setLinksLoading] = useState(true);
+  const [linksSaving, setLinksSaving] = useState(false);
+  const [linksError, setLinksError] = useState<string | null>(null);
 
   const additions = diffData?.total_additions ?? 0;
   const deletions = diffData?.total_deletions ?? 0;
@@ -147,6 +169,51 @@ export function StatsTab({ projectId, task }: StatsTabProps) {
       })
       .finally(() => setIsLoading(false));
   }, [projectId, task.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    // Reset request state when navigating between tasks.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setLinksLoading(true);
+    setLinksError(null);
+    Promise.all([getLinkedProjects(projectId, task.id), listProjects()])
+      .then(([links, projects]) => {
+        if (cancelled) return;
+        setLinkedProjects(links.linked_projects);
+        setAvailableProjects(projects.projects);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.error("Failed to load linked projects:", err);
+        setLinksError("Failed to load linked projects");
+      })
+      .finally(() => {
+        if (!cancelled) setLinksLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, task.id]);
+
+  const saveLinkedProjects = async (projectIds: string[]) => {
+    if (linksSaving) return;
+    setLinksSaving(true);
+    setLinksError(null);
+    try {
+      const result = await updateLinkedProjects(projectId, task.id, projectIds);
+      setLinkedProjects(result.linked_projects);
+    } catch (err) {
+      console.error("Failed to update linked projects:", err);
+      setLinksError("Failed to update linked projects");
+    } finally {
+      setLinksSaving(false);
+    }
+  };
+
+  const linkedIds = new Set(linkedProjects.map((project) => project.id));
+  const linkCandidates = availableProjects.filter(
+    (project) => project.id !== projectId && project.exists && !linkedIds.has(project.id),
+  );
 
   const maxEditCount = stats?.file_edits.length
     ? Math.max(...stats.file_edits.map((f) => f.edit_count))
@@ -188,6 +255,83 @@ export function StatsTab({ projectId, task }: StatsTabProps) {
           </div>
 
         </div>
+      </motion.div>
+
+      {/* Task-level workspace scope, mapped to ACP additionalDirectories. */}
+      <motion.div
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.05 }}
+        className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-4"
+      >
+        <div className="flex items-center justify-between gap-3 mb-3 select-none">
+          <div className="flex min-w-0 items-center gap-2">
+            <Link2 className="w-4 h-4 shrink-0 text-[var(--color-text-muted)]" />
+            <h3 className="text-sm font-medium text-[var(--color-text)]">Linked Projects</h3>
+          </div>
+          <LinkedProjectPicker
+            projects={linkCandidates}
+            disabled={linksSaving || linksLoading}
+            onSelect={(project) => {
+              void saveLinkedProjects([...linkedIds, project.id]);
+            }}
+          />
+        </div>
+
+        {linksLoading ? (
+          <div className="flex items-center gap-2 py-2 text-xs text-[var(--color-text-muted)]">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            Loading linked projects…
+          </div>
+        ) : linkedProjects.length === 0 ? (
+          <p className="text-xs leading-5 text-[var(--color-text-muted)]">
+            Link another Grove Project to this Task.
+          </p>
+        ) : (
+          <div className="space-y-1.5">
+            {linkedProjects.map((project) => {
+              const { color, Icon } = getProjectStyle(project.id, theme.accentPalette);
+              return (
+                <div
+                  key={project.id}
+                  className="flex items-center gap-3 rounded-md bg-[var(--color-bg-secondary)] px-2.5 py-2"
+                >
+                  <span
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg"
+                    style={{ backgroundColor: color.bg }}
+                  >
+                    <Icon className="h-4 w-4" style={{ color: color.fg }} />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span className="truncate text-sm font-medium text-[var(--color-text)]">
+                        {project.name}
+                      </span>
+                      {project.project_type && <ProjectTypeBadge type={project.project_type} />}
+                    </div>
+                    {!project.exists && (
+                      <div className="truncate text-xs text-[var(--color-error)]">
+                        Project is no longer available
+                      </div>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void saveLinkedProjects(linkedProjects.filter((item) => item.id !== project.id).map((item) => item.id))}
+                    disabled={linksSaving}
+                    className="rounded p-1 text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-error)] disabled:opacity-50"
+                    aria-label={`Unlink ${project.name}`}
+                    title={`Unlink ${project.name}`}
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {linksError && <p className="mt-2 text-xs text-[var(--color-error)]">{linksError}</p>}
       </motion.div>
 
       {/* Stats Grid */}

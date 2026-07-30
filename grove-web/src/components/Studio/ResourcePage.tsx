@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Trash2, Upload, Loader2, MoreHorizontal, Download, Eye,
-  FolderOpen, Save, FileText, RefreshCw, Sparkles,
+  FolderOpen, FolderSearch, Save, FileText, RefreshCw, Sparkles,
   Search, ArrowRight, Files, ShieldCheck, Clock3, X, Brain,
   FolderPlus, ChevronRight, Pencil, Check, CornerLeftUp, Edit3,
   Link as LinkIcon, SquareArrowOutUpRight,
@@ -11,7 +11,7 @@ import {
 import { useProject } from "../../context";
 import {
   listResources, uploadResource, deleteResource,
-  previewResource, resourceDownloadUrl, openResourceFile,
+  previewResource, resourceDownloadUrl, openResourceFile, revealResourceFile,
   createResourceFolder, moveResource, createResourceLink, updateResourceLink,
   getInstructions, updateInstructions,
   getMemory, updateMemory,
@@ -624,6 +624,11 @@ export function ResourcePage() {
     void openResourceFile(projectId, file.path);
   };
 
+  const handleRevealInFileManager = (file: ResourceFile) => {
+    if (!projectId || file.is_dir) return;
+    void revealResourceFile(projectId, file.path);
+  };
+
   const handleOpenLink = useCallback(async (file: ResourceFile) => {
     if (!projectId) return;
     let raw: string | null = null;
@@ -944,6 +949,7 @@ export function ResourcePage() {
                     onDownload={handleDownload}
                     onDelete={handleDelete}
                     onOpenInApp={handleOpenInApp}
+                    onRevealInFileManager={handleRevealInFileManager}
                     onOpenLink={handleOpenLink}
                     onEditLink={handleEditLink}
                     onStartRename={() => { setRenamingPath(item.data.path); setRenameValue(item.data.name); }}
@@ -1732,7 +1738,7 @@ function ResourceFolderRow({
 
 function ResourceFileRow({
   file, isRenaming, renameValue, renameInputRef,
-  onPreview, onDownload, onDelete, onOpenInApp, onOpenLink, onEditLink,
+  onPreview, onDownload, onDelete, onOpenInApp, onRevealInFileManager, onOpenLink, onEditLink,
   onStartRename, onRenameChange, onRenameConfirm, onRenameCancel,
   onDragStart, onMoveToParent,
 }: {
@@ -1744,6 +1750,7 @@ function ResourceFileRow({
   onDownload: (f: ResourceFile) => void;
   onDelete: (f: ResourceFile) => void;
   onOpenInApp?: (f: ResourceFile) => void;
+  onRevealInFileManager?: (f: ResourceFile) => void;
   onOpenLink?: (f: ResourceFile) => void;
   onEditLink?: (f: ResourceFile) => void;
   onStartRename: () => void;
@@ -1753,6 +1760,13 @@ function ResourceFileRow({
   onDragStart: (e: React.DragEvent) => void;
   onMoveToParent?: () => void;
 }) {
+  const canUseHostFileActions =
+    typeof window !== "undefined" &&
+    (window as unknown as Record<string, unknown>).__GROVE_REMOTE__ !== true;
+  const revealLabel =
+    typeof navigator !== "undefined" && /mac/i.test(navigator.userAgent)
+      ? "Show in Finder"
+      : "Show in File Manager";
   const isLink = isLinkFile(file.name);
   const canPreview = !isLink && canPreviewFile(file.name);
   const ext = getExtBadge(file.name);
@@ -1922,13 +1936,22 @@ function ResourceFileRow({
               <Download className="w-3.5 h-3.5" /> Download
             </button>
           )}
-          {!isLink && onOpenInApp && (
+          {!isLink && canUseHostFileActions && onOpenInApp && (
             <button
               onClick={(e) => { e.stopPropagation(); setShowMenu(false); onOpenInApp(file); }}
               className="w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors"
               onMouseEnter={e => e.currentTarget.style.background = "var(--color-bg-secondary)"}
               onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
               <SquareArrowOutUpRight className="w-3.5 h-3.5" /> Open
+            </button>
+          )}
+          {!isLink && canUseHostFileActions && onRevealInFileManager && (
+            <button
+              onClick={(e) => { e.stopPropagation(); setShowMenu(false); onRevealInFileManager(file); }}
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors"
+              onMouseEnter={e => e.currentTarget.style.background = "var(--color-bg-secondary)"}
+              onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+              <FolderSearch className="w-3.5 h-3.5" /> {revealLabel}
             </button>
           )}
           {!isLink && (

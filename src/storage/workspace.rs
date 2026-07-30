@@ -465,6 +465,16 @@ pub fn studio_project_dir(project_path: &str) -> std::path::PathBuf {
     grove_dir().join("studios").join(hash)
 }
 
+/// Return the real filesystem directory backing a registered Project.
+/// Studio Projects use a virtual registration path, so callers that need to
+/// access files must resolve them through the Studio storage directory.
+pub fn project_directory(project: &RegisteredProject) -> std::path::PathBuf {
+    match &project.project_type {
+        ProjectType::Studio => studio_project_dir(&project.path),
+        ProjectType::Repo => std::path::PathBuf::from(&project.path),
+    }
+}
+
 pub fn rename_project(hash: &str, new_name: &str) -> Result<()> {
     let conn = crate::storage::database::connection();
     let changes = conn.execute(

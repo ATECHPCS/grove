@@ -178,6 +178,7 @@ pub struct ResourceDeleteQuery {
 #[derive(Debug, Deserialize)]
 pub struct ResourceFileQuery {
     pub path: String,
+    pub action: Option<String>,
 }
 
 /// Query params for list resources (optional path for subdirectory listing)

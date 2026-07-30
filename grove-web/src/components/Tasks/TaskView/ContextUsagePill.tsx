@@ -86,22 +86,18 @@ export function ContextUsagePill({
   const popoverId = useId();
 
   const recomputePosition = useCallback(() => {
-    const trigger = triggerRef.current;
-    const anchor = anchorRef.current;
-    if (!trigger) return;
-    // Use the trigger pill for vertical placement so the popover hugs the
-    // pill, but borrow the chatbox container width as a sizing hint when
-    // available — keeps the card readable without stretching across the page.
-    const r = trigger.getBoundingClientRect();
-    const widthHint = anchor?.getBoundingClientRect().width ?? r.width;
+    const target = anchorRef.current ?? triggerRef.current;
+    if (!target) return;
+    // Position popover relative to the container box (anchorRef) like AgentQuotaPopover
+    const r = target.getBoundingClientRect();
     const viewportW = window.innerWidth;
     const available = Math.max(0, viewportW - VIEWPORT_PADDING * 2);
-    const desiredWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, widthHint));
+    const desiredWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, r.width));
     const width = Math.min(desiredWidth, available);
 
     const viewportH = window.innerHeight;
     const measuredHeight = popoverRef.current?.offsetHeight ?? 0;
-    const popoverHeight = measuredHeight > 0 ? measuredHeight : 200;
+    const popoverHeight = measuredHeight > 0 ? measuredHeight : 150;
     const spaceAbove = Math.max(0, r.top - POPOVER_GAP - VIEWPORT_PADDING);
     const spaceBelow = Math.max(
       0,
@@ -111,9 +107,10 @@ export function ContextUsagePill({
       spaceAbove >= popoverHeight || spaceAbove >= spaceBelow ? "top" : "bottom";
     const availableHeight = placement === "top" ? spaceAbove : spaceBelow;
     const maxHeight = Math.max(120, Math.min(popoverHeight, availableHeight));
+    const cardHeight = measuredHeight > 0 ? Math.min(measuredHeight, maxHeight) : maxHeight;
     const rawTop =
       placement === "top"
-        ? r.top - POPOVER_GAP - maxHeight
+        ? r.top - POPOVER_GAP - cardHeight
         : r.bottom + POPOVER_GAP;
     const maxTop = Math.max(
       VIEWPORT_PADDING,

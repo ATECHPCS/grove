@@ -1709,6 +1709,11 @@ pub struct TakeControlResponse {
     pub success: bool,
 }
 
+#[derive(Serialize)]
+pub struct ReconnectChatResponse {
+    pub success: bool,
+}
+
 /// POST /api/v1/projects/{id}/tasks/{taskId}/chats/{chatId}/take-control
 ///
 /// Kill the remote session owner so the Web frontend can take over.
@@ -1737,4 +1742,55 @@ pub async fn take_control(
             Ok(Json(TakeControlResponse { success: true }))
         }
     }
+}
+
+/// POST /api/v1/projects/{id}/tasks/{taskId}/chats/{chatId}/reconnect
+///
+/// Stop the current ACP owner and wait for its handle/socket to disappear.
+/// The following browser WebSocket connection then starts a fresh ACP process
+/// which resumes or loads the persisted Agent session through the normal path.
+pub async fn reconnect_chat(
+    Path((project_id, task_id, chat_id)): Path<(String, String, String)>,
+) -> Result<Json<ReconnectChatResponse>, AcpError> {
+    let (project_key, _, _) = resolve_project_key(&project_id)?;
+    let chat = tasks::get_chat_session(&project_key, &task_id, &chat_id)
+        .map_err(|e| AcpError::Internal(e.to_string()))?
+        .ok_or(AcpError::NotFound("Chat not found".to_string()))?;
+    if chat.launch_mode == "terminal" {
+        return Err(AcpError::Internal(
+            "Terminal sessions do not use ACP reconnect".to_string(),
+        ));
+    }
+
+    let session_key = format!("{}:{}:{}", project_key, task_id, chat_id);
+    match acp::discover_session(&project_key, &task_id, &chat_id, &session_key) {
+        Some(acp::SessionAccess::Local(handle)) => {
+            handle
+                .kill()
+                .await
+                .map_err(|e| AcpError::Internal(format!("Failed to stop ACP session: {}", e)))?;
+        }
+        Some(acp::SessionAccess::Remote { sock_path, .. }) => {
+            acp::send_socket_command(&sock_path, &acp::SocketCommand::Kill)
+                .await
+                .map_err(|e| {
+                    AcpError::Internal(format!("Failed to stop remote ACP session: {}", e))
+                })?;
+        }
+        None => {}
+    }
+
+    // `session/close` has a three-second best-effort timeout. Allow enough
+    // room for that plus subprocess/socket cleanup, while never starting a
+    // replacement process concurrently with the old owner.
+    for _ in 0..200 {
+        if acp::discover_session(&project_key, &task_id, &chat_id, &session_key).is_none() {
+            return Ok(Json(ReconnectChatResponse { success: true }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    Err(AcpError::Internal(
+        "Timed out while stopping the existing ACP session".to_string(),
+    ))
 }

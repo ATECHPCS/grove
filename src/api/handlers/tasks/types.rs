@@ -283,6 +283,7 @@ pub struct WriteFileRequest {
 #[derive(Debug, Deserialize)]
 pub struct FilePathQuery {
     pub path: String,
+    pub action: Option<String>,
 }
 
 /// Reply to review comment request
@@ -402,6 +403,7 @@ pub struct ArtifactsResponse {
 pub struct ArtifactQuery {
     pub path: String,
     pub dir: String,
+    pub action: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

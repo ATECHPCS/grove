@@ -271,6 +271,10 @@ pub fn remove_task(project: &str, task_id: &str) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     crate::storage::agent_graph::cascade_delete_for_task(&tx, project, task_id)?;
     tx.execute(
+        "DELETE FROM task_linked_projects WHERE project = ?1 AND task_id = ?2",
+        params![project, task_id],
+    )?;
+    tx.execute(
         "DELETE FROM tasks WHERE project = ?1 AND id = ?2",
         params![project, task_id],
     )?;
@@ -283,6 +287,10 @@ pub fn remove_archived_task(project: &str, task_id: &str) -> Result<()> {
     let conn = crate::storage::database::connection();
     let tx = conn.unchecked_transaction()?;
     crate::storage::agent_graph::cascade_delete_for_task(&tx, project, task_id)?;
+    tx.execute(
+        "DELETE FROM task_linked_projects WHERE project = ?1 AND task_id = ?2",
+        params![project, task_id],
+    )?;
     tx.execute(
         "DELETE FROM tasks WHERE project = ?1 AND id = ?2 AND status = 'archived'",
         params![project, task_id],
@@ -303,6 +311,46 @@ pub fn update_task_name(project: &str, task_id: &str, new_name: &str) -> Result<
             "task {task_id} not found in project {project}"
         )));
     }
+    Ok(())
+}
+
+/// Project IDs linked into a Task's ACP workspace, in user-defined order.
+pub fn load_linked_project_ids(project: &str, task_id: &str) -> Result<Vec<String>> {
+    let conn = crate::storage::database::connection();
+    let mut stmt = conn.prepare(
+        "SELECT linked_project_id FROM task_linked_projects
+         WHERE project = ?1 AND task_id = ?2 ORDER BY position, linked_project_id",
+    )?;
+    let ids = stmt
+        .query_map(params![project, task_id], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+/// Atomically replace the Task's linked Project IDs.
+pub fn replace_linked_project_ids(
+    project: &str,
+    task_id: &str,
+    linked_project_ids: &[String],
+) -> Result<()> {
+    let conn = crate::storage::database::connection();
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM task_linked_projects WHERE project = ?1 AND task_id = ?2",
+        params![project, task_id],
+    )?;
+    for (position, linked_project_id) in linked_project_ids.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO task_linked_projects
+             (project, task_id, linked_project_id, position) VALUES (?1, ?2, ?3, ?4)",
+            params![project, task_id, linked_project_id, position as i64],
+        )?;
+    }
+    tx.execute(
+        "UPDATE tasks SET updated_at = ?1 WHERE project = ?2 AND id = ?3",
+        params![Utc::now().to_rfc3339(), project, task_id],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 

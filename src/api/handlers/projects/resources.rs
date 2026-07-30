@@ -290,7 +290,18 @@ pub async fn open_resource(
     let (_project, studio_dir) = resolve_studio_dir(&id)?;
     let resource_dir = studio_dir.join("resource");
     let canonical_file = resolve_resource_file(&resource_dir, &query.path)?;
-    studio_common::open_with_default_app(&canonical_file);
+    if query.action.as_deref() == Some("reveal") {
+        studio_common::reveal_in_file_manager(&canonical_file).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: format!("Failed to reveal resource: {error}"),
+                }),
+            )
+        })?;
+    } else {
+        studio_common::open_with_default_app(&canonical_file);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

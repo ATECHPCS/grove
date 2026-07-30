@@ -125,8 +125,8 @@ pub struct AcpSessionHandle {
     /// agent 是否在 initialize 响应里声明了 `session.fork` 能力
     /// (`unstable_session_fork`)。前端据此显示/隐藏 Fork 按钮。
     pub fork_capable: std::sync::atomic::AtomicBool,
-    /// agent 是否在 initialize 响应里声明了 `session.delete` 能力
-    /// (`unstable_session_delete`)。删 chat 时若为 true 且连接活跃,
+    /// agent 是否在 initialize 响应里声明了稳定的 `session.delete` 能力。
+    /// 删 chat 时若为 true 且连接活跃,
     /// best-effort 调 `session/delete` 把 agent 那边的 session 也删掉。
     pub delete_capable: std::sync::atomic::AtomicBool,
     /// agent 是否在 initialize 响应里声明了 `session.close` 能力。
@@ -189,7 +189,7 @@ enum AcpCommand {
         cwd: PathBuf,
         reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
     },
-    /// 调用 ACP `session/delete`(`unstable_session_delete`),要求 agent 删掉
+    /// 调用 ACP v1 `session/delete`,要求 agent 删掉
     /// 当前 session(handle 自己的 session_id)。reply 回传成功/失败。
     DeleteSession {
         reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
@@ -381,7 +381,7 @@ pub enum AcpUpdate {
     /// done — TaskChat clears the override and falls back to its normal
     /// connecting/connected text driven by `connecting`/`SessionReady`).
     ConnectPhase { phase: String },
-    /// Context window usage update (ACP `unstable_session_usage`).
+    /// Context window usage update (ACP v1 `usage_update`).
     /// Agent reports current `used / size` tokens for the session, optionally
     /// with cumulative cost. Pushed every time the agent recomputes — frontend
     /// renders a context-window pill, no debouncing.
@@ -609,7 +609,7 @@ pub struct SessionMetadata {
     pub prompt_capabilities: PromptCapabilitiesData,
     #[serde(default)]
     pub available_commands: Vec<CommandInfo>,
-    /// Latest context-window usage snapshot (ACP `unstable_session_usage`).
+    /// Latest context-window usage snapshot (ACP v1 `usage_update`).
     /// Set on every `usage_update` notification; restored from disk on reopen.
     /// `None` when the agent has not reported usage yet — UI hides the pill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -741,27 +741,55 @@ fn grove_mcp_server(env_vars: &HashMap<String, String>) -> crate::error::Result<
 /// Build the `mcp_servers` list for `NewSessionRequest` / `LoadSessionRequest`.
 ///
 /// Always includes the existing stdio `grove mcp` (orchestrator tools). When
-/// `agent_graph_token` is `Some` and the in-process MCP HTTP listener is
-/// running, **also** appends a second entry — the loopback Streamable HTTP
-/// MCP that exposes the agent_graph tools. The two MCP servers run in
-/// parallel; their tool sets don't overlap (`grove_*` orchestrator vs
-/// `grove_agent_*` graph) so the agent sees them as one combined toolbox.
+/// `agent_graph_token` is `Some` and the in-process listener is running, also
+/// appends the agent_graph MCP using the Agent's advertised transport: direct
+/// Streamable HTTP when supported, otherwise the mandatory stdio transport
+/// through `grove mcp-bridge`. The exposed tools are identical either way.
 ///
-/// The HTTP entry is silently skipped when the listener hasn't booted (e.g.
+/// The agent_graph entry is silently skipped when the listener hasn't booted (e.g.
 /// `grove acp` standalone mode, tests). In that case the agent only sees
 /// stdio tools — agent_graph features become unavailable but the session
 /// still works for normal chat.
 fn build_mcp_servers(
     env_vars: &HashMap<String, String>,
     agent_graph_token: Option<&str>,
+    supports_http: bool,
 ) -> crate::error::Result<Vec<acp::McpServer>> {
     let mut servers = vec![grove_mcp_server(env_vars)?];
     if let Some(token) = agent_graph_token {
         if let Some(url) = crate::api::handlers::agent_graph_mcp::build_mcp_url(token) {
-            servers.push(acp::McpServer::Http(acp::McpServerHttp::new(
-                "grove_agent",
-                url,
-            )));
+            if supports_http {
+                servers.push(acp::McpServer::Http(acp::McpServerHttp::new(
+                    "grove_agent",
+                    url,
+                )));
+            } else {
+                // Stdio is mandatory for every ACP Agent. When Streamable HTTP
+                // is unavailable, expose the same agent_graph service through
+                // Grove's stdio-to-HTTP bridge instead.
+                let exe = std::env::current_exe().map_err(|e| {
+                    crate::error::GroveError::Session(format!(
+                        "Failed to resolve Grove MCP bridge executable: {}",
+                        e
+                    ))
+                })?;
+                let command = exe.canonicalize().unwrap_or(exe);
+                let env = env_vars
+                    .iter()
+                    .filter(|(name, _)| {
+                        matches!(
+                            name.as_str(),
+                            "GROVE_MCP_TOKEN" | "GROVE_MCP_PORT" | "GROVE_MCP_BRIDGE_TIMEOUT_SECS"
+                        )
+                    })
+                    .map(|(name, value)| acp::EnvVariable::new(name.clone(), value.clone()))
+                    .collect();
+                servers.push(acp::McpServer::Stdio(
+                    acp::McpServerStdio::new("grove_agent", command)
+                        .args(vec!["mcp-bridge".to_string()])
+                        .env(env),
+                ));
+            }
         }
     }
     // Inject stdio MCP servers contributed by installed plugins, forwarding the
@@ -769,6 +797,159 @@ fn build_mcp_servers(
     // context" the panel gets from host.getInfo).
     servers.extend(load_plugin_mcp_servers(env_vars));
     Ok(servers)
+}
+
+/// Resolve Task-level linked Grove Project IDs to the absolute directories
+/// sent on ACP session lifecycle requests. New/load/resume resolve this when
+/// the connection starts; fork resolves it again when the request is sent so
+/// a newly forked session receives the Task's latest linked Project set.
+fn resolve_linked_project_paths(
+    project_key: &str,
+    task_id: &str,
+) -> crate::error::Result<Vec<PathBuf>> {
+    let ids =
+        crate::storage::tasks::load_linked_project_ids(project_key, task_id).map_err(|error| {
+            crate::error::GroveError::Session(format!(
+                "Failed to load linked Project configuration: {error}"
+            ))
+        })?;
+    let registered = crate::storage::workspace::load_projects().map_err(|error| {
+        crate::error::GroveError::Session(format!(
+            "Failed to load registered Projects for linked workspace setup: {error}"
+        ))
+    })?;
+    let mut paths = Vec::new();
+    for id in ids {
+        let Some(project) = registered
+            .iter()
+            .find(|project| crate::storage::workspace::project_hash(&project.path) == id)
+        else {
+            eprintln!("[ACP] Linked project {id} is no longer registered; skipping");
+            continue;
+        };
+        let path = crate::storage::workspace::project_directory(project);
+        if !path.is_absolute() || !path.is_dir() {
+            eprintln!(
+                "[ACP] Linked project {} has no accessible absolute directory: {}",
+                project.name, project.path
+            );
+            continue;
+        }
+        let resolved = path.canonicalize().unwrap_or(path);
+        if !paths.contains(&resolved) {
+            paths.push(resolved);
+        }
+    }
+    Ok(paths)
+}
+
+fn is_executable_file(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    true
+}
+
+fn resolve_executable_candidate(
+    path: &std::path::Path,
+    env: &HashMap<String, String>,
+) -> Option<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        let _ = env;
+        is_executable_file(path).then(|| path.to_path_buf())
+    }
+
+    #[cfg(windows)]
+    {
+        let extensions: Vec<String> = env
+            .get("PATHEXT")
+            .cloned()
+            .or_else(|| std::env::var("PATHEXT").ok())
+            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(str::to_string)
+            .collect();
+        let literal_allowed = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                let extension = format!(".{extension}");
+                extensions
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(&extension))
+            });
+        if literal_allowed && is_executable_file(path) {
+            return Some(path.to_path_buf());
+        }
+        if path.extension().is_none() {
+            for extension in extensions {
+                let candidate = PathBuf::from(format!("{}{}", path.display(), extension));
+                if is_executable_file(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Resolve a plugin-authored logical command (for example `node`) to the
+/// absolute executable path required by ACP. Keep the discovered path itself
+/// rather than canonicalizing it so version-manager shims remain effective.
+fn resolve_plugin_mcp_command(
+    command: &str,
+    plugin_dir: &std::path::Path,
+    env: &HashMap<String, String>,
+) -> Option<String> {
+    let command_path = std::path::Path::new(command);
+
+    let plugin_relative = plugin_dir.join(command_path);
+    if let Some(plugin_relative) = resolve_executable_candidate(&plugin_relative, env) {
+        let absolute = if plugin_relative.is_absolute() {
+            plugin_relative
+        } else {
+            std::env::current_dir().ok()?.join(plugin_relative)
+        };
+        return Some(absolute.to_string_lossy().into_owned());
+    }
+
+    if command_path.is_absolute() {
+        return resolve_executable_candidate(command_path, env)
+            .map(|path| path.to_string_lossy().into_owned());
+    }
+
+    // A relative path containing a directory component is plugin-relative;
+    // if it did not resolve above, do not reinterpret it as a PATH command.
+    if command_path.components().count() > 1 {
+        return None;
+    }
+
+    let path = env
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"))?;
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(command_path);
+        if let Some(candidate) = resolve_executable_candidate(&candidate, env) {
+            let absolute = if candidate.is_absolute() {
+                candidate
+            } else {
+                std::env::current_dir().ok()?.join(candidate)
+            };
+            return Some(absolute.to_string_lossy().into_owned());
+        }
+    }
+    None
 }
 
 /// Build stdio MCP servers contributed by installed plugins. A plugin whose
@@ -799,11 +980,10 @@ fn load_plugin_mcp_servers(base_env: &HashMap<String, String>) -> Vec<acp::McpSe
             None => continue,
         };
         let plugin_dir = std::path::Path::new(&plugin.local_path);
-        // Resolve a value to an absolute path when it names a file inside the
-        // plugin folder. McpServerStdio has no cwd, so a relative entry like
-        // `dist/server.js` would otherwise resolve against Grove's cwd. Bare
-        // commands (`node`) and flags (`--foo`) don't match a file and pass
-        // through unchanged (PATH resolution handles `node`).
+        // Resolve argument values that name files inside the plugin folder.
+        // McpServerStdio has no cwd, so a relative entry like `dist/server.js`
+        // would otherwise resolve against Grove's cwd. The executable itself
+        // is handled separately below because ACP requires an absolute path.
         let resolve = |s: &str| -> String {
             let candidate = plugin_dir.join(s);
             if candidate.is_file() {
@@ -813,7 +993,16 @@ fn load_plugin_mcp_servers(base_env: &HashMap<String, String>) -> Vec<acp::McpSe
             }
         };
         let command = match mcp.get("command").and_then(|v| v.as_str()) {
-            Some(c) if !c.is_empty() => resolve(c),
+            Some(c) if !c.is_empty() => match resolve_plugin_mcp_command(c, plugin_dir, base_env) {
+                Some(command) => command,
+                None => {
+                    eprintln!(
+                        "grove: skipping MCP server for plugin '{}': executable '{}' was not found",
+                        plugin.name, c
+                    );
+                    continue;
+                }
+            },
             _ => continue,
         };
         let mut args: Vec<String> = mcp
@@ -986,8 +1175,8 @@ struct TerminalState {
 
 /// Grove ACP client 共享状态。
 ///
-/// 在 0.11 SDK 里 handler 不再是 trait 方法,而是注册到 `Client.builder()` 上的
-/// 独立闭包。每个 handler 闭包通过 `Arc::clone` 捕获一份这个结构体,所以字段要么
+/// Protocol handlers are registered as independent closures on `Client.builder()`.
+/// 每个 handler 闭包通过 `Arc::clone` 捕获一份这个结构体,所以字段要么
 /// 本身就是 `Send + Sync`、要么包在 `Mutex` 里。
 struct AcpClientState {
     handle: Arc<AcpSessionHandle>,
@@ -1182,7 +1371,7 @@ async fn handle_create_terminal(
 
     let terminals = state.terminals.clone();
     let term_id = id.clone();
-    // 0.11 handler 要求 Send,但 drive_terminal 的 future 是 Send;用 tokio::spawn
+    // handler 要求 Send,而 drive_terminal 的 future 也是 Send;用 tokio::spawn
     // 而不是 spawn_local 避免对 LocalSet 的隐式依赖。
     tokio::spawn(async move {
         drive_terminal(terminals, term_id, child, kill_rx, exit_notify).await;
@@ -2203,7 +2392,7 @@ async fn run_acp_session(
 
     // 根据 agent_type 分支获取 reader/writer（使用 trait object 统一类型）
     let mut child: Option<tokio::process::Child>;
-    // 0.11 ByteStreams 要求 Send + 'static;grove 的子进程 pipe 和 DuplexStream 都满足。
+    // ByteStreams 要求 Send + 'static;grove 的子进程 pipe 和 DuplexStream 都满足。
     let mut writer: Box<dyn futures::AsyncWrite + Send + Unpin>;
     let mut reader: Box<dyn futures::AsyncRead + Send + Unpin>;
 
@@ -2358,7 +2547,7 @@ async fn run_acp_session(
 
     let transport = acp::ByteStreams::new(writer, reader);
 
-    // 每个 handler 闭包通过 Arc::clone 捕获一份 state。0.11 要求 handler 的 F
+    // 每个 handler 闭包通过 Arc::clone 捕获一份 state。SDK 要求 handler 的 F
     // 本身是 Send,所以 state 必须是 Send + Sync(AcpClientState 已满足)。
     let result = acp::Client
         .builder()
@@ -2632,15 +2821,7 @@ async fn drive_session(
     }
 
     fn is_auth_required_error(e: &acp::Error) -> bool {
-        if i32::from(e.code) == -32000 {
-            return true;
-        }
-        let err_msg = e.to_string();
-        err_msg.contains("Failed to authenticate")
-            || err_msg.contains("authentication_failed")
-            || err_msg.contains("Invalid authentication credentials")
-            || err_msg.contains("401 Unauthorized")
-            || err_msg.contains("401 Invalid authentication")
+        i32::from(e.code) == -32000
     }
 
     // The agent_graph MCP token is generated and registered in `run_acp_session`
@@ -2706,7 +2887,7 @@ async fn drive_session(
     // Trae 目前已在新版中正确声明支持 load_session，此处可直接使用其实际能力声明
     let supports_load = init_resp.agent_capabilities.load_session;
 
-    // Resume 能力(ACP 0.12 stabilized `session/resume`):agent 在 capabilities 里
+    // Resume 能力:agent 在 capabilities 里
     // 声明 resume=Some(_) 表示支持。与 load_session 的本质区别 — resume **不 replay
     // 历史消息**(load 会把全部历史通过 session/update 回放回来)。Grove 的历史本就
     // 自己从磁盘加载,所以 resume 路线天然不需要 suppress_emit + 300ms 那套抛弃 hack。
@@ -2715,6 +2896,17 @@ async fn drive_session(
         .session_capabilities
         .resume
         .is_some();
+    let additional_directories_capable = init_resp
+        .agent_capabilities
+        .session_capabilities
+        .additional_directories
+        .is_some();
+    let additional_directories = if additional_directories_capable {
+        resolve_linked_project_paths(&config.project_key, &config.task_id).map_err(to_acp_err)?
+    } else {
+        Vec::new()
+    };
+    let supports_mcp_http = init_resp.agent_capabilities.mcp_capabilities.http;
 
     // Fork 能力(`unstable_session_fork`):agent 在 capabilities 里声明 fork=Some(_)
     // 表示支持 `session/fork`。同时 grove 的 fork 实现依赖 load_session — 派生
@@ -2730,7 +2922,7 @@ async fn drive_session(
         .fork_capable
         .store(fork_capable, std::sync::atomic::Ordering::Relaxed);
 
-    // Delete 能力(`unstable_session_delete`):agent 声明 session.delete 即可。
+    // Delete 是稳定能力:agent 声明 session.delete 即可。
     // 删 chat 时若连接活跃,best-effort 调 session/delete 删掉 agent 侧 session。
     let delete_capable = init_resp
         .agent_capabilities
@@ -2826,14 +3018,45 @@ async fn drive_session(
                                 if let Ok(mut slot) = handle.pending_auth.lock() {
                                     *slot = None;
                                 }
-                                return Err(acp::Error::internal_error());
+                                return Ok(());
                             }
                             Some(AcpCommand::Logout { reply }) => {
                                 let _ = reply
                                     .send(Err("Cannot log out while authentication is required"
                                         .to_string()));
                             }
-                            _ => {}
+                            Some(AcpCommand::Prompt {
+                                text,
+                                attachments,
+                                sender,
+                                terminal,
+                                config,
+                            }) => {
+                                handle.pending_queue.lock().unwrap().push(
+                                    QueuedMessage::new(
+                                        text,
+                                        attachments,
+                                        sender,
+                                        terminal,
+                                        config,
+                                    ),
+                                );
+                                handle.emit(AcpUpdate::QueueUpdate {
+                                    messages: handle.get_queue(),
+                                });
+                            }
+                            Some(AcpCommand::ForkSession { reply, .. }) => {
+                                let _ = reply.send(Err(
+                                    "Cannot fork while authentication is required".to_string(),
+                                ));
+                            }
+                            Some(AcpCommand::DeleteSession { reply }) => {
+                                let _ = reply.send(Err(
+                                    "Cannot delete the Agent session while authentication is required"
+                                        .to_string(),
+                                ));
+                            }
+                            Some(AcpCommand::Cancel | AcpCommand::RetryAuthentication) => {}
                         }
                     }
                 };
@@ -2876,7 +3099,7 @@ async fn drive_session(
                                 if let Ok(mut slot) = handle.pending_auth.lock() {
                                     *slot = None;
                                 }
-                                return Err(acp::Error::internal_error());
+                                return Ok(());
                             }
                             Some(AcpCommand::Logout { reply }) => {
                                 let _ = reply.send(Err(
@@ -2884,7 +3107,38 @@ async fn drive_session(
                                         .to_string(),
                                 ));
                             }
-                            _ => {}
+                            Some(AcpCommand::Prompt {
+                                text,
+                                attachments,
+                                sender,
+                                terminal,
+                                config,
+                            }) => {
+                                handle.pending_queue.lock().unwrap().push(
+                                    QueuedMessage::new(
+                                        text,
+                                        attachments,
+                                        sender,
+                                        terminal,
+                                        config,
+                                    ),
+                                );
+                                handle.emit(AcpUpdate::QueueUpdate {
+                                    messages: handle.get_queue(),
+                                });
+                            }
+                            Some(AcpCommand::ForkSession { reply, .. }) => {
+                                let _ = reply.send(Err(
+                                    "Cannot fork while authentication is in progress".to_string(),
+                                ));
+                            }
+                            Some(AcpCommand::DeleteSession { reply }) => {
+                                let _ = reply.send(Err(
+                                    "Cannot delete the Agent session while authentication is in progress"
+                                        .to_string(),
+                                ));
+                            }
+                            Some(AcpCommand::Cancel | AcpCommand::RetryAuthentication) => {}
                         }
                     }
                 }
@@ -2907,16 +3161,23 @@ async fn drive_session(
                 }
             }
             let mcp_servers =
-                build_mcp_servers(&config.env_vars, agent_graph_token).map_err(to_acp_err)?;
+                build_mcp_servers(
+                    &config.env_vars,
+                    agent_graph_token,
+                    supports_mcp_http,
+                )
+                .map_err(to_acp_err)?;
             // 重试循环:session/new 在用户没登录时(claude-code-acp / codex 都
             // 这样)会直接抛 -32000 AuthRequired。捕获后 emit AuthRequired banner,
             // 等用户在 chat 里点 Login → 收到 Authenticate cmd → 调 authenticate →
             // 成功后回到 loop 顶端再试一次 session/new。这一段没有进 cmd 主循环,
-            // 用户此时不可能发 prompt,所以 cmd_rx 里只会出现 Authenticate / Kill。
+            // 登录期间到达的 prompt 会进入可见队列，其他 session action 会得到
+            // 明确回复，避免共享 command channel 中的命令被静默丢弃。
             let resp = loop {
                 match conn
                     .send_request(
                         acp::NewSessionRequest::new(&config.working_dir)
+                            .additional_directories(additional_directories.clone())
                             .mcp_servers(mcp_servers.clone()),
                     )
                     .block_task()
@@ -3025,7 +3286,8 @@ async fn drive_session(
         // ResumeSessionRequest,Grove 照常从磁盘加载自己的历史。
         (Some(saved_id), true, _) => {
             let mcp_servers =
-                build_mcp_servers(&config.env_vars, agent_graph_token).map_err(to_acp_err)?;
+                build_mcp_servers(&config.env_vars, agent_graph_token, supports_mcp_http)
+                    .map_err(to_acp_err)?;
             let resp = loop {
                 match conn
                     .send_request(
@@ -3033,6 +3295,7 @@ async fn drive_session(
                             acp::SessionId::new(&*saved_id),
                             &config.working_dir,
                         )
+                        .additional_directories(additional_directories.clone())
                         .mcp_servers(mcp_servers.clone()),
                     )
                     .block_task()
@@ -3072,7 +3335,8 @@ async fn drive_session(
                 .suppress_emit
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             let mcp_servers =
-                build_mcp_servers(&config.env_vars, agent_graph_token).map_err(to_acp_err)?;
+                build_mcp_servers(&config.env_vars, agent_graph_token, supports_mcp_http)
+                    .map_err(to_acp_err)?;
             let resp = loop {
                 match conn
                     .send_request(
@@ -3080,6 +3344,7 @@ async fn drive_session(
                             acp::SessionId::new(&*saved_id),
                             &config.working_dir,
                         )
+                        .additional_directories(additional_directories.clone())
                         .mcp_servers(mcp_servers.clone()),
                     )
                     .block_task()
@@ -3109,9 +3374,12 @@ async fn drive_session(
             ) = extract_thought_level(resp.config_options.as_deref().unwrap_or(&[]));
             saved_id
         }
-        // Fresh 路线:无 saved_id,或有 saved_id 但 agent 既不支持 resume 也不支持
-        // load。与现状一致。
-        _ => create_new_session!(false),
+        // Existing Grove history remains the source of truth even when the
+        // Agent cannot restore its own session. Start a fresh Agent session,
+        // but never erase the user's locally persisted conversation.
+        (Some(_), false, false) => create_new_session!(true),
+        // A genuinely new chat starts from an empty local history.
+        (None, _, _) => create_new_session!(false),
     };
 
     let session_id_arc = acp::SessionId::new(&*session_id);
@@ -3378,7 +3646,7 @@ async fn drive_session(
                         Some(inner_cmd) = cmd_rx.recv() => {
                             match inner_cmd {
                                 AcpCommand::Cancel => {
-                                    // 0.11: cancel 是 Notification, send_notification 是同步 API.
+                                    // cancel 是 Notification, send_notification 是同步 API.
                                     // 多次 Cancel 都允许通过 (用户连点 Send Now / 多 WS 同时 cancel),
                                     // agent 侧需要幂等处理多份 CancelNotification — 这是 ACP spec
                                     // 的预期行为, 不在客户端去重。
@@ -3448,9 +3716,6 @@ async fn drive_session(
 
                 if got_kill {
                     handle.emit(AcpUpdate::Busy { value: false });
-                    handle.emit(AcpUpdate::Error {
-                        message: "Session killed".to_string(),
-                    });
                     break;
                 }
 
@@ -3641,14 +3906,12 @@ async fn drive_session(
                                             config,
                                         )) = pending
                                         {
-                                            let _ = handle.cmd_tx.try_send(
-                                                AcpCommand::Prompt {
-                                                    text,
-                                                    attachments,
-                                                    sender,
-                                                    terminal,
-                                                    config,
-                                                },
+                                            handle.retry_prompt_after_auth(
+                                                text,
+                                                attachments,
+                                                sender,
+                                                terminal,
+                                                config,
                                             );
                                         }
                                     }
@@ -3682,7 +3945,39 @@ async fn drive_session(
                                             .to_string(),
                                     ));
                                 }
-                                _ => {}
+                                Some(AcpCommand::Prompt {
+                                    text,
+                                    attachments,
+                                    sender,
+                                    terminal,
+                                    config,
+                                }) => {
+                                    handle.pending_queue.lock().unwrap().push(
+                                        QueuedMessage::new(
+                                            text,
+                                            attachments,
+                                            sender,
+                                            terminal,
+                                            config,
+                                        ),
+                                    );
+                                    handle.emit(AcpUpdate::QueueUpdate {
+                                        messages: handle.get_queue(),
+                                    });
+                                }
+                                Some(AcpCommand::ForkSession { reply, .. }) => {
+                                    let _ = reply.send(Err(
+                                        "Cannot fork while authentication is in progress"
+                                            .to_string(),
+                                    ));
+                                }
+                                Some(AcpCommand::DeleteSession { reply }) => {
+                                    let _ = reply.send(Err(
+                                        "Cannot delete the Agent session while authentication is in progress"
+                                            .to_string(),
+                                    ));
+                                }
+                                Some(AcpCommand::Cancel | AcpCommand::RetryAuthentication) => {}
                             }
                         }
                     }
@@ -3702,13 +3997,7 @@ async fn drive_session(
                     .ok()
                     .and_then(|mut retry| retry.take());
                 if let Some((text, attachments, sender, terminal, config)) = pending {
-                    let _ = handle.cmd_tx.try_send(AcpCommand::Prompt {
-                        text,
-                        attachments,
-                        sender,
-                        terminal,
-                        config,
-                    });
+                    handle.retry_prompt_after_auth(text, attachments, sender, terminal, config);
                 }
             }
             AcpCommand::Logout { reply } => {
@@ -3732,13 +4021,33 @@ async fn drive_session(
                 // Agent 必须声明 fork capability;否则 send_request 会被 agent
                 // 直接拒绝。这里不再二次校验,直接发出 — 失败会通过 reply 透传
                 // 给上层(API handler 把错误传回前端)。
-                let res = conn
-                    .send_request(acp::ForkSessionRequest::new(session_id_arc.clone(), cwd))
-                    .block_task()
-                    .await;
-                let outcome = match res {
-                    Ok(resp) => Ok(resp.session_id.to_string()),
-                    Err(e) => Err(format!("session/fork failed: {}", e)),
+                let outcome = match if additional_directories_capable {
+                    resolve_linked_project_paths(&config.project_key, &config.task_id)
+                } else {
+                    Ok(Vec::new())
+                } {
+                    Err(e) => Err(format!("session/fork workspace setup failed: {e}")),
+                    Ok(fork_directories) => match build_mcp_servers(
+                        &config.env_vars,
+                        agent_graph_token,
+                        supports_mcp_http,
+                    ) {
+                        Ok(mcp_servers) => {
+                            match conn
+                                .send_request(
+                                    acp::ForkSessionRequest::new(session_id_arc.clone(), cwd)
+                                        .additional_directories(fork_directories)
+                                        .mcp_servers(mcp_servers),
+                                )
+                                .block_task()
+                                .await
+                            {
+                                Ok(resp) => Ok(resp.session_id.to_string()),
+                                Err(e) => Err(format!("session/fork failed: {}", e)),
+                            }
+                        }
+                        Err(e) => Err(format!("session/fork MCP setup failed: {}", e)),
+                    },
                 };
                 let _ = reply.send(outcome);
             }
@@ -4448,7 +4757,7 @@ impl AcpSessionHandle {
         }
     }
 
-    /// 通过 ACP `session/delete` 删掉当前 session(`unstable_session_delete`)。
+    /// 通过 ACP v1 `session/delete` 删掉当前 session。
     /// 删 chat 时 best-effort 调用 — agent 那边把 session 一并删掉。
     pub async fn delete_session(&self) -> crate::error::Result<()> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -4626,6 +4935,44 @@ impl AcpSessionHandle {
                 config,
             })
             .is_ok()
+    }
+
+    /// Re-dispatch the prompt that failed with `auth_required`. If producers
+    /// filled the bounded command channel while authentication was completing,
+    /// retain the prompt at the front of the visible queue instead of dropping it.
+    fn retry_prompt_after_auth(
+        &self,
+        text: String,
+        attachments: Vec<ContentBlockData>,
+        sender: Option<String>,
+        terminal: bool,
+        config: Option<QueuedConfig>,
+    ) {
+        let command = AcpCommand::Prompt {
+            text,
+            attachments,
+            sender,
+            terminal,
+            config,
+        };
+        if let Err(error) = self.cmd_tx.try_send(command) {
+            if let AcpCommand::Prompt {
+                text,
+                attachments,
+                sender,
+                terminal,
+                config,
+            } = error.into_inner()
+            {
+                self.pending_queue.lock().unwrap().insert(
+                    0,
+                    QueuedMessage::new(text, attachments, sender, terminal, config),
+                );
+                self.emit(AcpUpdate::QueueUpdate {
+                    messages: self.get_queue(),
+                });
+            }
+        }
     }
 
     /// 返回当前 config 快照（用于 QueuedConfig）。

@@ -564,7 +564,18 @@ pub async fn open_artifact(
     let task_dir = resolve_task_dir(&project, &project_key, &task_id).ok_or_else(task_not_found)?;
     let file_path = task_dir.join(&query.dir).join(&query.path);
     let canonical_file = studio_common::validate_path_containment(&task_dir, &file_path)?;
-    studio_common::open_with_default_app(&canonical_file);
+    if query.action.as_deref() == Some("reveal") {
+        studio_common::reveal_in_file_manager(&canonical_file).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: format!("Failed to reveal artifact: {error}"),
+                }),
+            )
+        })?;
+    } else {
+        studio_common::open_with_default_app(&canonical_file);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

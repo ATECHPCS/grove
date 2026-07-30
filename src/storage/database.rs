@@ -166,6 +166,19 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS ix_tasks_project_status
             ON tasks (project, status, updated_at DESC);
 
+        -- Task-level workspace links. We persist Grove project IDs rather than
+        -- absolute paths; ACP lifecycle requests resolve the current path at
+        -- connection time and expose it as `additionalDirectories`.
+        CREATE TABLE IF NOT EXISTS task_linked_projects (
+            project           TEXT    NOT NULL,
+            task_id           TEXT    NOT NULL,
+            linked_project_id TEXT    NOT NULL,
+            position          INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (project, task_id, linked_project_id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_task_linked_projects_task
+            ON task_linked_projects (project, task_id, position);
+
         -- Task Groups
         CREATE TABLE IF NOT EXISTS task_groups (
             id         TEXT PRIMARY KEY,

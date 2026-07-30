@@ -323,6 +323,12 @@ pub fn create_api_router() -> Router {
             "/projects/{id}/tasks/{taskId}/chats/{chatId}/take-control",
             post(handlers::acp::take_control),
         )
+        // Restart the ACP process / remote WebSocket while preserving the
+        // Grove chat and its persisted ACP session id.
+        .route(
+            "/projects/{id}/tasks/{taskId}/chats/{chatId}/reconnect",
+            post(handlers::acp::reconnect_chat),
+        )
         // Fork chat (ACP session/fork)
         .route(
             "/projects/{id}/tasks/{taskId}/chats/{chatId}/fork",
@@ -449,6 +455,10 @@ pub fn create_api_router() -> Router {
         .route(
             "/projects/{id}/tasks/{taskId}/activate",
             post(handlers::tasks::activate_task),
+        )
+        .route(
+            "/projects/{id}/tasks/{taskId}/linked-projects",
+            get(handlers::tasks::get_linked_projects).put(handlers::tasks::update_linked_projects),
         )
         .route(
             "/projects/{id}/tasks/{taskId}/symbols/lookup",
@@ -653,10 +663,6 @@ pub fn create_api_router() -> Router {
         .route(
             "/projects/{id}/tasks/{taskId}/fs/open",
             post(handlers::tasks::open_file),
-        )
-        .route(
-            "/projects/{id}/tasks/{taskId}/fs/reveal",
-            post(handlers::tasks::reveal_file),
         )
         // Task Stats API
         .route(

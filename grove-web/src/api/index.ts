@@ -19,7 +19,7 @@ export type {
 
 export { checkAllDependencies, checkCommands } from './env';
 
-export { listProjects, getProject, addProject, deleteProject, renameProject, getProjectStats, getBranches, getRemotes, openIDE, openTerminal, initGitRepo, createNewProject, cloneProject, listResources, uploadResource, deleteResource, previewResource, resourceDownloadUrl, openResourceFile, getInstructions, updateInstructions, getMemory, updateMemory, listResourceWorkdirs, addResourceWorkdir, deleteResourceWorkdir, openResourceWorkdir, createResourceFolder, moveResource, createResourceLink, updateResourceLink } from './projects';
+export { listProjects, getProject, addProject, deleteProject, renameProject, getProjectStats, getBranches, getRemotes, openIDE, openTerminal, initGitRepo, createNewProject, cloneProject, listResources, uploadResource, deleteResource, previewResource, resourceDownloadUrl, openResourceFile, revealResourceFile, getInstructions, updateInstructions, getMemory, updateMemory, listResourceWorkdirs, addResourceWorkdir, deleteResourceWorkdir, openResourceWorkdir, createResourceFolder, moveResource, createResourceLink, updateResourceLink } from './projects';
 export type {
   ProjectListItem,
   ProjectResponse,
@@ -31,6 +31,8 @@ export type {
 export {
   listTasks,
   getTask,
+  getLinkedProjects,
+  updateLinkedProjects,
   createTask,
   renameTask,
   activateTask,
@@ -75,12 +77,14 @@ export {
   uploadChatAttachment,
   getChatHistory,
   takeControl,
+  reconnectChat,
   readFile,
   listArtifacts,
   previewArtifact,
   artifactDownloadUrl,
   deleteArtifact,
   openArtifactFile,
+  revealArtifactFile,
   openTaskFile,
   revealTaskFile,
   uploadArtifacts,
@@ -99,6 +103,8 @@ export type {
   CommitsResponse,
   ReviewCommentEntry,
   TaskStatsResponse,
+  LinkedProjectItem,
+  LinkedProjectsResponse,
   ChatSessionResponse,
   ArtifactFile,
   ArtifactsResponse,

@@ -3,13 +3,13 @@ import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Download, Trash2, Eye,
-  Loader2, Upload, MoreHorizontal, FolderOpen, RefreshCw, ArrowUpFromLine,
+  Loader2, Upload, MoreHorizontal, FolderOpen, FolderSearch, RefreshCw, ArrowUpFromLine,
   Link as LinkIcon, Edit3, Plus, SquareArrowOutUpRight,
 } from "lucide-react";
 import type { Task } from "../../../../data/types";
 import {
   listArtifacts, previewArtifact, artifactDownloadUrl, deleteArtifact,
-  uploadArtifacts, createArtifactLink, updateArtifactLink, syncArtifactToResource, listArtifactWorkdirs, addArtifactWorkdir, deleteArtifactWorkdir, openArtifactWorkdir, openArtifactFile,
+  uploadArtifacts, createArtifactLink, updateArtifactLink, syncArtifactToResource, listArtifactWorkdirs, addArtifactWorkdir, deleteArtifactWorkdir, openArtifactWorkdir, openArtifactFile, revealArtifactFile,
   listResources,
   type ArtifactFile, type ArtifactWorkDirectoryEntry, type DisplayItem,
 } from "../../../../api";
@@ -452,6 +452,11 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
     void openArtifactFile(projectId, task.id, file.directory, file.path);
   }, [projectId, task.id]);
 
+  const handleRevealInFileManager = useCallback((file: ArtifactFile) => {
+    if (!projectId || file.is_dir) return;
+    void revealArtifactFile(projectId, task.id, file.directory, file.path);
+  }, [projectId, task.id]);
+
   const handleCreatePreviewComment = useCallback((file: ArtifactFile, locator: PreviewCommentLocator, comment: string, rendererId: string) => {
     if (!projectId) return;
     addDraft({
@@ -819,7 +824,7 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
                 ) : (
                   <FileCard key={`f-${item.data.directory}/${item.data.path}`} file={item.data} projectId={projectId} taskId={task.id}
                     onPreview={handlePreview} onDownload={handleDownload} onDelete={handleDelete} allowDelete
-                    onSyncToResource={handleSyncToResource} onOpenLink={handleOpenLink} onEditLink={handleEditLink} onOpenInApp={handleOpenInApp} />
+                    onSyncToResource={handleSyncToResource} onOpenLink={handleOpenLink} onEditLink={handleEditLink} onOpenInApp={handleOpenInApp} onRevealInFileManager={handleRevealInFileManager} />
                 )
               )
             )}
@@ -900,7 +905,7 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
                 <FileCard key={entry.path} file={entry} projectId={projectId} taskId={task.id}
                   viewPath={currentOutputPath}
                   onPreview={handlePreview} onDownload={handleDownload}
-                  onSyncToResource={handleSyncToResource} onOpenLink={handleOpenLink} onEditLink={handleEditLink} onOpenInApp={handleOpenInApp} />
+                  onSyncToResource={handleSyncToResource} onOpenLink={handleOpenLink} onEditLink={handleEditLink} onOpenInApp={handleOpenInApp} onRevealInFileManager={handleRevealInFileManager} />
               )
             ))}
             {outputFileCount === 0 && (
@@ -1211,7 +1216,7 @@ function FolderEntryRow({
 /* ─── FileCard ─── */
 
 function FileCard({
-  file, projectId, taskId, viewPath = "", onPreview, onDownload, onDelete, allowDelete, onSyncToResource, onOpenLink, onEditLink, onOpenInApp,
+  file, projectId, taskId, viewPath = "", onPreview, onDownload, onDelete, allowDelete, onSyncToResource, onOpenLink, onEditLink, onOpenInApp, onRevealInFileManager,
 }: {
   file: ArtifactFile; projectId?: string; taskId: string;
   viewPath?: string;
@@ -1221,7 +1226,15 @@ function FileCard({
   onOpenLink?: (f: ArtifactFile) => void;
   onEditLink?: (f: ArtifactFile) => void;
   onOpenInApp?: (f: ArtifactFile) => void;
+  onRevealInFileManager?: (f: ArtifactFile) => void;
 }) {
+  const canUseHostFileActions =
+    typeof window !== "undefined" &&
+    (window as unknown as Record<string, unknown>).__GROVE_REMOTE__ !== true;
+  const revealLabel =
+    typeof navigator !== "undefined" && /mac/i.test(navigator.userAgent)
+      ? "Show in Finder"
+      : "Show in File Manager";
   // Mirror FileTree.tsx's drag protocol (`application/x-grove-file-path`) so the
   // chat composer can pick this up via its existing handleDrop and convert it
   // into an inline file chip. The path format `${directory}/${path}` matches
@@ -1373,12 +1386,20 @@ function FileCard({
               <Download className="w-3.5 h-3.5" /> Download
             </button>
           )}
-          {!isLink && onOpenInApp && (
+          {!isLink && canUseHostFileActions && onOpenInApp && (
             <button onClick={(e) => { e.stopPropagation(); setShowMenu(false); onOpenInApp(file); }}
               className="w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors"
               onMouseEnter={e => e.currentTarget.style.background = "var(--color-bg-secondary)"}
               onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
               <SquareArrowOutUpRight className="w-3.5 h-3.5" /> Open
+            </button>
+          )}
+          {!isLink && canUseHostFileActions && onRevealInFileManager && (
+            <button onClick={(e) => { e.stopPropagation(); setShowMenu(false); onRevealInFileManager(file); }}
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors"
+              onMouseEnter={e => e.currentTarget.style.background = "var(--color-bg-secondary)"}
+              onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+              <FolderSearch className="w-3.5 h-3.5" /> {revealLabel}
             </button>
           )}
           {onSyncToResource && (

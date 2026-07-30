@@ -27,6 +27,7 @@ export { ImageLightbox } from "./ImageLightbox";
 export { formatSize, formatTime } from "./FileListUtils";
 export { getPreviewRenderer } from "../Review/previewRenderers";
 export { DialogShell } from "./DialogShell";
+export { ProjectTypeBadge } from "./ProjectTypeBadge";
 export { PopBanner, type BannerType } from "./PopBanner";
 export { FileConflictDialog } from "./FileConflictDialog";
 export type { FileConflictState } from "./FileConflictDialog";

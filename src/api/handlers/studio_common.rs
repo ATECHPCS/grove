@@ -622,6 +622,48 @@ pub fn open_in_file_manager(path: &Path) {
     }
 }
 
+/// Reveal a file or directory in the OS file manager (selects files in Finder/Explorer).
+pub fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = std::process::Command::new("open");
+        if path.is_file() {
+            command.arg("-R").arg(path);
+        } else {
+            command.arg(path);
+        }
+        return command.spawn().map(|_| ());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = std::process::Command::new("explorer");
+        if path.is_file() {
+            command.arg(format!("/select,{}", path.display()));
+        } else {
+            command.arg(path);
+        }
+        return command.spawn().map(|_| ());
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let parent = if path.is_file() {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        return std::process::Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map(|_| ());
+    }
+
+    #[allow(unreachable_code)]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "revealing files is not supported on this platform",
+    ))
+}
+
 /// Open a file with the OS-configured default application.
 ///
 /// Delegates to the `open` crate (already used across the codebase for URLs),

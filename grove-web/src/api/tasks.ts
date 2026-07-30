@@ -146,6 +146,17 @@ export interface TaskStatsResponse {
   hourly_activity: ActivityEntry[];
 }
 
+export interface LinkedProjectItem {
+  id: string;
+  name: string;
+  exists: boolean;
+  project_type: string | null;
+}
+
+export interface LinkedProjectsResponse {
+  linked_projects: LinkedProjectItem[];
+}
+
 // ============================================================================
 // API Functions
 // ============================================================================
@@ -181,6 +192,28 @@ export async function getTask(
   return apiClient.get<TaskResponse>(
     `/api/v1/projects/${projectId}/tasks/${taskId}`,
     signal,
+  );
+}
+
+/** Grove Projects linked to a Task. */
+export async function getLinkedProjects(
+  projectId: string,
+  taskId: string,
+): Promise<LinkedProjectsResponse> {
+  return apiClient.get<LinkedProjectsResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/linked-projects`,
+  );
+}
+
+/** Replace the Task's linked Project set. */
+export async function updateLinkedProjects(
+  projectId: string,
+  taskId: string,
+  projectIds: string[],
+): Promise<LinkedProjectsResponse> {
+  return apiClient.put<{ project_ids: string[] }, LinkedProjectsResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/linked-projects`,
+    { project_ids: projectIds },
   );
 }
 
@@ -892,10 +925,12 @@ export async function deleteFileOrDir(
 export async function openTaskFile(
   projectId: string,
   taskId: string,
-  path: string
+  path: string,
+  action: "app" | "reveal" = "app",
 ): Promise<void> {
+  const actionQuery = action !== "app" ? `&action=${encodeURIComponent(action)}` : "";
   await apiClient.postNoContent(
-    `/api/v1/projects/${projectId}/tasks/${taskId}/fs/open?path=${encodeURIComponent(path)}`
+    `/api/v1/projects/${projectId}/tasks/${taskId}/fs/open?path=${encodeURIComponent(path)}${actionQuery}`
   );
 }
 
@@ -905,9 +940,7 @@ export async function revealTaskFile(
   taskId: string,
   path: string
 ): Promise<void> {
-  await apiClient.postNoContent(
-    `/api/v1/projects/${projectId}/tasks/${taskId}/fs/reveal?path=${encodeURIComponent(path)}`
-  );
+  return openTaskFile(projectId, taskId, path, "reveal");
 }
 
 interface MoveFileRequest {
@@ -974,6 +1007,10 @@ interface TakeControlResponse {
   success: boolean;
 }
 
+interface ReconnectChatResponse {
+  success: boolean;
+}
+
 /**
  * Get incremental chat history (for read-only polling mode)
  */
@@ -1005,6 +1042,17 @@ export async function takeControl(
 ): Promise<TakeControlResponse> {
   return apiClient.post<undefined, TakeControlResponse>(
     `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/take-control`
+  );
+}
+
+/** Restart the ACP owner while preserving the chat and persisted session. */
+export async function reconnectChat(
+  projectId: string,
+  taskId: string,
+  chatId: string
+): Promise<ReconnectChatResponse> {
+  return apiClient.post<undefined, ReconnectChatResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/reconnect`
   );
 }
 
@@ -1042,9 +1090,19 @@ export function deleteArtifact(projectId: string, taskId: string, dir: string, p
   return artifactApi(projectId, taskId).delete(path, { dir });
 }
 
-/** Open an artifact file with the OS default application (runs on the server host). */
-export function openArtifactFile(projectId: string, taskId: string, dir: string, path: string) {
-  return artifactApi(projectId, taskId).open(path, { dir });
+/** Open an artifact file with the OS default application or reveal in file manager. */
+export function openArtifactFile(
+  projectId: string,
+  taskId: string,
+  dir: string,
+  path: string,
+  action: "app" | "reveal" = "app",
+) {
+  return artifactApi(projectId, taskId).open(path, action !== "app" ? { dir, action } : { dir });
+}
+
+export function revealArtifactFile(projectId: string, taskId: string, dir: string, path: string) {
+  return openArtifactFile(projectId, taskId, dir, path, "reveal");
 }
 
 export function uploadArtifacts(projectId: string, taskId: string, files: File[]) {

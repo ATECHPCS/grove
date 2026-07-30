@@ -38,6 +38,7 @@ import {
   MoreHorizontal,
   LogIn,
   LogOut,
+  RefreshCw,
   Pencil,
   Square,
   Paperclip,
@@ -151,9 +152,11 @@ import {
   getTaskFiles,
   getChatHistory,
   takeControl,
+  reconnectChat,
   readFile,
   updateNotes,
 } from "../../../api";
+import { ConfirmDialog } from "../../Dialogs/ConfirmDialog";
 import type { ChatSessionResponse, CustomAgentServer } from "../../../api";
 import { listProjects, getProject, listResources, type ProjectListItem } from "../../../api/projects";
 import { openExternalUrl } from "../../../utils/openExternal";
@@ -458,11 +461,13 @@ interface SessionActionsMenuProps {
   forkCapable: boolean;
   authMethods: AuthMethodOption[];
   logoutCapable: boolean;
+  reconnectDisabled: boolean;
   actionsDisabled: boolean;
   deleteDisabled: boolean;
   onFork: (chatId: string) => void;
   onLogin: (method: AuthMethodOption) => void;
   onLogout: () => void;
+  onReconnect: () => void;
   onDelete: (chatId: string) => void;
 }
 
@@ -472,11 +477,13 @@ function SessionActionsMenu({
   forkCapable,
   authMethods,
   logoutCapable,
+  reconnectDisabled,
   actionsDisabled,
   deleteDisabled,
   onFork,
   onLogin,
   onLogout,
+  onReconnect,
   onDelete,
 }: SessionActionsMenuProps) {
   const items: Parameters<typeof DropdownMenu>[0]["items"] = [];
@@ -490,6 +497,13 @@ function SessionActionsMenu({
       disabled: actionsDisabled,
     });
   }
+  items.push({
+    id: "reconnect",
+    label: "Reconnect",
+    icon: RefreshCw,
+    onClick: onReconnect,
+    disabled: reconnectDisabled,
+  });
   if (authMethods.length > 0) {
     items.push({
       id: "login",
@@ -559,7 +573,7 @@ interface PerChatState {
   permissionLevel: string;
   modelOptions: { label: string; value: string }[];
   modeOptions: { label: string; value: string }[];
-  /** Thought-level / reasoning-effort selector (0.11 SessionConfigOption) */
+  /** Thought-level / reasoning-effort selector (ACP SessionConfigOption) */
   thoughtLevelOptions: { label: string; value: string }[];
   thoughtLevel: string;
   thoughtLevelConfigId: string;
@@ -2593,6 +2607,8 @@ export function TaskChat({
   const [forkCapable, setForkCapable] = useState(false);
   const [authMethods, setAuthMethods] = useState<AuthMethodOption[]>([]);
   const [logoutCapable, setLogoutCapable] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
+  const [reconnectConfirmOpen, setReconnectConfirmOpen] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const attachCountersRef = useRef<AttachmentCounters>({ image: 0, audio: 0, resource: 0 });
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -3953,6 +3969,10 @@ export function TaskChat({
       };
 
       ws.onmessage = (event) => {
+        // Ignore messages already queued by a socket that Reconnect replaced.
+        // Otherwise a late `session_ended` from the old owner can downgrade
+        // the state established by the successor connection.
+        if (wsMapRef.current.get(chatId) !== ws) return;
         try {
           const data = JSON.parse(event.data);
           // Permanent-failure check: if backend says "Resume session failed"
@@ -3989,6 +4009,10 @@ export function TaskChat({
       };
 
       ws.onclose = (event) => {
+        // A manually replaced socket may close after its successor has already
+        // been installed. Never let that stale callback delete or downgrade
+        // the new connection.
+        if (wsMapRef.current.get(chatId) !== ws) return;
         // Surface close code/reason — a silently-permanent "Connecting…" is
         // usually a proxy/tunnel dropping the WS upgrade (code 1006, no close
         // frame) rather than an app-level close. Without this there's no
@@ -4716,7 +4740,7 @@ export function TaskChat({
           setSlashCommands(msg.commands ?? []);
           break;
         case "usage_update":
-          // ACP `unstable_session_usage` — context window pill data.
+          // ACP v1 `usage_update` — context window pill data.
           // Agent decides cadence (typically once per turn). No debouncing.
           setContextUsage({
             used: Number(msg.used) || 0,
@@ -6235,6 +6259,69 @@ export function TaskChat({
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
     wsRef.current.send(JSON.stringify({ type: "logout" }));
   }, []);
+
+  const performReconnect = useCallback(async () => {
+    if (!activeChatId || isReconnecting) return;
+    const chatId = activeChatId;
+    const existingWs = wsMapRef.current.get(chatId);
+    setIsReconnecting(true);
+    setReconnectConfirmOpen(false);
+    cancelPendingReconnectRef.current(chatId);
+    intentionalCloseRef.current.add(chatId);
+
+    try {
+      await reconnectChat(projectId, task.id, chatId);
+
+      // The backend normally closes this socket through SessionEnded. Keep a
+      // local fallback for broken links where that close frame never arrives.
+      if (existingWs && existingWs.readyState !== WebSocket.CLOSED) {
+        existingWs.close();
+      }
+      if (wsMapRef.current.get(chatId) === existingWs) {
+        wsMapRef.current.delete(chatId);
+      }
+      intentionalCloseRef.current.delete(chatId);
+      connectingRef.current.delete(chatId);
+      if (getActiveChatId() === chatId) {
+        wsRef.current = null;
+        setIsConnected(false);
+        updateBusy(false);
+        setPendingMessages([]);
+      } else {
+        const cached = perChatStateRef.current.get(chatId);
+        if (cached) {
+          cached.isConnected = false;
+          cached.isBusy = false;
+          cached.pendingMessages = [];
+        }
+      }
+
+      await connectChatWs(chatId);
+      if (getActiveChatId() === chatId) {
+        wsRef.current = wsMapRef.current.get(chatId) ?? null;
+      }
+    } catch (error) {
+      intentionalCloseRef.current.delete(chatId);
+      const message = `Reconnect failed: ${error instanceof Error ? error.message : String(error)}`;
+      if (getActiveChatId() === chatId) {
+        setMessages((prev) => appendSystemMessage(prev, message));
+      } else {
+        const cached = perChatStateRef.current.get(chatId);
+        if (cached) cached.messages = appendSystemMessage(cached.messages, message);
+      }
+    } finally {
+      setIsReconnecting(false);
+    }
+  }, [activeChatId, connectChatWs, getActiveChatId, isReconnecting, projectId, task.id, updateBusy]);
+
+  const handleReconnect = useCallback(() => {
+    if (isReconnecting) return;
+    if (isBusy || pendingMessages.length > 0) {
+      setReconnectConfirmOpen(true);
+      return;
+    }
+    void performReconnect();
+  }, [isBusy, isReconnecting, pendingMessages.length, performReconnect]);
 
   const triggerProjectFilesLoad = useCallback((projectName: string) => {
     const project = allProjects.find(p => p.name.toLowerCase() === projectName.toLowerCase());
@@ -8064,11 +8151,13 @@ export function TaskChat({
                   forkCapable={forkCapable}
                   authMethods={authMethods}
                   logoutCapable={logoutCapable}
+                  reconnectDisabled={isReconnecting || activeChat.launch_mode === "terminal"}
                   actionsDisabled={!isConnected || isBusy || !!activeAuthMessage}
                   deleteDisabled={chats.length <= 1}
                   onFork={handleForkChat}
                   onLogin={handleMenuLogin}
                   onLogout={handleLogout}
+                  onReconnect={handleReconnect}
                   onDelete={handleDeleteChat}
                 />
               )}
@@ -8206,11 +8295,13 @@ export function TaskChat({
                       forkCapable={forkCapable}
                       authMethods={authMethods}
                       logoutCapable={logoutCapable}
+                      reconnectDisabled={isReconnecting || activeChat.launch_mode === "terminal"}
                       actionsDisabled={!isConnected || isBusy || !!activeAuthMessage}
                       deleteDisabled={chats.length <= 1}
                       onFork={handleForkChat}
                       onLogin={handleMenuLogin}
                       onLogout={handleLogout}
+                      onReconnect={handleReconnect}
                       onDelete={handleDeleteChat}
                     />
                   )}
@@ -9477,6 +9568,19 @@ export function TaskChat({
         </div>
       </div>
       {/* Image / SVG Lightbox */}
+      <ConfirmDialog
+        isOpen={reconnectConfirmOpen}
+        title="Reconnect Session"
+        message={
+          pendingMessages.length > 0
+            ? `Reconnect will stop the current response and discard ${pendingMessages.length} queued message${pendingMessages.length === 1 ? "" : "s"}. Chat history will be preserved.`
+            : "Reconnect will stop the current response. Chat history will be preserved."
+        }
+        confirmLabel={isReconnecting ? "Reconnecting..." : "Reconnect"}
+        variant="warning"
+        onConfirm={() => void performReconnect()}
+        onCancel={() => setReconnectConfirmOpen(false)}
+      />
       <ImageLightbox
         imageUrl={lightboxUrl}
         svgContent={lightboxSvg}
