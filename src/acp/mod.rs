@@ -116,6 +116,9 @@ pub struct AcpSessionHandle {
     /// agent 在 initialize 响应里声明的登录方法。空 = 未声明 / 不需要。
     /// 收到 `AuthRequired (-32000)` 时,client 用这里的第一个 id 走 `authenticate`。
     pub auth_methods: Mutex<Vec<AuthMethodInfo>>,
+    /// agent 是否在 initialize 响应里声明了 `auth.logout` 能力。
+    /// 前端据此显示 Logout，后端调用前仍会再次校验。
+    pub logout_capable: std::sync::atomic::AtomicBool,
     /// 因 `AuthRequired` 错误暂存待重试的 prompt(text, attachments, sender, terminal)。
     /// authenticate 成功后 outer command loop 会把它再丢回 cmd_tx。
     pending_auth_retry: Mutex<Option<PendingPromptRetry>>,
@@ -173,6 +176,13 @@ enum AcpCommand {
     Authenticate {
         method_id: String,
     },
+    /// Agent 未声明认证方法时，用户可先在外部 CLI 完成登录，再要求 Grove
+    /// 重试被 `auth_required` 拒绝的请求。
+    RetryAuthentication,
+    /// 调用 ACP v1 `logout`。reply 用于把协议调用结果返回给 WebSocket handler。
+    Logout {
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// 调用 ACP `session/fork`(`unstable_session_fork`),要求 agent 基于当前
     /// session 派生一个新的会话副本。reply 回传 fork 后的 acp session_id。
     ForkSession {
@@ -215,6 +225,12 @@ pub enum AcpUpdate {
         /// (`unstable_session_fork`)。老 history.jsonl 没这个字段时反序列化为 false。
         #[serde(default)]
         fork_capable: bool,
+        /// initialize.authMethods，供 More 菜单按 Agent 声明展示 Login。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        auth_methods: Vec<AuthMethodInfo>,
+        /// agentCapabilities.auth.logout，供 More 菜单展示 Logout。
+        #[serde(default)]
+        logout_capable: bool,
     },
     /// Agent 消息文本片段
     MessageChunk { text: String },
@@ -301,6 +317,11 @@ pub enum AcpUpdate {
     },
     /// authenticate 调用成功。发出后 grove 会自动把暂存的原 prompt 重新入队。
     AuthSucceeded,
+    /// authenticate 调用失败。前端保留认证面板并恢复按钮，允许用户重试或
+    /// 选择其他已声明的方法。
+    AuthFailed { message: String },
+    /// logout RPC 成功。该事件只用于即时 UI 反馈，不写入聊天历史。
+    AuthLoggedOut,
     /// 用户消息（load_session 回放时由 agent 发送）
     UserMessage {
         text: String,
@@ -436,6 +457,10 @@ pub struct AuthMethodInfo {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+fn is_advertised_auth_method(methods: &[AuthMethodInfo], method_id: &str) -> bool {
+    methods.iter().any(|method| method.id == method_id)
 }
 
 /// Agent 的 Prompt 能力声明（从 ACP InitializeResponse 提取）
@@ -1955,6 +1980,7 @@ pub async fn get_or_start_session(
         last_plan: Mutex::new(None),
                     last_permission_info: Mutex::new(None),
                     auth_methods: Mutex::new(Vec::new()),
+                    logout_capable: std::sync::atomic::AtomicBool::new(false),
                     pending_auth_retry: Mutex::new(None),
                     pending_auth: Mutex::new(None),
                     fork_capable: std::sync::atomic::AtomicBool::new(false),
@@ -2657,6 +2683,11 @@ async fn drive_session(
         }
     }
 
+    let logout_capable = init_resp.agent_capabilities.auth.logout.is_some();
+    handle
+        .logout_capable
+        .store(logout_capable, std::sync::atomic::Ordering::Relaxed);
+
     let mut agent_name = init_resp
         .agent_info
         .as_ref()
@@ -2749,6 +2780,118 @@ async fn drive_session(
     let current_thought_level_id;
     let thought_level_config_id;
 
+    /// Pause a pre-session request after `auth_required`, drive the advertised
+    /// Agent authentication flow, then return so the caller can retry the exact
+    /// request that failed. This is shared by new/resume/load.
+    macro_rules! await_authentication {
+        () => {{
+            let methods = handle
+                .auth_methods
+                .lock()
+                .map(|methods| methods.clone())
+                .unwrap_or_default();
+            if let Ok(mut slot) = handle.pending_auth.lock() {
+                *slot = Some(PendingAuthState {
+                    methods: methods.clone(),
+                    agent_name: Some(agent_name.clone()),
+                });
+            }
+            handle.emit(AcpUpdate::AuthRequired {
+                methods: methods.clone(),
+                agent_name: Some(agent_name.clone()),
+            });
+
+            let mut next_method_id: Option<String> = None;
+            'auth_wait: loop {
+                let method_id = if let Some(method_id) = next_method_id.take() {
+                    method_id
+                } else {
+                    loop {
+                        match cmd_rx.recv().await {
+                            None => {
+                                if let Ok(mut slot) = handle.pending_auth.lock() {
+                                    *slot = None;
+                                }
+                                return Err(acp::Error::internal_error());
+                            }
+                            Some(AcpCommand::Authenticate { method_id }) => break method_id,
+                            Some(AcpCommand::RetryAuthentication) if methods.is_empty() => {
+                                // The user completed login outside ACP. Treat this
+                                // as a request to retry, not proof of authentication;
+                                // another auth_required response will reopen the panel.
+                                handle.emit(AcpUpdate::AuthSucceeded);
+                                break 'auth_wait;
+                            }
+                            Some(AcpCommand::Kill) => {
+                                if let Ok(mut slot) = handle.pending_auth.lock() {
+                                    *slot = None;
+                                }
+                                return Err(acp::Error::internal_error());
+                            }
+                            Some(AcpCommand::Logout { reply }) => {
+                                let _ = reply
+                                    .send(Err("Cannot log out while authentication is required"
+                                        .to_string()));
+                            }
+                            _ => {}
+                        }
+                    }
+                };
+
+                let auth_fut = conn
+                    .send_request(acp::AuthenticateRequest::new(acp::AuthMethodId::new(
+                        method_id,
+                    )))
+                    .block_task();
+                tokio::pin!(auth_fut);
+                loop {
+                    tokio::select! {
+                        res = &mut auth_fut => {
+                            match res {
+                                Ok(_) => {
+                                    handle.emit(AcpUpdate::AuthSucceeded);
+                                    break 'auth_wait;
+                                }
+                                Err(auth_err) => {
+                                    handle.emit(AcpUpdate::AuthFailed {
+                                        message: format!("Authentication failed: {}", auth_err),
+                                    });
+                                    continue 'auth_wait;
+                                }
+                            }
+                        }
+                        cmd = cmd_rx.recv() => match cmd {
+                            None => {
+                                if let Ok(mut slot) = handle.pending_auth.lock() {
+                                    *slot = None;
+                                }
+                                return Err(acp::Error::internal_error());
+                            }
+                            Some(AcpCommand::Authenticate { method_id }) => {
+                                // A second choice supersedes an in-flight flow.
+                                next_method_id = Some(method_id);
+                                continue 'auth_wait;
+                            }
+                            Some(AcpCommand::Kill) => {
+                                if let Ok(mut slot) = handle.pending_auth.lock() {
+                                    *slot = None;
+                                }
+                                return Err(acp::Error::internal_error());
+                            }
+                            Some(AcpCommand::Logout { reply }) => {
+                                let _ = reply.send(Err(
+                                    "Cannot log out while authentication is in progress"
+                                        .to_string(),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }};
+    }
+
     macro_rules! create_new_session {
         ($preserve_history:expr) => {{
             // 仅在"明确从零起步"时才清 history.jsonl。Resume / Fork 场景下
@@ -2781,113 +2924,7 @@ async fn drive_session(
                 {
                     Ok(r) => break r,
                     Err(e) if is_auth_required_error(&e) => {
-                        let methods = handle
-                            .auth_methods
-                            .lock()
-                            .map(|m| m.clone())
-                            .unwrap_or_default();
-                        // 记录到 handle:WS 重连时据此判断"还在等登录",
-                        // 跳过假 SessionReady 改发 AuthRequired,避免刷新后
-                        // 体验上"似乎可以发消息"的死路。
-                        if let Ok(mut slot) = handle.pending_auth.lock() {
-                            *slot = Some(PendingAuthState {
-                                methods: methods.clone(),
-                                agent_name: Some(agent_name.clone()),
-                            });
-                        }
-                        handle.emit(AcpUpdate::AuthRequired {
-                            methods,
-                            agent_name: Some(agent_name.clone()),
-                        });
-
-                        // 等用户点登录;非 Authenticate / Kill 一律忽略。
-                        // 关键:in-flight authenticate 期间继续 select cmd_rx,
-                        // 新 Authenticate 抢占旧的(drop future = 放弃旧响应)。
-                        // 否则用户选了 A 没完成浏览器 OAuth → 刷新页面 → 点 B
-                        // 会被排队在 cmd_rx 永不处理,死锁。
-                        let mut authed = false;
-                        let mut next_method_id: Option<String> = None;
-                        'outer: while !authed {
-                            let method_id = if let Some(m) = next_method_id.take() {
-                                m
-                            } else {
-                                loop {
-                                    match cmd_rx.recv().await {
-                                        None => {
-                                            if let Ok(mut slot) =
-                                                handle.pending_auth.lock()
-                                            {
-                                                *slot = None;
-                                            }
-                                            return Err(acp::Error::internal_error());
-                                        }
-                                        Some(AcpCommand::Authenticate { method_id }) => {
-                                            break method_id;
-                                        }
-                                        Some(AcpCommand::Kill) => {
-                                            if let Ok(mut slot) =
-                                                handle.pending_auth.lock()
-                                            {
-                                                *slot = None;
-                                            }
-                                            return Err(acp::Error::internal_error());
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            };
-
-                            let auth_fut = conn
-                                .send_request(acp::AuthenticateRequest::new(
-                                    acp::AuthMethodId::new(method_id),
-                                ))
-                                .block_task();
-                            tokio::pin!(auth_fut);
-                            loop {
-                                tokio::select! {
-                                    res = &mut auth_fut => {
-                                        match res {
-                                            Ok(_) => {
-                                                handle.emit(AcpUpdate::AuthSucceeded);
-                                                authed = true;
-                                            }
-                                            Err(auth_err) => {
-                                                handle.emit(AcpUpdate::Error {
-                                                    message: format!(
-                                                        "Authentication failed: {}",
-                                                        auth_err
-                                                    ),
-                                                });
-                                                // 留在 outer,等下一次点击
-                                            }
-                                        }
-                                        continue 'outer;
-                                    }
-                                    cmd = cmd_rx.recv() => match cmd {
-                                        None => {
-                                            if let Ok(mut slot) = handle.pending_auth.lock() {
-                                                *slot = None;
-                                            }
-                                            return Err(acp::Error::internal_error());
-                                        }
-                                        Some(AcpCommand::Authenticate { method_id: new_id }) => {
-                                            // 抢占:用户在等待中又点了一次(可能是
-                                            // 同一个 method,也可能是另一个)。drop
-                                            // 旧 future,outer 用新 method_id 重跑。
-                                            next_method_id = Some(new_id);
-                                            continue 'outer;
-                                        }
-                                        Some(AcpCommand::Kill) => {
-                                            if let Ok(mut slot) = handle.pending_auth.lock() {
-                                                *slot = None;
-                                            }
-                                            return Err(acp::Error::internal_error());
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
+                        await_authentication!();
                     }
                     Err(e) => return Err(e),
                 }
@@ -2987,39 +3024,43 @@ async fn drive_session(
         // 完全不需要 suppress_emit + 300ms 那套抛弃 agent 回放的机制 — 直接发
         // ResumeSessionRequest,Grove 照常从磁盘加载自己的历史。
         (Some(saved_id), true, _) => {
-            let resume_result = {
-                let mcp_servers =
-                    build_mcp_servers(&config.env_vars, agent_graph_token).map_err(to_acp_err)?;
-                conn.send_request(
-                    acp::ResumeSessionRequest::new(
-                        acp::SessionId::new(&*saved_id),
-                        &config.working_dir,
+            let mcp_servers =
+                build_mcp_servers(&config.env_vars, agent_graph_token).map_err(to_acp_err)?;
+            let resp = loop {
+                match conn
+                    .send_request(
+                        acp::ResumeSessionRequest::new(
+                            acp::SessionId::new(&*saved_id),
+                            &config.working_dir,
+                        )
+                        .mcp_servers(mcp_servers.clone()),
                     )
-                    .mcp_servers(mcp_servers),
-                )
-                .block_task()
-                .await
+                    .block_task()
+                    .await
+                {
+                    Ok(resp) => break resp,
+                    Err(error) if is_auth_required_error(&error) => {
+                        await_authentication!();
+                    }
+                    Err(error) => {
+                        return Err(acp::Error::internal_error()
+                            .data(format!("Resume session failed: {}", error)));
+                    }
+                }
             };
-            match resume_result {
-                Ok(resp) => {
-                    (available_modes, current_mode_id) =
-                        extract_modes(&resp.modes, resp.config_options.as_deref().unwrap_or(&[]));
-                    (available_models, current_model_id, model_config_id) =
-                        extract_models(resp.config_options.as_deref().unwrap_or(&[]));
-                    (
-                        available_thought_levels,
-                        current_thought_level_id,
-                        thought_level_config_id,
-                    ) = extract_thought_level(resp.config_options.as_deref().unwrap_or(&[]));
-                    saved_id
-                }
-                Err(resume_err) => {
-                    // 与 load 失败行为一致:return Err,由 caller 统一 emit 单条错误,
-                    // 避免双重 banner。不 fall-through 到 fresh。
-                    return Err(acp::Error::internal_error()
-                        .data(format!("Resume session failed: {}", resume_err)));
-                }
+            if let Ok(mut slot) = handle.pending_auth.lock() {
+                *slot = None;
             }
+            (available_modes, current_mode_id) =
+                extract_modes(&resp.modes, resp.config_options.as_deref().unwrap_or(&[]));
+            (available_models, current_model_id, model_config_id) =
+                extract_models(resp.config_options.as_deref().unwrap_or(&[]));
+            (
+                available_thought_levels,
+                current_thought_level_id,
+                thought_level_config_id,
+            ) = extract_thought_level(resp.config_options.as_deref().unwrap_or(&[]));
+            saved_id
         }
         // Load 路线:agent 不支持 resume 但支持 load_session。agent 会 replay 历史
         // (Grove 统一从磁盘回放),所以抑制其回放 emit。关键:很多 agent 的
@@ -3030,41 +3071,43 @@ async fn drive_session(
             handle
                 .suppress_emit
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            let load_result = {
-                let mcp_servers =
-                    build_mcp_servers(&config.env_vars, agent_graph_token).map_err(to_acp_err)?;
-                conn.send_request(
-                    acp::LoadSessionRequest::new(
-                        acp::SessionId::new(&*saved_id),
-                        &config.working_dir,
+            let mcp_servers =
+                build_mcp_servers(&config.env_vars, agent_graph_token).map_err(to_acp_err)?;
+            let resp = loop {
+                match conn
+                    .send_request(
+                        acp::LoadSessionRequest::new(
+                            acp::SessionId::new(&*saved_id),
+                            &config.working_dir,
+                        )
+                        .mcp_servers(mcp_servers.clone()),
                     )
-                    .mcp_servers(mcp_servers),
-                )
-                .block_task()
-                .await
+                    .block_task()
+                    .await
+                {
+                    Ok(resp) => break resp,
+                    Err(error) if is_auth_required_error(&error) => {
+                        await_authentication!();
+                    }
+                    Err(error) => {
+                        return Err(acp::Error::internal_error()
+                            .data(format!("Load session failed: {}", error)));
+                    }
+                }
             };
-
-            match load_result {
-                Ok(resp) => {
-                    (available_modes, current_mode_id) =
-                        extract_modes(&resp.modes, resp.config_options.as_deref().unwrap_or(&[]));
-                    (available_models, current_model_id, model_config_id) =
-                        extract_models(resp.config_options.as_deref().unwrap_or(&[]));
-                    (
-                        available_thought_levels,
-                        current_thought_level_id,
-                        thought_level_config_id,
-                    ) = extract_thought_level(resp.config_options.as_deref().unwrap_or(&[]));
-                    saved_id
-                }
-                Err(load_err) => {
-                    // Don't emit AcpUpdate::Error here — run_acp_session's caller
-                    // already emits a single error message when this function returns
-                    // Err(...). Double-emitting shows the user the same banner twice.
-                    return Err(acp::Error::internal_error()
-                        .data(format!("Resume session failed: {}", load_err)));
-                }
+            if let Ok(mut slot) = handle.pending_auth.lock() {
+                *slot = None;
             }
+            (available_modes, current_mode_id) =
+                extract_modes(&resp.modes, resp.config_options.as_deref().unwrap_or(&[]));
+            (available_models, current_model_id, model_config_id) =
+                extract_models(resp.config_options.as_deref().unwrap_or(&[]));
+            (
+                available_thought_levels,
+                current_thought_level_id,
+                thought_level_config_id,
+            ) = extract_thought_level(resp.config_options.as_deref().unwrap_or(&[]));
+            saved_id
         }
         // Fresh 路线:无 saved_id,或有 saved_id 但 agent 既不支持 resume 也不支持
         // load。与现状一致。
@@ -3118,6 +3161,12 @@ async fn drive_session(
         thought_level_config_id,
         prompt_capabilities: prompt_capabilities.clone(),
         fork_capable,
+        auth_methods: handle
+            .auth_methods
+            .lock()
+            .map(|methods| methods.clone())
+            .unwrap_or_default(),
+        logout_capable,
     });
 
     // 处理命令循环
@@ -3367,6 +3416,16 @@ async fn drive_session(
                                     // 之后由用户点登录触发,此时 prompt_fut 不可能
                                     // 在飞 — 但 channel 是共享的,容错性 drop 掉。
                                 }
+                                AcpCommand::RetryAuthentication => {
+                                    // Same defensive handling as Authenticate: an auth
+                                    // retry is only meaningful after this prompt resolves
+                                    // with auth_required.
+                                }
+                                AcpCommand::Logout { reply } => {
+                                    let _ = reply.send(Err(
+                                        "Cannot log out while agent is busy".to_string(),
+                                    ));
+                                }
                                 AcpCommand::ForkSession { reply, .. } => {
                                     // Agent busy 期间 fork 风险较大(spec 未规定 agent
                                     // 必须支持 in-flight fork);拒绝并让前端把按钮 disable
@@ -3501,15 +3560,24 @@ async fn drive_session(
                             });
                         } else {
                             handle.emit(AcpUpdate::Error {
-                                message: format!("Prompt error: {}", e),
+                                // Preserve the Agent/ACP error text as-is. The event type
+                                // already provides the prompt-failure context; adding another
+                                // label here produced "Prompt error: Internal error: ...".
+                                message: e.to_string(),
                             });
                         }
                     }
                 }
 
-                if !handle
-                    .queue_paused
-                    .load(std::sync::atomic::Ordering::Relaxed)
+                let auth_pending = handle
+                    .pending_auth
+                    .lock()
+                    .map(|state| state.is_some())
+                    .unwrap_or(false);
+                if !auth_pending
+                    && !handle
+                        .queue_paused
+                        .load(std::sync::atomic::Ordering::Relaxed)
                 {
                     if let Some((send_msg, original_msgs)) = handle.pop_queue_for_auto_send() {
                         // M5: emit QueueUpdate only after successful enqueue.
@@ -3589,11 +3657,8 @@ async fn drive_session(
                                         // 方法再点。pending_auth_retry 保留:用户二次
                                         // 成功时仍要重发原 prompt。pending_auth 也不清,
                                         // 刷新页面仍能看到 banner。
-                                        handle.emit(AcpUpdate::Error {
-                                            message: format!(
-                                                "Authentication failed: {}",
-                                                e
-                                            ),
+                                        handle.emit(AcpUpdate::AuthFailed {
+                                            message: format!("Authentication failed: {}", e),
                                         });
                                     }
                                 }
@@ -3611,11 +3676,57 @@ async fn drive_session(
                                     }
                                     return Ok(());
                                 }
+                                Some(AcpCommand::Logout { reply }) => {
+                                    let _ = reply.send(Err(
+                                        "Cannot log out while authentication is in progress"
+                                            .to_string(),
+                                    ));
+                                }
                                 _ => {}
                             }
                         }
                     }
                 }
+            }
+            AcpCommand::RetryAuthentication => {
+                // No auth method was advertised, so the user completed login
+                // outside ACP. Retry the blocked prompt; another auth_required
+                // response will restore the panel if the external login failed.
+                if let Ok(mut slot) = handle.pending_auth.lock() {
+                    *slot = None;
+                }
+                handle.emit(AcpUpdate::AuthSucceeded);
+                let pending = handle
+                    .pending_auth_retry
+                    .lock()
+                    .ok()
+                    .and_then(|mut retry| retry.take());
+                if let Some((text, attachments, sender, terminal, config)) = pending {
+                    let _ = handle.cmd_tx.try_send(AcpCommand::Prompt {
+                        text,
+                        attachments,
+                        sender,
+                        terminal,
+                        config,
+                    });
+                }
+            }
+            AcpCommand::Logout { reply } => {
+                let result = conn
+                    .send_request(acp::LogoutRequest::new())
+                    .block_task()
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| format!("Logout failed: {}", e));
+                if result.is_ok() {
+                    if let Ok(mut slot) = handle.pending_auth.lock() {
+                        *slot = None;
+                    }
+                    if let Ok(mut slot) = handle.pending_auth_retry.lock() {
+                        *slot = None;
+                    }
+                }
+                let _ = reply.send(result);
             }
             AcpCommand::ForkSession { cwd, reply } => {
                 // Agent 必须声明 fork capability;否则 send_request 会被 agent
@@ -3832,7 +3943,12 @@ impl AcpSessionHandle {
             .load(std::sync::atomic::Ordering::Relaxed)
             && !matches!(
                 update,
-                AcpUpdate::AvailableCommands { .. } | AcpUpdate::SessionReady { .. }
+                AcpUpdate::AvailableCommands { .. }
+                    | AcpUpdate::SessionReady { .. }
+                    | AcpUpdate::AuthRequired { .. }
+                    | AcpUpdate::AuthSucceeded
+                    | AcpUpdate::AuthFailed { .. }
+                    | AcpUpdate::AuthLoggedOut
             )
         {
             return;
@@ -4231,13 +4347,70 @@ impl AcpSessionHandle {
             .map_err(|_| crate::error::GroveError::Session("ACP session closed".to_string()))
     }
 
-    /// 触发 ACP `authenticate(method_id)`。method_id 由前端从 `AuthRequired`
-    /// update 拿到再原样回传 — grove 不替换、不验证。
+    /// 触发 ACP `authenticate(method_id)`。协议要求 method_id 必须来自 Agent
+    /// 在 initialize 响应中声明的 authMethods。
     pub async fn authenticate(&self, method_id: String) -> crate::error::Result<()> {
+        let advertised = self
+            .auth_methods
+            .lock()
+            .map(|methods| is_advertised_auth_method(&methods, &method_id))
+            .unwrap_or(false);
+        if !advertised {
+            return Err(crate::error::GroveError::Session(format!(
+                "Agent did not advertise authentication method '{}'",
+                method_id
+            )));
+        }
         self.cmd_tx
             .send(AcpCommand::Authenticate { method_id })
             .await
             .map_err(|_| crate::error::GroveError::Session("ACP session closed".to_string()))
+    }
+
+    /// Agent 未声明认证方法时，允许用户在外部 CLI 登录后重试原请求。
+    pub async fn retry_authentication(&self) -> crate::error::Result<()> {
+        let can_retry = self
+            .pending_auth
+            .lock()
+            .map(|state| {
+                state
+                    .as_ref()
+                    .is_some_and(|pending| pending.methods.is_empty())
+            })
+            .unwrap_or(false);
+        if !can_retry {
+            return Err(crate::error::GroveError::Session(
+                "External authentication retry is not available".to_string(),
+            ));
+        }
+        self.cmd_tx
+            .send(AcpCommand::RetryAuthentication)
+            .await
+            .map_err(|_| crate::error::GroveError::Session("ACP session closed".to_string()))
+    }
+
+    /// 调用 ACP v1 `logout`。协议能力未声明时拒绝发送请求。
+    pub async fn logout(&self) -> crate::error::Result<()> {
+        if !self
+            .logout_capable
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(crate::error::GroveError::Session(
+                "Agent does not support logout".to_string(),
+            ));
+        }
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(AcpCommand::Logout { reply: reply_tx })
+            .await
+            .map_err(|_| crate::error::GroveError::Session("ACP session closed".to_string()))?;
+        match reply_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(crate::error::GroveError::Session(message)),
+            Err(_) => Err(crate::error::GroveError::Session(
+                "Logout request was dropped by ACP loop".to_string(),
+            )),
+        }
     }
 
     /// 取消当前处理
@@ -4808,6 +4981,7 @@ pub fn new_handle_for_test(
         last_plan: Mutex::new(None),
         last_permission_info: Mutex::new(None),
         auth_methods: Mutex::new(Vec::new()),
+        logout_capable: std::sync::atomic::AtomicBool::new(false),
         pending_auth_retry: Mutex::new(None),
         pending_auth: Mutex::new(None),
         fork_capable: std::sync::atomic::AtomicBool::new(false),
@@ -5717,6 +5891,19 @@ mod tests {
         assert!(partial.image);
         assert!(!partial.audio);
         assert!(!partial.embedded_context);
+    }
+
+    #[test]
+    fn authentication_accepts_only_advertised_method_ids() {
+        let methods = vec![AuthMethodInfo {
+            id: "agent-login".to_string(),
+            name: "Agent login".to_string(),
+            description: None,
+        }];
+
+        assert!(is_advertised_auth_method(&methods, "agent-login"));
+        assert!(!is_advertised_auth_method(&methods, "other-login"));
+        assert!(!is_advertised_auth_method(&[], "agent-login"));
     }
 
     #[test]

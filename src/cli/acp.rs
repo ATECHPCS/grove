@@ -167,6 +167,11 @@ pub async fn execute(agent: String, cwd: String) {
                     break;
                 }
                 Ok(AcpUpdate::AuthSucceeded) => continue,
+                Ok(AcpUpdate::AuthFailed { message }) => {
+                    eprintln!("\x1b[31mError: {}\x1b[0m", message);
+                    break;
+                }
+                Ok(AcpUpdate::AuthLoggedOut) => continue,
                 Ok(
                     AcpUpdate::Busy { .. }
                     | AcpUpdate::UserMessage { .. }

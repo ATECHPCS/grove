@@ -76,6 +76,10 @@ pub fn should_persist(update: &AcpUpdate) -> bool {
             | AcpUpdate::AvailableCommands { .. }
             | AcpUpdate::QueueUpdate { .. }
             | AcpUpdate::ConnectPhase { .. }
+            | AcpUpdate::AuthRequired { .. }
+            | AcpUpdate::AuthSucceeded
+            | AcpUpdate::AuthFailed { .. }
+            | AcpUpdate::AuthLoggedOut
             // Forms are transient UI dispatched by the `ask_form` MCP tool.
             // The user's answers come back as a regular user prompt (persisted
             // as user content); the form definition itself should not write
@@ -588,6 +592,25 @@ pub fn compact_events(events: Vec<AcpUpdate>) -> Vec<AcpUpdate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authentication_state_is_transient() {
+        let methods = vec![crate::acp::AuthMethodInfo {
+            id: "agent-login".to_string(),
+            name: "Agent login".to_string(),
+            description: None,
+        }];
+
+        assert!(!should_persist(&AcpUpdate::AuthRequired {
+            methods,
+            agent_name: Some("agent".to_string()),
+        }));
+        assert!(!should_persist(&AcpUpdate::AuthSucceeded));
+        assert!(!should_persist(&AcpUpdate::AuthFailed {
+            message: "failed".to_string(),
+        }));
+        assert!(!should_persist(&AcpUpdate::AuthLoggedOut));
+    }
 
     fn perm_req(id: &str) -> AcpUpdate {
         AcpUpdate::PermissionRequest {

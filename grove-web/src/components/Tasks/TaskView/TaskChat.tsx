@@ -35,6 +35,9 @@ import {
   ListPlus,
   Trash2,
   GitFork,
+  MoreHorizontal,
+  LogIn,
+  LogOut,
   Pencil,
   Square,
   Paperclip,
@@ -63,6 +66,7 @@ import {
   VSCodeIcon,
   FileMentionDropdown,
   AgentPickerMenuItems,
+  DropdownMenu,
 } from "../../ui";
 import { agentOptions } from "../../../data/agents";
 import {
@@ -442,6 +446,103 @@ interface PromptCaps {
   embeddedContext: boolean;
 }
 
+interface AuthMethodOption {
+  id: string;
+  name: string;
+  description?: string;
+}
+
+interface SessionActionsMenuProps {
+  surface: "header" | "sidebar";
+  chatId: string;
+  forkCapable: boolean;
+  authMethods: AuthMethodOption[];
+  logoutCapable: boolean;
+  actionsDisabled: boolean;
+  deleteDisabled: boolean;
+  onFork: (chatId: string) => void;
+  onLogin: (method: AuthMethodOption) => void;
+  onLogout: () => void;
+  onDelete: (chatId: string) => void;
+}
+
+function SessionActionsMenu({
+  surface,
+  chatId,
+  forkCapable,
+  authMethods,
+  logoutCapable,
+  actionsDisabled,
+  deleteDisabled,
+  onFork,
+  onLogin,
+  onLogout,
+  onDelete,
+}: SessionActionsMenuProps) {
+  const items: Parameters<typeof DropdownMenu>[0]["items"] = [];
+
+  if (forkCapable) {
+    items.push({
+      id: "fork",
+      label: "Fork",
+      icon: GitFork,
+      onClick: () => onFork(chatId),
+      disabled: actionsDisabled,
+    });
+  }
+  if (authMethods.length > 0) {
+    items.push({
+      id: "login",
+      label: "Login",
+      icon: LogIn,
+      disabled: actionsDisabled,
+      children: authMethods.map((method) => ({
+        id: `login-${method.id}`,
+        label: method.name.trim() || "Login",
+        onClick: () => onLogin(method),
+      })),
+    });
+  }
+  if (logoutCapable) {
+    items.push({
+      id: "logout",
+      label: "Logout",
+      icon: LogOut,
+      onClick: onLogout,
+      disabled: actionsDisabled,
+    });
+  }
+  items.push({
+    id: "delete",
+    label: "Delete",
+    icon: Trash2,
+    onClick: () => onDelete(chatId),
+    variant: "danger",
+    disabled: deleteDisabled,
+  });
+
+  const triggerClassName =
+    surface === "header"
+      ? "flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-highlight)]"
+      : "flex h-full shrink-0 items-center gap-1.5 rounded-md border border-dashed border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-transparent px-2 text-[12px] text-[var(--color-text-muted)] transition-colors hover:border-[color-mix(in_srgb,var(--color-highlight)_34%,transparent)] hover:text-[var(--color-highlight)]";
+
+  return (
+    <DropdownMenu
+      items={items}
+      trigger={
+        <>
+          <MoreHorizontal className={surface === "header" ? "h-3.5 w-3.5" : "h-3 w-3"} />
+          <span>More</span>
+        </>
+      }
+      triggerClassName={triggerClassName}
+      ariaLabel="Session actions"
+      portal
+      compact
+    />
+  );
+}
+
 type TitleEditSurface = "header" | "sidebar-header" | "sidebar-list";
 
 const AGENT_PICKER_MENU_WIDTH = 192;
@@ -471,6 +572,8 @@ interface PerChatState {
   /** Agent 是否声明 ACP `session/fork` 能力(`unstable_session_fork`)。
    * true → 在 chat 菜单的当前 chat 行显示 Fork 按钮。 */
   forkCapable: boolean;
+  authMethods: AuthMethodOption[];
+  logoutCapable: boolean;
   planFilePath: string;
   planFileContent: string;
   isRemoteSession: boolean;
@@ -513,6 +616,8 @@ function defaultPerChatState(): PerChatState {
     remoteOwnerName: "",
     promptCaps: { image: false, audio: false, embeddedContext: false },
     forkCapable: false,
+    authMethods: [],
+    logoutCapable: false,
     planFilePath: "",
     planFileContent: "",
     draftHtml: "",
@@ -2486,6 +2591,8 @@ export function TaskChat({
     embeddedContext: false,
   });
   const [forkCapable, setForkCapable] = useState(false);
+  const [authMethods, setAuthMethods] = useState<AuthMethodOption[]>([]);
+  const [logoutCapable, setLogoutCapable] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const attachCountersRef = useRef<AttachmentCounters>({ image: 0, audio: 0, resource: 0 });
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -3513,6 +3620,8 @@ export function TaskChat({
       agentIcon: AgentIcon,
       promptCaps,
       forkCapable,
+      authMethods,
+      logoutCapable,
       planFilePath,
       planFileContent,
       isRemoteSession,
@@ -3541,6 +3650,8 @@ export function TaskChat({
     AgentIcon,
     promptCaps,
     forkCapable,
+    authMethods,
+    logoutCapable,
     planFilePath,
     planFileContent,
     isRemoteSession,
@@ -3573,6 +3684,8 @@ export function TaskChat({
       // (agent 升级 / 能力被关掉)。等 SessionReady / snapshot 到达由 live
       // 信号刷新;在那之前先按"未知 → 隐藏"处理,避免误显示按钮。
       setForkCapable(false);
+      setAuthMethods([]);
+      setLogoutCapable(false);
       setPlanFilePath(cached.planFilePath);
       setPlanFileContent(cached.planFileContent);
       planFilePathRef.current = cached.planFilePath;
@@ -3600,6 +3713,8 @@ export function TaskChat({
       setIsTerminalMode(false);
       setPromptCaps({ image: false, audio: false, embeddedContext: false });
       setForkCapable(false);
+      setAuthMethods([]);
+      setLogoutCapable(false);
       setPlanFilePath("");
       setPlanFileContent("");
       planFilePathRef.current = "";
@@ -4041,6 +4156,8 @@ export function TaskChat({
                 });
               }
               setForkCapable(!!evt.fork_capable);
+              setAuthMethods(evt.auth_methods ?? []);
+              setLogoutCapable(!!evt.logout_capable);
               if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
                 wsRef.current.send(
                   JSON.stringify({ type: "set_queue_mode", mode: loadQueueMode() }),
@@ -4323,6 +4440,8 @@ export function TaskChat({
             });
           }
           setForkCapable(!!msg.fork_capable);
+          setAuthMethods(msg.auth_methods ?? []);
+          setLogoutCapable(!!msg.logout_capable);
           if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             wsRef.current.send(
               JSON.stringify({ type: "set_queue_mode", mode: loadQueueMode() }),
@@ -4465,7 +4584,9 @@ export function TaskChat({
           } else {
             setMessages((prev) => [
               ...prev,
-              { type: "system", content: `Error: ${msg.message}` },
+              // The server message already carries the Agent/ACP error label.
+              // Do not stack another presentation prefix on top of it.
+              { type: "system", content: msg.message },
             ]);
             updateBusy(false);
             onChatBecameIdle?.();
@@ -4510,6 +4631,35 @@ export function TaskChat({
           );
           break;
         }
+        case "auth_failed": {
+          const errorMessage =
+            typeof msg.message === "string"
+              ? msg.message
+              : "Authentication failed. Please try again.";
+          setMessages((prev) => {
+            const next = [...prev];
+            for (let i = next.length - 1; i >= 0; i -= 1) {
+              const message = next[i];
+              if (
+                message.type === "auth_required" &&
+                message.status === "in_progress"
+              ) {
+                next[i] = { ...message, status: "failed", errorMessage };
+                break;
+              }
+            }
+            return next;
+          });
+          updateBusy(false);
+          onChatBecameIdle?.();
+          break;
+        }
+        case "auth_logged_out":
+          setMessages((prev) => [
+            ...prev,
+            { type: "system", content: `Signed out of ${agentLabel}.` },
+          ]);
+          break;
         case "mode_changed":
           setPermissionLevel(msg.mode_id);
           break;
@@ -4633,7 +4783,7 @@ export function TaskChat({
           break;
       }
     },
-    [onConnectedProp, enableAutoStickToBottom, onChatBecameIdle, updateBusy, pruneActiveChatMessages, setAutoExpandSectionId],
+    [agentLabel, onConnectedProp, enableAutoStickToBottom, onChatBecameIdle, updateBusy, pruneActiveChatMessages, setAutoExpandSectionId],
   );
 
   /** Buffer a server message into the per-chat cache (for non-active chats) */
@@ -4681,6 +4831,8 @@ export function TaskChat({
             };
           }
           state.forkCapable = !!msg.fork_capable;
+          state.authMethods = msg.auth_methods ?? [];
+          state.logoutCapable = !!msg.logout_capable;
           {
             const bgWs = wsMapRef.current.get(chatId);
             if (bgWs && bgWs.readyState === WebSocket.OPEN) {
@@ -4773,6 +4925,12 @@ export function TaskChat({
           break;
         case "available_commands":
           state.slashCommands = msg.commands ?? [];
+          break;
+        case "auth_logged_out":
+          state.messages = [
+            ...state.messages,
+            { type: "system", content: "Signed out of the agent." },
+          ];
           break;
         case "session_ended":
           state.isConnected = false;
@@ -6031,6 +6189,52 @@ export function TaskChat({
     },
     [],
   );
+
+  /** Retry an auth-gated request after the user signs in through the Agent's
+   * external CLI. This is only shown when the Agent advertised no ACP method. */
+  const handleAuthRetry = useCallback((index: number) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    setMessages((prev) =>
+      prev.map((m, i) =>
+        i === index && m.type === "auth_required"
+          ? {
+              ...m,
+              status: "in_progress",
+              activeMethodId: undefined,
+              errorMessage: undefined,
+            }
+          : m,
+      ),
+    );
+    wsRef.current.send(JSON.stringify({ type: "retry_authentication" }));
+  }, []);
+
+  /** Start an advertised authentication method proactively from More. */
+  const handleMenuLogin = useCallback(
+    (method: AuthMethodOption) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+      setMessages((prev) => [
+        ...prev,
+        {
+          type: "auth_required",
+          methods: authMethods,
+          agentName: agentLabel,
+          status: "in_progress",
+          activeMethodId: method.id,
+        },
+      ]);
+      setShowAuthPanel(true);
+      wsRef.current.send(
+        JSON.stringify({ type: "authenticate", method_id: method.id }),
+      );
+    },
+    [agentLabel, authMethods],
+  );
+
+  const handleLogout = useCallback(() => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    wsRef.current.send(JSON.stringify({ type: "logout" }));
+  }, []);
 
   const triggerProjectFilesLoad = useCallback((projectName: string) => {
     const project = allProjects.find(p => p.name.toLowerCase() === projectName.toLowerCase());
@@ -7853,26 +8057,20 @@ export function TaskChat({
                   <span>New</span>
                 </button>
               </div>
-              {/* Fork 只在 source agent live 且当前空闲、不在登录中时允许。
-                  disabled 而不是隐藏:让用户知道按钮存在,只是当下不能用。 */}
-              {forkCapable && activeChat && (
-                <button
-                  onClick={() => handleForkChat(activeChat.id)}
-                  disabled={!isConnected || isBusy || !!activeAuthMessage}
-                  className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-highlight)] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-[var(--color-text-muted)]"
-                  title={
-                    !isConnected
-                      ? "Fork unavailable: source session not connected"
-                      : isBusy
-                        ? "Fork unavailable while agent is responding"
-                        : activeAuthMessage
-                          ? "Fork unavailable: finish login first"
-                          : "Fork Session — derive a new session from the current chat, copy the conversation history"
-                  }
-                >
-                  <GitFork className="w-3.5 h-3.5" />
-                  <span>Fork</span>
-                </button>
+              {activeChat && (
+                <SessionActionsMenu
+                  surface="header"
+                  chatId={activeChat.id}
+                  forkCapable={forkCapable}
+                  authMethods={authMethods}
+                  logoutCapable={logoutCapable}
+                  actionsDisabled={!isConnected || isBusy || !!activeAuthMessage}
+                  deleteDisabled={chats.length <= 1}
+                  onFork={handleForkChat}
+                  onLogin={handleMenuLogin}
+                  onLogout={handleLogout}
+                  onDelete={handleDeleteChat}
+                />
               )}
             </div>
 
@@ -8001,24 +8199,20 @@ export function TaskChat({
                       <span className="font-medium">New Session</span>
                     </button>
                   </div>
-                  {forkCapable && activeChat && (
-                    <button
-                      onClick={() => handleForkChat(activeChat.id)}
-                      disabled={!isConnected || isBusy || !!activeAuthMessage}
-                      className="flex shrink-0 items-center gap-1.5 rounded-md border border-dashed border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-transparent px-2 text-[12px] text-[var(--color-text-muted)] transition-colors hover:border-[color-mix(in_srgb,var(--color-highlight)_34%,transparent)] hover:text-[var(--color-highlight)] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] disabled:hover:text-[var(--color-text-muted)]"
-                      title={
-                        !isConnected
-                          ? "Fork unavailable: source session not connected"
-                          : isBusy
-                            ? "Fork unavailable while agent is responding"
-                            : activeAuthMessage
-                              ? "Fork unavailable: finish login first"
-                              : "Fork Session — derive a new session from the current chat, copy the conversation history"
-                      }
-                    >
-                      <GitFork className="h-3 w-3" />
-                      <span>Fork</span>
-                    </button>
+                  {activeChat && (
+                    <SessionActionsMenu
+                      surface="sidebar"
+                      chatId={activeChat.id}
+                      forkCapable={forkCapable}
+                      authMethods={authMethods}
+                      logoutCapable={logoutCapable}
+                      actionsDisabled={!isConnected || isBusy || !!activeAuthMessage}
+                      deleteDisabled={chats.length <= 1}
+                      onFork={handleForkChat}
+                      onLogin={handleMenuLogin}
+                      onLogout={handleLogout}
+                      onDelete={handleDeleteChat}
+                    />
                   )}
                 </div>
                 {orderedChats.map((chat) => {
@@ -8607,16 +8801,7 @@ export function TaskChat({
                           index={activeAuthMessageIndex}
                           agentLabel={agentLabel}
                           onAuthLogin={handleAuthLogin}
-                          onDismiss={(idx) => {
-                            setMessages((prev) =>
-                              prev.map((m, i) =>
-                                i === idx && m.type === "auth_required"
-                                  ? { ...m, status: "succeeded" }
-                                  : m
-                              )
-                            );
-                            setShowAuthPanel(false);
-                          }}
+                          onAuthRetry={handleAuthRetry}
                         />
                       )}
 
@@ -9309,7 +9494,7 @@ export function TaskChat({
               left: agentPickerAnchor.left,
               zIndex: 1000,
             }}
-            className="min-w-48 max-h-64 overflow-y-auto rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg py-1"
+            className="min-w-48 max-h-64 overflow-x-hidden overflow-y-auto rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg"
           >
             {!acpAvailabilityLoaded ? (
               <div className="flex items-center gap-2 px-3 py-2 text-sm text-[var(--color-text-muted)]">
@@ -10072,13 +10257,13 @@ function AuthRequiredPanel({
   index,
   agentLabel,
   onAuthLogin,
-  onDismiss,
+  onAuthRetry,
 }: {
   message: Extract<ChatMessage, { type: "auth_required" }>;
   index: number;
   agentLabel?: string;
   onAuthLogin?: (index: number, methodId: string) => void;
-  onDismiss?: (index: number) => void;
+  onAuthRetry?: (index: number) => void;
 }) {
   const agentDisplay = message.agentName || agentLabel || "Agent";
   const hasMethods = message.methods.length > 0;
@@ -10093,15 +10278,15 @@ function AuthRequiredPanel({
   } else if (message.status === "in_progress") {
     title = "Authenticating";
     description = activeMethod
-      ? `Complete the ${activeMethod.name} flow in the browser. The session will resume automatically once finished.`
-      : "Waiting for the agent to confirm authentication...";
+      ? `Complete the ${activeMethod.name} sign-in flow. The session will resume automatically once finished.`
+      : "Checking whether the external sign-in completed...";
   } else if (message.status === "failed") {
     title = "Login failed";
     description =
       message.errorMessage ?? "Please choose an option below to try again.";
   } else if (!hasMethods) {
     title = "Authentication required";
-    description = `${agentDisplay} did not advertise any login method. Run the agent's CLI login in a terminal, then send your message again.`;
+    description = `${agentDisplay} did not advertise a login method. Sign in with the agent's CLI, then retry the request.`;
   } else {
     title = "Authentication required";
     description = `${agentDisplay} needs you to sign in before continuing. Pick a login method below.`;
@@ -10110,15 +10295,7 @@ function AuthRequiredPanel({
     message.status === "in_progress" || message.status === "succeeded";
 
   return (
-    <div className="space-y-3 relative pr-6">
-      <button
-        type="button"
-        onClick={() => onDismiss?.(index)}
-        className="absolute top-0 right-0 rounded-md p-1 text-[var(--color-text-muted)] transition-colors hover:bg-[color-mix(in_srgb,var(--color-text)_10%,transparent)] hover:text-[var(--color-text)]"
-        title="Dismiss"
-      >
-        <X className="h-3.5 w-3.5" />
-      </button>
+    <div className="space-y-3 relative">
       <div className="flex items-start gap-2">
         <AlertTriangle className="h-4 w-4 shrink-0 text-[var(--color-warning)] mt-0.5" />
         <div className="min-w-0 flex-1">
@@ -10165,6 +10342,16 @@ function AuthRequiredPanel({
             );
           })}
         </div>
+      )}
+      {!hasMethods && (
+        <button
+          type="button"
+          disabled={buttonsDisabled}
+          onClick={() => onAuthRetry?.(index)}
+          className="flex w-full items-center justify-center rounded-xl border border-[color-mix(in_srgb,var(--color-warning)_18%,transparent)] bg-[color-mix(in_srgb,var(--color-warning)_7%,transparent)] px-3 py-2.5 text-sm font-medium text-[var(--color-text)] transition-colors hover:bg-[color-mix(in_srgb,var(--color-warning)_12%,transparent)] disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {message.status === "in_progress" ? "Retrying..." : "Retry"}
+        </button>
       )}
     </div>
   );

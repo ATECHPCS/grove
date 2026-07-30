@@ -95,6 +95,10 @@ enum ClientMessage {
     Authenticate {
         method_id: String,
     },
+    /// Agent 没有声明认证方法时，用户在外部完成登录后重试原请求。
+    RetryAuthentication,
+    /// Agent 声明 auth.logout capability 时，调用 ACP v1 logout。
+    Logout,
 }
 
 /// Server-to-client messages (serialized AcpUpdate)
@@ -118,6 +122,9 @@ enum ServerMessage {
         prompt_capabilities: PromptCapabilitiesData,
         /// agent 是否声明了 `session.fork` 能力 — 前端据此显示 Fork 按钮
         fork_capable: bool,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        auth_methods: Vec<AuthMethodMsg>,
+        logout_capable: bool,
     },
     MessageChunk {
         text: String,
@@ -260,6 +267,11 @@ enum ServerMessage {
     /// authenticate 调用成功。前端把 banner 状态切到"登录成功,正在重试...",
     /// 后续会自动收到原 prompt 的 UserMessage / Busy 流。
     AuthSucceeded,
+    /// authenticate 调用失败。前端恢复认证面板供用户重试。
+    AuthFailed {
+        message: String,
+    },
+    AuthLoggedOut,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -349,6 +361,8 @@ impl From<AcpUpdate> for ServerMessage {
                 thought_level_config_id,
                 prompt_capabilities,
                 fork_capable,
+                auth_methods,
+                logout_capable,
             } => ServerMessage::SessionReady {
                 session_id,
                 agent_name,
@@ -371,6 +385,15 @@ impl From<AcpUpdate> for ServerMessage {
                 thought_level_config_id,
                 prompt_capabilities,
                 fork_capable,
+                auth_methods: auth_methods
+                    .into_iter()
+                    .map(|method| AuthMethodMsg {
+                        id: method.id,
+                        name: method.name,
+                        description: method.description,
+                    })
+                    .collect(),
+                logout_capable,
             },
             AcpUpdate::MessageChunk { text } => ServerMessage::MessageChunk { text },
             AcpUpdate::ThoughtChunk { text } => ServerMessage::ThoughtChunk { text },
@@ -520,6 +543,8 @@ impl From<AcpUpdate> for ServerMessage {
                 agent_name,
             },
             AcpUpdate::AuthSucceeded => ServerMessage::AuthSucceeded,
+            AcpUpdate::AuthFailed { message } => ServerMessage::AuthFailed { message },
+            AcpUpdate::AuthLoggedOut => ServerMessage::AuthLoggedOut,
         }
     }
 }
@@ -671,6 +696,23 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                     fork_capable: handle
                         .fork_capable
                         .load(std::sync::atomic::Ordering::Relaxed),
+                    auth_methods: handle
+                        .auth_methods
+                        .lock()
+                        .map(|methods| {
+                            methods
+                                .iter()
+                                .map(|method| AuthMethodMsg {
+                                    id: method.id.clone(),
+                                    name: method.name.clone(),
+                                    description: method.description.clone(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    logout_capable: handle
+                        .logout_capable
+                        .load(std::sync::atomic::Ordering::Relaxed),
                 }
             })
             .unwrap_or_else(|| {
@@ -691,6 +733,23 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                     prompt_capabilities: PromptCapabilitiesData::default(),
                     fork_capable: handle
                         .fork_capable
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    auth_methods: handle
+                        .auth_methods
+                        .lock()
+                        .map(|methods| {
+                            methods
+                                .iter()
+                                .map(|method| AuthMethodMsg {
+                                    id: method.id.clone(),
+                                    name: method.name.clone(),
+                                    description: method.description.clone(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    logout_capable: handle
+                        .logout_capable
                         .load(std::sync::atomic::Ordering::Relaxed),
                 }
             });
@@ -930,11 +989,24 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                                 }
                                 ClientMessage::Authenticate { method_id } => {
                                     if let Err(e) = handle_for_input.authenticate(method_id).await {
-                                        handle_for_input.emit(AcpUpdate::Error {
-                                            message: format!("Authenticate dispatch failed: {}", e),
+                                        handle_for_input.emit(AcpUpdate::AuthFailed {
+                                            message: format!("Authentication failed: {}", e),
                                         });
                                     }
                                 }
+                                ClientMessage::RetryAuthentication => {
+                                    if let Err(e) = handle_for_input.retry_authentication().await {
+                                        handle_for_input.emit(AcpUpdate::AuthFailed {
+                                            message: format!("Authentication retry failed: {}", e),
+                                        });
+                                    }
+                                }
+                                ClientMessage::Logout => match handle_for_input.logout().await {
+                                    Ok(()) => handle_for_input.emit(AcpUpdate::AuthLoggedOut),
+                                    Err(e) => handle_for_input.emit(AcpUpdate::Error {
+                                        message: format!("Logout failed: {}", e),
+                                    }),
+                                },
                             }
                         }
                     }
