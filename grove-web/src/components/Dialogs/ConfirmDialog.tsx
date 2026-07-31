@@ -10,6 +10,10 @@ interface ConfirmDialogProps {
   message: React.ReactNode;
   confirmLabel?: string;
   cancelLabel?: string;
+  secondaryActionLabel?: string;
+  onSecondaryAction?: () => void;
+  actionsDisabled?: boolean;
+  compactActions?: boolean;
   variant?: "danger" | "warning" | "info";
   onConfirm: () => void;
   onCancel: () => void;
@@ -21,6 +25,10 @@ export function ConfirmDialog({
   message,
   confirmLabel = "Confirm",
   cancelLabel = "Cancel",
+  secondaryActionLabel,
+  onSecondaryAction,
+  actionsDisabled = false,
+  compactActions = false,
   variant = "danger",
   onConfirm,
   onCancel,
@@ -85,15 +93,21 @@ export function ConfirmDialog({
         </div>
 
         {/* Actions */}
-        <div className="flex justify-end gap-3 px-5 py-4 bg-[var(--color-bg)] border-t border-[var(--color-border)]">
-          <Button variant="secondary" onClick={onCancel}>
+        <div className={`flex justify-end bg-[var(--color-bg)] border-t border-[var(--color-border)] ${compactActions ? "gap-2 px-5 py-3" : "gap-3 px-5 py-4"}`}>
+          <Button variant="secondary" size={compactActions ? "sm" : "md"} onClick={onCancel} disabled={actionsDisabled} className="whitespace-nowrap">
             {cancelLabel}
           </Button>
+          {secondaryActionLabel && onSecondaryAction && (
+            <Button variant="secondary" size={compactActions ? "sm" : "md"} onClick={onSecondaryAction} disabled={actionsDisabled} className="whitespace-nowrap">
+              {secondaryActionLabel}
+            </Button>
+          )}
           <motion.button
             whileHover={{ scale: 1.02 }}
             whileTap={{ scale: 0.98 }}
             onClick={onConfirm}
-            className={`px-4 py-2 rounded-lg text-sm font-medium text-white transition-colors ${styles.buttonBg}`}
+            disabled={actionsDisabled}
+            className={`${compactActions ? "px-2.5 py-1.5 text-xs" : "px-4 py-2 text-sm"} whitespace-nowrap rounded-lg font-medium text-white transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${styles.buttonBg}`}
           >
             {confirmLabel}
           </motion.button>

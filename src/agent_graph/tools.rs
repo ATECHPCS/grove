@@ -709,6 +709,7 @@ pub async fn grove_agent_spawn(
         remote_url: resolved.url,
         remote_auth: resolved.auth_header,
         suppress_initial_connecting: false,
+        import_session: false,
         persona_injection,
     };
 
@@ -1128,6 +1129,7 @@ pub(crate) async fn ensure_target_handle(
         remote_url: resolved.url,
         remote_auth: resolved.auth_header,
         suppress_initial_connecting: false,
+        import_session: false,
         persona_injection,
     };
 

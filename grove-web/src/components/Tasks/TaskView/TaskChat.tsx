@@ -58,6 +58,7 @@ import {
   Search,
   User,
   ListChecks,
+  Download,
 } from "lucide-react";
 import { iconUrlForFile } from "../../ui/iconUrl";
 import {
@@ -148,6 +149,8 @@ import {
   updateChatTitle,
   deleteChat,
   forkChat,
+  listImportSessions,
+  importSession,
   uploadChatAttachment,
   getTaskFiles,
   getChatHistory,
@@ -157,7 +160,7 @@ import {
   updateNotes,
 } from "../../../api";
 import { ConfirmDialog } from "../../Dialogs/ConfirmDialog";
-import type { ChatSessionResponse, CustomAgentServer } from "../../../api";
+import type { ChatSessionResponse, CustomAgentServer, ImportableSession } from "../../../api";
 import { listProjects, getProject, listResources, type ProjectListItem } from "../../../api/projects";
 import { openExternalUrl } from "../../../utils/openExternal";
 import { ansiToHtml, stripAnsi } from "../../../utils/ansi";
@@ -455,16 +458,36 @@ interface AuthMethodOption {
   description?: string;
 }
 
+function apiErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object" && "message" in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message;
+    if (message && typeof message === "object" && "message" in message) {
+      const nested = (message as { message?: unknown }).message;
+      if (typeof nested === "string" && nested.trim()) return nested;
+    }
+  }
+  return "The request failed. Please try again.";
+}
+
 interface SessionActionsMenuProps {
   surface: "header" | "sidebar";
   chatId: string;
   forkCapable: boolean;
+  importCapable: boolean;
+  importSessions: ImportableSession[];
+  importLoading: boolean;
+  importNextCursor?: string;
   authMethods: AuthMethodOption[];
   logoutCapable: boolean;
   reconnectDisabled: boolean;
   actionsDisabled: boolean;
   deleteDisabled: boolean;
   onFork: (chatId: string) => void;
+  onOpenImport: () => void;
+  onLoadMoreImport: () => void;
+  onImport: (session: ImportableSession) => void;
   onLogin: (method: AuthMethodOption) => void;
   onLogout: () => void;
   onReconnect: () => void;
@@ -475,12 +498,19 @@ function SessionActionsMenu({
   surface,
   chatId,
   forkCapable,
+  importCapable,
+  importSessions,
+  importLoading,
+  importNextCursor,
   authMethods,
   logoutCapable,
   reconnectDisabled,
   actionsDisabled,
   deleteDisabled,
   onFork,
+  onOpenImport,
+  onLoadMoreImport,
+  onImport,
   onLogin,
   onLogout,
   onReconnect,
@@ -496,6 +526,29 @@ function SessionActionsMenu({
       onClick: () => onFork(chatId),
       disabled: actionsDisabled,
     });
+  }
+  if (importCapable) {
+    const children: NonNullable<
+      Parameters<typeof DropdownMenu>[0]["items"][number]["children"]
+    > = importSessions.map((session) => ({
+      id: `import-${session.session_id}`,
+      label: session.title?.trim() || `Session ${session.session_id.slice(0, 8)}`,
+      description: `${session.updated_at ? `Updated ${new Date(session.updated_at).toLocaleString()} · ` : ""}ID ${session.session_id.slice(0, 12)}`,
+      onClick: () => onImport(session),
+      disabled: importLoading,
+    }));
+    if (importLoading && children.length === 0) children.push({ id: "loading", label: "Loading…", description: "", onClick: () => {}, disabled: true });
+    if (!importLoading && children.length === 0) children.push({ id: "empty", label: "No sessions to import", description: "", onClick: () => {}, disabled: true });
+    if (importNextCursor) children.push({
+      id: "more",
+      label: importLoading ? "Loading…" : "Load more",
+      description: "",
+      onClick: onLoadMoreImport,
+      disabled: importLoading,
+      keepOpenOnClick: true,
+      listAction: true,
+    });
+    items.push({ id: "import", label: "Import", icon: Download, children, onOpen: onOpenImport, wideChildren: true, disabled: actionsDisabled });
   }
   items.push({
     id: "reconnect",
@@ -586,6 +639,8 @@ interface PerChatState {
   /** Agent 是否声明 ACP `session/fork` 能力(`unstable_session_fork`)。
    * true → 在 chat 菜单的当前 chat 行显示 Fork 按钮。 */
   forkCapable: boolean;
+  importCapable: boolean;
+  deleteCapable: boolean;
   authMethods: AuthMethodOption[];
   logoutCapable: boolean;
   planFilePath: string;
@@ -630,6 +685,8 @@ function defaultPerChatState(): PerChatState {
     remoteOwnerName: "",
     promptCaps: { image: false, audio: false, embeddedContext: false },
     forkCapable: false,
+    importCapable: false,
+    deleteCapable: false,
     authMethods: [],
     logoutCapable: false,
     planFilePath: "",
@@ -2064,31 +2121,48 @@ function reduceHistoryMessages(
       );
     }
     case "user_message":
-      return [
-        ...messages,
-        {
+      {
+        const incomingAttachments: Attachment[] = msg.attachments?.map((a: ServerEvent) => ({
+          type:
+            a.type === "resource_link"
+              ? "resource"
+              : (a.type as "image" | "audio" | "resource"),
+          data: a.data ?? a.blob ?? a.text ?? "",
+          mimeType: a.mime_type ?? "",
+          name: a.name ?? a.uri?.split("/").filter(Boolean).pop() ?? "",
+          label: a.label ?? a.title ?? a.name ?? "",
+          uri: a.uri ?? undefined,
+          size: a.size ?? undefined,
+          previewUrl:
+            a.type === "image"
+              ? `data:${a.mime_type};base64,${a.data}`
+              : undefined,
+        })) ?? [];
+        const previous = messages[messages.length - 1];
+        if (previous?.type === "user" && !previous.terminal && !msg.terminal) {
+          return [
+            ...messages.slice(0, -1),
+            {
+              ...previous,
+              content: `${previous.content}${msg.text ?? ""}`,
+              attachments: [
+                ...(previous.attachments ?? []),
+                ...incomingAttachments,
+              ],
+            },
+          ];
+        }
+        return [
+          ...messages,
+          {
           type: "user",
           content: msg.text,
           terminal: !!msg.terminal,
           sender: msg.sender || undefined,
-          attachments: msg.attachments?.map((a: ServerEvent) => ({
-            type:
-              a.type === "resource_link"
-                ? "resource"
-                : (a.type as "image" | "audio" | "resource"),
-            data: a.data ?? "",
-            mimeType: a.mime_type ?? "",
-            name: a.name ?? "",
-            label: a.label ?? a.name ?? "",
-            uri: a.uri ?? undefined,
-            size: a.size ?? undefined,
-            previewUrl:
-              a.type === "image"
-                ? `data:${a.mime_type};base64,${a.data}`
-                : undefined,
-          })),
-        },
-      ];
+            attachments: incomingAttachments,
+          },
+        ];
+      }
     case "terminal_execute":
       return [
         ...messages,
@@ -2605,10 +2679,21 @@ export function TaskChat({
     embeddedContext: false,
   });
   const [forkCapable, setForkCapable] = useState(false);
+  const [importCapable, setImportCapable] = useState(false);
+  const [deleteCapable, setDeleteCapable] = useState(false);
+  const [importSessions, setImportSessions] = useState<ImportableSession[]>([]);
+  const [importNextCursor, setImportNextCursor] = useState<string>();
+  const [importLoading, setImportLoading] = useState(false);
+  const importRequestRef = useRef(0);
+  const initialImportChatIdRef = useRef<string | null>(null);
   const [authMethods, setAuthMethods] = useState<AuthMethodOption[]>([]);
   const [logoutCapable, setLogoutCapable] = useState(false);
   const [isReconnecting, setIsReconnecting] = useState(false);
   const [reconnectConfirmOpen, setReconnectConfirmOpen] = useState(false);
+  const [deleteConfirmChatId, setDeleteConfirmChatId] = useState<string | null>(null);
+  const [deleteConfirmTargetCapable, setDeleteConfirmTargetCapable] = useState(false);
+  const [isDeletingChat, setIsDeletingChat] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const attachCountersRef = useRef<AttachmentCounters>({ image: 0, audio: 0, resource: 0 });
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -3458,7 +3543,7 @@ export function TaskChat({
   // bottom, or (b) a hard fallback timeout fires.
   const { chatPositioning, notifyPositionedAtBottom } = useChatPositioning({
     activeChatId,
-    messagesLength: messages.length,
+    hasMessages: messages.length > 0,
     scrollMessagesToBottom,
     initialPinChatIdRef,
     suppressNextSmoothScrollRef,
@@ -3636,6 +3721,8 @@ export function TaskChat({
       agentIcon: AgentIcon,
       promptCaps,
       forkCapable,
+      importCapable,
+      deleteCapable,
       authMethods,
       logoutCapable,
       planFilePath,
@@ -3666,6 +3753,8 @@ export function TaskChat({
     AgentIcon,
     promptCaps,
     forkCapable,
+    importCapable,
+    deleteCapable,
     authMethods,
     logoutCapable,
     planFilePath,
@@ -3696,12 +3785,14 @@ export function TaskChat({
       setAgentLabel(cached.agentLabel);
       if (cached.agentIcon) setAgentIcon(() => cached.agentIcon);
       setPromptCaps(cached.promptCaps);
-      // 不从 cache 恢复 forkCapable:cache 是 chat 切换前的快照,可能 stale
-      // (agent 升级 / 能力被关掉)。等 SessionReady / snapshot 到达由 live
-      // 信号刷新;在那之前先按"未知 → 隐藏"处理,避免误显示按钮。
-      setForkCapable(false);
-      setAuthMethods([]);
-      setLogoutCapable(false);
+      // Each live WebSocket keeps its own initialized Agent capabilities.
+      // Switching chats does not trigger another session_ready, so restore
+      // the matching chat's snapshot; a later session_ready overwrites it.
+      setForkCapable(cached.forkCapable);
+      setImportCapable(cached.importCapable);
+      setDeleteCapable(cached.deleteCapable);
+      setAuthMethods(cached.authMethods);
+      setLogoutCapable(cached.logoutCapable);
       setPlanFilePath(cached.planFilePath);
       setPlanFileContent(cached.planFileContent);
       planFilePathRef.current = cached.planFilePath;
@@ -3729,6 +3820,7 @@ export function TaskChat({
       setIsTerminalMode(false);
       setPromptCaps({ image: false, audio: false, embeddedContext: false });
       setForkCapable(false);
+      setDeleteCapable(false);
       setAuthMethods([]);
       setLogoutCapable(false);
       setPlanFilePath("");
@@ -3738,6 +3830,11 @@ export function TaskChat({
       setIsRemoteSession(false);
       setRemoteOwnerName("");
     }
+    if (!cached) setImportCapable(false);
+    importRequestRef.current += 1;
+    setImportSessions([]);
+    setImportNextCursor(undefined);
+    setImportLoading(false);
     // 从缓存恢复 pending queue;tab 切换时 WS 不会断,server 也不会主动
     // 重发 queue_update,只能靠本地缓存 — 若 cache miss(首次进入此 chat)
     // 才置空,等首条 queue_update 灌入。
@@ -3813,7 +3910,7 @@ export function TaskChat({
   // Forward-declared ref for connectChatWs so handlers defined before its
   // useCallback (e.g. the ChatListChanged refetch handler) can call it
   // without creating a TDZ reference that React Compiler refuses to compile.
-  const connectChatWsRef = useRef<(chatId: string) => Promise<void>>(
+  const connectChatWsRef = useRef<(chatId: string, importing?: boolean) => Promise<void>>(
     async () => {},
   );
 
@@ -3930,7 +4027,7 @@ export function TaskChat({
 
   /** Connect a WebSocket for a given chat ID (idempotent) */
   const connectChatWs = useCallback(
-    async (chatId: string) => {
+    async (chatId: string, importing = false) => {
       if (wsMapRef.current.has(chatId)) return; // Already connected
       if (connectingRef.current.has(chatId)) return; // Connection already in-flight
       // Terminal-mode chats have no ACP WebSocket — they speak PTY only.
@@ -3953,7 +4050,7 @@ export function TaskChat({
       const host = getApiHost();
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const url = await appendHmacToUrl(
-        `${protocol}//${host}/api/v1/projects/${projectId}/tasks/${task.id}/chats/${chatId}/ws`,
+        `${protocol}//${host}/api/v1/projects/${projectId}/tasks/${task.id}/chats/${chatId}/ws${importing ? "?import=true" : ""}`,
       );
 
       connectingRef.current.delete(chatId);
@@ -3988,7 +4085,9 @@ export function TaskChat({
           if (
             data?.type === "error" &&
             typeof data.message === "string" &&
-            data.message.includes("Resume session failed")
+            ["Resume session failed", "Load session failed", "Import session failed"].some(
+              (failure) => data.message.includes(failure),
+            )
           ) {
             intentionalCloseRef.current.add(chatId);
             cancelPendingReconnectRef.current(chatId);
@@ -4090,12 +4189,20 @@ export function TaskChat({
   useEffect(() => {
     if (!activeChatId) return;
     const chatId = activeChatId;
-    historyLoadingRef.current = true;
-    wsEventBufferRef.current = [];
+    const isInitialImport = initialImportChatIdRef.current === chatId;
+    historyLoadingRef.current = !isInitialImport;
+    if (!isInitialImport) wsEventBufferRef.current = [];
     (async () => {
       // Step 1: Connect WS for real-time events
       await connectChatWs(chatId);
       wsRef.current = wsMapRef.current.get(chatId) ?? null;
+      // A newly imported chat has no Grove history yet. Its first render is
+      // the live session/load replay; later opens use the normal HTTP history
+      // path because this marker is deliberately one-shot and in-memory.
+      if (isInitialImport) {
+        initialImportChatIdRef.current = null;
+        return;
+      }
       // Step 2: Load history from HTTP (one-shot, avoids "过电影" effect)
       if (chatId !== getActiveChatId()) return;
       let res: Awaited<ReturnType<typeof getChatHistory>>;
@@ -4180,8 +4287,21 @@ export function TaskChat({
                 });
               }
               setForkCapable(!!evt.fork_capable);
+              setImportCapable(!!evt.import_capable);
+              setDeleteCapable(!!evt.delete_capable);
               setAuthMethods(evt.auth_methods ?? []);
               setLogoutCapable(!!evt.logout_capable);
+              {
+                const state =
+                  perChatStateRef.current.get(chatId) ?? defaultPerChatState();
+                state.isConnected = true;
+                state.forkCapable = !!evt.fork_capable;
+                state.importCapable = !!evt.import_capable;
+                state.deleteCapable = !!evt.delete_capable;
+                state.authMethods = evt.auth_methods ?? [];
+                state.logoutCapable = !!evt.logout_capable;
+                perChatStateRef.current.set(chatId, state);
+              }
               if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
                 wsRef.current.send(
                   JSON.stringify({ type: "set_queue_mode", mode: loadQueueMode() }),
@@ -4464,8 +4584,28 @@ export function TaskChat({
             });
           }
           setForkCapable(!!msg.fork_capable);
+          setImportCapable(!!msg.import_capable);
+          setDeleteCapable(!!msg.delete_capable);
           setAuthMethods(msg.auth_methods ?? []);
           setLogoutCapable(!!msg.logout_capable);
+          // A live session_ready is the authoritative snapshot for this chat.
+          // Keep the per-chat cache in sync as well as the visible controls;
+          // otherwise a later chat switch/delete restores the default false
+          // capabilities even though this WebSocket is still connected.
+          {
+            const chatId = getActiveChatId();
+            if (chatId) {
+              const state =
+                perChatStateRef.current.get(chatId) ?? defaultPerChatState();
+              state.isConnected = true;
+              state.forkCapable = !!msg.fork_capable;
+              state.importCapable = !!msg.import_capable;
+              state.deleteCapable = !!msg.delete_capable;
+              state.authMethods = msg.auth_methods ?? [];
+              state.logoutCapable = !!msg.logout_capable;
+              perChatStateRef.current.set(chatId, state);
+            }
+          }
           if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             wsRef.current.send(
               JSON.stringify({ type: "set_queue_mode", mode: loadQueueMode() }),
@@ -4807,7 +4947,7 @@ export function TaskChat({
           break;
       }
     },
-    [agentLabel, onConnectedProp, enableAutoStickToBottom, onChatBecameIdle, updateBusy, pruneActiveChatMessages, setAutoExpandSectionId],
+    [agentLabel, onConnectedProp, enableAutoStickToBottom, getActiveChatId, onChatBecameIdle, updateBusy, pruneActiveChatMessages, setAutoExpandSectionId],
   );
 
   /** Buffer a server message into the per-chat cache (for non-active chats) */
@@ -4855,6 +4995,8 @@ export function TaskChat({
             };
           }
           state.forkCapable = !!msg.fork_capable;
+          state.importCapable = !!msg.import_capable;
+          state.deleteCapable = !!msg.delete_capable;
           state.authMethods = msg.auth_methods ?? [];
           state.logoutCapable = !!msg.logout_capable;
           {
@@ -5147,11 +5289,24 @@ export function TaskChat({
 
   // ─── Chat deletion ─────────────────────────────────────────────────────
 
+  const requestDeleteChat = useCallback(
+    (chatId: string) => {
+      setShowChatMenu(false);
+      setDeleteError(null);
+      setDeleteConfirmTargetCapable(
+        chatId === activeChatId && isConnected && !isRemoteSession && deleteCapable,
+      );
+      setDeleteConfirmChatId(chatId);
+    },
+    [activeChatId, deleteCapable, isConnected, isRemoteSession],
+  );
+
   const handleDeleteChat = useCallback(
-    async (chatId: string) => {
+    async (chatId: string, scope: "grove" | "agent") => {
       if (chats.length <= 1) return; // Don't delete the last chat
+      setIsDeletingChat(true);
       try {
-        await deleteChat(projectId, task.id, chatId);
+        await deleteChat(projectId, task.id, chatId, scope);
         // Close WebSocket if connected; cancel any pending reconnect timer so
         // it doesn't fire later trying to reconnect a deleted chat.
         const ws = wsMapRef.current.get(chatId);
@@ -5172,8 +5327,14 @@ export function TaskChat({
           }
           return updated;
         });
+        setDeleteConfirmChatId(null);
+        setDeleteConfirmTargetCapable(false);
+        setDeleteError(null);
       } catch (err) {
         console.error("Failed to delete chat:", err);
+        setDeleteError(apiErrorMessage(err));
+      } finally {
+        setIsDeletingChat(false);
       }
       setShowChatMenu(false);
     },
@@ -5207,6 +5368,57 @@ export function TaskChat({
     },
     [projectId, task.id, restoreChatState, setActiveChatId],
   );
+
+  const loadImportSessions = useCallback(async (cursor?: string) => {
+    if (!activeChatId || importLoading) return;
+    const requestedChatId = activeChatId;
+    const requestId = ++importRequestRef.current;
+    setImportLoading(true);
+    try {
+      const page = await listImportSessions(projectId, task.id, requestedChatId, cursor);
+      if (importRequestRef.current !== requestId || getActiveChatId() !== requestedChatId) return;
+      setImportSessions((previous) => cursor ? [...previous, ...page.sessions] : page.sessions);
+      setImportNextCursor(page.next_cursor);
+    } catch (error) {
+      if (importRequestRef.current !== requestId || getActiveChatId() !== requestedChatId) return;
+      setMessages((previous) => appendSystemMessage(previous, `Import list failed: ${error instanceof Error ? error.message : String(error)}`));
+    } finally {
+      if (importRequestRef.current === requestId && getActiveChatId() === requestedChatId) {
+        setImportLoading(false);
+      }
+    }
+  }, [activeChatId, getActiveChatId, importLoading, projectId, task.id]);
+
+  const handleImportSession = useCallback(async (session: ImportableSession) => {
+    if (!activeChatId || importLoading) return;
+    setImportLoading(true);
+    try {
+      const created = await importSession(projectId, task.id, activeChatId, session);
+      if (!chatsRef.current.some((chat) => chat.id === created.id)) {
+        chatsRef.current = [...chatsRef.current, created];
+      }
+      setChats((previous) =>
+        previous.some((chat) => chat.id === created.id)
+          ? previous
+          : [...previous, created],
+      );
+      saveCurrentChatState();
+      // Claim the connection synchronously with the one-shot import flag. The
+      // normal active-chat effect sees connectingRef and cannot replace it.
+      initialImportChatIdRef.current = created.id;
+      const connecting = connectChatWs(created.id, true);
+      setActiveChatId(created.id);
+      writeLastActiveTab("chat", projectId, task.id, created.id);
+      restoreChatState(created.id);
+      await connecting;
+      wsRef.current = wsMapRef.current.get(created.id) ?? null;
+      setImportSessions((previous) => previous.filter((item) => item.session_id !== session.session_id));
+    } catch (error) {
+      setMessages((previous) => appendSystemMessage(previous, `Import failed: ${error instanceof Error ? error.message : String(error)}`));
+    } finally {
+      setImportLoading(false);
+    }
+  }, [activeChatId, connectChatWs, importLoading, projectId, restoreChatState, saveCurrentChatState, setActiveChatId, task.id]);
 
   // ─── User actions ────────────────────────────────────────────────────────
 
@@ -8113,7 +8325,7 @@ export function TaskChat({
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    handleDeleteChat(chat.id);
+                                    requestDeleteChat(chat.id);
                                   }}
                                   className="shrink-0 p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-error)] group-hover:opacity-100"
                                   title="Delete chat"
@@ -8149,16 +8361,23 @@ export function TaskChat({
                   surface="header"
                   chatId={activeChat.id}
                   forkCapable={forkCapable}
+                  importCapable={importCapable}
+                  importSessions={importSessions}
+                  importLoading={importLoading}
+                  importNextCursor={importNextCursor}
                   authMethods={authMethods}
                   logoutCapable={logoutCapable}
                   reconnectDisabled={isReconnecting || activeChat.launch_mode === "terminal"}
                   actionsDisabled={!isConnected || isBusy || !!activeAuthMessage}
                   deleteDisabled={chats.length <= 1}
                   onFork={handleForkChat}
+                  onOpenImport={() => { if (importSessions.length === 0) void loadImportSessions(); }}
+                  onLoadMoreImport={() => { if (importNextCursor) void loadImportSessions(importNextCursor); }}
+                  onImport={(session) => void handleImportSession(session)}
                   onLogin={handleMenuLogin}
                   onLogout={handleLogout}
                   onReconnect={handleReconnect}
-                  onDelete={handleDeleteChat}
+                  onDelete={requestDeleteChat}
                 />
               )}
             </div>
@@ -8293,16 +8512,23 @@ export function TaskChat({
                       surface="sidebar"
                       chatId={activeChat.id}
                       forkCapable={forkCapable}
+                      importCapable={importCapable}
+                      importSessions={importSessions}
+                      importLoading={importLoading}
+                      importNextCursor={importNextCursor}
                       authMethods={authMethods}
                       logoutCapable={logoutCapable}
                       reconnectDisabled={isReconnecting || activeChat.launch_mode === "terminal"}
                       actionsDisabled={!isConnected || isBusy || !!activeAuthMessage}
                       deleteDisabled={chats.length <= 1}
                       onFork={handleForkChat}
+                      onOpenImport={() => { if (importSessions.length === 0) void loadImportSessions(); }}
+                      onLoadMoreImport={() => { if (importNextCursor) void loadImportSessions(importNextCursor); }}
+                      onImport={(session) => void handleImportSession(session)}
                       onLogin={handleMenuLogin}
                       onLogout={handleLogout}
                       onReconnect={handleReconnect}
-                      onDelete={handleDeleteChat}
+                      onDelete={requestDeleteChat}
                     />
                   )}
                 </div>
@@ -8364,7 +8590,7 @@ export function TaskChat({
                           editingTitle.surface === "sidebar-list"
                         ) && (
                           <button
-                            onClick={() => handleDeleteChat(chat.id)}
+                            onClick={() => requestDeleteChat(chat.id)}
                             className="shrink-0 rounded p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-error)] group-hover:opacity-100"
                             title="Delete chat"
                           >
@@ -9568,6 +9794,54 @@ export function TaskChat({
         </div>
       </div>
       {/* Image / SVG Lightbox */}
+      <ConfirmDialog
+        isOpen={deleteConfirmChatId !== null}
+        title="Delete Session"
+        message={
+          <div className="space-y-2">
+            <p>
+              {deleteConfirmTargetCapable
+                ? "Remove this session from Grove only, or delete it from the Agent as well."
+                : "This removes the session and its local history from Grove. The Agent-owned session is kept."}
+            </p>
+            {deleteError && (
+              <p className="text-[var(--color-error)]">{deleteError}</p>
+            )}
+          </div>
+        }
+        confirmLabel={
+          isDeletingChat
+            ? "Deleting…"
+            : deleteConfirmTargetCapable
+              ? "Delete from Agent"
+              : "Remove from Grove"
+        }
+        secondaryActionLabel={
+          deleteConfirmTargetCapable ? "Remove from Grove" : undefined
+        }
+        onSecondaryAction={
+          deleteConfirmTargetCapable && deleteConfirmChatId
+            ? () => void handleDeleteChat(deleteConfirmChatId, "grove")
+            : undefined
+        }
+        actionsDisabled={isDeletingChat}
+        compactActions
+        variant="danger"
+        onConfirm={() => {
+          if (!deleteConfirmChatId || isDeletingChat) return;
+          void handleDeleteChat(
+            deleteConfirmChatId,
+            deleteConfirmTargetCapable ? "agent" : "grove",
+          );
+        }}
+        onCancel={() => {
+          if (!isDeletingChat) {
+            setDeleteConfirmChatId(null);
+            setDeleteConfirmTargetCapable(false);
+            setDeleteError(null);
+          }
+        }}
+      />
       <ConfirmDialog
         isOpen={reconnectConfirmOpen}
         title="Reconnect Session"

@@ -55,6 +55,9 @@ pub struct AcpSessionHandle {
     chat_id: Option<String>,
     /// load_session 期间抑制 emit（只恢复 agent 内部状态，不转发回放通知）
     suppress_emit: std::sync::atomic::AtomicBool,
+    /// Import 的 session/load 回放需要保留 Agent 发回的用户消息。普通会话
+    /// 仍忽略该 echo，避免与 Grove 在 Prompt 时写入的 UserMessage 重复。
+    replay_user_messages: std::sync::atomic::AtomicBool,
     /// 待执行消息队列（agent 完成当前任务后自动发送下一条）
     pending_queue: Mutex<Vec<QueuedMessage>>,
     /// 队列暂停标志（用户正在编辑队列消息时暂停 auto-send）
@@ -125,6 +128,7 @@ pub struct AcpSessionHandle {
     /// agent 是否在 initialize 响应里声明了 `session.fork` 能力
     /// (`unstable_session_fork`)。前端据此显示/隐藏 Fork 按钮。
     pub fork_capable: std::sync::atomic::AtomicBool,
+    pub import_capable: std::sync::atomic::AtomicBool,
     /// agent 是否在 initialize 响应里声明了稳定的 `session.delete` 能力。
     /// 删 chat 时若为 true 且连接活跃,
     /// best-effort 调 `session/delete` 把 agent 那边的 session 也删掉。
@@ -194,6 +198,24 @@ enum AcpCommand {
     DeleteSession {
         reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
+    ListSessions {
+        cursor: Option<String>,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<SessionListPage, String>>,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ListedSession {
+    pub session_id: String,
+    pub cwd: String,
+    pub title: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionListPage {
+    pub sessions: Vec<ListedSession>,
+    pub next_cursor: Option<String>,
 }
 
 /// 从 agent 接收的流式更新
@@ -225,6 +247,10 @@ pub enum AcpUpdate {
         /// (`unstable_session_fork`)。老 history.jsonl 没这个字段时反序列化为 false。
         #[serde(default)]
         fork_capable: bool,
+        #[serde(default)]
+        import_capable: bool,
+        #[serde(default)]
+        delete_capable: bool,
         /// initialize.authMethods，供 More 菜单按 Agent 声明展示 Login。
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         auth_methods: Vec<AuthMethodInfo>,
@@ -505,6 +531,8 @@ pub enum ContentBlockData {
         uri: String,
         mime_type: Option<String>,
         text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blob: Option<String>,
     },
 }
 
@@ -692,6 +720,8 @@ pub struct AcpStartConfig {
     /// to avoid a disconnected→connecting flicker) so the WS doesn't carry a
     /// duplicate event.
     pub suppress_initial_connecting: bool,
+    /// True only for the WebSocket opened directly by the Import action.
+    pub import_session: bool,
     /// Custom Agent (persona) seed: injected as the first prompt on **create**
     /// path only. Resume / Load paths intentionally skip this — the prompt is
     /// already in chat history. Wrapped in a `<grove-meta>` envelope of type
@@ -1692,10 +1722,20 @@ async fn handle_session_notification(
                 }
             }
         }
-        acp::SessionUpdate::UserMessageChunk(_) => {
-            // Intentionally ignored: Grove already emits UserMessage
-            // when AcpCommand::Prompt is received in run_acp_session's loop.
-            // Processing this agent echo would duplicate every user message.
+        acp::SessionUpdate::UserMessageChunk(chunk) => {
+            if state
+                .handle
+                .replay_user_messages
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let (text, attachments) = content_block_to_user_message(&chunk.content);
+                state.handle.emit(AcpUpdate::UserMessage {
+                    text,
+                    attachments,
+                    sender: None,
+                    terminal: false,
+                });
+            }
         }
         acp::SessionUpdate::CurrentModeUpdate(update) => {
             let mode_id = update.current_mode_id.to_string();
@@ -1918,6 +1958,63 @@ pub fn content_block_to_text(block: &acp::ContentBlock) -> String {
     }
 }
 
+/// Preserve the original ACP content block when replaying user history from
+/// `session/load`. Text remains message text; every non-text block travels as
+/// a structured attachment so the frontend can render the same user turn.
+fn content_block_to_user_message(block: &acp::ContentBlock) -> (String, Vec<ContentBlockData>) {
+    let attachment = match block {
+        acp::ContentBlock::Text(text) => return (text.text.clone(), Vec::new()),
+        acp::ContentBlock::Image(image) => ContentBlockData::Image {
+            data: image.data.clone(),
+            mime_type: image.mime_type.clone(),
+            label: image.uri.clone(),
+        },
+        acp::ContentBlock::Audio(audio) => ContentBlockData::Audio {
+            data: audio.data.clone(),
+            mime_type: audio.mime_type.clone(),
+            label: audio
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        },
+        acp::ContentBlock::ResourceLink(resource) => ContentBlockData::ResourceLink {
+            uri: resource.uri.clone(),
+            name: resource.name.clone(),
+            mime_type: resource.mime_type.clone(),
+            size: resource.size,
+            title: resource.title.clone(),
+            description: resource.description.clone(),
+            label: resource
+                .title
+                .clone()
+                .or_else(|| Some(resource.name.clone())),
+        },
+        acp::ContentBlock::Resource(resource) => match &resource.resource {
+            acp::EmbeddedResourceResource::TextResourceContents(contents) => {
+                ContentBlockData::Resource {
+                    uri: contents.uri.clone(),
+                    mime_type: contents.mime_type.clone(),
+                    text: Some(contents.text.clone()),
+                    blob: None,
+                }
+            }
+            acp::EmbeddedResourceResource::BlobResourceContents(contents) => {
+                ContentBlockData::Resource {
+                    uri: contents.uri.clone(),
+                    mime_type: contents.mime_type.clone(),
+                    text: None,
+                    blob: Some(contents.blob.clone()),
+                }
+            }
+            _ => return (String::new(), Vec::new()),
+        },
+        _ => return (String::new(), Vec::new()),
+    };
+    (String::new(), vec![attachment])
+}
+
 /// 将 ContentBlockData 转换为 ACP ContentBlock
 fn to_acp_content_block(block: &ContentBlockData) -> acp::ContentBlock {
     match block {
@@ -1965,14 +2062,22 @@ fn to_acp_content_block(block: &ContentBlockData) -> acp::ContentBlock {
         }
         ContentBlockData::Resource {
             uri,
-            mime_type: _,
+            mime_type,
             text,
-        } => acp::ContentBlock::Resource(acp::EmbeddedResource::new(
-            acp::EmbeddedResourceResource::TextResourceContents(acp::TextResourceContents::new(
-                text.clone().unwrap_or_default(),
-                uri,
-            )),
-        )),
+            blob,
+        } => {
+            let resource = if let Some(blob) = blob {
+                acp::EmbeddedResourceResource::BlobResourceContents(
+                    acp::BlobResourceContents::new(blob, uri).mime_type(mime_type.clone()),
+                )
+            } else {
+                acp::EmbeddedResourceResource::TextResourceContents(
+                    acp::TextResourceContents::new(text.clone().unwrap_or_default(), uri)
+                        .mime_type(mime_type.clone()),
+                )
+            };
+            acp::ContentBlock::Resource(acp::EmbeddedResource::new(resource))
+        }
     }
 }
 
@@ -2151,6 +2256,9 @@ pub async fn get_or_start_session(
                     task_id: config.task_id.clone(),
                     chat_id: config.chat_id.clone(),
                     suppress_emit: std::sync::atomic::AtomicBool::new(false),
+                    replay_user_messages: std::sync::atomic::AtomicBool::new(
+                        config.import_session,
+                    ),
                     pending_queue: Mutex::new(Vec::new()),
                     queue_paused: std::sync::atomic::AtomicBool::new(false),
                     queue_mode: Mutex::new(QueueMode::default()),
@@ -2173,6 +2281,7 @@ pub async fn get_or_start_session(
                     pending_auth_retry: Mutex::new(None),
                     pending_auth: Mutex::new(None),
                     fork_capable: std::sync::atomic::AtomicBool::new(false),
+                    import_capable: std::sync::atomic::AtomicBool::new(false),
                     delete_capable: std::sync::atomic::AtomicBool::new(false),
                     close_capable: std::sync::atomic::AtomicBool::new(false),
                 });
@@ -2921,6 +3030,15 @@ async fn drive_session(
     handle
         .fork_capable
         .store(fork_capable, std::sync::atomic::Ordering::Relaxed);
+    let import_capable = init_resp
+        .agent_capabilities
+        .session_capabilities
+        .list
+        .is_some()
+        && supports_load;
+    handle
+        .import_capable
+        .store(import_capable, std::sync::atomic::Ordering::Relaxed);
 
     // Delete 是稳定能力:agent 声明 session.delete 即可。
     // 删 chat 时若连接活跃,best-effort 调 session/delete 删掉 agent 侧 session。
@@ -3057,6 +3175,9 @@ async fn drive_session(
                                 ));
                             }
                             Some(AcpCommand::Cancel | AcpCommand::RetryAuthentication) => {}
+                            Some(AcpCommand::ListSessions { reply, .. }) => {
+                                let _ = reply.send(Err("session/list unavailable during authentication".into()));
+                            }
                         }
                     }
                 };
@@ -3139,6 +3260,9 @@ async fn drive_session(
                                 ));
                             }
                             Some(AcpCommand::Cancel | AcpCommand::RetryAuthentication) => {}
+                            Some(AcpCommand::ListSessions { reply, .. }) => {
+                                let _ = reply.send(Err("session/list unavailable during authentication".into()));
+                            }
                         }
                     }
                 }
@@ -3280,11 +3404,47 @@ async fn drive_session(
         }};
     }
 
-    let session_id = match (saved_id, supports_resume, supports_load) {
+    let session_id = match (
+        saved_id,
+        supports_resume,
+        supports_load,
+        config.import_session,
+    ) {
+        // Import is the only path that intentionally exposes session/load replay.
+        // It is selected by an ephemeral flag on this WebSocket connection only.
+        (Some(saved_id), _, true, true) => {
+            let mcp_servers =
+                build_mcp_servers(&config.env_vars, agent_graph_token, supports_mcp_http)
+                    .map_err(to_acp_err)?;
+            let resp = conn
+                .send_request(
+                    acp::LoadSessionRequest::new(
+                        acp::SessionId::new(&*saved_id),
+                        &config.working_dir,
+                    )
+                    .additional_directories(Vec::<PathBuf>::new())
+                    .mcp_servers(mcp_servers),
+                )
+                .block_task()
+                .await
+                .map_err(|error| {
+                    acp::Error::internal_error().data(format!("Import session failed: {error}"))
+                })?;
+            (available_modes, current_mode_id) =
+                extract_modes(&resp.modes, resp.config_options.as_deref().unwrap_or(&[]));
+            (available_models, current_model_id, model_config_id) =
+                extract_models(resp.config_options.as_deref().unwrap_or(&[]));
+            (
+                available_thought_levels,
+                current_thought_level_id,
+                thought_level_config_id,
+            ) = extract_thought_level(resp.config_options.as_deref().unwrap_or(&[]));
+            saved_id
+        }
         // Resume 路线(优先):agent 支持 session/resume。不 replay 历史,所以
         // 完全不需要 suppress_emit + 300ms 那套抛弃 agent 回放的机制 — 直接发
         // ResumeSessionRequest,Grove 照常从磁盘加载自己的历史。
-        (Some(saved_id), true, _) => {
+        (Some(saved_id), true, _, false) => {
             let mcp_servers =
                 build_mcp_servers(&config.env_vars, agent_graph_token, supports_mcp_http)
                     .map_err(to_acp_err)?;
@@ -3330,7 +3490,7 @@ async fn drive_session(
         // replay 在 LoadSessionResponse **之后**才异步流式发出,固定时间窗口抓不住
         // → suppress 保持 true,直到 cmd loop 收到首个用户 prompt 才解除(见 Prompt
         // arm)。恢复 session 后、用户发新消息前,agent 主动 emit 的只可能是 replay。
-        (Some(saved_id), false, true) => {
+        (Some(saved_id), false, true, false) => {
             handle
                 .suppress_emit
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3377,9 +3537,16 @@ async fn drive_session(
         // Existing Grove history remains the source of truth even when the
         // Agent cannot restore its own session. Start a fresh Agent session,
         // but never erase the user's locally persisted conversation.
-        (Some(_), false, false) => create_new_session!(true),
+        (Some(_), _, false, true) => {
+            return Err(acp::Error::internal_error()
+                .data("Agent does not support session/load required for import"));
+        }
+        (Some(_), false, false, false) => create_new_session!(true),
         // A genuinely new chat starts from an empty local history.
-        (None, _, _) => create_new_session!(false),
+        (None, _, _, true) => {
+            return Err(acp::Error::internal_error().data("Imported session id is missing"));
+        }
+        (None, _, _, false) => create_new_session!(false),
     };
 
     let session_id_arc = acp::SessionId::new(&*session_id);
@@ -3429,6 +3596,8 @@ async fn drive_session(
         thought_level_config_id,
         prompt_capabilities: prompt_capabilities.clone(),
         fork_capable,
+        import_capable,
+        delete_capable,
         auth_methods: handle
             .auth_methods
             .lock()
@@ -3447,6 +3616,12 @@ async fn drive_session(
                 terminal,
                 config: prompt_config,
             } => {
+                // Import replay is complete once the user starts a new turn.
+                // From here on UserMessageChunk is a normal Agent echo and
+                // must be ignored to avoid duplicating Grove's own message.
+                handle
+                    .replay_user_messages
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 // load 路线:首个用户 prompt 到来即解除 replay 抑制。此前 agent 的
                 // 主动 emit 都是 load replay(Grove 已从磁盘显示历史),从这条新消息
                 // 起恢复正常。必须在下面第一个 emit(UserMessage) 之前。幂等:
@@ -3708,6 +3883,9 @@ async fn drive_session(
                                     let _ = reply.send(Err(
                                         "Cannot delete while agent is busy".to_string(),
                                     ));
+                                }
+                                AcpCommand::ListSessions { reply, .. } => {
+                                    let _ = reply.send(Err("session/list unavailable while busy".into()));
                                 }
                             }
                         }
@@ -3978,6 +4156,9 @@ async fn drive_session(
                                     ));
                                 }
                                 Some(AcpCommand::Cancel | AcpCommand::RetryAuthentication) => {}
+                                Some(AcpCommand::ListSessions { reply, .. }) => {
+                                    let _ = reply.send(Err("session/list unavailable during authentication".into()));
+                                }
                             }
                         }
                     }
@@ -4062,6 +4243,31 @@ async fn drive_session(
                     Ok(_) => Ok(()),
                     Err(e) => Err(format!("session/delete failed: {}", e)),
                 };
+                let _ = reply.send(outcome);
+            }
+            AcpCommand::ListSessions { cursor, reply } => {
+                let outcome = conn
+                    .send_request(
+                        acp::ListSessionsRequest::new()
+                            .cwd(config.working_dir.clone())
+                            .cursor(cursor),
+                    )
+                    .block_task()
+                    .await
+                    .map(|response| SessionListPage {
+                        sessions: response
+                            .sessions
+                            .into_iter()
+                            .map(|session| ListedSession {
+                                session_id: session.session_id.to_string(),
+                                cwd: session.cwd.to_string_lossy().to_string(),
+                                title: session.title,
+                                updated_at: session.updated_at.map(|value| value.to_string()),
+                            })
+                            .collect(),
+                        next_cursor: response.next_cursor,
+                    })
+                    .map_err(|error| format!("session/list failed: {error}"));
                 let _ = reply.send(outcome);
             }
             AcpCommand::Kill => {
@@ -4774,6 +4980,31 @@ impl AcpSessionHandle {
         }
     }
 
+    pub async fn list_sessions(
+        &self,
+        cursor: Option<String>,
+    ) -> crate::error::Result<SessionListPage> {
+        if !self
+            .import_capable
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(crate::error::GroveError::Session(
+                "Agent does not support session import".into(),
+            ));
+        }
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(AcpCommand::ListSessions { cursor, reply })
+            .await
+            .map_err(|_| crate::error::GroveError::Session("ACP session closed".into()))?;
+        result
+            .await
+            .map_err(|_| {
+                crate::error::GroveError::Session("session/list request was dropped".into())
+            })?
+            .map_err(crate::error::GroveError::Session)
+    }
+
     /// 订阅更新流
     pub fn subscribe(&self) -> broadcast::Receiver<AcpUpdate> {
         self.update_tx.subscribe()
@@ -5310,6 +5541,7 @@ pub fn new_handle_for_test(
         task_id: task_id.to_string(),
         chat_id: Some(chat_id.to_string()),
         suppress_emit: std::sync::atomic::AtomicBool::new(false),
+        replay_user_messages: std::sync::atomic::AtomicBool::new(false),
         pending_queue: Mutex::new(Vec::new()),
         queue_paused: std::sync::atomic::AtomicBool::new(false),
         queue_mode: Mutex::new(QueueMode::default()),
@@ -5332,6 +5564,7 @@ pub fn new_handle_for_test(
         pending_auth_retry: Mutex::new(None),
         pending_auth: Mutex::new(None),
         fork_capable: std::sync::atomic::AtomicBool::new(false),
+        import_capable: std::sync::atomic::AtomicBool::new(false),
         delete_capable: std::sync::atomic::AtomicBool::new(false),
         close_capable: std::sync::atomic::AtomicBool::new(false),
     });

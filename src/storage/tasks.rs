@@ -619,6 +619,17 @@ pub fn load_chat_sessions(project: &str, task_id: &str) -> Result<Vec<ChatSessio
     Ok(chats)
 }
 
+pub fn load_acp_session_ids_for_agent(agent: &str) -> Result<std::collections::HashSet<String>> {
+    let conn = crate::storage::database::connection();
+    let mut stmt = conn.prepare(
+        "SELECT acp_session_id FROM session WHERE agent = ?1 AND acp_session_id IS NOT NULL",
+    )?;
+    let ids = stmt
+        .query_map(params![agent], |row| row.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(ids)
+}
+
 /// 添加 ChatSession
 pub fn add_chat_session(project: &str, task_id: &str, chat: ChatSession) -> Result<()> {
     let conn = crate::storage::database::connection();

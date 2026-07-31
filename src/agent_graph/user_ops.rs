@@ -132,6 +132,7 @@ pub async fn user_spawn_node(
         remote_url: resolved.url,
         remote_auth: resolved.auth_header,
         suppress_initial_connecting: true,
+        import_session: false,
         persona_injection,
     };
 

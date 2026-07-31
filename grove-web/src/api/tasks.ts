@@ -516,6 +516,18 @@ export interface ChatSessionResponse {
   launch_mode: string;
 }
 
+export interface ImportableSession {
+  session_id: string;
+  cwd: string;
+  title?: string;
+  updated_at?: string;
+}
+
+export interface ImportSessionsPage {
+  sessions: ImportableSession[];
+  next_cursor?: string;
+}
+
 interface ChatListResponse {
   chats: ChatSessionResponse[];
 }
@@ -791,16 +803,36 @@ export async function forkChat(
   );
 }
 
+export function listImportSessions(projectId: string, taskId: string, chatId: string, cursor?: string) {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+  return apiClient.get<ImportSessionsPage>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/import-sessions${query}`,
+  );
+}
+
+export function importSession(
+  projectId: string,
+  taskId: string,
+  chatId: string,
+  session: Pick<ImportableSession, "session_id" | "title">,
+) {
+  return apiClient.post<typeof session, ChatSessionResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/import-sessions`,
+    session,
+  );
+}
+
 /**
  * Delete a chat
  */
 export async function deleteChat(
   projectId: string,
   taskId: string,
-  chatId: string
+  chatId: string,
+  scope: "grove" | "agent" = "grove",
 ): Promise<void> {
   return apiClient.delete(
-    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}`
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}?scope=${scope}`
   );
 }
 

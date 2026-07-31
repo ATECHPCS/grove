@@ -37,6 +37,7 @@ pub async fn execute(agent: String, cwd: String) {
         remote_url: resolved.url,
         remote_auth: resolved.auth_header,
         suppress_initial_connecting: false,
+        import_session: false,
         persona_injection: None,
     };
 

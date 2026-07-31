@@ -3,7 +3,7 @@ import type { MutableRefObject, RefObject } from "react";
 
 interface Params {
   activeChatId: string | null;
-  messagesLength: number;
+  hasMessages: boolean;
   scrollMessagesToBottom: (behavior: "auto" | "smooth") => void;
   // Refs that are owned by TaskChat but flipped here as part of the chat-
   // switch positioning sequence.
@@ -33,7 +33,7 @@ interface Result {
  */
 export function useChatPositioning({
   activeChatId,
-  messagesLength,
+  hasMessages,
   scrollMessagesToBottom,
   initialPinChatIdRef,
   suppressNextSmoothScrollRef,
@@ -46,7 +46,11 @@ export function useChatPositioning({
   const onPositionedAtBottomRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
-    if (messagesLength === 0) return;
+    if (!hasMessages) {
+      initialPinChatIdRef.current = null;
+      const resetTimer = window.setTimeout(() => setChatPositioning(false), 0);
+      return () => window.clearTimeout(resetTimer);
+    }
     if (initialPinChatIdRef.current === activeChatId) return;
     initialPinChatIdRef.current = activeChatId;
     suppressNextSmoothScrollRef.current = true;
@@ -90,7 +94,7 @@ export function useChatPositioning({
     };
   }, [
     activeChatId,
-    messagesLength,
+    hasMessages,
     scrollMessagesToBottom,
     initialPinChatIdRef,
     suppressNextSmoothScrollRef,

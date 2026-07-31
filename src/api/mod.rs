@@ -284,6 +284,10 @@ pub fn create_api_router() -> Router {
             "/projects/{id}/tasks/{taskId}/chats/{chatId}/attachments",
             post(handlers::acp::upload_chat_attachment),
         )
+        .route(
+            "/projects/{id}/tasks/{taskId}/chats/{chatId}/import-sessions",
+            get(handlers::acp::list_import_sessions).post(handlers::acp::import_session),
+        )
         // Chat WebSocket (per-chat)
         .route(
             "/projects/{id}/tasks/{taskId}/chats/{chatId}/ws",

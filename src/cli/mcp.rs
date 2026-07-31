@@ -2823,6 +2823,7 @@ async fn start_chat_impl(p: StartChatParams) -> Result<CallToolResult, McpError>
         remote_url: resolved.url,
         remote_auth: resolved.auth_header,
         suppress_initial_connecting: false,
+        import_session: false,
         persona_injection: None,
     };
 
@@ -2878,6 +2879,7 @@ async fn resolve_session_access(
         remote_url: resolved.url,
         remote_auth: resolved.auth_header,
         suppress_initial_connecting: false,
+        import_session: false,
         persona_injection: None,
     };
 

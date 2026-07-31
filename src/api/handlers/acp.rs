@@ -122,6 +122,8 @@ enum ServerMessage {
         prompt_capabilities: PromptCapabilitiesData,
         /// agent 是否声明了 `session.fork` 能力 — 前端据此显示 Fork 按钮
         fork_capable: bool,
+        import_capable: bool,
+        delete_capable: bool,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         auth_methods: Vec<AuthMethodMsg>,
         logout_capable: bool,
@@ -361,6 +363,8 @@ impl From<AcpUpdate> for ServerMessage {
                 thought_level_config_id,
                 prompt_capabilities,
                 fork_capable,
+                import_capable,
+                delete_capable,
                 auth_methods,
                 logout_capable,
             } => ServerMessage::SessionReady {
@@ -385,6 +389,8 @@ impl From<AcpUpdate> for ServerMessage {
                 thought_level_config_id,
                 prompt_capabilities,
                 fork_capable,
+                import_capable,
+                delete_capable,
                 auth_methods: auth_methods
                     .into_iter()
                     .map(|method| AuthMethodMsg {
@@ -696,6 +702,12 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                     fork_capable: handle
                         .fork_capable
                         .load(std::sync::atomic::Ordering::Relaxed),
+                    import_capable: handle
+                        .import_capable
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    delete_capable: handle
+                        .delete_capable
+                        .load(std::sync::atomic::Ordering::Relaxed),
                     auth_methods: handle
                         .auth_methods
                         .lock()
@@ -733,6 +745,12 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                     prompt_capabilities: PromptCapabilitiesData::default(),
                     fork_capable: handle
                         .fork_capable
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    import_capable: handle
+                        .import_capable
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    delete_capable: handle
+                        .delete_capable
                         .load(std::sync::atomic::Ordering::Relaxed),
                     auth_methods: handle
                         .auth_methods
@@ -1056,6 +1074,7 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
 
 /// Error type for ACP handler
 pub enum AcpError {
+    BadRequest(String),
     NotFound(String),
     Internal(String),
 }
@@ -1063,6 +1082,7 @@ pub enum AcpError {
 impl IntoResponse for AcpError {
     fn into_response(self) -> Response {
         match self {
+            AcpError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             AcpError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
             AcpError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
         }
@@ -1100,6 +1120,11 @@ pub struct CreateChatRequest {
 #[derive(Deserialize)]
 pub struct UpdateChatRequest {
     pub title: String,
+}
+
+#[derive(Default, Deserialize)]
+pub struct DeleteChatQuery {
+    scope: Option<String>,
 }
 
 impl ChatSessionResponse {
@@ -1273,6 +1298,91 @@ pub async fn create_chat(
     )))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ImportSessionsQuery {
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportSessionRequest {
+    session_id: String,
+    title: Option<String>,
+}
+
+fn import_session_title(title: Option<String>) -> String {
+    const MAX_CHARS: usize = 80;
+    let title = title
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| "Imported Session".into());
+    let mut chars = title.trim().chars();
+    let truncated: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{}…", truncated.trim_end())
+    } else {
+        truncated
+    }
+}
+
+pub async fn list_import_sessions(
+    Path((project_id, task_id, chat_id)): Path<(String, String, String)>,
+    Query(query): Query<ImportSessionsQuery>,
+) -> Result<Json<acp::SessionListPage>, AcpError> {
+    let (project_key, _, _) = resolve_project_key(&project_id)?;
+    let chat = tasks::get_chat_session(&project_key, &task_id, &chat_id)
+        .map_err(|e| AcpError::Internal(e.to_string()))?
+        .ok_or_else(|| AcpError::NotFound("Chat not found".into()))?;
+    let key = format!("{project_key}:{task_id}:{chat_id}");
+    let handle = acp::get_session_handle(&key)
+        .ok_or_else(|| AcpError::Internal("Connect the Agent before importing sessions".into()))?;
+    let imported = tasks::load_acp_session_ids_for_agent(&chat.agent)
+        .map_err(|e| AcpError::Internal(e.to_string()))?;
+    let mut cursor = query.cursor;
+    loop {
+        let mut page = handle
+            .list_sessions(cursor)
+            .await
+            .map_err(|e| AcpError::Internal(e.to_string()))?;
+        page.sessions
+            .retain(|session| !imported.contains(&session.session_id));
+        if !page.sessions.is_empty() || page.next_cursor.is_none() {
+            return Ok(Json(page));
+        }
+        cursor = page.next_cursor;
+    }
+}
+
+pub async fn import_session(
+    Path((project_id, task_id, chat_id)): Path<(String, String, String)>,
+    Json(body): Json<ImportSessionRequest>,
+) -> Result<Json<ChatSessionResponse>, AcpError> {
+    let (project_key, _, _) = resolve_project_key(&project_id)?;
+    let source = tasks::get_chat_session(&project_key, &task_id, &chat_id)
+        .map_err(|e| AcpError::Internal(e.to_string()))?
+        .ok_or_else(|| AcpError::NotFound("Chat not found".into()))?;
+    let chat = tasks::ChatSession {
+        id: tasks::generate_chat_id(),
+        title: import_session_title(body.title),
+        agent: source.agent,
+        acp_session_id: Some(body.session_id),
+        created_at: chrono::Utc::now(),
+        duty: None,
+        launch_mode: "acp".into(),
+    };
+    tasks::add_chat_session(&project_key, &task_id, chat.clone())
+        .map_err(|e| AcpError::Internal(e.to_string()))?;
+    crate::api::handlers::walkie_talkie::broadcast_radio_event(
+        crate::api::handlers::walkie_talkie::RadioEvent::ChatListChanged {
+            project_id,
+            task_id: task_id.clone(),
+        },
+    );
+    Ok(Json(ChatSessionResponse::build(
+        &project_key,
+        &task_id,
+        &chat,
+    )))
+}
+
 /// Update a chat's title
 pub async fn update_chat(
     Path((project_id, task_id, chat_id)): Path<(String, String, String)>,
@@ -1332,23 +1442,41 @@ pub async fn update_chat(
 /// Delete a chat (and kill its ACP session if running)
 pub async fn delete_chat(
     Path((project_id, task_id, chat_id)): Path<(String, String, String)>,
+    Query(query): Query<DeleteChatQuery>,
 ) -> Result<StatusCode, AcpError> {
     let (project_key, _, _) = resolve_project_key(&project_id)?;
 
     let session_key = format!("{}:{}:{}", project_key, task_id, chat_id);
 
-    // best-effort:若该 chat 当前有活跃 ACP 连接且 agent 声明支持 session/delete,
-    // 先让 agent 删掉它那边的 session,再 kill 连接(kill 会关掉连接,故必须在前)。
-    // 失败 / 超时 / agent busy 一律忽略 —— 不阻塞 grove 本地删除。
-    if let Some(handle) = acp::get_session_handle(&session_key) {
-        if handle
+    let scope = query.scope.as_deref().unwrap_or("grove");
+    if !matches!(scope, "grove" | "agent") {
+        return Err(AcpError::BadRequest(format!(
+            "Unsupported delete scope: {scope}"
+        )));
+    }
+
+    // Agent deletion is explicit and fail-closed. Never fall through to a
+    // local deletion when the Agent request was unavailable, unsupported, or
+    // failed: the two choices in the confirmation dialog must mean exactly
+    // what they say.
+    if scope == "agent" {
+        let handle = acp::get_session_handle(&session_key).ok_or_else(|| {
+            AcpError::BadRequest(
+                "Delete from Agent requires an active session connection".to_string(),
+            )
+        })?;
+        if !handle
             .delete_capable
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(5), handle.delete_session())
-                    .await;
+            return Err(AcpError::BadRequest(
+                "This Agent does not support session deletion".to_string(),
+            ));
         }
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.delete_session())
+            .await
+            .map_err(|_| AcpError::Internal("Agent session deletion timed out".to_string()))?
+            .map_err(|error| AcpError::Internal(error.to_string()))?;
     }
 
     // Kill the ACP session for this chat if running
@@ -1553,10 +1681,17 @@ pub async fn upload_chat_attachment(
 
 // ─── Chat WebSocket Handler ─────────────────────────────────────────────────
 
+#[derive(Default, Deserialize)]
+pub struct ImportConnectQuery {
+    #[serde(default)]
+    import: bool,
+}
+
 /// WebSocket upgrade handler for per-chat ACP sessions
 pub async fn chat_ws_handler(
     ws: WebSocketUpgrade,
     Path((project_id, task_id, chat_id)): Path<(String, String, String)>,
+    Query(query): Query<ImportConnectQuery>,
 ) -> Result<Response, AcpError> {
     let (project_key, project_path, project_name) = resolve_project_key(&project_id)?;
 
@@ -1657,6 +1792,7 @@ pub async fn chat_ws_handler(
         remote_url: resolved.url,
         remote_auth: resolved.auth_header,
         suppress_initial_connecting: false,
+        import_session: query.import,
         persona_injection,
     };
 
