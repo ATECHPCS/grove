@@ -6,31 +6,30 @@ describe("extractEditToolPaths", () => {
   it("prefers explicit ACP locations", () => {
     expect(extractEditToolPaths({
       locations: [{ path: "/repo/src/client.ts" }],
-      rawInput: { file_path: "src/client.ts", path: "src/duplicate.ts" },
+      input: [{ label: "Path", value: "src/duplicate.ts" }],
     })).toEqual(["/repo/src/client.ts"]);
   });
 
   it("extracts common edit-tool path fields", () => {
     expect(extractEditToolPaths({
-      rawInput: {
-        edits: [
-          { file_path: "src/client.ts" },
-          { path: "src/server.ts" },
-        ],
-      },
+      input: [
+        { label: "Edits · File path", value: "src/client.ts" },
+        { label: "Edits · Path", value: "src/server.ts" },
+      ],
     })).toEqual(["src/client.ts", "src/server.ts"]);
   });
 
   it("extracts every file from an apply_patch request", () => {
     expect(extractEditToolPaths({
-      rawInput: {
-        patch: [
+      input: [{
+        label: "Patch",
+        value: [
           "*** Begin Patch",
           "*** Update File: src/client.ts",
           "*** Add File: src/profile.ts",
           "*** End Patch",
         ].join("\n"),
-      },
+      }],
     })).toEqual(["src/client.ts", "src/profile.ts"]);
   });
 

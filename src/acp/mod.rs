@@ -39,6 +39,12 @@ pub struct AcpSessionHandle {
     pub key: String,
     pub update_tx: broadcast::Sender<AcpUpdate>,
     cmd_tx: mpsc::Sender<AcpCommand>,
+    /// Out-of-band shutdown signal for the whole ACP transport/process.
+    ///
+    /// This must not share the command queue: the command loop can be blocked
+    /// awaiting an Agent RPC (notably `session/delete`), in which case a queued
+    /// `Kill` cannot be observed until that RPC has already completed.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// Agent info stored after initialization: (session_id, name, version)
     pub agent_info: std::sync::RwLock<Option<(String, String, String)>>,
     /// 待处理的权限请求响应 channel + 它的 id（来源是 ACP tool_call.id）。
@@ -116,6 +122,13 @@ pub struct AcpSessionHandle {
     /// `respond_permission`. Only meaningful while `has_pending_permission()`
     /// is true; consumers must gate on that to avoid reading stale data.
     last_permission_info: Mutex<Option<crate::api::handlers::walkie_talkie::PermissionInfo>>,
+    /// Tool calls in the current turn that have not reached a terminal status.
+    /// Used to apply ACP's preemptive client-side cancellation semantics.
+    active_tool_calls: Mutex<std::collections::HashSet<String>>,
+    /// True from the moment `session/cancel` is sent until the current prompt
+    /// resolves. Permission requests arriving in that window are immediately
+    /// answered with the protocol-level `cancelled` outcome.
+    cancel_requested: std::sync::atomic::AtomicBool,
     /// agent 在 initialize 响应里声明的登录方法。空 = 未声明 / 不需要。
     /// 收到 `AuthRequired (-32000)` 时,client 用这里的第一个 id 走 `authenticate`。
     pub auth_methods: Mutex<Vec<AuthMethodInfo>>,
@@ -129,9 +142,9 @@ pub struct AcpSessionHandle {
     /// (`unstable_session_fork`)。前端据此显示/隐藏 Fork 按钮。
     pub fork_capable: std::sync::atomic::AtomicBool,
     pub import_capable: std::sync::atomic::AtomicBool,
-    /// agent 是否在 initialize 响应里声明了稳定的 `session.delete` 能力。
-    /// 删 chat 时若为 true 且连接活跃,
-    /// best-effort 调 `session/delete` 把 agent 那边的 session 也删掉。
+    /// agent 是否声明了 `session.delete` 能力。
+    /// 用户明确选择 Agent deletion 时，Grove 先等待 `session/delete`
+    /// 成功，再删除本地 Chat。
     pub delete_capable: std::sync::atomic::AtomicBool,
     /// agent 是否在 initialize 响应里声明了 `session.close` 能力。
     /// tear down 一个 session 前若为 true,先发 `session/close` 让 agent
@@ -260,6 +273,9 @@ pub enum AcpUpdate {
     },
     /// Agent 消息文本片段
     MessageChunk { text: String },
+    /// Agent 消息中的结构化内容片段。Text 继续使用 MessageChunk 兼容旧历史；
+    /// Image / Audio / ResourceLink / EmbeddedResource 保留完整 payload。
+    MessageContentChunk { content: ContentBlockData },
     /// Agent 思考过程片段
     ThoughtChunk { text: String },
     /// 工具调用开始
@@ -286,6 +302,51 @@ pub enum AcpUpdate {
         /// 才透出 — 这里也带上,前端按更新覆盖。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         raw_input: Option<serde_json::Value>,
+    },
+    /// Complete ACP v1 tool snapshot. Kept separate from legacy Grove events so
+    /// old string-delta history remains readable without changing its semantics.
+    ToolCallV1 {
+        id: String,
+        title: String,
+        kind: String,
+        status: String,
+        content: Option<String>,
+        #[serde(default)]
+        input: Vec<ToolCallInputData>,
+        #[serde(default, rename = "raw_input", skip_serializing)]
+        legacy_raw_input: Option<serde_json::Value>,
+        #[serde(default, rename = "raw_output", skip_serializing)]
+        legacy_raw_output: Option<serde_json::Value>,
+        #[serde(default, alias = "tool_content")]
+        output: Vec<ToolCallContentData>,
+        locations: Vec<(String, Option<u32>)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<DateTime<Utc>>,
+    },
+    /// Partial ACP v1 update. Optional fields preserve omitted-vs-present, and
+    /// collection values replace the previous snapshot, including empty clears.
+    ToolCallUpdateV1 {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<Vec<ToolCallContentData>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        locations: Option<Vec<(String, Option<u32>)>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<Vec<ToolCallInputData>>,
+        #[serde(default, rename = "raw_input", skip_serializing)]
+        legacy_raw_input: Option<serde_json::Value>,
+        #[serde(default, rename = "raw_output", skip_serializing)]
+        legacy_raw_output: Option<serde_json::Value>,
+        #[serde(default, rename = "content", skip_serializing)]
+        legacy_content: Option<serde_json::Value>,
     },
     /// 权限请求（带选项，等待用户交互）。`id` 是 ACP tool_call.id，
     /// 用于把后续的 PermissionResponse 精确对应到这条 Request；老历史里的
@@ -430,7 +491,7 @@ pub struct UsageCost {
 /// Per-turn token accounting (from ACP `PromptResponse.usage`). Persisted
 /// alongside `Complete` events in chat history so the UI can render a
 /// per-message meta row, and inserted into `chat_token_usage` for stats.
-/// Per ACP, fields are *this turn's* delta — not session totals.
+/// Per ACP, fields are this prompt turn's usage, not session totals.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct TurnUsage {
     pub input_tokens: u64,
@@ -509,6 +570,8 @@ pub enum ContentBlockData {
         data: String,
         mime_type: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        uri: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
     Audio {
@@ -534,6 +597,56 @@ pub enum ContentBlockData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         blob: Option<String>,
     },
+}
+
+/// Lossless Grove representation of ACP v1 `ToolCallContent`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolCallContentData {
+    Content {
+        content: ContentBlockData,
+    },
+    Diff {
+        path: String,
+        old_text: Option<String>,
+        new_text: String,
+        /// Adapter-formatted text retained for compact summaries and legacy UI.
+        display_text: String,
+    },
+    Terminal {
+        terminal_id: String,
+    },
+}
+
+/// User-facing tool input after Grove removes transport metadata and assigns
+/// readable labels. ACP's opaque rawInput never leaves the protocol boundary.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ToolCallInputData {
+    pub label: String,
+    pub value: String,
+}
+
+fn validate_prompt_content(
+    capabilities: &PromptCapabilitiesData,
+    attachments: &[ContentBlockData],
+) -> Result<(), String> {
+    for block in attachments {
+        let unsupported = match block {
+            ContentBlockData::Image { .. } if !capabilities.image => Some("image"),
+            ContentBlockData::Audio { .. } if !capabilities.audio => Some("audio"),
+            ContentBlockData::Resource { .. } if !capabilities.embedded_context => {
+                Some("embedded resource")
+            }
+            ContentBlockData::Text { .. } | ContentBlockData::ResourceLink { .. } => None,
+            _ => None,
+        };
+        if let Some(content_type) = unsupported {
+            return Err(format!(
+                "Prompt not sent — the Agent did not advertise support for {content_type} content"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 队列合并发送模式：Separate = 逐条按原队列顺序发送（默认）；
@@ -1287,6 +1400,15 @@ async fn handle_request_permission(
     args: acp::RequestPermissionRequest,
 ) -> acp::Result<acp::RequestPermissionResponse> {
     let _guard = state.handle.permission_lock.lock().await;
+    if state
+        .handle
+        .cancel_requested
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Ok(acp::RequestPermissionResponse::new(
+            acp::RequestPermissionOutcome::Cancelled,
+        ));
+    }
 
     let request_id = args.tool_call.tool_call_id.to_string();
     let title = args.tool_call.fields.title.clone().unwrap_or_default();
@@ -1487,22 +1609,29 @@ async fn handle_session_notification(
 ) -> acp::Result<(), acp::Error> {
     match args.update {
         acp::SessionUpdate::AgentMessageChunk(chunk) => {
-            let text = content_block_to_text(&chunk.content);
-            if let Ok(mut buf) = state.handle.last_assistant_text.lock() {
-                // 若上一段文本之后夹过 tool_call，则在续写新文本前补段落分隔，
-                // 与前端「tool 边界另起气泡」的行为对齐。连续文本块（无 tool
-                // 间隔）仍直接拼接。
-                if state
-                    .handle
-                    .pending_text_separator
-                    .swap(false, std::sync::atomic::Ordering::Relaxed)
-                    && !buf.is_empty()
-                {
-                    buf.push_str("\n\n");
+            if let acp::ContentBlock::Text(text) = &chunk.content {
+                if let Ok(mut buf) = state.handle.last_assistant_text.lock() {
+                    // 若上一段文本之后夹过 tool_call，则在续写新文本前补段落分隔，
+                    // 与前端「tool 边界另起气泡」的行为对齐。连续文本块（无 tool
+                    // 间隔）仍直接拼接。
+                    if state
+                        .handle
+                        .pending_text_separator
+                        .swap(false, std::sync::atomic::Ordering::Relaxed)
+                        && !buf.is_empty()
+                    {
+                        buf.push_str("\n\n");
+                    }
+                    buf.push_str(&text.text);
                 }
-                buf.push_str(&text);
+                state.handle.emit(AcpUpdate::MessageChunk {
+                    text: text.text.clone(),
+                });
+            } else if let Some(content) = content_block_to_data(&chunk.content) {
+                state
+                    .handle
+                    .emit(AcpUpdate::MessageContentChunk { content });
             }
-            state.handle.emit(AcpUpdate::MessageChunk { text });
         }
         acp::SessionUpdate::AgentThoughtChunk(chunk) => {
             let text = content_block_to_text(&chunk.content);
@@ -1514,12 +1643,24 @@ async fn handle_session_notification(
             }
         }
         acp::SessionUpdate::ToolCall(tool_call) => {
+            let tool_call_id = tool_call.tool_call_id.to_string();
+            {
+                let mut active = state.handle.active_tool_calls.lock().unwrap();
+                if matches!(
+                    tool_call.status,
+                    acp::ToolCallStatus::Completed | acp::ToolCallStatus::Failed
+                ) {
+                    active.remove(&tool_call_id);
+                } else {
+                    active.insert(tool_call_id.clone());
+                }
+            }
             // 标记：此处出现了 tool_call，下一段 agent 文本应另起段落。
             state
                 .handle
                 .pending_text_separator
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            let explicit_locations = tool_call
+            let explicit_locations: Vec<(String, Option<u32>)> = tool_call
                 .locations
                 .iter()
                 .map(|l| (l.path.display().to_string(), l.line))
@@ -1528,31 +1669,28 @@ async fn handle_session_notification(
             // put edited file paths only in ToolCallContent::Diff and leave the
             // top-level locations empty. Preserve those paths before the
             // content-only start event is followed by a status-only update.
-            let locations = merge_diff_locations(explicit_locations, &tool_call.content);
-            state.handle.emit(AcpUpdate::ToolCall {
-                id: tool_call.tool_call_id.to_string(),
+            let locations = merge_diff_locations(explicit_locations.clone(), &tool_call.content);
+            let output = tool_output_to_data(
+                state.adapter.as_ref(),
+                &tool_call.content,
+                tool_call.raw_output.as_ref(),
+            );
+            state.handle.emit(AcpUpdate::ToolCallV1 {
+                id: tool_call_id.clone(),
                 title: tool_call.title.clone(),
-                locations: locations.clone(),
+                kind: tool_kind_name(&tool_call.kind).to_string(),
+                status: tool_status_name(&tool_call.status).to_string(),
+                content: tool_output_display_text(&output),
+                input: tool_input_to_data(tool_call.raw_input.as_ref()),
+                legacy_raw_input: None,
+                legacy_raw_output: None,
+                output,
+                // Keep protocol locations exact. The frontend derives Diff
+                // paths from structured output separately, so later output
+                // replacement can remove stale Diff paths correctly.
+                locations: explicit_locations,
                 timestamp: Some(Utc::now()),
-                raw_input: tool_call.raw_input.clone(),
             });
-
-            // `tool_call` is already allowed to carry output. In particular,
-            // codex-acp reports completed file edits as a single ToolCall whose
-            // Diff entries never reappear in a ToolCallUpdate. Mirror that
-            // initial payload into Grove's update-shaped event instead of
-            // dropping it at the ACP boundary.
-            let initial_content = tool_contents_to_text(state.adapter.as_ref(), &tool_call.content)
-                .or_else(|| tool_raw_output_text(tool_call.raw_output.as_ref()));
-            if initial_content.is_some() {
-                state.handle.emit(AcpUpdate::ToolCallUpdate {
-                    id: tool_call.tool_call_id.to_string(),
-                    status: format!("{:?}", tool_call.status).to_lowercase(),
-                    content: initial_content,
-                    locations: locations.clone(),
-                    raw_input: tool_call.raw_input.clone(),
-                });
-            }
 
             // 记录 Write 工具的 tool_call_id → file_path(用于 PlanFileUpdate 检测)。
             // 路径可能在第二个 ToolCall 事件才出现,所以每次有 locations 时更新。
@@ -1606,14 +1744,23 @@ async fn handle_session_notification(
                 .fields
                 .content
                 .as_deref()
-                .and_then(|blocks| tool_contents_to_text(state.adapter.as_ref(), blocks))
-                .or_else(|| tool_raw_output_text(update.fields.raw_output.as_ref()));
+                .and_then(|blocks| tool_contents_to_text(state.adapter.as_ref(), blocks));
             let status = update
                 .fields
                 .status
                 .as_ref()
-                .map(|s| format!("{:?}", s).to_lowercase())
+                .map(tool_status_name)
+                .map(str::to_owned)
                 .unwrap_or_default();
+            let tool_call_id = update.tool_call_id.to_string();
+            if !status.is_empty() {
+                let mut active = state.handle.active_tool_calls.lock().unwrap();
+                if matches!(status.as_str(), "completed" | "failed") {
+                    active.remove(&tool_call_id);
+                } else {
+                    active.insert(tool_call_id.clone());
+                }
+            }
             let explicit_locations: Vec<(String, Option<u32>)> = update
                 .fields
                 .locations
@@ -1636,22 +1783,60 @@ async fn handle_session_notification(
                 .as_ref()
                 .is_some_and(|s| matches!(s, acp::ToolCallStatus::Completed));
 
+            let snapshot = update
+                .fields
+                .status
+                .as_ref()
+                .is_some_and(|value| {
+                    matches!(
+                        value,
+                        acp::ToolCallStatus::Completed | acp::ToolCallStatus::Failed
+                    )
+                })
+                .then(|| {
+                    state
+                        .file_snapshots
+                        .lock()
+                        .unwrap()
+                        .remove(&update.tool_call_id.to_string())
+                })
+                .flatten();
+
+            let mut fallback_tool_content = None;
             if content.is_none() && is_completed {
-                let snapshot = state
-                    .file_snapshots
-                    .lock()
-                    .unwrap()
-                    .remove(&update.tool_call_id.to_string());
                 if let Some((abs_path, old_content)) = snapshot {
                     if let Ok(new_text) = std::fs::read_to_string(&abs_path) {
-                        content = Some(adapter::generate_file_diff(
+                        let display_text = adapter::generate_file_diff(
                             &abs_path,
                             old_content.as_deref(),
                             &new_text,
-                        ));
+                        );
+                        fallback_tool_content = Some(vec![ToolCallContentData::Diff {
+                            path: abs_path.display().to_string(),
+                            old_text: old_content,
+                            new_text,
+                            display_text: display_text.clone(),
+                        }]);
+                        content = Some(display_text);
                     }
                 }
             }
+
+            let output = if let Some(blocks) = update.fields.content.as_deref() {
+                Some(tool_output_to_data(
+                    state.adapter.as_ref(),
+                    blocks,
+                    update.fields.raw_output.as_ref(),
+                ))
+            } else if update.fields.raw_output.is_some() {
+                Some(tool_output_to_data(
+                    state.adapter.as_ref(),
+                    &[],
+                    update.fields.raw_output.as_ref(),
+                ))
+            } else {
+                fallback_tool_content
+            };
 
             // ToolCallUpdate 中也可能带 locations(路径可能只在中间的 update 出现),
             // 及时更新 write_tool_paths 以便 completed 时能拿到正确路径
@@ -1680,12 +1865,41 @@ async fn handle_session_notification(
                 }
             }
 
-            state.handle.emit(AcpUpdate::ToolCallUpdate {
-                id: update.tool_call_id.to_string(),
-                status: status.clone(),
-                content,
-                locations: locations.clone(),
-                raw_input: update.fields.raw_input.clone(),
+            let display_content = match output.as_deref() {
+                Some(output) => tool_output_display_text(output),
+                None => content,
+            };
+            state.handle.emit(AcpUpdate::ToolCallUpdateV1 {
+                id: tool_call_id,
+                title: update.fields.title.clone(),
+                kind: update
+                    .fields
+                    .kind
+                    .as_ref()
+                    .map(tool_kind_name)
+                    .map(str::to_owned),
+                status: update
+                    .fields
+                    .status
+                    .as_ref()
+                    .map(tool_status_name)
+                    .map(str::to_owned),
+                output,
+                display_content,
+                locations: update.fields.locations.as_ref().map(|values| {
+                    values
+                        .iter()
+                        .map(|value| (value.path.display().to_string(), value.line))
+                        .collect()
+                }),
+                input: update
+                    .fields
+                    .raw_input
+                    .as_ref()
+                    .map(|value| tool_input_to_data(Some(value))),
+                legacy_raw_input: None,
+                legacy_raw_output: None,
+                legacy_content: None,
             });
 
             // 检测 Plan File:Write 工具 completed 且在 plan mode 下写入 .md 文件
@@ -1849,8 +2063,154 @@ fn tool_contents_to_text(
     (!text.is_empty()).then_some(text)
 }
 
-fn tool_raw_output_text(raw_output: Option<&serde_json::Value>) -> Option<String> {
-    let value = raw_output?;
+fn tool_kind_name(kind: &acp::ToolKind) -> &'static str {
+    match kind {
+        acp::ToolKind::Read => "read",
+        acp::ToolKind::Edit => "edit",
+        acp::ToolKind::Delete => "delete",
+        acp::ToolKind::Move => "move",
+        acp::ToolKind::Search => "search",
+        acp::ToolKind::Execute => "execute",
+        acp::ToolKind::Think => "think",
+        acp::ToolKind::Fetch => "fetch",
+        acp::ToolKind::SwitchMode => "switch_mode",
+        acp::ToolKind::Other => "other",
+        _ => "other",
+    }
+}
+
+fn tool_status_name(status: &acp::ToolCallStatus) -> &'static str {
+    match status {
+        acp::ToolCallStatus::Pending => "pending",
+        acp::ToolCallStatus::InProgress => "in_progress",
+        acp::ToolCallStatus::Completed => "completed",
+        acp::ToolCallStatus::Failed => "failed",
+        _ => "pending",
+    }
+}
+
+fn tool_contents_to_data(
+    adapter: &dyn adapter::AgentContentAdapter,
+    content: &[acp::ToolCallContent],
+) -> Vec<ToolCallContentData> {
+    content
+        .iter()
+        .filter_map(|item| match item {
+            acp::ToolCallContent::Content(value) => {
+                let mut data = content_block_to_data(&value.content)?;
+                // Preserve adapter-specific cleanup for textual tool output.
+                if let ContentBlockData::Text { text } = &mut data {
+                    *text = adapter.tool_call_content_to_text(item);
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                        let looks_internal = value.as_object().is_some_and(|object| {
+                            object
+                                .keys()
+                                .any(|key| TOOL_INPUT_METADATA_KEYS.contains(&key.as_str()))
+                        });
+                        if looks_internal {
+                            *text = protocol_output_text(Some(&value)).unwrap_or_default();
+                        }
+                    }
+                    if text.trim().is_empty() {
+                        return None;
+                    }
+                }
+                Some(ToolCallContentData::Content { content: data })
+            }
+            acp::ToolCallContent::Diff(diff) => Some(ToolCallContentData::Diff {
+                path: diff.path.display().to_string(),
+                old_text: diff.old_text.clone(),
+                new_text: diff.new_text.clone(),
+                display_text: adapter.tool_call_content_to_text(item),
+            }),
+            acp::ToolCallContent::Terminal(terminal) => Some(ToolCallContentData::Terminal {
+                terminal_id: terminal.terminal_id.to_string(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_output_to_data(
+    adapter: &dyn adapter::AgentContentAdapter,
+    content: &[acp::ToolCallContent],
+    protocol_output: Option<&serde_json::Value>,
+) -> Vec<ToolCallContentData> {
+    let structured = tool_contents_to_data(adapter, content);
+    if !structured.is_empty() {
+        return structured;
+    }
+    protocol_output_text(protocol_output)
+        .map(|text| {
+            vec![ToolCallContentData::Content {
+                content: ContentBlockData::Text { text },
+            }]
+        })
+        .unwrap_or_default()
+}
+
+pub fn legacy_tool_output_to_data(
+    content: Option<&serde_json::Value>,
+    raw_output: Option<&serde_json::Value>,
+) -> Option<Vec<ToolCallContentData>> {
+    if let Some(content) = content {
+        if let Ok(values) = serde_json::from_value::<Vec<ToolCallContentData>>(content.clone()) {
+            if !values.is_empty() || raw_output.is_none() {
+                return Some(values);
+            }
+        }
+    }
+
+    raw_output.and_then(|value| {
+        protocol_output_text(Some(value)).map(|text| {
+            vec![ToolCallContentData::Content {
+                content: ContentBlockData::Text { text },
+            }]
+        })
+    })
+}
+
+fn tool_output_display_text(output: &[ToolCallContentData]) -> Option<String> {
+    let text = output
+        .iter()
+        .map(|item| match item {
+            ToolCallContentData::Content {
+                content: ContentBlockData::Text { text },
+            } => text.clone(),
+            ToolCallContentData::Content { content } => match content {
+                ContentBlockData::Image { label, .. } => {
+                    label.clone().unwrap_or_else(|| "Image".to_string())
+                }
+                ContentBlockData::Audio { label, .. } => {
+                    label.clone().unwrap_or_else(|| "Audio".to_string())
+                }
+                ContentBlockData::ResourceLink {
+                    title, name, uri, ..
+                } => title.clone().unwrap_or_else(|| {
+                    if name.is_empty() {
+                        uri.clone()
+                    } else {
+                        name.clone()
+                    }
+                }),
+                ContentBlockData::Resource { text, uri, .. } => {
+                    text.clone().unwrap_or_else(|| uri.clone())
+                }
+                ContentBlockData::Text { text } => text.clone(),
+            },
+            ToolCallContentData::Diff { display_text, .. } => display_text.clone(),
+            ToolCallContentData::Terminal { terminal_id } => {
+                format!("Terminal {terminal_id}")
+            }
+        })
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn protocol_output_text(protocol_output: Option<&serde_json::Value>) -> Option<String> {
+    let value = protocol_output?;
     if let Some(text) = value.as_str() {
         return (!text.is_empty()).then(|| text.to_string());
     }
@@ -1861,6 +2221,19 @@ fn tool_raw_output_text(raw_output: Option<&serde_json::Value>) -> Option<String
             if !text.is_empty() {
                 return Some(text.to_string());
             }
+        }
+    }
+
+    if let Some(content) = object.get("content").and_then(serde_json::Value::as_array) {
+        let text = content
+            .iter()
+            .filter_map(serde_json::Value::as_object)
+            .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            return Some(text);
         }
     }
 
@@ -1877,7 +2250,225 @@ fn tool_raw_output_text(raw_output: Option<&serde_json::Value>) -> Option<String
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(if stdout.ends_with('\n') { "" } else { "\n" });
-    (!combined.is_empty()).then_some(combined)
+    if !combined.is_empty() {
+        return Some(combined);
+    }
+
+    // Unknown responses may still contain meaningful user-facing fields (for
+    // example old_title/new_title). Remove transport metadata, then retain the
+    // remaining processed structure rather than treating it as empty.
+    const OUTPUT_METADATA_KEYS: &[&str] = &[
+        "exit_code",
+        "is_error",
+        "isError",
+        "status",
+        "success",
+        "command",
+        "cmd",
+        "cwd",
+    ];
+    let readable = object
+        .iter()
+        .filter(|(key, _)| {
+            !TOOL_INPUT_METADATA_KEYS.contains(&key.as_str())
+                && !OUTPUT_METADATA_KEYS.contains(&key.as_str())
+        })
+        .filter(|(_, value)| match value {
+            serde_json::Value::Null => false,
+            serde_json::Value::String(text) => !text.trim().is_empty(),
+            serde_json::Value::Array(values) => !values.is_empty(),
+            serde_json::Value::Object(object) => !object.is_empty(),
+            serde_json::Value::Bool(value) => *value,
+            serde_json::Value::Number(_) => true,
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    if readable.is_empty() {
+        None
+    } else {
+        serde_json::to_string_pretty(&serde_json::Value::Object(readable)).ok()
+    }
+}
+
+const TOOL_INPUT_METADATA_KEYS: &[&str] = &[
+    "call_id",
+    "process_id",
+    "turn_id",
+    "session_id",
+    "tool_call_id",
+    "started_at_ms",
+    "completed_at_ms",
+    "yield_time_ms",
+    "source",
+    "parsed_cmd",
+];
+
+fn readable_input_label(key: &str) -> String {
+    match key {
+        "cwd" => "Working directory".to_string(),
+        "cmd" | "command" => "Command".to_string(),
+        "query" | "pattern" => "Query".to_string(),
+        "path" | "file_path" => "Path".to_string(),
+        "url" | "uri" => "URL".to_string(),
+        "arguments" | "args" => "Parameters".to_string(),
+        _ => key
+            .split('_')
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn input_value_text(key: &str, value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => (!text.trim().is_empty()).then(|| text.clone()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Array(values) if matches!(key, "command" | "cmd") => {
+            let parts: Vec<&str> = values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            if parts.len() >= 3 && parts[1] == "-c" {
+                Some(parts[2].to_string())
+            } else if !parts.is_empty() {
+                Some(parts.join(" "))
+            } else {
+                None
+            }
+        }
+        serde_json::Value::Array(values) => {
+            let parts: Vec<String> = values
+                .iter()
+                .filter_map(|value| input_value_text(key, value))
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(", "))
+        }
+        // Direct objects are flattened by `collect_tool_input_fields`. Objects
+        // nested inside arrays cannot be flattened without losing item
+        // boundaries, so retain them as readable structured values.
+        serde_json::Value::Object(_) => serde_json::to_string_pretty(value).ok(),
+    }
+}
+
+fn collect_tool_input_fields(
+    prefix: Option<&str>,
+    object: &serde_json::Map<String, serde_json::Value>,
+    fields: &mut Vec<ToolCallInputData>,
+) {
+    const PREFERRED_KEYS: &[&str] = &[
+        "query",
+        "pattern",
+        "path",
+        "file_path",
+        "command",
+        "cmd",
+        "cwd",
+        "url",
+        "uri",
+        "server",
+        "tool",
+        "arguments",
+        "args",
+    ];
+    if prefix.is_none() {
+        if let Some(parsed_commands) = object
+            .get("parsed_cmd")
+            .and_then(serde_json::Value::as_array)
+        {
+            for parsed in parsed_commands
+                .iter()
+                .filter_map(serde_json::Value::as_object)
+            {
+                for key in ["query", "pattern", "path", "file_path", "url", "uri"] {
+                    let Some(value) = parsed
+                        .get(key)
+                        .and_then(|value| input_value_text(key, value))
+                    else {
+                        continue;
+                    };
+                    let field = ToolCallInputData {
+                        label: readable_input_label(key),
+                        value,
+                    };
+                    if !fields.contains(&field) {
+                        fields.push(field);
+                    }
+                }
+            }
+        }
+    }
+
+    let ordered_keys = PREFERRED_KEYS
+        .iter()
+        .copied()
+        .filter(|key| object.contains_key(*key))
+        .chain(
+            object
+                .keys()
+                .map(String::as_str)
+                .filter(|key| !PREFERRED_KEYS.contains(key)),
+        );
+
+    for key in ordered_keys {
+        if TOOL_INPUT_METADATA_KEYS.contains(&key) {
+            continue;
+        }
+        let Some(value) = object.get(key) else {
+            continue;
+        };
+        if let serde_json::Value::Object(nested) = value {
+            let nested_prefix = match prefix {
+                Some(prefix) => format!("{prefix} · {}", readable_input_label(key)),
+                None => readable_input_label(key),
+            };
+            collect_tool_input_fields(Some(&nested_prefix), nested, fields);
+            continue;
+        }
+        let Some(value) = input_value_text(key, value) else {
+            continue;
+        };
+        let label = match prefix {
+            Some(prefix) => format!("{prefix} · {}", readable_input_label(key)),
+            None => readable_input_label(key),
+        };
+        if !fields
+            .iter()
+            .any(|field| field.label == label && field.value == value)
+        {
+            fields.push(ToolCallInputData { label, value });
+        }
+    }
+}
+
+pub(crate) fn tool_input_to_data(
+    protocol_input: Option<&serde_json::Value>,
+) -> Vec<ToolCallInputData> {
+    let Some(value) = protocol_input else {
+        return Vec::new();
+    };
+    if let serde_json::Value::Object(object) = value {
+        let mut fields = Vec::new();
+        collect_tool_input_fields(None, object, &mut fields);
+        fields
+    } else {
+        input_value_text("input", value)
+            .map(|value| {
+                vec![ToolCallInputData {
+                    label: "Input".to_string(),
+                    value,
+                }]
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Emit a synthetic `ThoughtLevelsUpdate` after a successful
@@ -1958,18 +2549,18 @@ pub fn content_block_to_text(block: &acp::ContentBlock) -> String {
     }
 }
 
-/// Preserve the original ACP content block when replaying user history from
-/// `session/load`. Text remains message text; every non-text block travels as
-/// a structured attachment so the frontend can render the same user turn.
-fn content_block_to_user_message(block: &acp::ContentBlock) -> (String, Vec<ContentBlockData>) {
-    let attachment = match block {
-        acp::ContentBlock::Text(text) => return (text.text.clone(), Vec::new()),
-        acp::ContentBlock::Image(image) => ContentBlockData::Image {
+fn content_block_to_data(block: &acp::ContentBlock) -> Option<ContentBlockData> {
+    match block {
+        acp::ContentBlock::Text(text) => Some(ContentBlockData::Text {
+            text: text.text.clone(),
+        }),
+        acp::ContentBlock::Image(image) => Some(ContentBlockData::Image {
             data: image.data.clone(),
             mime_type: image.mime_type.clone(),
+            uri: image.uri.clone(),
             label: image.uri.clone(),
-        },
-        acp::ContentBlock::Audio(audio) => ContentBlockData::Audio {
+        }),
+        acp::ContentBlock::Audio(audio) => Some(ContentBlockData::Audio {
             data: audio.data.clone(),
             mime_type: audio.mime_type.clone(),
             label: audio
@@ -1978,8 +2569,8 @@ fn content_block_to_user_message(block: &acp::ContentBlock) -> (String, Vec<Cont
                 .and_then(|meta| meta.get("name"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
-        },
-        acp::ContentBlock::ResourceLink(resource) => ContentBlockData::ResourceLink {
+        }),
+        acp::ContentBlock::ResourceLink(resource) => Some(ContentBlockData::ResourceLink {
             uri: resource.uri.clone(),
             name: resource.name.clone(),
             mime_type: resource.mime_type.clone(),
@@ -1990,29 +2581,39 @@ fn content_block_to_user_message(block: &acp::ContentBlock) -> (String, Vec<Cont
                 .title
                 .clone()
                 .or_else(|| Some(resource.name.clone())),
-        },
+        }),
         acp::ContentBlock::Resource(resource) => match &resource.resource {
             acp::EmbeddedResourceResource::TextResourceContents(contents) => {
-                ContentBlockData::Resource {
+                Some(ContentBlockData::Resource {
                     uri: contents.uri.clone(),
                     mime_type: contents.mime_type.clone(),
                     text: Some(contents.text.clone()),
                     blob: None,
-                }
+                })
             }
             acp::EmbeddedResourceResource::BlobResourceContents(contents) => {
-                ContentBlockData::Resource {
+                Some(ContentBlockData::Resource {
                     uri: contents.uri.clone(),
                     mime_type: contents.mime_type.clone(),
                     text: None,
                     blob: Some(contents.blob.clone()),
-                }
+                })
             }
-            _ => return (String::new(), Vec::new()),
+            _ => None,
         },
-        _ => return (String::new(), Vec::new()),
-    };
-    (String::new(), vec![attachment])
+        _ => None,
+    }
+}
+
+/// Preserve the original ACP content block when replaying user history from
+/// `session/load`. Text remains message text; every non-text block travels as
+/// a structured attachment so the frontend can render the same user turn.
+fn content_block_to_user_message(block: &acp::ContentBlock) -> (String, Vec<ContentBlockData>) {
+    match content_block_to_data(block) {
+        Some(ContentBlockData::Text { text }) => (text, Vec::new()),
+        Some(attachment) => (String::new(), vec![attachment]),
+        None => (String::new(), Vec::new()),
+    }
 }
 
 /// 将 ContentBlockData 转换为 ACP ContentBlock
@@ -2022,11 +2623,12 @@ fn to_acp_content_block(block: &ContentBlockData) -> acp::ContentBlock {
         ContentBlockData::Image {
             data,
             mime_type,
-            label,
+            uri,
+            label: _,
         } => {
             let mut img = acp::ImageContent::new(data, mime_type);
-            if let Some(l) = label {
-                img = img.uri(l.clone());
+            if let Some(uri) = uri {
+                img = img.uri(uri.clone());
             }
             acp::ContentBlock::Image(img)
         }
@@ -2244,11 +2846,13 @@ pub async fn get_or_start_session(
 
                 let (update_tx, update_rx) = broadcast::channel::<AcpUpdate>(256);
                 let (cmd_tx, cmd_rx) = mpsc::channel::<AcpCommand>(32);
+                let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
                 let handle = Arc::new(AcpSessionHandle {
                     key: key.clone(),
                     update_tx: update_tx.clone(),
                     cmd_tx,
+                    shutdown_tx,
                     agent_info: std::sync::RwLock::new(None),
                     pending_permission: Mutex::new(None),
                     permission_lock: tokio::sync::Mutex::new(()),
@@ -2273,9 +2877,11 @@ pub async fn get_or_start_session(
                     is_busy: std::sync::atomic::AtomicBool::new(false),
                     last_assistant_text: Mutex::new(String::new()),
                     pending_text_separator: std::sync::atomic::AtomicBool::new(false),
-        last_user_prompt: Mutex::new(None),
-        last_plan: Mutex::new(None),
+                    last_user_prompt: Mutex::new(None),
+                    last_plan: Mutex::new(None),
                     last_permission_info: Mutex::new(None),
+                    active_tool_calls: Mutex::new(std::collections::HashSet::new()),
+                    cancel_requested: std::sync::atomic::AtomicBool::new(false),
                     auth_methods: Mutex::new(Vec::new()),
                     logout_capable: std::sync::atomic::AtomicBool::new(false),
                     pending_auth_retry: Mutex::new(None),
@@ -2658,7 +3264,8 @@ async fn run_acp_session(
 
     // 每个 handler 闭包通过 Arc::clone 捕获一份 state。SDK 要求 handler 的 F
     // 本身是 Send,所以 state 必须是 Send + Sync(AcpClientState 已满足)。
-    let result = acp::Client
+    let mut shutdown_rx = handle.shutdown_tx.subscribe();
+    let connection = acp::Client
         .builder()
         .on_receive_notification(
             {
@@ -2743,8 +3350,12 @@ async fn run_acp_session(
         )
         .connect_with(transport, move |conn: acp::ConnectionTo<acp::Agent>| {
             drive_session(handle, config, cmd_rx, conn)
-        })
-        .await;
+        });
+    tokio::pin!(connection);
+    let result = tokio::select! {
+        result = &mut connection => result,
+        _ = shutdown_rx.wait_for(|requested| *requested) => Ok(()),
+    };
 
     // Diagnostics: if the agent subprocess had already exited by the time
     // the ACP I/O loop ended, that's very likely *why* it ended (crash /
@@ -3040,8 +3651,7 @@ async fn drive_session(
         .import_capable
         .store(import_capable, std::sync::atomic::Ordering::Relaxed);
 
-    // Delete 是稳定能力:agent 声明 session.delete 即可。
-    // 删 chat 时若连接活跃,best-effort 调 session/delete 删掉 agent 侧 session。
+    // Agent 声明 session.delete 后才允许发送 session/delete。
     let delete_capable = init_resp
         .agent_capabilities
         .session_capabilities
@@ -3616,6 +4226,10 @@ async fn drive_session(
                 terminal,
                 config: prompt_config,
             } => {
+                handle
+                    .cancel_requested
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                handle.active_tool_calls.lock().unwrap().clear();
                 // Import replay is complete once the user starts a new turn.
                 // From here on UserMessageChunk is a normal Agent echo and
                 // must be ignored to avoid duplicating Grove's own message.
@@ -3629,6 +4243,10 @@ async fn drive_session(
                 handle
                     .suppress_emit
                     .store(false, std::sync::atomic::Ordering::Relaxed);
+                if let Err(message) = validate_prompt_content(&prompt_capabilities, &attachments) {
+                    handle.emit(AcpUpdate::Error { message });
+                    continue;
+                }
                 // 提前快照,便于 -32000 AuthRequired 时把这条 prompt 暂存起来
                 // 等 authenticate 成功后自动重试。sender/attachments 后续会被
                 // 移动进 emit / content_blocks,所以必须 clone。
@@ -3821,6 +4439,7 @@ async fn drive_session(
                         Some(inner_cmd) = cmd_rx.recv() => {
                             match inner_cmd {
                                 AcpCommand::Cancel => {
+                                    handle.cancel_current_turn_state();
                                     // cancel 是 Notification, send_notification 是同步 API.
                                     // 多次 Cancel 都允许通过 (用户连点 Send Now / 多 WS 同时 cancel),
                                     // agent 侧需要幂等处理多份 CancelNotification — 这是 ACP spec
@@ -3878,8 +4497,8 @@ async fn drive_session(
                                     ));
                                 }
                                 AcpCommand::DeleteSession { reply } => {
-                                    // 同 fork:busy 期间拒绝。删除是 best-effort,
-                                    // 上层收到 Err 会跳过 agent delete、照常删本地。
+                                    // 同 fork:busy 期间拒绝。上层收到 Err 后保留
+                                    // Grove Chat，不把 Agent deletion 降级成本地删除。
                                     let _ = reply.send(Err(
                                         "Cannot delete while agent is busy".to_string(),
                                     ));
@@ -3897,6 +4516,9 @@ async fn drive_session(
                     break;
                 }
 
+                handle
+                    .cancel_requested
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 match result {
                     Ok(resp) => {
                         // Prompt 成功 = agent 当前认账户已登录,任何 stale 的
@@ -3931,11 +4553,11 @@ async fn drive_session(
                         );
                         handle.emit(AcpUpdate::Busy { value: false });
                         let turn_end_ts = chrono::Utc::now().timestamp();
-                        let turn_usage = resp.usage.as_ref().map(|u| TurnUsage {
-                            input_tokens: u.input_tokens,
-                            output_tokens: u.output_tokens,
-                            total_tokens: u.total_tokens,
-                            cached_read_tokens: u.cached_read_tokens,
+                        let turn_usage = resp.usage.as_ref().map(|usage| TurnUsage {
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            total_tokens: usage.total_tokens,
+                            cached_read_tokens: usage.cached_read_tokens,
                         });
                         // Layer A: persist per-turn usage to SQLite for stats.
                         // Best-effort — a write error here must not fail the turn.
@@ -4233,8 +4855,8 @@ async fn drive_session(
                 let _ = reply.send(outcome);
             }
             AcpCommand::DeleteSession { reply } => {
-                // best-effort:agent 必须声明 delete capability(调用方已校验)。
-                // 删的是当前 session,直接用 session_id_arc。失败透传给上层。
+                // Agent 必须声明 delete capability(调用方已校验)。删的是当前
+                // session，直接使用 session_id_arc；失败完整透传给上层。
                 let res = conn
                     .send_request(acp::DeleteSessionRequest::new(session_id_arc.clone()))
                     .block_task()
@@ -4798,11 +5420,13 @@ impl AcpSessionHandle {
             // produces exactly one session.json write.
             if let Some(ref chat_id) = self.chat_id {
                 let snapshot = self.current_usage.lock().ok().and_then(|g| g.clone());
-                if let Some(snapshot) = snapshot {
+                if snapshot.is_some() {
                     if let Some(mut meta) =
                         read_session_metadata(&self.project_key, &self.task_id, chat_id)
                     {
-                        meta.current_usage = Some(snapshot);
+                        if let Some(snapshot) = snapshot {
+                            meta.current_usage = Some(snapshot);
+                        }
                         write_session_metadata(&self.project_key, &self.task_id, chat_id, &meta);
                     }
                 }
@@ -4936,10 +5560,40 @@ impl AcpSessionHandle {
             .map_err(|_| crate::error::GroveError::Session("ACP session closed".to_string()))
     }
 
+    fn cancel_current_turn_state(&self) {
+        self.cancel_requested
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        if let Some((id, sender)) = self.pending_permission.lock().unwrap().take() {
+            drop(sender);
+            if let Ok(mut slot) = self.last_permission_info.lock() {
+                *slot = None;
+            }
+            self.emit(AcpUpdate::PermissionResponse {
+                id,
+                option_id: "Cancelled".to_string(),
+            });
+        }
+
+        let active_tool_calls: Vec<String> =
+            self.active_tool_calls.lock().unwrap().drain().collect();
+        for id in active_tool_calls {
+            self.emit(AcpUpdate::ToolCallUpdate {
+                id,
+                status: "cancelled".to_string(),
+                content: None,
+                locations: Vec::new(),
+                raw_input: None,
+            });
+        }
+    }
+
     /// 终止会话
     pub async fn kill(&self) -> crate::error::Result<()> {
-        let _ = self.cmd_tx.send(AcpCommand::Kill).await;
-        Ok(())
+        self.cmd_tx
+            .send(AcpCommand::Kill)
+            .await
+            .map_err(|_| crate::error::GroveError::Session("ACP session closed".to_string()))
     }
 
     /// 通过 ACP `session/fork` 派生新会话(`unstable_session_fork`)。
@@ -4964,7 +5618,6 @@ impl AcpSessionHandle {
     }
 
     /// 通过 ACP v1 `session/delete` 删掉当前 session。
-    /// 删 chat 时 best-effort 调用 — agent 那边把 session 一并删掉。
     pub async fn delete_session(&self) -> crate::error::Result<()> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
@@ -4978,6 +5631,19 @@ impl AcpSessionHandle {
                 "Delete request was dropped by ACP loop".to_string(),
             )),
         }
+    }
+
+    /// Request immediate teardown of the ACP transport and its backing process.
+    ///
+    /// Unlike `AcpCommand::Kill`, this remains observable while the command
+    /// loop is blocked waiting for an Agent response.
+    pub(crate) fn request_shutdown(&self) {
+        self.shutdown_tx.send_replace(true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shutdown_requested(&self) -> bool {
+        *self.shutdown_tx.borrow()
     }
 
     pub async fn list_sessions(
@@ -5525,11 +6191,13 @@ pub fn new_handle_for_test(
 ) {
     let (update_tx, update_rx) = broadcast::channel::<AcpUpdate>(256);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<AcpCommand>(32);
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
     let handle = Arc::new(AcpSessionHandle {
         key: key.to_string(),
         update_tx: update_tx.clone(),
         cmd_tx,
+        shutdown_tx,
         agent_info: std::sync::RwLock::new(Some((
             "session-test".into(),
             "claude".into(),
@@ -5559,6 +6227,8 @@ pub fn new_handle_for_test(
         last_user_prompt: Mutex::new(None),
         last_plan: Mutex::new(None),
         last_permission_info: Mutex::new(None),
+        active_tool_calls: Mutex::new(std::collections::HashSet::new()),
+        cancel_requested: std::sync::atomic::AtomicBool::new(false),
         auth_methods: Mutex::new(Vec::new()),
         logout_capable: std::sync::atomic::AtomicBool::new(false),
         pending_auth_retry: Mutex::new(None),
@@ -6474,6 +7144,276 @@ mod tests {
     }
 
     #[test]
+    fn session_delete_capability_requires_an_advertised_object() {
+        let omitted: acp::SessionCapabilities =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        let null: acp::SessionCapabilities =
+            serde_json::from_value(serde_json::json!({ "delete": null })).unwrap();
+        let advertised: acp::SessionCapabilities =
+            serde_json::from_value(serde_json::json!({ "delete": {} })).unwrap();
+
+        assert!(omitted.delete.is_none());
+        assert!(null.delete.is_none());
+        assert!(advertised.delete.is_some());
+    }
+
+    #[test]
+    fn session_delete_request_preserves_the_opaque_session_id() {
+        let request = acp::DeleteSessionRequest::new("agent/session:opaque-123");
+        let json = serde_json::to_value(request).unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!({ "sessionId": "agent/session:opaque-123" })
+        );
+    }
+
+    #[test]
+    fn session_delete_accepts_an_empty_success_result() {
+        let response: acp::DeleteSessionResponse =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+
+        assert!(response.meta.is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_kill_is_reliably_delivered_through_the_command_queue() {
+        let key = format!("delete-shutdown-test-{}", uuid::Uuid::new_v4());
+        let (handle, _updates, _guard) = new_handle_for_test(&key, "project", "task", "chat");
+
+        assert!(!handle.shutdown_requested());
+        handle.kill().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !handle.cmd_tx.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!handle.shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_turn_cancels_permission_and_active_tools_locally() {
+        let key = format!("turn-cancel-test-{}", uuid::Uuid::new_v4());
+        let (handle, mut updates, _guard) = new_handle_for_test(&key, "project", "task", "chat");
+        let (permission_tx, permission_rx) = tokio::sync::oneshot::channel();
+        handle
+            .pending_permission
+            .lock()
+            .unwrap()
+            .replace(("permission-1".to_string(), permission_tx));
+        handle
+            .active_tool_calls
+            .lock()
+            .unwrap()
+            .insert("tool-1".to_string());
+
+        handle.cancel_current_turn_state();
+
+        assert!(permission_rx.await.is_err());
+        assert!(handle
+            .cancel_requested
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(handle.active_tool_calls.lock().unwrap().is_empty());
+
+        let first = updates.recv().await.unwrap();
+        let second = updates.recv().await.unwrap();
+        assert!(matches!(
+            first,
+            AcpUpdate::PermissionResponse { id, option_id }
+                if id == "permission-1" && option_id == "Cancelled"
+        ));
+        assert!(matches!(
+            second,
+            AcpUpdate::ToolCallUpdate { id, status, .. }
+                if id == "tool-1" && status == "cancelled"
+        ));
+    }
+
+    #[test]
+    fn prompt_content_validation_applies_only_to_optional_content_types() {
+        let capabilities = PromptCapabilitiesData::default();
+        let baseline = vec![
+            ContentBlockData::Text {
+                text: "hello".to_string(),
+            },
+            ContentBlockData::ResourceLink {
+                uri: "file:///tmp/context.txt".to_string(),
+                name: "context.txt".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                size: None,
+                title: None,
+                description: None,
+                label: None,
+            },
+        ];
+        assert!(validate_prompt_content(&capabilities, &baseline).is_ok());
+
+        let image = vec![ContentBlockData::Image {
+            data: "base64".to_string(),
+            mime_type: "image/png".to_string(),
+            uri: None,
+            label: None,
+        }];
+        let audio = vec![ContentBlockData::Audio {
+            data: "base64".to_string(),
+            mime_type: "audio/wav".to_string(),
+            label: None,
+        }];
+        let embedded = vec![ContentBlockData::Resource {
+            uri: "file:///tmp/context.txt".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            text: Some("context".to_string()),
+            blob: None,
+        }];
+        assert!(validate_prompt_content(&capabilities, &image).is_err());
+        assert!(validate_prompt_content(&capabilities, &audio).is_err());
+        assert!(validate_prompt_content(&capabilities, &embedded).is_err());
+
+        let all = PromptCapabilitiesData {
+            image: true,
+            audio: true,
+            embedded_context: true,
+        };
+        assert!(validate_prompt_content(&all, &image).is_ok());
+        assert!(validate_prompt_content(&all, &audio).is_ok());
+        assert!(validate_prompt_content(&all, &embedded).is_ok());
+    }
+
+    #[test]
+    fn structured_content_roundtrip_preserves_protocol_fields() {
+        let blocks = [
+            ContentBlockData::Image {
+                data: "image-data".to_string(),
+                mime_type: "image/png".to_string(),
+                uri: Some("file:///tmp/image.png".to_string()),
+                label: Some("Image #1".to_string()),
+            },
+            ContentBlockData::Audio {
+                data: "audio-data".to_string(),
+                mime_type: "audio/wav".to_string(),
+                label: Some("recording.wav".to_string()),
+            },
+            ContentBlockData::ResourceLink {
+                uri: "file:///tmp/report.md".to_string(),
+                name: "report.md".to_string(),
+                mime_type: Some("text/markdown".to_string()),
+                size: Some(42),
+                title: Some("Report".to_string()),
+                description: Some("Generated report".to_string()),
+                label: None,
+            },
+            ContentBlockData::Resource {
+                uri: "file:///tmp/context.txt".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some("context".to_string()),
+                blob: None,
+            },
+            ContentBlockData::Resource {
+                uri: "file:///tmp/archive.bin".to_string(),
+                mime_type: Some("application/octet-stream".to_string()),
+                text: None,
+                blob: Some("blob-data".to_string()),
+            },
+        ];
+
+        let converted: Vec<_> = blocks
+            .iter()
+            .map(to_acp_content_block)
+            .map(|block| content_block_to_data(&block).unwrap())
+            .collect();
+
+        assert!(matches!(
+            &converted[0],
+            ContentBlockData::Image {
+                data,
+                mime_type,
+                uri: Some(uri),
+                ..
+            } if data == "image-data"
+                && mime_type == "image/png"
+                && uri == "file:///tmp/image.png"
+        ));
+        assert!(matches!(
+            &converted[1],
+            ContentBlockData::Audio {
+                data,
+                mime_type,
+                label: Some(label),
+            } if data == "audio-data"
+                && mime_type == "audio/wav"
+                && label == "recording.wav"
+        ));
+        assert!(matches!(
+            &converted[2],
+            ContentBlockData::ResourceLink {
+                uri,
+                name,
+                mime_type: Some(mime_type),
+                size: Some(42),
+                title: Some(title),
+                description: Some(description),
+                ..
+            } if uri == "file:///tmp/report.md"
+                && name == "report.md"
+                && mime_type == "text/markdown"
+                && title == "Report"
+                && description == "Generated report"
+        ));
+        assert!(matches!(
+            &converted[3],
+            ContentBlockData::Resource {
+                uri,
+                mime_type: Some(mime_type),
+                text: Some(text),
+                blob: None,
+            } if uri == "file:///tmp/context.txt"
+                && mime_type == "text/plain"
+                && text == "context"
+        ));
+        assert!(matches!(
+            &converted[4],
+            ContentBlockData::Resource {
+                uri,
+                mime_type: Some(mime_type),
+                text: None,
+                blob: Some(blob),
+            } if uri == "file:///tmp/archive.bin"
+                && mime_type == "application/octet-stream"
+                && blob == "blob-data"
+        ));
+    }
+
+    #[test]
+    fn image_display_label_is_never_used_as_protocol_uri() {
+        let block = to_acp_content_block(&ContentBlockData::Image {
+            data: "image-data".to_string(),
+            mime_type: "image/png".to_string(),
+            uri: None,
+            label: Some("Image #1".to_string()),
+        });
+
+        assert!(matches!(
+            block,
+            acp::ContentBlock::Image(image) if image.uri.is_none()
+        ));
+    }
+
+    #[test]
+    fn image_content_without_uri_remains_history_compatible() {
+        let content: ContentBlockData = serde_json::from_value(serde_json::json!({
+            "type": "image",
+            "data": "image-data",
+            "mime_type": "image/png",
+            "label": "Image #1"
+        }))
+        .unwrap();
+
+        assert!(matches!(content, ContentBlockData::Image { uri: None, .. }));
+    }
+
+    #[test]
     fn authentication_accepts_only_advertised_method_ids() {
         let methods = vec![AuthMethodInfo {
             id: "agent-login".to_string(),
@@ -6536,23 +7476,177 @@ mod tests {
     }
 
     #[test]
-    fn tool_raw_output_text_reads_codex_formatted_output() {
+    fn tool_content_data_preserves_protocol_variants() {
+        let diff = acp::Diff::new("/repo/model.rs", "new text").old_text("old text");
+        let content = vec![
+            acp::ToolCallContent::Content(acp::Content::new(acp::ContentBlock::Text(
+                acp::TextContent::new("result"),
+            ))),
+            acp::ToolCallContent::Diff(diff),
+            acp::ToolCallContent::Terminal(acp::Terminal::new("terminal-7")),
+        ];
+
+        let converted = tool_contents_to_data(&adapter::DefaultAdapter, &content);
+
+        assert!(matches!(
+            &converted[0],
+            ToolCallContentData::Content {
+                content: ContentBlockData::Text { text }
+            } if text == "result"
+        ));
+        assert!(matches!(
+            &converted[1],
+            ToolCallContentData::Diff {
+                path,
+                old_text: Some(old_text),
+                new_text,
+                ..
+            } if path == "/repo/model.rs" && old_text == "old text" && new_text == "new text"
+        ));
+        assert!(matches!(
+            &converted[2],
+            ToolCallContentData::Terminal { terminal_id } if terminal_id == "terminal-7"
+        ));
+    }
+
+    #[test]
+    fn v1_tool_update_serialization_preserves_empty_replacements_and_omissions() {
+        let update = AcpUpdate::ToolCallUpdateV1 {
+            id: "tool-1".to_string(),
+            title: None,
+            kind: None,
+            status: None,
+            output: Some(Vec::new()),
+            display_content: None,
+            locations: Some(Vec::new()),
+            input: None,
+            legacy_raw_input: None,
+            legacy_raw_output: None,
+            legacy_content: None,
+        };
+
+        let value = serde_json::to_value(update).unwrap();
+        assert_eq!(value["output"], serde_json::json!([]));
+        assert_eq!(value["locations"], serde_json::json!([]));
+        assert!(value.get("title").is_none());
+        assert!(value.get("status").is_none());
+    }
+
+    #[test]
+    fn tool_kind_and_status_names_match_v1_wire_values() {
+        assert_eq!(tool_kind_name(&acp::ToolKind::SwitchMode), "switch_mode");
+        assert_eq!(
+            tool_status_name(&acp::ToolCallStatus::InProgress),
+            "in_progress"
+        );
+    }
+
+    #[test]
+    fn protocol_output_is_normalized_to_readable_text() {
         let raw_output = serde_json::json!({
             "formatted_output": "diff --git a/model/config.go b/model/config.go\n",
             "exit_code": 0
         });
 
         assert_eq!(
-            tool_raw_output_text(Some(&raw_output)).as_deref(),
+            protocol_output_text(Some(&raw_output)).as_deref(),
             Some("diff --git a/model/config.go b/model/config.go\n")
         );
     }
 
     #[test]
-    fn tool_raw_output_text_keeps_truly_empty_output_empty() {
+    fn protocol_output_retains_meaningful_fields_without_transport_metadata() {
+        let raw_output = serde_json::json!({
+            "session_id": "chat-internal",
+            "old_title": "Old title",
+            "new_title": "Readable title"
+        });
+
+        let text = protocol_output_text(Some(&raw_output)).unwrap();
+        assert!(!text.contains("session_id"));
+        assert!(text.contains("old_title"));
+        assert!(text.contains("Readable title"));
+    }
+
+    #[test]
+    fn empty_protocol_output_does_not_create_user_output() {
         let raw_output = serde_json::json!({ "formatted_output": "", "exit_code": 0 });
 
-        assert_eq!(tool_raw_output_text(Some(&raw_output)), None);
+        assert_eq!(protocol_output_text(Some(&raw_output)), None);
+    }
+
+    #[test]
+    fn tool_input_is_reduced_to_readable_fields() {
+        let protocol_input = serde_json::json!({
+            "call_id": "internal-call",
+            "process_id": "65474",
+            "turn_id": "internal-turn",
+            "started_at_ms": 1785533000426_u64,
+            "command": ["/bin/zsh", "-c", "rg -n 'needle' document.md"],
+            "cwd": "/repo",
+            "parsed_cmd": [{
+                "type": "search",
+                "cmd": "rg -n 'needle' document.md",
+                "query": "needle",
+                "path": "document.md"
+            }],
+            "source": "unified_exec_startup"
+        });
+
+        assert_eq!(
+            tool_input_to_data(Some(&protocol_input)),
+            vec![
+                ToolCallInputData {
+                    label: "Query".to_string(),
+                    value: "needle".to_string(),
+                },
+                ToolCallInputData {
+                    label: "Path".to_string(),
+                    value: "document.md".to_string(),
+                },
+                ToolCallInputData {
+                    label: "Command".to_string(),
+                    value: "rg -n 'needle' document.md".to_string(),
+                },
+                ToolCallInputData {
+                    label: "Working directory".to_string(),
+                    value: "/repo".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_input_retains_objects_nested_in_arrays() {
+        let protocol_input = serde_json::json!({
+            "steps": [
+                { "path": "a.rs", "line": 12 },
+                { "path": "b.rs", "line": 24 }
+            ]
+        });
+
+        let fields = tool_input_to_data(Some(&protocol_input));
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].label, "Steps");
+        assert!(fields[0].value.contains("a.rs"));
+        assert!(fields[0].value.contains("b.rs"));
+    }
+
+    #[test]
+    fn internal_json_tool_content_is_not_rendered_as_output() {
+        let content = vec![acp::ToolCallContent::Content(acp::Content::new(
+            acp::ContentBlock::Text(acp::TextContent::new(
+                serde_json::json!({
+                    "call_id": "internal-call",
+                    "process_id": "42",
+                    "command": ["/bin/zsh", "-c", "true"],
+                    "exit_code": 0
+                })
+                .to_string(),
+            )),
+        ))];
+
+        assert!(tool_contents_to_data(&adapter::DefaultAdapter, &content).is_empty());
     }
 
     #[test]

@@ -5,6 +5,7 @@ import type { DiffFile, DiffStatsResult } from '../../api/review';
 import { getReviewComments, getCommits, getTaskFiles, getTaskDirEntries, getTask, openTaskFile, revealTaskFile } from '../../api/tasks';
 import type { ReviewCommentEntry, ReviewCommentsResponse, DirEntry, CommitsResponse } from '../../api/tasks';
 import { buildMentionItems } from '../../utils/fileMention';
+import { taskRelativeFilePath } from './fileNavigation';
 
 export interface VersionOption {
   id: string;
@@ -667,7 +668,13 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
     // Find matching file — try exact match first, then suffix match in both directions
     const target = pending.file;
+    const relativeTarget = taskRelativeFilePath(target, taskPath);
     let match = displayFiles.find((f) => f.new_path === target && !f.new_path.endsWith('/'));
+    if (!match && relativeTarget !== null) {
+      match = displayFiles.find(
+        (f) => f.new_path === relativeTarget && !f.new_path.endsWith('/'),
+      );
+    }
     if (!match) {
       // Target is absolute, file is relative: check if target ends with /file
       match = displayFiles.find((f) => !f.new_path.endsWith('/') && target.endsWith('/' + f.new_path));
@@ -683,8 +690,10 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
     if (!match && viewMode === 'full' && focusMode) {
       // File not yet in tree — expand parent directories to trigger lazy load.
-      // Build all ancestor paths of the target file (relative path assumed).
-      const parts = target.replace(/^\//, '').split('/');
+      // Absolute Agent paths cannot be sent to the task-relative tree API.
+      // Wait for taskPath, then expand only ancestors beneath that root.
+      if (relativeTarget === null) return;
+      const parts = relativeTarget.split('/');
       const parentPaths: string[] = [];
       for (let i = 1; i < parts.length; i++) {
         parentPaths.push(parts.slice(0, i).join('/'));
@@ -726,7 +735,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
         requestAnimationFrame(() => scrollToFile(resolvedPath));
       }
     }
-  }, [displayFiles, navigateToFile, viewMode, focusMode, projectId, taskId, appendLazyFiles, scrollToFile]);
+  }, [displayFiles, navigateToFile, viewMode, focusMode, projectId, taskId, taskPath, appendLazyFiles, scrollToFile]);
 
   // Load full file content with concurrency control
   const loadFullFileContent = useCallback(async (filePath: string, forceReload = false) => {

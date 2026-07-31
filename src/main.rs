@@ -497,7 +497,16 @@ fn main() -> io::Result<()> {
                     .to_string_lossy()
                     .to_string()
             });
-            let name = std::path::Path::new(&path)
+            // Resolve "." / ".." / relative paths against current_dir so that
+            // `file_name()` returns the real directory name instead of "." / "..".
+            let name_path = std::path::Path::new(&path);
+            let name_path = match name_path.file_name() {
+                Some(name) if name != "." && name != ".." => name_path,
+                _ => &std::env::current_dir()
+                    .expect("Failed to get current directory")
+                    .join(&path),
+            };
+            let name = name_path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.clone());

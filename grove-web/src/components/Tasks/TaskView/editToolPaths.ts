@@ -1,19 +1,8 @@
 type EditPathSource = {
   locations?: Array<{ path: string }>;
-  rawInput?: unknown;
+  input?: Array<{ label: string; value: string }>;
   content?: string;
 };
-
-const PATH_KEYS = new Set([
-  "file_path",
-  "filePath",
-  "filename",
-  "path",
-  "target_file",
-  "targetFile",
-]);
-
-const PATH_LIST_KEYS = new Set(["files", "file_paths", "filePaths", "paths"]);
 
 function cleanPath(path: string): string {
   return path.trim().replace(/^['"]|['"]$/g, "");
@@ -50,28 +39,14 @@ export function extractEditToolPaths(source: EditPathSource): string[] {
   for (const location of source.locations ?? []) add(location.path);
 
   // ACP locations and Diff paths are authoritative. Do not then mix in a
-  // relative path parsed from rawInput for the same file (for example
+  // relative path parsed from input for the same file (for example
   // `/repo/client.go` plus `client.go`), which would create duplicate chips.
   if (paths.length > 0) return Array.from(new Set(paths));
 
-  const visit = (value: unknown, key?: string) => {
-    if (typeof value === "string") {
-      if (key && PATH_KEYS.has(key)) add(value);
-      else if (key && PATH_LIST_KEYS.has(key)) add(value);
-      for (const path of pathsFromPatchText(value)) add(path);
-      return;
-    }
-    if (Array.isArray(value)) {
-      for (const entry of value) visit(entry, key);
-      return;
-    }
-    if (!value || typeof value !== "object") return;
-    for (const [childKey, childValue] of Object.entries(value)) {
-      visit(childValue, childKey);
-    }
-  };
-
-  visit(source.rawInput);
+  for (const field of source.input ?? []) {
+    if (/\b(path|file|files)\b/i.test(field.label)) add(field.value);
+    for (const path of pathsFromPatchText(field.value)) add(path);
+  }
   for (const path of pathsFromPatchText(source.content ?? "")) add(path);
 
   return Array.from(new Set(paths));

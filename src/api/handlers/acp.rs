@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use crate::acp::{
     self, AcpStartConfig, AcpUpdate, ContentBlockData, PromptCapabilitiesData, QueueMode,
-    QueuedConfig, QueuedMessage,
+    QueuedConfig, QueuedMessage, ToolCallContentData, ToolCallInputData,
 };
 use crate::storage::{chat_attachments, chat_history, config, tasks, workspace};
 
@@ -131,25 +131,45 @@ enum ServerMessage {
     MessageChunk {
         text: String,
     },
+    MessageContentChunk {
+        content: ContentBlockData,
+    },
     ThoughtChunk {
         text: String,
     },
     ToolCall {
         id: String,
         title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        input: Vec<ToolCallInputData>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<Vec<ToolCallContentData>>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         locations: Vec<LocationMsg>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        raw_input: Option<serde_json::Value>,
     },
     ToolCallUpdate {
         id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
         status: String,
         content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input: Option<Vec<ToolCallInputData>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<Vec<ToolCallContentData>>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         locations: Vec<LocationMsg>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        raw_input: Option<serde_json::Value>,
+        locations_replace: bool,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        protocol_v1: bool,
     },
     PermissionRequest {
         id: String,
@@ -402,6 +422,9 @@ impl From<AcpUpdate> for ServerMessage {
                 logout_capable,
             },
             AcpUpdate::MessageChunk { text } => ServerMessage::MessageChunk { text },
+            AcpUpdate::MessageContentChunk { content } => {
+                ServerMessage::MessageContentChunk { content }
+            }
             AcpUpdate::ThoughtChunk { text } => ServerMessage::ThoughtChunk { text },
             AcpUpdate::ToolCall {
                 id,
@@ -412,11 +435,15 @@ impl From<AcpUpdate> for ServerMessage {
             } => ServerMessage::ToolCall {
                 id,
                 title,
+                kind: None,
+                status: None,
+                content: None,
+                input: acp::tool_input_to_data(raw_input.as_ref()),
+                output: None,
                 locations: locations
                     .into_iter()
                     .map(|(path, line)| LocationMsg { path, line })
                     .collect(),
-                raw_input,
             },
             AcpUpdate::ToolCallUpdate {
                 id,
@@ -426,14 +453,100 @@ impl From<AcpUpdate> for ServerMessage {
                 raw_input,
             } => ServerMessage::ToolCallUpdate {
                 id,
+                title: None,
+                kind: None,
                 status,
                 content,
+                input: raw_input
+                    .as_ref()
+                    .map(|value| acp::tool_input_to_data(Some(value))),
+                output: None,
                 locations: locations
                     .into_iter()
                     .map(|(path, line)| LocationMsg { path, line })
                     .collect(),
-                raw_input,
+                locations_replace: false,
+                protocol_v1: false,
             },
+            AcpUpdate::ToolCallV1 {
+                id,
+                title,
+                kind,
+                status,
+                content,
+                input,
+                output,
+                legacy_raw_input,
+                legacy_raw_output,
+                locations,
+                ..
+            } => {
+                let input = if input.is_empty() {
+                    acp::tool_input_to_data(legacy_raw_input.as_ref())
+                } else {
+                    input
+                };
+                let output = if output.is_empty() {
+                    acp::legacy_tool_output_to_data(None, legacy_raw_output.as_ref())
+                        .unwrap_or(output)
+                } else {
+                    output
+                };
+                ServerMessage::ToolCall {
+                    id,
+                    title,
+                    kind: Some(kind),
+                    status: Some(status),
+                    content,
+                    input,
+                    output: Some(output),
+                    locations: locations
+                        .into_iter()
+                        .map(|(path, line)| LocationMsg { path, line })
+                        .collect(),
+                }
+            }
+            AcpUpdate::ToolCallUpdateV1 {
+                id,
+                title,
+                kind,
+                status,
+                output,
+                display_content,
+                locations,
+                input,
+                legacy_raw_input,
+                legacy_raw_output,
+                legacy_content,
+            } => {
+                let input = input.or_else(|| {
+                    legacy_raw_input
+                        .as_ref()
+                        .map(|value| acp::tool_input_to_data(Some(value)))
+                });
+                let output = output.or_else(|| {
+                    acp::legacy_tool_output_to_data(
+                        legacy_content.as_ref(),
+                        legacy_raw_output.as_ref(),
+                    )
+                });
+                ServerMessage::ToolCallUpdate {
+                    id,
+                    title,
+                    kind,
+                    status: status.unwrap_or_default(),
+                    content: display_content,
+                    input,
+                    output,
+                    locations_replace: locations.is_some(),
+                    protocol_v1: true,
+                    locations: locations
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(path, line)| LocationMsg { path, line })
+                        .collect(),
+                }
+            }
             AcpUpdate::PermissionRequest {
                 id,
                 description,
@@ -1127,6 +1240,31 @@ pub struct DeleteChatQuery {
     scope: Option<String>,
 }
 
+const AGENT_DELETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn await_agent_delete<F>(
+    handle: &acp::AcpSessionHandle,
+    delete: F,
+    timeout: std::time::Duration,
+) -> Result<(), AcpError>
+where
+    F: std::future::Future<Output = crate::error::Result<()>>,
+{
+    match tokio::time::timeout(timeout, delete).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(AcpError::Internal(error.to_string())),
+        Err(_) => {
+            // The JSON-RPC request may already be in flight. Tear down the
+            // transport/process out of band so it cannot continue waiting in
+            // the blocked command loop after Grove reports a timeout.
+            handle.request_shutdown();
+            Err(AcpError::Internal(
+                "Agent session deletion timed out".to_string(),
+            ))
+        }
+    }
+}
+
 impl ChatSessionResponse {
     fn build(project_key: &str, task_id: &str, chat: &tasks::ChatSession) -> Self {
         let abs = crate::storage::chat_history::history_file_path(project_key, task_id, &chat.id);
@@ -1473,14 +1611,23 @@ pub async fn delete_chat(
                 "This Agent does not support session deletion".to_string(),
             ));
         }
-        tokio::time::timeout(std::time::Duration::from_secs(5), handle.delete_session())
-            .await
-            .map_err(|_| AcpError::Internal("Agent session deletion timed out".to_string()))?
-            .map_err(|error| AcpError::Internal(error.to_string()))?;
+        await_agent_delete(
+            handle.as_ref(),
+            handle.delete_session(),
+            AGENT_DELETE_TIMEOUT,
+        )
+        .await?;
     }
 
-    // Kill the ACP session for this chat if running
-    let _ = acp::kill_session(&session_key);
+    // Reliably enqueue Kill before removing the local Chat. The async send
+    // cannot be lost merely because the bounded command queue is temporarily
+    // full, and the normal command-loop path still performs session/close.
+    if let Some(handle) = acp::get_session_handle(&session_key) {
+        handle
+            .kill()
+            .await
+            .map_err(|error| AcpError::Internal(error.to_string()))?;
+    }
 
     // Remove chat entry from chats.toml
     tasks::delete_chat_session(&project_key, &task_id, &chat_id)
@@ -1929,4 +2076,126 @@ pub async fn reconnect_chat(
     Err(AcpError::Internal(
         "Timed out while stopping the existing ACP session".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v1_tool_update_maps_to_wire_replacement_semantics() {
+        let message = ServerMessage::from(AcpUpdate::ToolCallUpdateV1 {
+            id: "tool-1".to_string(),
+            title: None,
+            kind: None,
+            status: None,
+            output: Some(Vec::new()),
+            display_content: None,
+            locations: Some(Vec::new()),
+            input: None,
+            legacy_raw_input: None,
+            legacy_raw_output: None,
+            legacy_content: None,
+        });
+        let value = serde_json::to_value(message).unwrap();
+
+        assert_eq!(value["type"], "tool_call_update");
+        assert_eq!(value["output"], serde_json::json!([]));
+        assert_eq!(value["locations_replace"], true);
+        assert_eq!(value["protocol_v1"], true);
+        assert_eq!(value["status"], "");
+        assert!(value.get("title").is_none());
+    }
+
+    #[test]
+    fn legacy_v1_tool_history_is_migrated_to_readable_wire_fields() {
+        let created: AcpUpdate = serde_json::from_value(serde_json::json!({
+            "type": "tool_call_v1",
+            "id": "search-1",
+            "title": "Searching the Web",
+            "kind": "fetch",
+            "status": "pending",
+            "content": null,
+            "tool_content": [],
+            "locations": [],
+            "raw_input": { "query": "guardrail architecture" }
+        }))
+        .unwrap();
+        let created = serde_json::to_value(ServerMessage::from(created)).unwrap();
+        assert_eq!(created["input"][0]["label"], "Query");
+        assert_eq!(created["input"][0]["value"], "guardrail architecture");
+        assert_eq!(created["output"], serde_json::json!([]));
+
+        let updated: AcpUpdate = serde_json::from_value(serde_json::json!({
+            "type": "tool_call_update_v1",
+            "id": "search-1",
+            "title": "Searching for: guardrail architecture",
+            "status": "completed",
+            "raw_input": { "query": "guardrail architecture" },
+            "content": [{
+                "type": "content",
+                "content": { "type": "text", "text": "Useful result" }
+            }]
+        }))
+        .unwrap();
+        let updated = serde_json::to_value(ServerMessage::from(updated)).unwrap();
+        assert_eq!(updated["input"][0]["label"], "Query");
+        assert_eq!(updated["output"][0]["content"]["text"], "Useful result");
+    }
+
+    fn test_handle() -> (std::sync::Arc<acp::AcpSessionHandle>, acp::TestSessionGuard) {
+        let key = format!("agent-delete-test-{}", uuid::Uuid::new_v4());
+        let (handle, _updates, guard) = acp::new_handle_for_test(&key, "project", "task", "chat");
+        (handle, guard)
+    }
+
+    #[tokio::test]
+    async fn agent_delete_success_keeps_the_connection_alive_for_local_cleanup() {
+        let (handle, _guard) = test_handle();
+
+        let result = await_agent_delete(
+            handle.as_ref(),
+            std::future::ready(Ok(())),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(!handle.shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn agent_delete_error_is_propagated_without_downgrading_to_local_delete() {
+        let (handle, _guard) = test_handle();
+        let delete = std::future::ready(Err(crate::error::GroveError::Session(
+            "Agent refused session/delete".to_string(),
+        )));
+
+        let error = await_agent_delete(handle.as_ref(), delete, std::time::Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AcpError::Internal(message) if message.contains("Agent refused session/delete")
+        ));
+        assert!(!handle.shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn agent_delete_timeout_immediately_requests_transport_shutdown() {
+        let (handle, _guard) = test_handle();
+        let delete = std::future::pending::<crate::error::Result<()>>();
+
+        let error =
+            await_agent_delete(handle.as_ref(), delete, std::time::Duration::from_millis(1))
+                .await
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AcpError::Internal(message) if message == "Agent session deletion timed out"
+        ));
+        assert!(handle.shutdown_requested());
+    }
 }

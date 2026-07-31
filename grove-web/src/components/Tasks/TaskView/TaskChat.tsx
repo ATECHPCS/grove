@@ -59,6 +59,7 @@ import {
   User,
   ListChecks,
   Download,
+  ArrowRightLeft,
 } from "lucide-react";
 import { iconUrlForFile } from "../../ui/iconUrl";
 import {
@@ -125,6 +126,23 @@ import { useACPAvailability } from "./useACPAvailability";
 import { useInitialChatLoad } from "./useInitialChatLoad";
 import { useActiveChatId } from "./useActiveChatId";
 import { useTypewriter } from "./useTypewriter";
+import {
+  appendStructuredContentBlock,
+  appendTextContentBlock,
+  type AgentContentBlock,
+} from "./agentContentBlocks";
+import {
+  applyToolCallCreated,
+  applyToolCallUpdated,
+  canApplyToolCallUpdate,
+  hasReadableToolInput,
+  hasReadableToolOutput,
+  toolCallChipTone,
+  toolCallHoverText,
+  type ToolCallContentData,
+  type ToolCallInputData,
+  type ToolCallMessage,
+} from "./toolCallReducer";
 import { listSketches, type SketchMeta } from "../../../api/sketches";
 import { writeLastActiveTab } from "../../../utils/lastActiveTab";
 import { XTerminal } from "../TaskDetail/XTerminal";
@@ -324,18 +342,7 @@ interface TaskChatProps {
   onBusyStateChange?: (busy: boolean) => void;
 }
 
-type ToolMessage = {
-  type: "tool";
-  id: string;
-  title: string;
-  status: string;
-  content?: string;
-  collapsed: boolean;
-  locations?: { path: string; line?: number }[];
-  /// ACP `tool_call.raw_input` — agent 实际调用工具时的入参 JSON。
-  /// Bash 的 `command`、Grep 的 `pattern`、MCP 的入参等。
-  rawInput?: unknown;
-};
+type ToolMessage = ToolCallMessage;
 
 interface PermOption {
   option_id: string;
@@ -372,6 +379,9 @@ interface TurnUsageData {
   cachedReadTokens?: number;
 }
 
+const REFUSAL_CONTEXT_NOTICE =
+  "Agent declined this request. This turn won't be included in future conversation context.";
+
 type AskFormMessage = {
   /** Special-case rendering of the `ask_form` MCP tool call: instead of a
    *  collapsed tool card we show an interactive form (FormPill). The agent
@@ -381,7 +391,7 @@ type AskFormMessage = {
   type: "ask_form";
   /** ACP tool_call id. Stable across tool_call_update events. */
   id: string;
-  /** Direct passthrough of `tool_call.raw_input`. */
+  /** Validated form definition used by the dedicated form experience. */
   definition: AskFormDefinition;
   /** Set to true locally once the user submits / skips / cancels — the next
    *  render returns null so the pill disappears. */
@@ -400,6 +410,8 @@ type ChatMessage =
       type: "assistant";
       content: string;
       complete: boolean;
+      /** Ordered ACP content blocks. Absent for legacy text-only cached state. */
+      blocks?: AgentContentBlock[];
       /** Per-turn token accounting from the agent's PromptResponse, attached
        * by the `complete` reducer to the most recent assistant message in
        * the turn. Absent on streaming messages and on agents that don't
@@ -1007,6 +1019,20 @@ function buildRenderItems(messages: ChatMessage[], isBusy = false): RenderItem[]
       continue;
     }
 
+    // Rich ACP content must retain its exact position relative to text and
+    // tools. The compact WorkSummary intentionally rearranges process items,
+    // so keep these uncommon turns in the sequential renderer.
+    const hasStructuredAssistantContent = turnEntries.some(
+      (message) =>
+        message.type === "assistant" &&
+        message.blocks?.some((block) => block.type !== "text"),
+    );
+    if (hasStructuredAssistantContent) {
+      items.push(...buildSequentialRenderItems(turnEntries, userIndex + 1));
+      cursor = nextUserIndex;
+      continue;
+    }
+
     let processEndOffset = -1;
     for (let i = turnEntries.length - 1; i >= 0; i -= 1) {
       if (turnEntries[i].type === "tool") {
@@ -1149,7 +1175,7 @@ function getAutoScrollTailSignature(messages: ChatMessage[]): string {
     .map((message) => {
       switch (message.type) {
         case "assistant":
-          return `assistant:${message.complete ? 1 : 0}:${message.content.length}`;
+          return `assistant:${message.complete ? 1 : 0}:${message.content.length}:${message.blocks?.length ?? 0}`;
         case "thinking":
           return `thinking:${message.complete ? 1 : 0}:${message.content.length}`;
         case "tool":
@@ -1248,21 +1274,6 @@ function formatPreviewCommentPrompt(comments: PreviewCommentDraft[]): string {
  * de-duped by (path, line). Preserves insertion order so early-discovered
  * locations stay on top.
  */
-function mergeLocations(
-  existing: { path: string; line?: number }[] | undefined,
-  incoming: { path: string; line?: number }[] | undefined,
-): { path: string; line?: number }[] | undefined {
-  if (!incoming || incoming.length === 0) return existing;
-  const base = existing ?? [];
-  const out = [...base];
-  for (const loc of incoming) {
-    if (!out.some((e) => e.path === loc.path && e.line === loc.line)) {
-      out.push(loc);
-    }
-  }
-  return out;
-}
-
 function completeThinking(messages: ChatMessage[]): ChatMessage[] {
   let changed = false;
   const result = messages.map((m) => {
@@ -1950,7 +1961,11 @@ function reduceHistoryMessages(
         const m = prev[i];
         if (m.type === "assistant") {
           const updated = [...prev];
-          updated[i] = { ...m, content: m.content + msg.text };
+          updated[i] = {
+            ...m,
+            content: m.content + msg.text,
+            blocks: appendTextContentBlock(m.blocks, m.content, msg.text),
+          };
           return updated;
         }
         if (m.type === "user" || m.type === "tool") break;
@@ -1958,7 +1973,42 @@ function reduceHistoryMessages(
       if (!msg.text?.trim()) return prev;
       return [
         ...prev,
-        { type: "assistant", content: msg.text, complete: false },
+        {
+          type: "assistant",
+          content: msg.text,
+          complete: false,
+          blocks: [{ type: "text", text: msg.text }],
+        },
+      ];
+    }
+    case "message_content_chunk": {
+      const content = msg.content as AgentContentBlock | undefined;
+      if (!content || content.type === "text") return messages;
+      const prev = completeThinking(messages);
+      for (let i = prev.length - 1; i >= 0; i -= 1) {
+        const m = prev[i];
+        if (m.type === "assistant") {
+          const updated = [...prev];
+          updated[i] = {
+            ...m,
+            blocks: appendStructuredContentBlock(
+              m.blocks,
+              m.content,
+              content,
+            ),
+          };
+          return updated;
+        }
+        if (m.type === "user" || m.type === "tool") break;
+      }
+      return [
+        ...prev,
+        {
+          type: "assistant",
+          content: "",
+          complete: false,
+          blocks: [content],
+        },
       ];
     }
     case "thought_chunk": {
@@ -1986,14 +2036,7 @@ function reduceHistoryMessages(
       if (prev.some((m) => m.type === "tool" && m.id === msg.id)) {
         return prev.map((m) =>
           m.type === "tool" && m.id === msg.id
-            ? {
-                ...m,
-                title: msg.title,
-                // locations 按增量合并，按 (path,line) 去重保序
-                locations: mergeLocations(m.locations, msg.locations),
-                // raw_input 后到优先（agent 在 update 阶段才补全 input 时不抹掉）
-                rawInput: msg.raw_input !== undefined ? msg.raw_input : m.rawInput,
-              }
+            ? applyToolCallCreated(m, msg)
             : m,
         );
       }
@@ -2002,63 +2045,25 @@ function reduceHistoryMessages(
       );
       return [
         ...completed,
-        {
-          type: "tool",
-          id: msg.id,
-          title: msg.title,
-          status: "running",
-          collapsed: false,
-          locations: msg.locations,
-          rawInput: msg.raw_input,
-        },
+        applyToolCallCreated(undefined, msg),
       ];
     }
     case "tool_call_update": {
-      // 按 ACP 规范，每条 tool_call_update 的 content 是增量内容，应在已有
-      // content 上追加（去重），而不是覆盖。覆盖会让早期的命令/进度被最终
-      // 的结果/错误挤掉。
-      const mergeContent = (
-        prev: string | undefined,
-        next: string | undefined,
-      ): string | undefined => {
-        if (!next) return prev;
-        if (!prev) return next;
-        // 见后端 compact_events 同名逻辑：三种 agent 行为
-        //   1. 纯增量（next 是 delta）→ 拼接
-        //   2. 累积快照（next 以 prev 为前缀）→ 用 next 替换，避免 O(n²)
-        //   3. 重复广播（next 已包含在 prev 中）→ 跳过
-        if (prev.includes(next)) return prev;
-        if (next.startsWith(prev)) return next;
-        return prev.endsWith("\n") ? prev + next : prev + "\n" + next;
-      };
       const exists = messages.some((m) => m.type === "tool" && m.id === msg.id);
       if (exists) {
         return messages.map((m) =>
           m.type === "tool" && m.id === msg.id
-            ? {
-                ...m,
-                status: msg.status,
-                content: mergeContent(m.content, msg.content),
-                locations: mergeLocations(m.locations, msg.locations),
-                rawInput:
-                  msg.raw_input !== undefined ? msg.raw_input : m.rawInput,
-              }
+            ? applyToolCallUpdated(m, msg)
             : m,
         );
       }
-      return [
-        ...messages,
-        {
-          type: "tool",
-          id: msg.id,
-          title: msg.id,
-          status: msg.status,
-          content: msg.content,
-          collapsed: true,
-          locations: msg.locations ?? [],
-          rawInput: msg.raw_input,
-        },
-      ];
+      // ACP can only construct a missing ToolCall from an update when the
+      // required title is present. Keep malformed v1 updates out of the UI;
+      // a later complete ToolCall event can still create the item normally.
+      if (!canApplyToolCallUpdate(undefined, msg)) {
+        return messages;
+      }
+      return [...messages, applyToolCallUpdated(undefined, msg)];
     }
     case "permission_request":
       return [
@@ -2114,11 +2119,14 @@ function reduceHistoryMessages(
       const startTs =
         typeof msg.start_ts === "number" ? msg.start_ts : undefined;
       const endTs = typeof msg.end_ts === "number" ? msg.end_ts : undefined;
-      return completed.map((m) =>
+      const completedTurn = completed.map((m) =>
         m.type === "assistant" && !m.complete
           ? { ...m, complete: true, usage, startTs, endTs }
           : m,
       );
+      return String(msg.stop_reason).toLowerCase() === "refusal"
+        ? appendSystemMessage(completedTurn, REFUSAL_CONTEXT_NOTICE)
+        : completedTurn;
     }
     case "user_message":
       {
@@ -4613,6 +4621,7 @@ export function TaskChat({
           }
           break;
         case "message_chunk":
+        case "message_content_chunk":
           // Auto-close the current tool section (one-time)
           setAutoExpandSectionId((prev) => {
             if (prev) {
@@ -5031,6 +5040,7 @@ export function TaskChat({
           };
           break;
         case "message_chunk":
+        case "message_content_chunk":
         case "tool_call":
         case "thought_chunk":
         case "tool_call_update":
@@ -5989,6 +5999,7 @@ export function TaskChat({
             data: att.data,
             label: att.label,
             mime_type: att.mimeType,
+            ...(att.type === "image" && att.uri ? { uri: att.uri } : {}),
           }),
     }));
 
@@ -10264,6 +10275,167 @@ function ThinkingStatus({ label, active }: { label: string; active: boolean }) {
   );
 }
 
+function contentResourceName(uri: string, fallback = "Resource"): string {
+  const tail = uri.split(/[\\/]/).filter(Boolean).at(-1);
+  if (!tail) return fallback;
+  try {
+    return decodeURIComponent(tail);
+  } catch {
+    return tail;
+  }
+}
+
+function ContentResourceCard({
+  block,
+}: {
+  block: Extract<AgentContentBlock, { type: "resource_link" }>;
+}) {
+  const label = block.title || block.label || block.name;
+  return (
+    <button
+      type="button"
+      onClick={() => openExternalUrl(block.uri)}
+      className="flex w-full max-w-[420px] items-center gap-3 rounded-xl border border-[color-mix(in_srgb,var(--color-border)_70%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_72%,transparent)] px-3 py-2.5 text-left transition-colors hover:bg-[var(--color-bg-secondary)]"
+      title={block.uri}
+    >
+      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[var(--color-bg)]">
+        <Paperclip className="h-4 w-4 text-[var(--color-text-muted)]" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-xs font-medium text-[var(--color-text)]">
+          {label}
+        </div>
+        {(block.description || block.mime_type || typeof block.size === "number") && (
+          <div className="mt-0.5 truncate text-[10px] text-[var(--color-text-muted)]">
+            {[
+              block.description,
+              block.mime_type,
+              typeof block.size === "number"
+                ? `${Math.max(1, Math.round(block.size / 1024))} KB`
+                : "",
+            ]
+              .filter(Boolean)
+              .join(" · ")}
+          </div>
+        )}
+      </div>
+      <ExternalLink className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-muted)]" />
+    </button>
+  );
+}
+
+function EmbeddedResourceCard({
+  block,
+}: {
+  block: Extract<AgentContentBlock, { type: "resource" }>;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const name = contentResourceName(block.uri);
+  const downloadHref = block.blob
+    ? `data:${block.mime_type || "application/octet-stream"};base64,${block.blob}`
+    : undefined;
+  return (
+    <div className="w-full max-w-[520px] overflow-hidden rounded-xl border border-[color-mix(in_srgb,var(--color-border)_70%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_72%,transparent)]">
+      <div className="flex items-center gap-3 px-3 py-2.5">
+        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[var(--color-bg)]">
+          <Paperclip className="h-4 w-4 text-[var(--color-text-muted)]" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-xs font-medium text-[var(--color-text)]">
+            {name}
+          </div>
+          <div className="truncate text-[10px] text-[var(--color-text-muted)]">
+            {block.mime_type || (block.text != null ? "text/plain" : "Embedded resource")}
+          </div>
+        </div>
+        {block.text != null && (
+          <button
+            type="button"
+            onClick={() => setExpanded((value) => !value)}
+            className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[10px] text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+          >
+            {expanded ? "Collapse" : "Preview"}
+            <ChevronDown
+              className={`h-3 w-3 transition-transform ${expanded ? "rotate-180" : ""}`}
+            />
+          </button>
+        )}
+        {downloadHref && (
+          <a
+            href={downloadHref}
+            download={name}
+            className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[10px] text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+          >
+            <Download className="h-3 w-3" />
+            Download
+          </a>
+        )}
+        {block.uri && (
+          <button
+            type="button"
+            onClick={() => openExternalUrl(block.uri)}
+            className="rounded-md p-1.5 text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+            title={block.uri}
+          >
+            <ExternalLink className="h-3.5 w-3.5" />
+          </button>
+        )}
+      </div>
+      {expanded && block.text != null && (
+        <pre className="max-h-72 overflow-auto border-t border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[var(--color-bg)] px-3 py-2.5 text-[11px] leading-5 text-[var(--color-text)] whitespace-pre-wrap break-words">
+          {block.text}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+function AgentContentBlocks({
+  blocks,
+  renderText,
+  onImageClick,
+}: {
+  blocks: AgentContentBlock[];
+  renderText: (text: string, index: number) => ReactNode;
+  onImageClick?: (url: string) => void;
+}) {
+  return (
+    <div className="space-y-2.5">
+      {blocks.map((block, index) => {
+        if (block.type === "text") {
+          return <Fragment key={index}>{renderText(block.text, index)}</Fragment>;
+        }
+        if (block.type === "image") {
+          const src = `data:${block.mime_type};base64,${block.data}`;
+          return (
+            <img
+              key={index}
+              src={src}
+              alt={block.label || contentResourceName(block.uri || "", "Agent image")}
+              className="max-h-[420px] max-w-full rounded-xl border border-[color-mix(in_srgb,var(--color-border)_70%,transparent)] object-contain shadow-sm cursor-pointer hover:opacity-95"
+              onClick={() => onImageClick?.(src)}
+            />
+          );
+        }
+        if (block.type === "audio") {
+          return (
+            <audio
+              key={index}
+              controls
+              src={`data:${block.mime_type};base64,${block.data}`}
+              className="w-full max-w-[520px]"
+            />
+          );
+        }
+        if (block.type === "resource_link") {
+          return <ContentResourceCard key={index} block={block} />;
+        }
+        return <EmbeddedResourceCard key={index} block={block} />;
+      })}
+    </div>
+  );
+}
+
 /** Individual message rendering */
 const MessageItem = memo(function MessageItem({
   message,
@@ -10513,8 +10685,11 @@ const MessageItem = memo(function MessageItem({
       // Use the typewriter-revealed text while streaming; once complete
       // the hook returns the full content immediately.
       const shown = message.complete ? message.content : streamDisplay;
-      // Skip empty/whitespace-only assistant messages
-      if (!shown.trim()) return null;
+      const hasStructuredContent =
+        message.blocks?.some((block) => block.type !== "text") ?? false;
+      // Skip empty/whitespace-only assistant messages unless they carry a
+      // structured ACP content block.
+      if (!shown.trim() && !hasStructuredContent) return null;
       return (
         <div className="flex justify-start">
           <div
@@ -10522,17 +10697,44 @@ const MessageItem = memo(function MessageItem({
             data-grove-commentable-message="true"
             data-grove-message-index={index}
           >
-            <MarkdownRenderer
-              content={shown}
-              onFileClick={onFileClick}
-              resolveImageUrl={resolveImageUrl}
-              onMermaidClick={onMermaidClick}
-              onD2Click={onD2Click}
-              onImageClick={onImageClick}
-              enableRunCommand
-              sketchContext={sketchContext}
-              comments={markdownComments}
-            />
+            {hasStructuredContent && message.blocks ? (
+              <AgentContentBlocks
+                blocks={message.blocks}
+                onImageClick={onImageClick}
+                renderText={(text, blockIndex) => (
+                  <MarkdownRenderer
+                    content={text}
+                    onFileClick={onFileClick}
+                    resolveImageUrl={resolveImageUrl}
+                    onMermaidClick={onMermaidClick}
+                    onD2Click={onD2Click}
+                    onImageClick={onImageClick}
+                    enableRunCommand
+                    sketchContext={sketchContext}
+                    comments={
+                      markdownComments
+                        ? {
+                            ...markdownComments,
+                            previewId: `${markdownComments.previewId}-block-${blockIndex}`,
+                          }
+                        : undefined
+                    }
+                  />
+                )}
+              />
+            ) : (
+              <MarkdownRenderer
+                content={shown}
+                onFileClick={onFileClick}
+                resolveImageUrl={resolveImageUrl}
+                onMermaidClick={onMermaidClick}
+                onD2Click={onD2Click}
+                onImageClick={onImageClick}
+                enableRunCommand
+                sketchContext={sketchContext}
+                comments={markdownComments}
+              />
+            )}
             {message.complete && message.usage && (
               <TurnUsageMeta
                 inputTokens={message.usage.inputTokens}
@@ -10862,7 +11064,7 @@ function normalizeToolVerb(title: string): string {
 }
 
 function isEditTool(message: ToolMessage): boolean {
-  return normalizeToolVerb(message.title) === "edit";
+  return message.kind === "edit" || normalizeToolVerb(message.title) === "edit";
 }
 
 /**
@@ -10876,10 +11078,17 @@ type ActionKind =
   | "todo"
   | "mcp"
   | "permission"
+  | "read"
+  | "edit"
+  | "delete"
+  | "move"
+  | "search"
+  | "fetch"
+  | "switch_mode"
   | "generic";
 
-function classifyActionKind(title: string): ActionKind {
-  const lower = title.toLowerCase().trim();
+function classifyActionKind(message: ToolMessage): ActionKind {
+  const lower = message.title.toLowerCase().trim();
   // 注：不匹配 "terminal"（会被 isBackgroundAction 先剔掉，走不到这里）。
   if (lower === "bash" || lower.startsWith("run ")) return "bash";
   if (lower === "bash_output") return "bash_output";
@@ -10892,6 +11101,19 @@ function classifyActionKind(title: string): ActionKind {
     return "todo";
   if (lower.startsWith("mcp__") || lower.startsWith("mcp_")) return "mcp";
   if (lower.includes("permission")) return "permission";
+  if (message.kind === "execute") return "bash";
+  if (message.kind === "think") return "todo";
+  if (
+    message.kind === "read" ||
+    message.kind === "edit" ||
+    message.kind === "delete" ||
+    message.kind === "move" ||
+    message.kind === "search" ||
+    message.kind === "fetch" ||
+    message.kind === "switch_mode"
+  ) {
+    return message.kind;
+  }
   return "generic";
 }
 
@@ -10918,19 +11140,11 @@ function extractActionChipLabel(
   switch (kind) {
     case "bash":
     case "bash_output": {
-      // 1. Try to extract command from rawInput first if available.
-      if (message.rawInput) {
-        if (typeof message.rawInput === "string") {
-          const firstCmd = firstNonEmptyLine(message.rawInput);
-          if (firstCmd) return firstCmd;
-        } else if (typeof message.rawInput === "object" && message.rawInput !== null) {
-          const obj = message.rawInput as Record<string, unknown>;
-          if (typeof obj.command === "string") {
-            const firstCmd = firstNonEmptyLine(obj.command);
-            if (firstCmd) return firstCmd;
-          }
-        }
-      }
+      const command = message.input?.find(
+        (field) => field.label === "Command",
+      )?.value;
+      const firstCmd = command ? firstNonEmptyLine(command) : "";
+      if (firstCmd) return firstCmd;
 
       // 2. Fallback to content typically starts with the command or its output.
       // If it looks like a shell command (starts with a letter and no obvious
@@ -11028,6 +11242,20 @@ function renderActionKindIcon(
       return <Plug className={className} />;
     case "permission":
       return <ShieldCheck className={className} />;
+    case "read":
+      return <Eye className={className} />;
+    case "edit":
+      return <Pencil className={className} />;
+    case "delete":
+      return <Trash2 className={className} />;
+    case "move":
+      return <ArrowRightLeft className={className} />;
+    case "search":
+      return <Search className={className} />;
+    case "fetch":
+      return <Globe className={className} />;
+    case "switch_mode":
+      return <RefreshCw className={className} />;
     default:
       return <Wrench className={className} />;
   }
@@ -11039,6 +11267,9 @@ function isBackgroundAction(message: ToolMessage): boolean {
   // broad shell output. Treat them as background exploration instead of a primary
   // action so the UI does not surface a low-signal "Terminal" action chip.
   return (
+    message.kind === "read" ||
+    message.kind === "search" ||
+    message.kind === "fetch" ||
     verb === "read" ||
     verb === "search" ||
     verb === "list" ||
@@ -11236,6 +11467,7 @@ function extractFailureReason(tools: ToolSectionItem[]): string | null {
 
 function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean) {
   const running = tools.filter((t) => t.message.status === "running").length;
+  const pending = tools.filter((t) => t.message.status === "pending").length;
   const failed = tools.filter(
     (t) => t.message.status === "error" || t.message.status === "failed",
   ).length;
@@ -11243,11 +11475,12 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
     (t) => t.message.status === "cancelled",
   ).length;
   const total = tools.length;
-  const succeeded = total - running - failed - cancelled;
+  const succeeded = total - running - pending - failed - cancelled;
   // Only compute terminal statuses when the section is truly finished
   // (i.e. a new message/thinking/turn-end appeared after this tool section, or chat is idle)
-  const settled = sectionFinished && running === 0;
+  const settled = sectionFinished && running === 0 && pending === 0;
   const allFailed = settled && failed > 0 && succeeded === 0;
+  const allCancelled = settled && cancelled > 0 && succeeded === 0 && failed === 0;
   const partialFailed = settled && failed > 0 && !allFailed;
 
   // statusLabel: only show when it adds info beyond the title
@@ -11267,6 +11500,7 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
 
   let title = "Working";
   if (allFailed) title = "Action failed";
+  else if (allCancelled) title = "Actions cancelled";
   else if (partialFailed) title = "Completed with errors";
   else if (
     tools.some((t) => normalizeToolVerb(t.message.title) === "permission")
@@ -11294,7 +11528,7 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
     for (const tool of edits) {
       const editPaths = extractEditToolPaths({
         locations: tool.message.locations,
-        rawInput: tool.message.rawInput,
+        input: tool.message.input,
         content: tool.message.content,
       });
       const targets = editPaths.length > 0 ? editPaths : [""];
@@ -11338,17 +11572,18 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
   })();
 
   const buildChipItem = (tool: ToolSectionItem): ActionChipItem => {
-    const kind = classifyActionKind(tool.message.title);
+    const kind = classifyActionKind(tool.message);
     const derived = extractActionChipLabel(tool.message, kind);
     return {
       key: tool.message.id,
       kind,
       label: truncateChipLabel(stripAnsi(derived)),
-      rawTitle: tool.message.title,
       content: tool.message.content ?? "",
       locations: tool.message.locations ?? [],
       status: tool.message.status,
-      rawInput: tool.message.rawInput,
+      input: tool.message.input,
+      output: tool.message.output,
+      hoverText: toolCallHoverText(tool.message.title, tool.message.input),
     };
   };
   const actionItems = foregroundActions.map(buildChipItem);
@@ -11357,7 +11592,11 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
   // action chips so the user can still see what was inspected and expand to read
   // the output.
   const inspectionActionItems = backgroundActions
-    .filter((t) => (t.message.locations?.length ?? 0) === 0)
+    .filter(
+      (t) =>
+        hasReadableToolInput(t.message.input) ||
+        hasReadableToolOutput(t.message.output, t.message.content ?? ""),
+    )
     .map(buildChipItem);
 
   const inspectionEntries = collectLocationChips(tools, isBackgroundAction);
@@ -11418,6 +11657,7 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
     actionVisibleEntries: actionEntries.slice(0, 3),
     actionOverflow: Math.max(0, actionEntries.length - 3),
     failureReason: extractFailureReason(tools),
+    pending,
     running,
     failed,
     cancelled,
@@ -11425,15 +11665,16 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
 }
 
 function getStatusChipClasses(status: string, muted = false): string {
-  if (status === "error" || status === "failed") {
+  const tone = toolCallChipTone(status);
+  if (tone === "warning") {
     return "bg-[color-mix(in_srgb,var(--color-warning)_16%,var(--color-bg))] text-[color-mix(in_srgb,var(--color-warning)_92%,white_8%)] border border-[color-mix(in_srgb,var(--color-warning)_28%,transparent)]";
   }
-  if (status === "running") {
+  if (tone === "running") {
     return muted
       ? "bg-[color-mix(in_srgb,var(--color-highlight)_10%,var(--color-bg))] text-[color-mix(in_srgb,var(--color-highlight)_80%,white_8%)] border border-[color-mix(in_srgb,var(--color-highlight)_18%,transparent)]"
       : "bg-[color-mix(in_srgb,var(--color-highlight)_12%,var(--color-bg))] text-[var(--color-text)] border border-[color-mix(in_srgb,var(--color-highlight)_18%,transparent)]";
   }
-  if (status === "cancelled") {
+  if (tone === "cancelled") {
     return "bg-[color-mix(in_srgb,var(--color-text-muted)_10%,var(--color-bg))] text-[var(--color-text-muted)] border border-[color-mix(in_srgb,var(--color-text-muted)_18%,transparent)]";
   }
   return muted
@@ -11445,11 +11686,12 @@ type ActionChipItem = {
   key: string;
   kind: ActionKind;
   label: string;
-  rawTitle: string;
   content: string;
   locations: { path: string; line?: number }[];
   status: string;
-  rawInput?: unknown;
+  input?: ToolCallInputData[];
+  output?: ToolCallContentData[];
+  hoverText: string;
 };
 
 /** Render a diff string with +/-/@@ line coloring. Inline `<pre>` block. */
@@ -11486,24 +11728,92 @@ function DiffPreview({ diff }: { diff: string }) {
   );
 }
 
-/**
- * Pretty-format `tool_call.raw_input` for the expanded panel REQUEST block.
- * Bash 类工具直接渲 `command`(更短更直观);其他工具 JSON.stringify。
- * 返回 null 表示没有可显示的 raw_input,调用方应隐藏整个 REQUEST 块。
- */
-function formatRawInput(raw: unknown, kind: ActionKind): string | null {
-  if (raw == null) return null;
-  if (typeof raw === "string") return raw.trim() || null;
-  if (typeof raw !== "object") return String(raw);
-  const obj = raw as Record<string, unknown>;
-  if ((kind === "bash" || kind === "bash_output") && typeof obj.command === "string") {
-    return obj.command;
+type ToolStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
+
+function normalizedToolStatus(status: string): ToolStatus {
+  if (status === "running" || status === "in_progress") return "running";
+  if (status === "completed" || status === "success") return "completed";
+  if (status === "failed" || status === "error") return "failed";
+  if (status === "cancelled" || status === "canceled") return "cancelled";
+  return "pending";
+}
+
+function toolStatusLabel(status: ToolStatus): string {
+  return {
+    pending: "Pending",
+    running: "Running",
+    completed: "Completed",
+    failed: "Failed",
+    cancelled: "Cancelled",
+  }[status];
+}
+
+function ToolStatusIcon({ status, className = "h-3 w-3" }: { status: ToolStatus; className?: string }) {
+  if (status === "running") {
+    return <Loader2 className={`${className} animate-spin text-[var(--color-highlight)]`} />;
   }
-  try {
-    return JSON.stringify(obj, null, 2);
-  } catch {
-    return null;
+  if (status === "completed") {
+    return <CheckCircle2 className={`${className} text-[var(--color-success)]`} />;
   }
+  if (status === "failed") {
+    return <AlertTriangle className={`${className} text-[var(--color-warning)]`} />;
+  }
+  if (status === "cancelled") {
+    return <X className={`${className} text-[var(--color-text-muted)]`} />;
+  }
+  return <Circle className={`${className} text-[var(--color-text-muted)]`} />;
+}
+
+function ToolInputFields({ fields }: { fields: ToolCallInputData[] }) {
+  return (
+    <dl className="divide-y divide-[color-mix(in_srgb,var(--color-border)_55%,transparent)] overflow-hidden rounded-lg border border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[var(--color-bg)]">
+      {fields.map((field, index) => (
+        <div key={`${field.label}:${index}`} className="grid grid-cols-[minmax(110px,0.28fr)_minmax(0,1fr)] gap-3 px-3 py-2.5">
+          <dt className="text-[11px] font-medium text-[var(--color-text-muted)]">
+            {field.label}
+          </dt>
+          <dd className="min-w-0 whitespace-pre-wrap break-words font-mono text-[11px] leading-[1.5] text-[var(--color-text)]">
+            {field.value}
+          </dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function ToolContentBlocks({ content }: { content: ToolCallContentData[] }) {
+  return (
+    <div className="space-y-2.5">
+      {content.map((item, index) => {
+        if (item.type === "content") {
+          return (
+            <AgentContentBlocks
+              key={index}
+              blocks={[item.content]}
+              renderText={(text) => (
+                <div className="text-[12px] leading-[1.45]">
+                  <MarkdownRenderer content={text} />
+                </div>
+              )}
+            />
+          );
+        }
+        if (item.type === "diff") {
+          return <DiffPreview key={index} diff={item.display_text} />;
+        }
+        return (
+          <div
+            key={index}
+            className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2 text-[11px] text-[var(--color-text-muted)]"
+          >
+            <Terminal className="h-3.5 w-3.5" />
+            <span>Terminal</span>
+            <code className="text-[var(--color-text)]">{item.terminal_id}</code>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 /** Single clickable / expandable action chip. */
@@ -11522,12 +11832,13 @@ function ActionChip({
     mode?: "diff" | "full",
   ) => Promise<boolean>;
 }) {
-  const hasContent = item.content.trim().length > 0;
-  const requestText = formatRawInput(item.rawInput, item.kind);
-  const hasDetails = hasContent || requestText !== null;
+  const status = normalizedToolStatus(item.status);
+  const hasOutput = hasReadableToolOutput(item.output, item.content);
+  const hasInput = hasReadableToolInput(item.input);
+  const hasDetails = hasOutput || hasInput;
   const hasLocation = item.locations.length > 0;
   // Prefer details when the tool exposes a request or response. Running tools
-  // often have rawInput before they have output; treating those as expandable
+  // often have input before they have output; treating those as expandable
   // lets the user inspect the complete command while it is still executing.
   // Location-only chips retain their direct file navigation behavior.
   const handleClick = (e: React.MouseEvent) => {
@@ -11558,7 +11869,7 @@ function ActionChip({
       type="button"
       onClick={handleClick}
       disabled={!isInteractive}
-      title={requestText ?? item.rawTitle}
+      title={item.hoverText}
       className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] transition-colors max-w-[320px] ${
         isInteractive
           ? "cursor-pointer hover:brightness-110"
@@ -11569,8 +11880,8 @@ function ActionChip({
           : ""
       }`}
     >
-      {item.status === "running" ? (
-        <Loader2 className="h-3 w-3 animate-spin text-[var(--color-highlight)] shrink-0" />
+      {status === "running" ? (
+        <Loader2 className="h-3 w-3 shrink-0 animate-spin text-[var(--color-highlight)]" />
       ) : (
         renderActionKindIcon(item.kind)
       )}
@@ -11637,66 +11948,79 @@ function ActionChipList({
               item.kind === "skill" ||
               item.kind === "todo" ||
               item.kind === "mcp";
+            const status = normalizedToolStatus(item.status);
+            const hasInput = hasReadableToolInput(item.input);
+            const hasOutput = hasReadableToolOutput(item.output, item.content);
+            const resBody = item.output && item.output.length > 0 ? (
+              <ToolContentBlocks content={item.output} />
+            ) : renderMarkdown ? (
+              <div className="text-[12px] leading-[1.45]">
+                <MarkdownRenderer content={item.content} />
+              </div>
+            ) : (
+              <pre
+                className="m-0 whitespace-pre-wrap break-words font-mono text-[11px] leading-[1.5] text-[var(--color-text)]"
+                dangerouslySetInnerHTML={{
+                  __html:
+                    ansiToHtml(item.content) ||
+                    (status === "running" ? "Waiting for output…" : "No additional output."),
+                }}
+              />
+            );
             return (
               <div
                 key={`${item.key}:expanded`}
-                className="rounded-lg border border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_58%,transparent)] px-3 py-2"
+                className="overflow-hidden rounded-xl border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] bg-[var(--color-bg)]"
               >
-                <div className="flex items-center gap-2 mb-1.5">
-                  <span
-                    className="text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]"
-                    dangerouslySetInnerHTML={{
-                      __html: ansiToHtml(item.rawTitle) || "action",
-                    }}
-                  />
+                <div className="flex items-center gap-2 border-b border-[color-mix(in_srgb,var(--color-border)_55%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_55%,transparent)] px-3 py-2.5">
+                  <span className="shrink-0 text-[var(--color-text-muted)]">
+                    {renderActionKindIcon(item.kind)}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-xs font-medium text-[var(--color-text)]">
+                    {item.label}
+                  </span>
+                  <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] bg-[var(--color-bg)] px-2 py-0.5 text-[10px] text-[var(--color-text-muted)]">
+                    <ToolStatusIcon status={status} className="h-2.5 w-2.5" />
+                    {toolStatusLabel(status)}
+                  </span>
                   <button
                     type="button"
                     onClick={(e) => {
                       e.stopPropagation();
                       onToggleExpand(item.key);
                     }}
-                    className="ml-auto text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] cursor-pointer transition-colors"
+                    className="ml-0 inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-md text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-secondary)] hover:text-[var(--color-text)]"
+                    aria-label="Collapse details"
                   >
-                    collapse
+                    <ChevronUp className="h-3.5 w-3.5" />
                   </button>
                 </div>
-                {(() => {
-                  const reqText = formatRawInput(item.rawInput, item.kind);
-                  const resBody = renderMarkdown ? (
-                    <div className="text-[12px] leading-[1.45]">
-                      <MarkdownRenderer content={item.content} />
-                    </div>
-                  ) : (
-                    <pre
-                      className="text-[11px] leading-[1.45] font-mono whitespace-pre-wrap break-all text-[var(--color-text)] m-0"
-                      dangerouslySetInnerHTML={{
-                        __html: ansiToHtml(item.content) || "(no output)",
-                      }}
-                    />
-                  );
-                  return (
-                    <div className="space-y-2">
-                      {reqText && (
-                        <div>
-                          <div className="mb-1 text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
-                            Request
-                          </div>
-                          <pre className="text-[11px] leading-[1.45] font-mono whitespace-pre-wrap break-all text-[var(--color-text)] m-0">
-                            {reqText}
-                          </pre>
-                        </div>
-                      )}
-                      <div>
-                        {reqText && (
-                          <div className="mb-1 text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
-                            Response
-                          </div>
-                        )}
+                <div className="space-y-4 px-3 py-3">
+                  {hasInput && (
+                    <section>
+                      <h4 className="mb-2 text-xs font-medium text-[var(--color-text)]">
+                        Input
+                      </h4>
+                      <ToolInputFields fields={item.input ?? []} />
+                    </section>
+                  )}
+                  {hasOutput && (
+                    <section>
+                      <h4 className="mb-2 text-xs font-medium text-[var(--color-text)]">
+                        Output
+                      </h4>
+                      <div
+                        className={`rounded-lg border px-3 py-2.5 ${
+                          status === "failed"
+                            ? "border-[color-mix(in_srgb,var(--color-warning)_22%,var(--color-border))] bg-[color-mix(in_srgb,var(--color-warning)_5%,var(--color-bg))]"
+                            : "border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_35%,transparent)]"
+                        }`}
+                      >
                         {resBody}
                       </div>
-                    </div>
-                  );
-                })()}
+                    </section>
+                  )}
+                </div>
               </div>
             );
           })}
@@ -11835,8 +12159,12 @@ const ToolSectionView = memo(function ToolSectionView({
   const summaryIcon =
     summary.running > 0 ? (
       <Loader2 className="w-3.5 h-3.5 text-[var(--color-highlight)] animate-spin shrink-0" />
-    ) : summary.failed > 0 || summary.cancelled > 0 ? (
-      <DoneIcon className="w-3.5 h-3.5 text-[var(--color-warning)] shrink-0" />
+    ) : summary.pending > 0 ? (
+      <Circle className="w-3.5 h-3.5 text-[var(--color-text-muted)] shrink-0" />
+    ) : summary.failed > 0 ? (
+      <AlertTriangle className="w-3.5 h-3.5 text-[var(--color-error)] shrink-0" />
+    ) : summary.cancelled > 0 ? (
+      <X className="w-3.5 h-3.5 text-[var(--color-text-muted)] shrink-0" />
     ) : (
       <DoneIcon className="w-3.5 h-3.5 text-[var(--color-success)] shrink-0" />
     );
@@ -11975,6 +12303,12 @@ const ToolSectionView = memo(function ToolSectionView({
                       )?.message;
                       const path = item.fullPath || tool?.locations?.[0]?.path;
                       const hasDiff = item.diff.trim().length > 0;
+                      const hasToolDetails = Boolean(
+                        tool &&
+                          (hasReadableToolInput(tool.input) ||
+                            hasReadableToolOutput(tool.output, tool.content ?? "")),
+                      );
+                      const canExpand = hasDiff || hasToolDetails;
                       return (
                         <div
                           key={item.key}
@@ -11987,11 +12321,11 @@ const ToolSectionView = memo(function ToolSectionView({
                           <button
                             type="button"
                             onClick={() => {
-                              if (!hasDiff) return;
+                              if (!canExpand) return;
                               toggleDetail(item.key);
                             }}
-                            disabled={!hasDiff}
-                            className={`inline-flex items-center gap-1.5 ${hasDiff ? "cursor-pointer" : "cursor-default"} max-w-[320px]`}
+                            disabled={!canExpand}
+                            className={`inline-flex items-center gap-1.5 ${canExpand ? "cursor-pointer" : "cursor-default"} max-w-[320px]`}
                             title={path}
                           >
                             <VSCodeIcon filename={item.label} size={13} />
@@ -12009,7 +12343,7 @@ const ToolSectionView = memo(function ToolSectionView({
                                 </span>
                               </span>
                             )}
-                            {hasDiff ? (
+                            {canExpand ? (
                               isExpanded ? (
                                 <ChevronUp className="h-3 w-3 shrink-0 text-[var(--color-text-muted)]" />
                               ) : (
@@ -12041,25 +12375,86 @@ const ToolSectionView = memo(function ToolSectionView({
                   {summary.editItems
                     .filter((item) => expandedDetailKey === item.key)
                     .map((item) => {
+                      const tool = tools.find(
+                        (candidate) => candidate.message.id === item.toolId,
+                      )?.message;
+                      const status = normalizedToolStatus(
+                        tool?.status ?? item.status,
+                      );
+                      const hasInput = hasReadableToolInput(tool?.input);
+                      const hasOutput = hasReadableToolOutput(
+                        tool?.output,
+                        tool?.content ?? "",
+                      );
+                      const outputBody =
+                        tool?.output && tool.output.length > 0 ? (
+                          <ToolContentBlocks content={tool.output} />
+                        ) : item.diff.trim().length > 0 ? (
+                          <DiffPreview diff={item.diff} />
+                        ) : (
+                          <pre
+                            className="m-0 whitespace-pre-wrap break-words font-mono text-[11px] leading-[1.5] text-[var(--color-text)]"
+                            dangerouslySetInnerHTML={{
+                              __html:
+                                ansiToHtml(tool?.content ?? "") ||
+                                (status === "running"
+                                  ? "Waiting for output…"
+                                  : "No additional output."),
+                            }}
+                          />
+                        );
                       return (
                         <div
                           key={`${item.key}:diff`}
-                          className="rounded-lg border border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_58%,transparent)] px-3 py-2"
+                          className="overflow-hidden rounded-xl border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] bg-[var(--color-bg)]"
                         >
-                          <div className="mb-1.5 flex items-center gap-2">
+                          <div className="flex items-center gap-2 border-b border-[color-mix(in_srgb,var(--color-border)_55%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_55%,transparent)] px-3 py-2.5">
                             <VSCodeIcon filename={item.label} size={13} />
-                            <span className="text-[11px] text-[var(--color-text)]">
+                            <span className="min-w-0 flex-1 truncate text-xs font-medium text-[var(--color-text)]">
                               {item.label}
+                            </span>
+                            <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] bg-[var(--color-bg)] px-2 py-0.5 text-[10px] text-[var(--color-text-muted)]">
+                              <ToolStatusIcon
+                                status={status}
+                                className="h-2.5 w-2.5"
+                              />
+                              {toolStatusLabel(status)}
                             </span>
                             <button
                               type="button"
                               onClick={() => toggleDetail(item.key)}
-                              className="ml-auto text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] cursor-pointer transition-colors"
+                              className="inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-md text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-secondary)] hover:text-[var(--color-text)]"
+                              aria-label="Collapse details"
                             >
-                              collapse
+                              <ChevronUp className="h-3.5 w-3.5" />
                             </button>
                           </div>
-                          <DiffPreview diff={item.diff} />
+                          <div className="space-y-4 px-3 py-3">
+                            {hasInput && (
+                              <section>
+                                <h4 className="mb-2 text-xs font-medium text-[var(--color-text)]">
+                                  Input
+                                </h4>
+                                <ToolInputFields fields={tool?.input ?? []} />
+                              </section>
+                            )}
+                            {hasOutput && (
+                              <section>
+                                <h4 className="mb-2 text-xs font-medium text-[var(--color-text)]">
+                                  Output
+                                </h4>
+                                <div
+                                  className={`rounded-lg border px-3 py-2.5 ${
+                                    status === "failed"
+                                      ? "border-[color-mix(in_srgb,var(--color-warning)_22%,var(--color-border))] bg-[color-mix(in_srgb,var(--color-warning)_5%,var(--color-bg))]"
+                                      : "border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_35%,transparent)]"
+                                  }`}
+                                >
+                                  {outputBody}
+                                </div>
+                              </section>
+                            )}
+                          </div>
                         </div>
                       );
                     })}
