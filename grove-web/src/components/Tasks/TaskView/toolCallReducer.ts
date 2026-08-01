@@ -33,6 +33,27 @@ export function hasReadableToolInput(input: ToolCallInputData[] | undefined): bo
   return input?.some((field) => field.value.trim().length > 0) ?? false;
 }
 
+/** Restore readable JSON for structured inputs, including legacy Grove
+ * history that stored object arrays without their outer brackets. */
+export function formatToolInputValue(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return value;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return value;
+    try {
+      parsed = JSON.parse(`[${trimmed}]`);
+    } catch {
+      return value;
+    }
+  }
+  return parsed && typeof parsed === "object"
+    ? JSON.stringify(parsed, null, 2)
+    : value;
+}
+
 function hasReadableContentBlock(block: AgentContentBlock): boolean {
   if (block.type === "text") return block.text.trim().length > 0;
   if (block.type === "image") return block.data.length > 0 || Boolean(block.uri);

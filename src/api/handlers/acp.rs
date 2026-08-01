@@ -332,6 +332,8 @@ struct ThoughtLevelOption {
 #[derive(Debug, Serialize, Clone)]
 struct PlanEntryMsg {
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<String>,
     status: String,
 }
 
@@ -625,6 +627,7 @@ impl From<AcpUpdate> for ServerMessage {
                     .into_iter()
                     .map(|e| PlanEntryMsg {
                         content: e.content,
+                        priority: e.priority,
                         status: e.status,
                     })
                     .collect(),

@@ -136,6 +136,7 @@ import {
   applyToolCallUpdated,
   applyTerminalOutputUpdate,
   canApplyToolCallUpdate,
+  formatToolInputValue,
   hasReadableToolInput,
   hasReadableToolOutput,
   toolCallChipTone,
@@ -144,6 +145,12 @@ import {
   type ToolCallInputData,
   type ToolCallMessage,
 } from "./toolCallReducer";
+import {
+  normalizePlanEntries,
+  shouldOpenPlan,
+  sortPlanEntries,
+  type PlanEntry,
+} from "./planEntries";
 import { listSketches, type SketchMeta } from "../../../api/sketches";
 import { writeLastActiveTab } from "../../../utils/lastActiveTab";
 import { XTerminal } from "../TaskDetail/XTerminal";
@@ -448,11 +455,6 @@ type ServerEvent = {
   [key: string]: any;
 };
 
-interface PlanEntry {
-  content: string;
-  status: string;
-}
-
 interface SlashCommand {
   name: string;
   description: string;
@@ -628,7 +630,6 @@ type TitleEditSurface = "header" | "sidebar-header" | "sidebar-list";
 const AGENT_PICKER_MENU_WIDTH = 192;
 const AGENT_PICKER_MENU_MAX_HEIGHT = 256;
 const AGENT_PICKER_VIEWPORT_MARGIN = 8;
-
 /** Per-chat cached state (preserved across chat switches) */
 interface PerChatState {
   messages: ChatMessage[];
@@ -644,6 +645,7 @@ interface PerChatState {
   thoughtLevel: string;
   thoughtLevelConfigId: string;
   planEntries: PlanEntry[];
+  showPlan: boolean;
   slashCommands: SlashCommand[];
   isConnected: boolean;
   agentLabel: string;
@@ -690,6 +692,7 @@ function defaultPerChatState(): PerChatState {
     thoughtLevel: "",
     thoughtLevelConfigId: "",
     planEntries: [],
+    showPlan: false,
     slashCommands: [],
     isConnected: false,
     agentLabel: "Chat",
@@ -2782,6 +2785,10 @@ export function TaskChat({
     ? quotaBadgePercent(agentQuota)
     : null;
   const orderedChats = useMemo(() => [...chats].reverse(), [chats]);
+  const displayedPlanEntries = useMemo(
+    () => sortPlanEntries(planEntries),
+    [planEntries],
+  );
   const hasTodoPanel = planEntries.length > 0;
   const hasPlanPanel = !!planFileContent;
   const hasPendingPanel = pendingMessages.length > 0;
@@ -3735,6 +3742,7 @@ export function TaskChat({
       thoughtLevel,
       thoughtLevelConfigId,
       planEntries,
+      showPlan,
       slashCommands,
       isConnected,
       agentLabel,
@@ -3767,6 +3775,7 @@ export function TaskChat({
     thoughtLevel,
     thoughtLevelConfigId,
     planEntries,
+    showPlan,
     slashCommands,
     isConnected,
     agentLabel,
@@ -3800,6 +3809,7 @@ export function TaskChat({
       setThoughtLevel(cached.thoughtLevel);
       setThoughtLevelConfigId(cached.thoughtLevelConfigId);
       setPlanEntries(cached.planEntries);
+      setShowPlan(cached.showPlan ?? false);
       setSlashCommands(cached.slashCommands);
       setIsConnected(cached.isConnected);
       setAgentLabel(cached.agentLabel);
@@ -3832,6 +3842,7 @@ export function TaskChat({
       setThoughtLevel("");
       setThoughtLevelConfigId("");
       setPlanEntries([]);
+      setShowPlan(false);
       setContextUsage(null);
       setSlashCommands([]);
       setIsConnected(false);
@@ -4236,8 +4247,12 @@ export function TaskChat({
       if (chatId !== getActiveChatId()) return;
       {
         let msgs: ChatMessage[] = [];
+        let historicalPlanEntries: PlanEntry[] | null = null;
         for (const evt of res.events) {
           msgs = reduceHistoryMessages(msgs, evt);
+          if (evt.type === "plan_update") {
+            historicalPlanEntries = normalizePlanEntries(evt.entries);
+          }
         }
         // Drain buffered WS events that arrived during HTTP load
         const buffered = wsEventBufferRef.current;
@@ -4256,6 +4271,12 @@ export function TaskChat({
         msgs = prunedHistory.messages;
         setMessages(msgs);
         updateHiddenMessageCount(prunedHistory.hiddenMessageCount);
+        if (historicalPlanEntries) {
+          setPlanEntries(historicalPlanEntries);
+          // Restored history exposes the Todo pill without unexpectedly
+          // opening the composer panel on every app launch.
+          setShowPlan(false);
+        }
         // Keep attachment numbering based on full history, even when old
         // rendered messages are hidden from the view.
         attachCountersRef.current = attachmentCounters;
@@ -4345,9 +4366,17 @@ export function TaskChat({
             case "complete":
               updateBusy(false);
               break;
-            case "plan_update":
-              setPlanEntries(evt.entries || []);
+            case "plan_update": {
+              const entries = normalizePlanEntries(evt.entries);
+              const shouldOpen = shouldOpenPlan(entries);
+              setPlanEntries(entries);
+              setShowPlan(shouldOpen);
+              if (shouldOpen) {
+                setShowPlanFile(false);
+                setShowPendingQueue(false);
+              }
               break;
+            }
             case "queue_update":
               setPendingMessages(
                 (evt.messages ?? []).map(
@@ -4867,13 +4896,10 @@ export function TaskChat({
           setThoughtLevelConfigId(msg.config_id ?? "");
           break;
         case "plan_update": {
-          const entries: PlanEntry[] = msg.entries ?? [];
+          const entries = normalizePlanEntries(msg.entries);
           setPlanEntries(entries);
           // Auto-expand while in progress, auto-collapse when all done
-          const allDone =
-            entries.length > 0 &&
-            entries.every((e: PlanEntry) => e.status === "completed");
-          const shouldOpen = !allDone;
+          const shouldOpen = shouldOpenPlan(entries);
           setShowPlan(shouldOpen);
           if (shouldOpen) {
             setShowPlanFile(false);
@@ -5106,9 +5132,12 @@ export function TaskChat({
             state.hiddenMessageCount = pruned.hiddenMessageCount;
           }
           break;
-        case "plan_update":
-          state.planEntries = msg.entries ?? [];
+        case "plan_update": {
+          const entries = normalizePlanEntries(msg.entries);
+          state.planEntries = entries;
+          state.showPlan = shouldOpenPlan(entries);
           break;
+        }
         case "plan_file_update":
           state.planFilePath = msg.path;
           if (msg.content) {
@@ -8809,10 +8838,14 @@ export function TaskChat({
                     <div className={`max-h-[min(360px,48vh)] overflow-y-auto overscroll-contain ${activeComposerPanel === "previewComments" ? "" : activeComposerPanel === "pending" ? "px-2.5 py-1.5" : "px-3 py-3"}`}>
                       {activeComposerPanel === "todo" && (
                         <div className="space-y-1">
-                          {planEntries.map((entry, i) => (
+                          {displayedPlanEntries.map((entry, i) => (
                             <div
-                              key={i}
-                              className="flex items-center gap-2 py-0.5 text-sm"
+                              key={`${entry.priority ?? "legacy"}:${entry.content}:${i}`}
+                              className={`flex items-center gap-2 rounded-md px-1.5 py-1 text-sm ${
+                                entry.status === "in_progress"
+                                  ? "bg-[color-mix(in_srgb,var(--color-highlight)_10%,transparent)]"
+                                  : ""
+                              }`}
                             >
                               {entry.status === "completed" ? (
                                 <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-[var(--color-success)]" />
@@ -8822,11 +8855,13 @@ export function TaskChat({
                                 <Circle className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-muted)]" />
                               )}
                               <span
-                                className={
+                                className={`min-w-0 flex-1 ${
                                   entry.status === "completed"
                                     ? "text-[var(--color-text-muted)] line-through"
-                                    : "text-[var(--color-text)]"
-                                }
+                                    : entry.status === "in_progress"
+                                      ? "font-medium text-[var(--color-highlight)]"
+                                      : "text-[var(--color-text)]"
+                                }`}
                               >
                                 {entry.content}
                               </span>
@@ -11783,16 +11818,31 @@ function ToolStatusIcon({ status, className = "h-3 w-3" }: { status: ToolStatus;
 function ToolInputFields({ fields }: { fields: ToolCallInputData[] }) {
   return (
     <dl className="divide-y divide-[color-mix(in_srgb,var(--color-border)_55%,transparent)] overflow-hidden rounded-lg border border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[var(--color-bg)]">
-      {fields.map((field, index) => (
-        <div key={`${field.label}:${index}`} className="grid grid-cols-[minmax(110px,0.28fr)_minmax(0,1fr)] gap-3 px-3 py-2.5">
-          <dt className="text-[11px] font-medium text-[var(--color-text-muted)]">
-            {field.label}
-          </dt>
-          <dd className="min-w-0 whitespace-pre-wrap break-words font-mono text-[11px] leading-[1.5] text-[var(--color-text)]">
-            {field.value}
-          </dd>
-        </div>
-      ))}
+      {fields.map((field, index) => {
+        const value = formatToolInputValue(field.value);
+        const multiline = value.includes("\n");
+        return (
+          <div
+            key={`${field.label}:${index}`}
+            className={
+              multiline
+                ? "px-3 py-2.5"
+                : "grid grid-cols-[96px_minmax(0,1fr)] gap-3 px-3 py-2.5"
+            }
+          >
+            <dt
+              className={`text-[11px] font-medium text-[var(--color-text-muted)] ${
+                multiline ? "mb-2" : ""
+              }`}
+            >
+              {field.label}
+            </dt>
+            <dd className="min-w-0 whitespace-pre-wrap break-words font-mono text-[11px] leading-[1.5] text-[var(--color-text)]">
+              {value}
+            </dd>
+          </div>
+        );
+      })}
     </dl>
   );
 }
@@ -11970,7 +12020,7 @@ function ActionChipList({
   const expandedItem = items.find((item) => item.key === expandedKey);
   return (
     <div className="space-y-2">
-      <div className="flex flex-wrap gap-1.5">
+      <div className="flex flex-wrap gap-1.5 p-px">
         {items.map((item) => (
           <ActionChip
             key={item.key}

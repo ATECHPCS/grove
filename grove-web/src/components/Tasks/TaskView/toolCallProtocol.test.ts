@@ -4,6 +4,7 @@ import {
   applyToolCallUpdated,
   applyTerminalOutputUpdate,
   canApplyToolCallUpdate,
+  formatToolInputValue,
   hasReadableToolInput,
   hasReadableToolOutput,
   toolCallChipTone,
@@ -11,6 +12,12 @@ import {
 } from "./toolCallReducer";
 
 describe("ACP v1 tool-call reduction", () => {
+  it("renders legacy object sequences as complete formatted JSON arrays", () => {
+    expect(
+      formatToolInputValue('{"content":"First"}, {"content":"Second"}'),
+    ).toBe('[\n  {\n    "content": "First"\n  },\n  {\n    "content": "Second"\n  }\n]');
+  });
+
   it("replaces present structured collections, including empty clears", () => {
     const created = applyToolCallCreated(undefined, {
       type: "tool_call",

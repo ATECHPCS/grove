@@ -3368,6 +3368,7 @@ fn extract_last_plan(events: &[acp::AcpUpdate]) -> Option<serde_json::Value> {
             .iter()
             .map(|entry| json!({
                 "content": entry.content,
+                "priority": entry.priority,
                 "status": entry.status,
             }))
             .collect::<Vec<_>>())),

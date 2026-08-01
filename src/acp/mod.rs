@@ -536,7 +536,20 @@ pub struct PermOptionData {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PlanEntryData {
     pub content: String,
+    /// Missing on Grove history written before ACP plan priorities were
+    /// preserved. New protocol events always populate this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    #[serde(deserialize_with = "deserialize_plan_status")]
     pub status: String,
+}
+
+fn deserialize_plan_status<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let status = <String as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(normalize_plan_status(&status))
 }
 
 /// Slash command 数据（从 ACP AvailableCommandsUpdate 提取）
@@ -1374,12 +1387,6 @@ struct AcpClientState {
     file_snapshots: Mutex<HashMap<String, (PathBuf, Option<String>)>>,
     /// Write 工具的 tool_call_id → file_path（用于 PlanFileUpdate 检测）
     write_tool_paths: Mutex<HashMap<String, String>>,
-    /// "plan-like" 工具（如 Trae 的 `todo_write` / `update_plan`）的 tool_call_id：
-    /// 某些 agent 不会对这些 tool 发 `ToolCallUpdate{status=completed}`，而是
-    /// 用紧随其后的 `SessionUpdate::Plan` 事件代表"已应用"。没有人兜底的话，
-    /// 前端这条 tool_call 会永远显示 running。我们在收到 Plan 时把它们合成
-    /// 为 completed。
-    pending_plan_tool_ids: Mutex<Vec<String>>,
 }
 
 /// Build a richer permission description by extracting the most useful
@@ -1775,20 +1782,6 @@ async fn handle_session_notification(
                 }
             }
 
-            // 追踪 plan-like 工具:Trae 的 `todo_write` / `update_plan` 不走
-            // ToolCallUpdate completed,而是用 SessionUpdate::Plan 代表完成。
-            let lower_title = tool_call.title.to_lowercase();
-            if matches!(
-                lower_title.as_str(),
-                "todo_write" | "todowrite" | "update_plan"
-            ) {
-                state
-                    .pending_plan_tool_ids
-                    .lock()
-                    .unwrap()
-                    .push(tool_call.tool_call_id.to_string());
-            }
-
             // 缓存 Write/Edit 文件快照(locations 在第二个 ToolCall 事件才有路径)
             let title = &tool_call.title;
             if title.starts_with("Write") || title.starts_with("Edit") {
@@ -1918,19 +1911,6 @@ async fn handle_session_notification(
                 }
             }
 
-            // 若这个 tool_id 是 plan-like(之前记过),并且本次 update 是终态,
-            // 从 pending 表里移掉,避免 Plan 事件误触重复完成。
-            if matches!(
-                status.as_str(),
-                "completed" | "failed" | "error" | "cancelled"
-            ) {
-                let tc_id = update.tool_call_id.to_string();
-                let mut ids = state.pending_plan_tool_ids.lock().unwrap();
-                if let Some(pos) = ids.iter().position(|x| x == &tc_id) {
-                    ids.swap_remove(pos);
-                }
-            }
-
             let display_content = match output.as_deref() {
                 Some(output) => tool_output_display_text(output),
                 None => content,
@@ -2028,23 +2008,11 @@ async fn handle_session_notification(
                 .iter()
                 .map(|e| PlanEntryData {
                     content: e.content.clone(),
-                    status: format!("{:?}", e.status).to_lowercase(),
+                    priority: Some(plan_priority_name(&e.priority).to_string()),
+                    status: plan_status_name(&e.status).to_string(),
                 })
                 .collect();
             state.handle.emit(AcpUpdate::PlanUpdate { entries });
-            // 给所有已观察到但还没收到 completed 的 plan-like tool_call 合成
-            // 一条 completed ToolCallUpdate,避免前端上 spinner 永远转。
-            let pending_ids: Vec<String> =
-                std::mem::take(&mut *state.pending_plan_tool_ids.lock().unwrap());
-            for id in pending_ids {
-                state.handle.emit(AcpUpdate::ToolCallUpdate {
-                    id,
-                    status: "completed".to_string(),
-                    content: None,
-                    locations: Default::default(),
-                    raw_input: None,
-                });
-            }
         }
         acp::SessionUpdate::AvailableCommandsUpdate(update) => {
             let commands = update
@@ -2152,6 +2120,32 @@ fn tool_status_name(status: &acp::ToolCallStatus) -> &'static str {
         acp::ToolCallStatus::Completed => "completed",
         acp::ToolCallStatus::Failed => "failed",
         _ => "pending",
+    }
+}
+
+fn plan_priority_name(priority: &acp::PlanEntryPriority) -> &'static str {
+    match priority {
+        acp::PlanEntryPriority::High => "high",
+        acp::PlanEntryPriority::Medium => "medium",
+        acp::PlanEntryPriority::Low => "low",
+        _ => "medium",
+    }
+}
+
+fn plan_status_name(status: &acp::PlanEntryStatus) -> &'static str {
+    match status {
+        acp::PlanEntryStatus::Pending => "pending",
+        acp::PlanEntryStatus::InProgress => "in_progress",
+        acp::PlanEntryStatus::Completed => "completed",
+        _ => "pending",
+    }
+}
+
+fn normalize_plan_status(status: &str) -> String {
+    if status == "inprogress" {
+        "in_progress".to_string()
+    } else {
+        status.to_string()
     }
 }
 
@@ -2434,6 +2428,13 @@ fn input_value_text(key: &str, value: &serde_json::Value) -> Option<String> {
             } else {
                 None
             }
+        }
+        serde_json::Value::Array(values)
+            if values
+                .iter()
+                .any(|value| value.is_object() || value.is_array()) =>
+        {
+            serde_json::to_string_pretty(value).ok()
         }
         serde_json::Value::Array(values) => {
             let parts: Vec<String> = values
@@ -3505,7 +3506,6 @@ async fn run_acp_session(
         adapter,
         file_snapshots: Mutex::new(HashMap::new()),
         write_tool_paths: Mutex::new(HashMap::new()),
-        pending_plan_tool_ids: Mutex::new(Vec::new()),
     });
 
     let transport = acp::ByteStreams::new(writer, reader);
@@ -7419,7 +7419,6 @@ mod tests {
             adapter: adapter::resolve_adapter("test", "test"),
             file_snapshots: Mutex::new(HashMap::new()),
             write_tool_paths: Mutex::new(HashMap::new()),
-            pending_plan_tool_ids: Mutex::new(Vec::new()),
         })
     }
 
@@ -7988,6 +7987,37 @@ mod tests {
     }
 
     #[test]
+    fn plan_enum_names_match_v1_wire_values() {
+        assert_eq!(plan_priority_name(&acp::PlanEntryPriority::High), "high");
+        assert_eq!(
+            plan_priority_name(&acp::PlanEntryPriority::Medium),
+            "medium"
+        );
+        assert_eq!(plan_priority_name(&acp::PlanEntryPriority::Low), "low");
+        assert_eq!(plan_status_name(&acp::PlanEntryStatus::Pending), "pending");
+        assert_eq!(
+            plan_status_name(&acp::PlanEntryStatus::InProgress),
+            "in_progress"
+        );
+        assert_eq!(
+            plan_status_name(&acp::PlanEntryStatus::Completed),
+            "completed"
+        );
+    }
+
+    #[test]
+    fn legacy_plan_entries_normalize_status_and_allow_missing_priority() {
+        let entry: PlanEntryData = serde_json::from_value(serde_json::json!({
+            "content": "Implement the change",
+            "status": "inprogress"
+        }))
+        .unwrap();
+
+        assert_eq!(entry.status, "in_progress");
+        assert_eq!(entry.priority, None);
+    }
+
+    #[test]
     fn authentication_accepts_only_advertised_method_ids() {
         let methods = vec![AuthMethodInfo {
             id: "agent-login".to_string(),
@@ -8202,6 +8232,8 @@ mod tests {
         let fields = tool_input_to_data(Some(&protocol_input));
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].label, "Steps");
+        assert!(fields[0].value.starts_with('['));
+        assert!(fields[0].value.ends_with(']'));
         assert!(fields[0].value.contains("a.rs"));
         assert!(fields[0].value.contains("b.rs"));
     }
