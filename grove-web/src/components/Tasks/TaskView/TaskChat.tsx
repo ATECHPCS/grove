@@ -60,6 +60,8 @@ import {
   ListChecks,
   Download,
   ArrowRightLeft,
+  SlidersHorizontal,
+  Box,
 } from "lucide-react";
 import { iconUrlForFile } from "../../ui/iconUrl";
 import {
@@ -93,6 +95,17 @@ import {
 } from "../../../utils/agentIcon";
 import type { MentionItem, FilteredMentionItem } from "../../../utils/fileMention";
 import { getMentionCandidates } from "../../../api";
+import type {
+  SessionConfigOption,
+  SessionConfigSelectGroup,
+  SessionConfigSelectValue,
+} from "../../../api/tasks";
+import {
+  configCategoryMatches,
+  configDropdownValues,
+  isConfigGroup,
+  quickConfigOptions,
+} from "./sessionConfigOptions";
 import { listExtensionTabs, getExtensionStatus } from "../../../api/extension";
 import { useProject } from "../../../context/ProjectContext";
 import { useConfig } from "../../../context/ConfigContext";
@@ -630,6 +643,14 @@ type TitleEditSurface = "header" | "sidebar-header" | "sidebar-list";
 const AGENT_PICKER_MENU_WIDTH = 192;
 const AGENT_PICKER_MENU_MAX_HEIGHT = 256;
 const AGENT_PICKER_VIEWPORT_MARGIN = 8;
+
+type ChatDropdownOption = {
+  label: string;
+  value: string;
+  description?: string | null;
+  group?: string;
+};
+
 /** Per-chat cached state (preserved across chat switches) */
 interface PerChatState {
   messages: ChatMessage[];
@@ -638,12 +659,13 @@ interface PerChatState {
   isBusy: boolean;
   selectedModel: string;
   permissionLevel: string;
-  modelOptions: { label: string; value: string }[];
-  modeOptions: { label: string; value: string }[];
+  modelOptions: ChatDropdownOption[];
+  modeOptions: ChatDropdownOption[];
   /** Thought-level / reasoning-effort selector (ACP SessionConfigOption) */
-  thoughtLevelOptions: { label: string; value: string }[];
+  thoughtLevelOptions: ChatDropdownOption[];
   thoughtLevel: string;
   thoughtLevelConfigId: string;
+  sessionConfigOptions: SessionConfigOption[];
   planEntries: PlanEntry[];
   showPlan: boolean;
   slashCommands: SlashCommand[];
@@ -678,6 +700,38 @@ interface PerChatState {
   pendingMessages: { id: string; text: string }[];
 }
 
+const applyConfigOptionsToCachedState = (
+  state: PerChatState,
+  options: SessionConfigOption[],
+) => {
+  state.sessionConfigOptions = options;
+  const quick = quickConfigOptions(options);
+  const applySelect = (
+    option: SessionConfigOption | undefined,
+  ): { options: ChatDropdownOption[]; current: string } =>
+    option?.type === "select"
+      ? {
+          options: configDropdownValues(option).map((value) => ({
+            label: value.name,
+            value: value.value,
+            description: value.description,
+            group: value.group,
+          })),
+          current: option.currentValue,
+        }
+      : { options: [], current: "" };
+  const model = applySelect(quick.model);
+  const mode = applySelect(quick.mode);
+  const thinking = applySelect(quick.thinking);
+  state.modelOptions = model.options;
+  state.selectedModel = model.current;
+  state.modeOptions = mode.options;
+  state.permissionLevel = mode.current;
+  state.thoughtLevelOptions = thinking.options;
+  state.thoughtLevel = thinking.current;
+  state.thoughtLevelConfigId = quick.thinking?.id ?? "";
+};
+
 function defaultPerChatState(): PerChatState {
   return {
     messages: [],
@@ -691,6 +745,7 @@ function defaultPerChatState(): PerChatState {
     thoughtLevelOptions: [],
     thoughtLevel: "",
     thoughtLevelConfigId: "",
+    sessionConfigOptions: [],
     planEntries: [],
     showPlan: false,
     slashCommands: [],
@@ -2450,16 +2505,23 @@ export function TaskChat({
   const [selectedModel, setSelectedModel] = useState("");
   const [permissionLevel, setPermissionLevel] = useState("");
   const [modelOptions, setModelOptions] = useState<
-    { label: string; value: string }[]
+    ChatDropdownOption[]
   >([]);
   const [modeOptions, setModeOptions] = useState<
-    { label: string; value: string }[]
+    ChatDropdownOption[]
   >([]);
   const [thoughtLevel, setThoughtLevel] = useState("");
   const [thoughtLevelConfigId, setThoughtLevelConfigId] = useState("");
   const [thoughtLevelOptions, setThoughtLevelOptions] = useState<
-    { label: string; value: string }[]
+    ChatDropdownOption[]
   >([]);
+  const [sessionConfigOptions, setSessionConfigOptions] = useState<
+    SessionConfigOption[]
+  >([]);
+  const [pendingConfigIds, setPendingConfigIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [showSessionSettings, setShowSessionSettings] = useState(false);
   const [showThoughtLevelMenu, setShowThoughtLevelMenu] = useState(false);
   const [showModelMenu, setShowModelMenu] = useState(false);
   const [showPermMenu, setShowPermMenu] = useState(false);
@@ -2478,6 +2540,93 @@ export function TaskChat({
   const [planFilePath, setPlanFilePath] = useState("");
   const [planFileContent, setPlanFileContent] = useState("");
   const [showPlanFile, setShowPlanFile] = useState(false);
+
+  const applyConfigOptionsSnapshot = useCallback(
+    (options: SessionConfigOption[]) => {
+      setSessionConfigOptions(options);
+      const quick = quickConfigOptions(options);
+
+      const applySelect = (
+        option: SessionConfigOption | undefined,
+        setOptions: (value: ChatDropdownOption[]) => void,
+        setCurrent: (value: string) => void,
+      ) => {
+        if (!option || option.type !== "select") {
+          setOptions([]);
+          setCurrent("");
+          return;
+        }
+        setOptions(
+          configDropdownValues(option).map((value) => ({
+            label: value.name,
+            value: value.value,
+            description: value.description,
+            group: value.group,
+          })),
+        );
+        setCurrent(option.currentValue);
+      };
+
+      applySelect(quick.model, setModelOptions, setSelectedModel);
+      applySelect(quick.mode, setModeOptions, setPermissionLevel);
+      applySelect(quick.thinking, setThoughtLevelOptions, setThoughtLevel);
+      setThoughtLevelConfigId(quick.thinking?.id ?? "");
+      setPendingConfigIds(new Set());
+    },
+    [],
+  );
+
+  const requestConfigOptionChange = useCallback(
+    (option: SessionConfigOption, value: string | boolean) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        setMessages((previous) => [
+          ...previous,
+          { type: "system", content: "Session setting is unavailable while offline." },
+        ]);
+        return;
+      }
+      setPendingConfigIds((previous) => {
+        const next = new Set(previous);
+        next.add(option.id);
+        return next;
+      });
+      ws.send(
+        JSON.stringify({
+          type: "set_config_option",
+          config_id: option.id,
+          value,
+        }),
+      );
+    },
+    [],
+  );
+
+  const requestLegacyModeChange = useCallback((modeId: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    setPendingConfigIds((previous) => {
+      const next = new Set(previous);
+      next.add("__legacy_mode");
+      return next;
+    });
+    ws.send(JSON.stringify({ type: "set_mode", mode_id: modeId }));
+  }, []);
+
+  const matchedSessionConfig = useMemo(
+    () => quickConfigOptions(sessionConfigOptions),
+    [sessionConfigOptions],
+  );
+  const additionalSessionConfigOptions = useMemo(() => {
+    const matchedIds = new Set(
+      [
+        matchedSessionConfig.model?.id,
+        matchedSessionConfig.mode?.id,
+        matchedSessionConfig.thinking?.id,
+      ].filter((id): id is string => !!id),
+    );
+    return sessionConfigOptions.filter((option) => !matchedIds.has(option.id));
+  }, [matchedSessionConfig, sessionConfigOptions]);
   const [showPermissionPanel, setShowPermissionPanel] = useState(false);
   const [showFormPanel, setShowFormPanel] = useState(false);
   const [showAuthPanel, setShowAuthPanel] = useState(false);
@@ -2570,6 +2719,7 @@ export function TaskChat({
   const modelMenuRef = useRef<HTMLDivElement>(null);
   const permMenuRef = useRef<HTMLDivElement>(null);
   const thoughtLevelMenuRef = useRef<HTMLDivElement>(null);
+  const sessionSettingsRef = useRef<HTMLDivElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
   const slashItemRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const [taskFiles, setTaskFiles] = useState<string[]>([]);
@@ -3647,6 +3797,15 @@ export function TaskChat({
       )
         setShowThoughtLevelMenu(false);
       if (
+        sessionSettingsRef.current &&
+        !sessionSettingsRef.current.contains(e.target as Node) &&
+        !(
+          e.target instanceof Element &&
+          e.target.closest("[data-session-settings-menu]")
+        )
+      )
+        setShowSessionSettings(false);
+      if (
         chatMenuRef.current &&
         !chatMenuRef.current.contains(e.target as Node)
       )
@@ -3741,6 +3900,7 @@ export function TaskChat({
       thoughtLevelOptions,
       thoughtLevel,
       thoughtLevelConfigId,
+      sessionConfigOptions,
       planEntries,
       showPlan,
       slashCommands,
@@ -3774,6 +3934,7 @@ export function TaskChat({
     thoughtLevelOptions,
     thoughtLevel,
     thoughtLevelConfigId,
+    sessionConfigOptions,
     planEntries,
     showPlan,
     slashCommands,
@@ -3808,6 +3969,8 @@ export function TaskChat({
       setThoughtLevelOptions(cached.thoughtLevelOptions);
       setThoughtLevel(cached.thoughtLevel);
       setThoughtLevelConfigId(cached.thoughtLevelConfigId);
+      setSessionConfigOptions(cached.sessionConfigOptions ?? []);
+      setPendingConfigIds(new Set());
       setPlanEntries(cached.planEntries);
       setShowPlan(cached.showPlan ?? false);
       setSlashCommands(cached.slashCommands);
@@ -4286,39 +4449,34 @@ export function TaskChat({
             case "session_ready":
               setIsConnected(true);
               onConnectedPropRef.current?.();
-              if (evt.available_modes?.length) {
+              if (evt.uses_config_options || (Array.isArray(evt.config_options) && evt.config_options.length > 0)) {
+                applyConfigOptionsSnapshot(evt.config_options ?? []);
+              } else {
+                setSessionConfigOptions([]);
                 setModeOptions(
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  evt.available_modes.map((m: any) => ({
+                  (evt.available_modes ?? []).map((m: { id: string; name: string; description?: string }) => ({
                     label: m.name,
                     value: m.id,
+                    description: m.description,
                   })),
                 );
-              }
-              if (evt.current_mode_id) setPermissionLevel(evt.current_mode_id);
-              if (evt.available_models?.length) {
+                setPermissionLevel(evt.current_mode_id ?? "");
                 setModelOptions(
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  evt.available_models.map((m: any) => ({
+                  (evt.available_models ?? []).map((m: { id: string; name: string }) => ({
                     label: m.name,
                     value: m.id,
                   })),
                 );
-              }
-              if (evt.current_model_id) setSelectedModel(evt.current_model_id);
-              if (evt.available_thought_levels?.length) {
+                setSelectedModel(evt.current_model_id ?? "");
                 setThoughtLevelOptions(
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  evt.available_thought_levels.map((t: any) => ({
+                  (evt.available_thought_levels ?? []).map((t: { id: string; name: string }) => ({
                     label: t.name,
                     value: t.id,
                   })),
                 );
+                setThoughtLevel(evt.current_thought_level_id ?? "");
+                setThoughtLevelConfigId(evt.thought_level_config_id ?? "");
               }
-              if (evt.current_thought_level_id)
-                setThoughtLevel(evt.current_thought_level_id);
-              if (evt.thought_level_config_id)
-                setThoughtLevelConfigId(evt.thought_level_config_id);
               if (evt.prompt_capabilities) {
                 setPromptCaps({
                   image: evt.prompt_capabilities.image ?? false,
@@ -4359,6 +4517,9 @@ export function TaskChat({
               );
               setThoughtLevel(evt.current ?? "");
               setThoughtLevelConfigId(evt.config_id ?? "");
+              break;
+            case "config_options_update":
+              applyConfigOptionsSnapshot(evt.config_options ?? []);
               break;
             case "busy":
               updateBusy(true);
@@ -4423,36 +4584,34 @@ export function TaskChat({
         const hadSessionReady = buffered.some((e) => e.type === "session_ready");
         if (!hadSessionReady && res.session) {
           const s = res.session;
-          if (s.available_modes?.length) {
+          if (s.uses_config_options || (Array.isArray(s.config_options) && s.config_options.length > 0)) {
+            applyConfigOptionsSnapshot(s.config_options ?? []);
+          } else {
+            setSessionConfigOptions([]);
             setModeOptions(
-              s.available_modes.map(([id, name]) => ({
+              (s.available_modes ?? []).map(([id, name]) => ({
                 label: name,
                 value: id,
+                description: s.mode_descriptions?.[id],
               })),
             );
-          }
-          if (s.current_mode_id) setPermissionLevel(s.current_mode_id);
-          if (s.available_models?.length) {
+            setPermissionLevel(s.current_mode_id ?? "");
             setModelOptions(
-              s.available_models.map(([id, name]) => ({
+              (s.available_models ?? []).map(([id, name]) => ({
                 label: name,
                 value: id,
               })),
             );
-          }
-          if (s.current_model_id) setSelectedModel(s.current_model_id);
-          if (s.available_thought_levels?.length) {
+            setSelectedModel(s.current_model_id ?? "");
             setThoughtLevelOptions(
-              s.available_thought_levels.map(([id, name]) => ({
+              (s.available_thought_levels ?? []).map(([id, name]) => ({
                 label: name,
                 value: id,
               })),
             );
+            setThoughtLevel(s.current_thought_level_id ?? "");
+            setThoughtLevelConfigId(s.thought_level_config_id ?? "");
           }
-          if (s.current_thought_level_id)
-            setThoughtLevel(s.current_thought_level_id);
-          if (s.thought_level_config_id)
-            setThoughtLevelConfigId(s.thought_level_config_id);
           if (s.prompt_capabilities) {
             setPromptCaps({
               image: s.prompt_capabilities.image ?? false,
@@ -4500,7 +4659,7 @@ export function TaskChat({
     // loading after this effect's first run (when launch_mode was still
     // undefined → connectChatWs bailed), the effect re-fires with the
     // resolved mode and routes the chat correctly (ACP WS vs PTY-only).
-  }, [activeChatId, activeChat?.launch_mode, connectChatWs, projectId, task.id, updateBusy, chatRenderWindowSettings, updateHiddenMessageCount, getActiveChatId]);
+  }, [activeChatId, activeChat?.launch_mode, connectChatWs, projectId, task.id, updateBusy, chatRenderWindowSettings, updateHiddenMessageCount, getActiveChatId, applyConfigOptionsSnapshot]);
 
   // Cleanup all WebSockets on unmount, plus any pending reconnect timers —
   // otherwise an in-flight backoff timer fires after unmount and creates a
@@ -4592,39 +4751,36 @@ export function TaskChat({
           setConnectPhase(null);
           setConnectPhaseStartedAt(null);
           onConnectedProp?.();
-          // Dynamic modes/models from agent
-          if (msg.available_modes?.length) {
+          if (msg.uses_config_options || (Array.isArray(msg.config_options) && msg.config_options.length > 0)) {
+            applyConfigOptionsSnapshot(msg.config_options ?? []);
+          } else {
+            setSessionConfigOptions([]);
             setModeOptions(
-              msg.available_modes.map((m: { id: string; name: string }) => ({
+              (msg.available_modes ?? []).map((m: { id: string; name: string; description?: string }) => ({
                 label: m.name,
                 value: m.id,
+                description: m.description,
               })),
             );
-          }
-          if (msg.current_mode_id) setPermissionLevel(msg.current_mode_id);
-          if (msg.available_models?.length) {
+            setPermissionLevel(msg.current_mode_id ?? "");
             setModelOptions(
-              msg.available_models.map((m: { id: string; name: string }) => ({
+              (msg.available_models ?? []).map((m: { id: string; name: string }) => ({
                 label: m.name,
                 value: m.id,
               })),
             );
-          }
-          if (msg.current_model_id) setSelectedModel(msg.current_model_id);
-          if (msg.available_thought_levels?.length) {
+            setSelectedModel(msg.current_model_id ?? "");
             setThoughtLevelOptions(
-              msg.available_thought_levels.map(
+              (msg.available_thought_levels ?? []).map(
                 (t: { id: string; name: string }) => ({
                   label: t.name,
                   value: t.id,
                 }),
               ),
             );
+            setThoughtLevel(msg.current_thought_level_id ?? "");
+            setThoughtLevelConfigId(msg.thought_level_config_id ?? "");
           }
-          if (msg.current_thought_level_id)
-            setThoughtLevel(msg.current_thought_level_id);
-          if (msg.thought_level_config_id)
-            setThoughtLevelConfigId(msg.thought_level_config_id);
           // Extract prompt capabilities
           if (msg.prompt_capabilities) {
             setPromptCaps({
@@ -4649,6 +4805,34 @@ export function TaskChat({
               const state =
                 perChatStateRef.current.get(chatId) ?? defaultPerChatState();
               state.isConnected = true;
+              if (msg.uses_config_options || (Array.isArray(msg.config_options) && msg.config_options.length > 0)) {
+                applyConfigOptionsToCachedState(state, msg.config_options ?? []);
+              } else {
+                state.sessionConfigOptions = [];
+                state.modeOptions = (msg.available_modes ?? []).map(
+                  (mode: { id: string; name: string; description?: string }) => ({
+                    label: mode.name,
+                    value: mode.id,
+                    description: mode.description,
+                  }),
+                );
+                state.permissionLevel = msg.current_mode_id ?? "";
+                state.modelOptions = (msg.available_models ?? []).map(
+                  (model: { id: string; name: string }) => ({
+                    label: model.name,
+                    value: model.id,
+                  }),
+                );
+                state.selectedModel = msg.current_model_id ?? "";
+                state.thoughtLevelOptions = (msg.available_thought_levels ?? []).map(
+                  (level: { id: string; name: string }) => ({
+                    label: level.name,
+                    value: level.id,
+                  }),
+                );
+                state.thoughtLevel = msg.current_thought_level_id ?? "";
+                state.thoughtLevelConfigId = msg.thought_level_config_id ?? "";
+              }
               state.forkCapable = !!msg.fork_capable;
               state.importCapable = !!msg.import_capable;
               state.deleteCapable = !!msg.delete_capable;
@@ -4881,9 +5065,37 @@ export function TaskChat({
           break;
         case "mode_changed":
           setPermissionLevel(msg.mode_id);
+          setPendingConfigIds((previous) => {
+            const next = new Set(previous);
+            next.delete("__legacy_mode");
+            return next;
+          });
           break;
         case "model_changed":
           setSelectedModel(msg.model_id);
+          break;
+        case "config_options_update":
+          applyConfigOptionsSnapshot(msg.config_options ?? []);
+          {
+            const chatId = getActiveChatId();
+            if (chatId) {
+              const state =
+                perChatStateRef.current.get(chatId) ?? defaultPerChatState();
+              applyConfigOptionsToCachedState(state, msg.config_options ?? []);
+              perChatStateRef.current.set(chatId, state);
+            }
+          }
+          break;
+        case "config_option_error":
+          setPendingConfigIds((previous) => {
+            const next = new Set(previous);
+            next.delete(msg.config_id);
+            return next;
+          });
+          setMessages((previous) => [
+            ...previous,
+            { type: "system", content: msg.message },
+          ]);
           break;
         case "thought_levels_update":
           setThoughtLevelOptions(
@@ -4999,7 +5211,7 @@ export function TaskChat({
           break;
       }
     },
-    [agentLabel, onConnectedProp, enableAutoStickToBottom, getActiveChatId, onChatBecameIdle, updateBusy, pruneActiveChatMessages, setAutoExpandSectionId],
+    [agentLabel, onConnectedProp, enableAutoStickToBottom, getActiveChatId, onChatBecameIdle, updateBusy, pruneActiveChatMessages, setAutoExpandSectionId, applyConfigOptionsSnapshot],
   );
 
   /** Buffer a server message into the per-chat cache (for non-active chats) */
@@ -5011,33 +5223,34 @@ export function TaskChat({
       switch (msg.type) {
         case "session_ready":
           state.isConnected = true;
-          if (msg.available_modes?.length)
-            state.modeOptions = msg.available_modes.map(
+          if (msg.uses_config_options || (Array.isArray(msg.config_options) && msg.config_options.length > 0)) {
+            applyConfigOptionsToCachedState(state, msg.config_options ?? []);
+          } else {
+            state.sessionConfigOptions = [];
+            state.modeOptions = (msg.available_modes ?? []).map(
+              (m: { id: string; name: string; description?: string }) => ({
+                label: m.name,
+                value: m.id,
+                description: m.description,
+              }),
+            );
+            state.permissionLevel = msg.current_mode_id ?? "";
+            state.modelOptions = (msg.available_models ?? []).map(
               (m: { id: string; name: string }) => ({
                 label: m.name,
                 value: m.id,
               }),
             );
-          if (msg.current_mode_id) state.permissionLevel = msg.current_mode_id;
-          if (msg.available_models?.length)
-            state.modelOptions = msg.available_models.map(
-              (m: { id: string; name: string }) => ({
-                label: m.name,
-                value: m.id,
-              }),
-            );
-          if (msg.current_model_id) state.selectedModel = msg.current_model_id;
-          if (msg.available_thought_levels?.length)
-            state.thoughtLevelOptions = msg.available_thought_levels.map(
+            state.selectedModel = msg.current_model_id ?? "";
+            state.thoughtLevelOptions = (msg.available_thought_levels ?? []).map(
               (t: { id: string; name: string }) => ({
                 label: t.name,
                 value: t.id,
               }),
             );
-          if (msg.current_thought_level_id)
-            state.thoughtLevel = msg.current_thought_level_id;
-          if (msg.thought_level_config_id)
-            state.thoughtLevelConfigId = msg.thought_level_config_id;
+            state.thoughtLevel = msg.current_thought_level_id ?? "";
+            state.thoughtLevelConfigId = msg.thought_level_config_id ?? "";
+          }
           if (msg.prompt_capabilities) {
             state.promptCaps = {
               image: msg.prompt_capabilities.image ?? false,
@@ -5069,6 +5282,21 @@ export function TaskChat({
           );
           state.thoughtLevel = msg.current ?? "";
           state.thoughtLevelConfigId = msg.config_id ?? "";
+          break;
+        case "config_options_update":
+          applyConfigOptionsToCachedState(state, msg.config_options ?? []);
+          break;
+        case "config_option_error":
+          state.messages = [
+            ...state.messages,
+            { type: "system", content: msg.message },
+          ];
+          break;
+        case "mode_changed":
+          state.permissionLevel = msg.mode_id;
+          break;
+        case "model_changed":
+          state.selectedModel = msg.model_id;
           break;
         case "usage_update":
           state.contextUsage = {
@@ -5775,13 +6003,15 @@ export function TaskChat({
     setIsSavingToNote(false);
   }, [planFileContent, isSavingToNote, projectId, task.id]);
 
-  // Bundle current model/mode/thought_level into a `config` object for every
-  // prompt/queue_message send. The backend cmd_loop applies these as ACP
-  // SetSessionMode/Model/ThoughtLevel requests right before the prompt itself —
-  // so per-prompt config swaps land in the correct order even when the user
-  // toggles selectors between rapid sends. Replaces the old set_mode/set_model/
-  // set_thought_level standalone WS messages.
+  // Legacy compatibility for queued messages created before full ACP
+  // configOptions support. New sessions change settings immediately and do
+  // not capture per-prompt snapshots.
   const buildPromptConfig = useCallback(() => {
+    // New configOptions-aware sessions apply settings immediately and use
+    // the Agent's authoritative session state when a queued prompt is later
+    // dispatched. Keep the legacy bundle only for old sessions/messages that
+    // predate full config snapshots.
+    if (sessionConfigOptions.length > 0) return undefined;
     const cfg: {
       model?: string;
       mode?: string;
@@ -5795,7 +6025,7 @@ export function TaskChat({
       cfg.thought_level_config_id = thoughtLevelConfigId;
     }
     return Object.keys(cfg).length === 0 ? undefined : cfg;
-  }, [selectedModel, permissionLevel, thoughtLevel, thoughtLevelConfigId]);
+  }, [sessionConfigOptions.length, selectedModel, permissionLevel, thoughtLevel, thoughtLevelConfigId]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -6311,10 +6541,15 @@ export function TaskChat({
       if (modeOptions.length === 0) return;
       const currentIdx = modeOptions.findIndex((m) => m.value === permissionLevel);
       const nextIdx = (currentIdx + 1) % modeOptions.length;
-      setPermissionLevel(modeOptions[nextIdx].value);
+      const nextMode = modeOptions[nextIdx].value;
+      if (matchedSessionConfig.mode) {
+        requestConfigOptionChange(matchedSessionConfig.mode, nextMode);
+      } else {
+        requestLegacyModeChange(nextMode);
+      }
     },
-    { enabled: () => modeOptions.length > 0 },
-    [modeOptions, permissionLevel],
+    { enabled: () => isConnected && modeOptions.length > 0 },
+    [isConnected, modeOptions, permissionLevel, matchedSessionConfig.mode, requestConfigOptionChange, requestLegacyModeChange],
   );
   useCommand(
     "chat.pending.clear",
@@ -9735,18 +9970,27 @@ export function TaskChat({
                     {!isTerminalLaunchMode && !composerNarrow && modelOptions.length > 0 && (
                       <DropdownSelect
                         ref={modelMenuRef}
-                        label="Model"
+                        label={matchedSessionConfig.model?.name ?? "Model"}
+                        icon={<Box className="h-3 w-3" />}
                         options={modelOptions}
                         value={selectedModel}
                         open={showModelMenu}
+                        disabled={!isConnected}
+                        loading={
+                          !!matchedSessionConfig.model &&
+                          pendingConfigIds.has(matchedSessionConfig.model.id)
+                        }
                         onToggle={() => {
                           setShowModelMenu(!showModelMenu);
                           setShowPermMenu(false);
                           setShowThoughtLevelMenu(false);
                         }}
                         onSelect={(v) => {
-                          // Local-only: model now travels with the next prompt's config bundle.
-                          setSelectedModel(v);
+                          if (matchedSessionConfig.model) {
+                            requestConfigOptionChange(matchedSessionConfig.model, v);
+                          } else {
+                            setSelectedModel(v);
+                          }
                           setShowModelMenu(false);
                         }}
                       />
@@ -9754,18 +9998,28 @@ export function TaskChat({
                     {!isTerminalLaunchMode && !composerNarrow && modeOptions.length > 0 && (
                       <DropdownSelect
                         ref={permMenuRef}
-                        label="Mode"
+                        label={matchedSessionConfig.mode?.name ?? "Mode"}
+                        icon={<ShieldCheck className="h-3 w-3" />}
                         options={modeOptions}
                         value={permissionLevel}
                         open={showPermMenu}
+                        disabled={!isConnected}
+                        loading={
+                          matchedSessionConfig.mode
+                            ? pendingConfigIds.has(matchedSessionConfig.mode.id)
+                            : pendingConfigIds.has("__legacy_mode")
+                        }
                         onToggle={() => {
                           setShowPermMenu(!showPermMenu);
                           setShowModelMenu(false);
                           setShowThoughtLevelMenu(false);
                         }}
                         onSelect={(v) => {
-                          // Local-only: mode now travels with the next prompt's config bundle.
-                          setPermissionLevel(v);
+                          if (matchedSessionConfig.mode) {
+                            requestConfigOptionChange(matchedSessionConfig.mode, v);
+                          } else {
+                            requestLegacyModeChange(v);
+                          }
                           setShowPermMenu(false);
                         }}
                       />
@@ -9773,20 +10027,45 @@ export function TaskChat({
                     {!isTerminalLaunchMode && !composerHideThinking && thoughtLevelOptions.length > 0 && thoughtLevelConfigId && (
                       <DropdownSelect
                         ref={thoughtLevelMenuRef}
-                        label="Thinking"
+                        label={matchedSessionConfig.thinking?.name ?? "Thinking"}
+                        icon={<Brain className="h-3 w-3" />}
                         options={thoughtLevelOptions}
                         value={thoughtLevel}
                         open={showThoughtLevelMenu}
+                        disabled={!isConnected}
+                        loading={
+                          !!matchedSessionConfig.thinking &&
+                          pendingConfigIds.has(matchedSessionConfig.thinking.id)
+                        }
                         onToggle={() => {
                           setShowThoughtLevelMenu(!showThoughtLevelMenu);
                           setShowModelMenu(false);
                           setShowPermMenu(false);
                         }}
                         onSelect={(v) => {
-                          // Local-only: thought_level now travels with the next prompt's config bundle.
-                          setThoughtLevel(v);
+                          if (matchedSessionConfig.thinking) {
+                            requestConfigOptionChange(matchedSessionConfig.thinking, v);
+                          } else {
+                            setThoughtLevel(v);
+                          }
                           setShowThoughtLevelMenu(false);
                         }}
+                      />
+                    )}
+                    {!isTerminalLaunchMode && additionalSessionConfigOptions.length > 0 && (
+                      <SessionSettingsMenu
+                        ref={sessionSettingsRef}
+                        options={additionalSessionConfigOptions}
+                        open={showSessionSettings}
+                        disabled={!isConnected}
+                        pendingConfigIds={pendingConfigIds}
+                        onToggle={() => {
+                          setShowSessionSettings(!showSessionSettings);
+                          setShowModelMenu(false);
+                          setShowPermMenu(false);
+                          setShowThoughtLevelMenu(false);
+                        }}
+                        onSelect={requestConfigOptionChange}
                       />
                     )}
                     {activePermissionMessage && isBusy ? (
@@ -9961,21 +10240,198 @@ export function TaskChat({
 
 // ─── Sub-components ──────────────────────────────────────────────────────────
 
+const SessionSettingsMenu = ({
+  ref,
+  options,
+  open,
+  disabled,
+  pendingConfigIds,
+  onToggle,
+  onSelect,
+}: {
+  ref: React.RefObject<HTMLDivElement | null>;
+  options: SessionConfigOption[];
+  open: boolean;
+  disabled: boolean;
+  pendingConfigIds: Set<string>;
+  onToggle: () => void;
+  onSelect: (option: SessionConfigOption, value: string | boolean) => void;
+}) => {
+  const [menuAnchor, setMenuAnchor] = useState<{
+    left: number;
+    bottom: number;
+    maxHeight: number;
+  } | null>(null);
+
+  const positionMenu = useCallback((trigger: HTMLElement) => {
+    const rect = trigger.getBoundingClientRect();
+    const viewportMargin = 8;
+    const menuGap = 4;
+    const menuWidth = 320;
+    setMenuAnchor({
+      left: Math.min(
+        Math.max(viewportMargin, rect.right - menuWidth),
+        window.innerWidth - menuWidth - viewportMargin,
+      ),
+      bottom: window.innerHeight - rect.top + menuGap,
+      maxHeight: Math.max(
+        120,
+        Math.min(320, rect.top - menuGap - viewportMargin),
+      ),
+    });
+  }, []);
+
+  const iconForOption = (option: SessionConfigOption) => {
+    if (configCategoryMatches(option, "model")) return <Box className="h-3.5 w-3.5" />;
+    if (configCategoryMatches(option, "mode")) return <ShieldCheck className="h-3.5 w-3.5" />;
+    if (configCategoryMatches(option, "thought_level")) return <Brain className="h-3.5 w-3.5" />;
+    return <SlidersHorizontal className="h-3.5 w-3.5" />;
+  };
+
+  const renderValue = (
+    option: SessionConfigOption,
+    value: SessionConfigSelectValue,
+  ) => (
+    <button
+      key={value.value}
+      type="button"
+      disabled={pendingConfigIds.has(option.id)}
+      onMouseDown={(event) => event.preventDefault()}
+      onClick={() => onSelect(option, value.value)}
+      className="grid w-full grid-cols-[14px_minmax(0,1fr)_auto] items-start gap-x-2 rounded-md px-1 py-1.5 text-left hover:bg-[var(--color-bg-tertiary)] disabled:opacity-50"
+    >
+      <span aria-hidden="true" />
+      <span className="min-w-0">
+        <span className="block text-xs text-[var(--color-text)]">{value.name}</span>
+        {value.description && (
+          <span className="mt-0.5 block text-[10px] leading-4 text-[var(--color-text-muted)]">
+            {value.description}
+          </span>
+        )}
+      </span>
+      {option.currentValue === value.value && (
+        <span className="mt-0.5 justify-self-end text-xs text-[var(--color-highlight)]">✓</span>
+      )}
+    </button>
+  );
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        onClick={(event) => {
+          if (!open) positionMenu(event.currentTarget);
+          onToggle();
+        }}
+        disabled={disabled}
+        title="Session settings"
+        aria-label="Session settings"
+        className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-[var(--color-bg)] text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)] disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        <SlidersHorizontal className="h-3.5 w-3.5" />
+      </button>
+      {open && !disabled && menuAnchor && typeof document !== "undefined" &&
+        createPortal(
+        <div
+          data-session-settings-menu
+          className="fixed z-[1000] flex w-80 flex-col overflow-y-auto rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-1.5 shadow-lg"
+          style={{
+            left: menuAnchor.left,
+            bottom: menuAnchor.bottom,
+            maxHeight: menuAnchor.maxHeight,
+            overflowAnchor: "none",
+          }}
+        >
+          {options.map((option) => (
+            <div key={option.id} className="border-b border-[var(--color-border)] px-1 py-2 last:border-b-0">
+              <div className="mb-1 grid grid-cols-[14px_minmax(0,1fr)_auto] items-start gap-x-2 px-1">
+                <span className="mt-0.5 text-[var(--color-text-muted)]">
+                  {iconForOption(option)}
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-xs font-medium text-[var(--color-text)]">
+                    {option.name}
+                  </span>
+                  {option.description && (
+                    <span className="mt-0.5 block text-[10px] leading-4 text-[var(--color-text-muted)]">
+                      {option.description}
+                    </span>
+                  )}
+                </span>
+              </div>
+              {option.type === "boolean" ? (
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={option.currentValue}
+                  disabled={pendingConfigIds.has(option.id)}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => onSelect(option, !option.currentValue)}
+                  className="mt-1 grid w-full grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-x-2 rounded-md px-1 py-1.5 text-left text-xs text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] disabled:opacity-50"
+                >
+                  <span aria-hidden="true" />
+                  <span>{option.currentValue ? "On" : "Off"}</span>
+                  <span
+                    className={`relative inline-block h-4 w-7 justify-self-end rounded-full transition-colors ${
+                      option.currentValue
+                        ? "bg-[var(--color-highlight)]"
+                        : "bg-[var(--color-bg-tertiary)]"
+                    }`}
+                  >
+                    <span
+                      className={`absolute top-0.5 block h-3 w-3 rounded-full bg-white shadow-sm transition-transform ${
+                        option.currentValue ? "translate-x-3.5" : "translate-x-0.5"
+                      }`}
+                    />
+                  </span>
+                </button>
+              ) : option.options.some(isConfigGroup) ? (
+                (option.options as SessionConfigSelectGroup[]).map((group) => (
+                  <div key={group.group} className="mt-1">
+                    <div className="grid grid-cols-[14px_minmax(0,1fr)_auto] gap-x-2 px-1 py-1">
+                      <span aria-hidden="true" />
+                      <span className="text-[10px] font-medium uppercase tracking-wide text-[var(--color-text-muted)]">
+                        {group.name}
+                      </span>
+                    </div>
+                    {group.options.map((value) => renderValue(option, value))}
+                  </div>
+                ))
+              ) : (
+                (option.options as SessionConfigSelectValue[]).map((value) =>
+                  renderValue(option, value),
+                )
+              )}
+            </div>
+          ))}
+        </div>,
+        document.body,
+      )}
+    </div>
+  );
+};
+
 /** Reusable dropdown selector for bottom toolbar */
 const DropdownSelect = ({
   ref,
   label,
+  icon,
   options,
   value,
   open,
+  disabled = false,
+  loading = false,
   onToggle,
   onSelect,
 }: {
   ref: React.RefObject<HTMLDivElement | null>;
   label: string;
-  options: { label: string; value: string }[];
+  icon?: ReactNode;
+  options: ChatDropdownOption[];
   value: string;
   open: boolean;
+  disabled?: boolean;
+  loading?: boolean;
   onToggle: () => void;
   onSelect: (value: string) => void;
 }) => {
@@ -10023,16 +10479,19 @@ const DropdownSelect = ({
   return (
     <div className="relative" ref={ref}>
       <button
+        type="button"
         onClick={onToggle}
-        className="inline-flex h-7 items-center gap-1 rounded-full bg-[var(--color-bg)] px-2.5 text-[11px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
+        disabled={disabled}
+        className="inline-flex h-7 items-center gap-1 rounded-full bg-[var(--color-bg)] px-2.5 text-[11px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:cursor-not-allowed disabled:opacity-40"
       >
+        {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : icon}
         <span className="chatbox-dropdown-label opacity-70">{label}</span>
         <span className="max-w-40 truncate text-[var(--color-text)]">
           {options.find((o) => o.value === value)?.label ?? "Default"}
         </span>
         <ChevronDown className="w-3 h-3 opacity-70" />
       </button>
-      {open && (
+      {open && !disabled && (
         <div className="absolute bottom-full right-0 mb-1 min-w-44 max-h-64 flex flex-col rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg py-1 z-50">
           {enableSearch && (
             <div className="px-2 pt-1.5 pb-1 border-b border-[var(--color-border)] flex-shrink-0">
@@ -10051,21 +10510,34 @@ const DropdownSelect = ({
             </div>
           )}
           <div className="overflow-y-auto flex-1">
-          {filteredOptions.map((opt) => (
-            <button
-              key={opt.value}
-              onClick={() => onSelect(opt.value)}
-              className={`w-full text-left px-3 py-1.5 text-sm flex items-center justify-between hover:bg-[var(--color-bg-tertiary)] transition-colors ${
-                value === opt.value
-                  ? "text-[var(--color-text)]"
-                  : "text-[var(--color-text-muted)]"
-              }`}
-            >
-              <span>{opt.label}</span>
-              {value === opt.value && (
-                <span className="text-[var(--color-highlight)]">✓</span>
+          {filteredOptions.map((opt, index) => (
+            <Fragment key={opt.value}>
+              {opt.group && filteredOptions[index - 1]?.group !== opt.group && (
+                <div className="px-3 pb-1 pt-2 text-[10px] font-medium uppercase tracking-wide text-[var(--color-text-muted)]">
+                  {opt.group}
+                </div>
               )}
-            </button>
+              <button
+                onClick={() => onSelect(opt.value)}
+                className={`w-full text-left px-3 py-1.5 text-sm flex items-center justify-between hover:bg-[var(--color-bg-tertiary)] transition-colors ${
+                  value === opt.value
+                    ? "text-[var(--color-text)]"
+                    : "text-[var(--color-text-muted)]"
+                }`}
+              >
+                <span className="min-w-0">
+                  <span className="block truncate">{opt.label}</span>
+                  {opt.description && (
+                    <span className="mt-0.5 block text-[10px] leading-4 text-[var(--color-text-muted)]">
+                      {opt.description}
+                    </span>
+                  )}
+                </span>
+                {value === opt.value && (
+                  <span className="text-[var(--color-highlight)]">✓</span>
+                )}
+              </button>
+            </Fragment>
           ))}
           {enableSearch && filteredOptions.length === 0 && (
             <div className="px-3 py-2 text-xs text-[var(--color-text-muted)] text-center">

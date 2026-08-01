@@ -1005,12 +1005,15 @@ interface SessionMetadata {
   agent_name: string;
   agent_version: string;
   available_modes?: [string, string][] | null;
+  mode_descriptions?: Record<string, string> | null;
   current_mode_id?: string | null;
   available_models?: [string, string][] | null;
   current_model_id?: string | null;
   available_thought_levels?: [string, string][] | null;
   current_thought_level_id?: string | null;
   thought_level_config_id?: string | null;
+  config_options?: SessionConfigOption[] | null;
+  uses_config_options?: boolean;
   prompt_capabilities?: {
     image?: boolean;
     audio?: boolean;
@@ -1027,6 +1030,36 @@ interface SessionMetadata {
     cost?: { amount: number; currency: string } | null;
   } | null;
 }
+
+export interface SessionConfigSelectValue {
+  value: string;
+  name: string;
+  description?: string | null;
+}
+
+export interface SessionConfigSelectGroup {
+  group: string;
+  name: string;
+  options: SessionConfigSelectValue[];
+}
+
+export type SessionConfigOption = {
+  id: string;
+  name: string;
+  description?: string | null;
+  category?: string | null;
+  currentValue: string | boolean;
+} & (
+  | {
+      type: "select";
+      currentValue: string;
+      options: SessionConfigSelectValue[] | SessionConfigSelectGroup[];
+    }
+  | {
+      type: "boolean";
+      currentValue: boolean;
+    }
+);
 
 interface ChatHistoryResponse {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

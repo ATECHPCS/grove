@@ -225,6 +225,8 @@ pub async fn execute(agent: String, cwd: String) {
                     | AcpUpdate::ModeChanged { .. }
                     | AcpUpdate::ModelChanged { .. }
                     | AcpUpdate::ThoughtLevelsUpdate { .. }
+                    | AcpUpdate::ConfigOptionsUpdate { .. }
+                    | AcpUpdate::ConfigOptionError { .. }
                     | AcpUpdate::PlanUpdate { .. }
                     | AcpUpdate::AvailableCommands { .. }
                     | AcpUpdate::PermissionResponse { .. }
