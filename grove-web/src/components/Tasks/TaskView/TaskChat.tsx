@@ -4461,7 +4461,9 @@ export function TaskChat({
                 s.prompt_capabilities.embedded_context ?? false,
             });
           }
-          if (s.available_commands?.length) {
+          // An empty list is an authoritative ACP snapshot: it means the
+          // Agent removed every command and must clear any cached menu.
+          if (s.available_commands) {
             setSlashCommands(
               s.available_commands.map((c) => ({
                 name: c.name,

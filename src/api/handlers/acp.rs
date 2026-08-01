@@ -910,22 +910,7 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                 let _ = ws_sender.send(Message::Text(json.into())).await;
             }
         }
-        if let Some(meta) = meta
-            .as_ref()
-            .filter(|meta| !meta.available_commands.is_empty())
-        {
-            let msg = ServerMessage::AvailableCommands {
-                commands: meta
-                    .available_commands
-                    .iter()
-                    .cloned()
-                    .map(|c| CommandMsg {
-                        name: c.name,
-                        description: c.description,
-                        input_hint: c.input_hint,
-                    })
-                    .collect(),
-            };
+        if let Some(msg) = restored_available_commands_message(meta.as_ref()) {
             if let Ok(json) = serde_json::to_string(&msg) {
                 let _ = ws_sender.send(Message::Text(json.into())).await;
             }
@@ -1204,6 +1189,23 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
     // Note: we do NOT kill the session here.
     // The session stays alive for future WebSocket connections.
     // It's only killed explicitly via ClientMessage::Kill.
+}
+
+fn restored_available_commands_message(
+    meta: Option<&crate::acp::SessionMetadata>,
+) -> Option<ServerMessage> {
+    meta.map(|meta| ServerMessage::AvailableCommands {
+        commands: meta
+            .available_commands
+            .iter()
+            .cloned()
+            .map(|c| CommandMsg {
+                name: c.name,
+                description: c.description,
+                input_hint: c.input_hint,
+            })
+            .collect(),
+    })
 }
 
 /// Error type for ACP handler
@@ -2102,6 +2104,34 @@ pub async fn reconnect_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_available_commands_preserves_an_authoritative_empty_list() {
+        let meta = crate::acp::SessionMetadata {
+            pid: 1,
+            agent_name: "agent".to_string(),
+            agent_version: "1".to_string(),
+            available_modes: Vec::new(),
+            current_mode_id: None,
+            available_models: Vec::new(),
+            current_model_id: None,
+            model_config_id: None,
+            available_thought_levels: Vec::new(),
+            current_thought_level_id: None,
+            thought_level_config_id: None,
+            prompt_capabilities: crate::acp::PromptCapabilitiesData::default(),
+            available_commands: Vec::new(),
+            current_usage: None,
+        };
+
+        let Some(ServerMessage::AvailableCommands { commands }) =
+            restored_available_commands_message(Some(&meta))
+        else {
+            panic!("session metadata should always restore a command snapshot");
+        };
+        assert!(commands.is_empty());
+        assert!(restored_available_commands_message(None).is_none());
+    }
 
     #[test]
     fn v1_tool_update_maps_to_wire_replacement_semantics() {

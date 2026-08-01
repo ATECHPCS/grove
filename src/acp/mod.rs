@@ -1677,6 +1677,14 @@ async fn handle_session_notification(
     state: &AcpClientState,
     args: acp::SessionNotification,
 ) -> acp::Result<(), acp::Error> {
+    // A single ACP connection may know about more than one Session (for
+    // example, after session/fork). Once this handle's active Session ID is
+    // known, never apply another Session's updates to its chat state. During
+    // session/new or session/load the response may not have supplied the ID
+    // yet, so notifications received in that short window remain accepted.
+    if !session_notification_targets_handle(&state.handle, &args.session_id) {
+        return Ok(());
+    }
     match args.update {
         acp::SessionUpdate::AgentMessageChunk(chunk) => {
             if let acp::ContentBlock::Text(text) = &chunk.content {
@@ -2063,6 +2071,18 @@ async fn handle_session_notification(
         _ => {}
     }
     Ok(())
+}
+
+fn session_notification_targets_handle(
+    handle: &AcpSessionHandle,
+    notification_session_id: &acp::SessionId,
+) -> bool {
+    let Ok(agent_info) = handle.agent_info.read() else {
+        return true;
+    };
+    agent_info
+        .as_ref()
+        .is_none_or(|(session_id, _, _)| session_id == &notification_session_id.to_string())
 }
 
 fn merge_diff_locations(
@@ -7420,6 +7440,29 @@ mod tests {
             file_snapshots: Mutex::new(HashMap::new()),
             write_tool_paths: Mutex::new(HashMap::new()),
         })
+    }
+
+    #[tokio::test]
+    async fn session_notifications_are_scoped_to_the_handles_active_session() {
+        let key = format!("session-notification-routing-test-{}", uuid::Uuid::new_v4());
+        let (handle, _updates, _guard) = new_handle_for_test(&key, "project", "task", "chat");
+
+        assert!(session_notification_targets_handle(
+            &handle,
+            &acp::SessionId::new("session-test")
+        ));
+        assert!(!session_notification_targets_handle(
+            &handle,
+            &acp::SessionId::new("another-session")
+        ));
+
+        // Before session/new or session/load returns, the active ID is not
+        // known yet. Accept early notifications during that window.
+        *handle.agent_info.write().unwrap() = None;
+        assert!(session_notification_targets_handle(
+            &handle,
+            &acp::SessionId::new("new-session")
+        ));
     }
 
     #[test]
