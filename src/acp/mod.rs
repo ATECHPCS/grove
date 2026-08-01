@@ -13,7 +13,9 @@ pub mod adapter;
 mod acp {
     pub use agent_client_protocol::schema::v1::*;
     pub use agent_client_protocol::schema::ProtocolVersion;
-    pub use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Error, Result};
+    pub use agent_client_protocol::{
+        Agent, ByteStreams, Client, ConnectionTo, Error, RequestCancellation, Result,
+    };
 }
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -1398,8 +1400,12 @@ fn truncate_for_row(s: &str, limit: usize) -> String {
 async fn handle_request_permission(
     state: &AcpClientState,
     args: acp::RequestPermissionRequest,
+    cancellation: acp::RequestCancellation,
 ) -> acp::Result<acp::RequestPermissionResponse> {
-    let _guard = state.handle.permission_lock.lock().await;
+    let _guard = tokio::select! {
+        guard = state.handle.permission_lock.lock() => guard,
+        _ = cancellation.cancelled() => return Err(acp::Error::request_cancelled()),
+    };
     if state
         .handle
         .cancel_requested
@@ -1442,7 +1448,7 @@ async fn handle_request_permission(
         .replace((request_id.clone(), tx));
 
     state.handle.emit(AcpUpdate::PermissionRequest {
-        id: request_id,
+        id: request_id.clone(),
         description: desc.clone(),
         options: options.clone(),
     });
@@ -1457,13 +1463,21 @@ async fn handle_request_permission(
         Some(&options),
     );
 
-    match rx.await {
-        Ok(option_id) => Ok(acp::RequestPermissionResponse::new(
-            acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(option_id)),
-        )),
-        Err(_) => Ok(acp::RequestPermissionResponse::new(
-            acp::RequestPermissionOutcome::Cancelled,
-        )),
+    tokio::select! {
+        result = rx => match result {
+            Ok(option_id) => Ok(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Selected(
+                    acp::SelectedPermissionOutcome::new(option_id),
+                ),
+            )),
+            Err(_) => Ok(acp::RequestPermissionResponse::new(
+                acp::RequestPermissionOutcome::Cancelled,
+            )),
+        },
+        _ = cancellation.cancelled() => {
+            state.handle.cancel_pending_permission(&request_id);
+            Err(acp::Error::request_cancelled())
+        }
     }
 }
 
@@ -1566,6 +1580,7 @@ async fn handle_release_terminal(
 async fn handle_wait_for_terminal_exit(
     state: &AcpClientState,
     args: acp::WaitForTerminalExitRequest,
+    cancellation: acp::RequestCancellation,
 ) -> acp::Result<acp::WaitForTerminalExitResponse> {
     let notify = {
         let terms = state.terminals.lock().unwrap();
@@ -1578,7 +1593,10 @@ async fn handle_wait_for_terminal_exit(
         }
         term.exit_notify.clone()
     };
-    notify.notified().await;
+    tokio::select! {
+        _ = notify.notified() => {}
+        _ = cancellation.cancelled() => return Err(acp::Error::request_cancelled()),
+    }
 
     let terms = state.terminals.lock().unwrap();
     let tid = &*args.terminal_id.0;
@@ -3279,11 +3297,16 @@ async fn run_acp_session(
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
-                async move |req: acp::RequestPermissionRequest, responder, _cx| {
-                    match handle_request_permission(&state, req).await {
-                        Ok(r) => responder.respond(r),
-                        Err(e) => responder.respond_with_error(e),
-                    }
+                async move |req: acp::RequestPermissionRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        let cancellation = responder.cancellation();
+                        match handle_request_permission(&state, req, cancellation).await {
+                            Ok(r) => responder.respond(r),
+                            Err(e) => responder.respond_with_error(e),
+                        }
+                    })?;
+                    Ok(())
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -3327,11 +3350,16 @@ async fn run_acp_session(
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
-                async move |req: acp::WaitForTerminalExitRequest, responder, _cx| {
-                    match handle_wait_for_terminal_exit(&state, req).await {
-                        Ok(r) => responder.respond(r),
-                        Err(e) => responder.respond_with_error(e),
-                    }
+                async move |req: acp::WaitForTerminalExitRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        let cancellation = responder.cancellation();
+                        match handle_wait_for_terminal_exit(&state, req, cancellation).await {
+                            Ok(r) => responder.respond(r),
+                            Err(e) => responder.respond_with_error(e),
+                        }
+                    })?;
+                    Ok(())
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -5047,6 +5075,38 @@ impl AcpSessionHandle {
         }
         let _ = tx.send(option_id.clone());
         self.emit(AcpUpdate::PermissionResponse { id, option_id });
+        self.broadcast_permission_cleared_status();
+        true
+    }
+
+    /// Resolve one specific live permission because the Agent cancelled its
+    /// JSON-RPC request. Matching by tool-call ID prevents a late cancellation
+    /// from dismissing a newer permission request on the same connection.
+    fn cancel_pending_permission(&self, expected_id: &str) -> bool {
+        let pending = {
+            let mut slot = self.pending_permission.lock().unwrap();
+            if slot.as_ref().is_some_and(|(id, _)| id == expected_id) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        let Some((id, tx)) = pending else {
+            return false;
+        };
+        drop(tx);
+        if let Ok(mut slot) = self.last_permission_info.lock() {
+            *slot = None;
+        }
+        self.emit(AcpUpdate::PermissionResponse {
+            id,
+            option_id: "Cancelled".to_string(),
+        });
+        self.broadcast_permission_cleared_status();
+        true
+    }
+
+    fn broadcast_permission_cleared_status(&self) {
         // Permission gone — announce the post-take status so graph nodes can
         // leave the orange "permission_required" state immediately.
         if let Some(ref chat_id) = self.chat_id {
@@ -5067,7 +5127,6 @@ impl AcpSessionHandle {
                 todo_total: self.last_plan.lock().ok().and_then(|p| p.map(|(_, t)| t)),
             });
         }
-        true
     }
 
     /// 发送更新并记录到 history buffer（带磁盘持久化）
@@ -7116,6 +7175,24 @@ async fn drain_stderr_to_file(stderr: tokio::process::ChildStderr, path: PathBuf
 mod tests {
     use super::*;
 
+    fn client_state_for_test(
+        handle: Arc<AcpSessionHandle>,
+        terminals: Arc<Mutex<HashMap<String, TerminalState>>>,
+    ) -> Arc<AcpClientState> {
+        Arc::new(AcpClientState {
+            handle,
+            working_dir: PathBuf::from("/tmp"),
+            terminals,
+            project_key: "project".to_string(),
+            task_id: "task".to_string(),
+            chat_id: Some("chat".to_string()),
+            adapter: adapter::resolve_adapter("test", "test"),
+            file_snapshots: Mutex::new(HashMap::new()),
+            write_tool_paths: Mutex::new(HashMap::new()),
+            pending_plan_tool_ids: Mutex::new(Vec::new()),
+        })
+    }
+
     #[test]
     fn initialization_rejects_non_v1_protocol_version() {
         assert!(validate_v1_protocol_version(acp::ProtocolVersion::V1).is_ok());
@@ -7229,6 +7306,114 @@ mod tests {
             AcpUpdate::ToolCallUpdate { id, status, .. }
                 if id == "tool-1" && status == "cancelled"
         ));
+    }
+
+    #[tokio::test]
+    async fn request_cancellation_only_clears_the_matching_permission() {
+        let key = format!("request-cancel-permission-test-{}", uuid::Uuid::new_v4());
+        let (handle, mut updates, _guard) = new_handle_for_test(&key, "project", "task", "chat");
+        let (permission_tx, permission_rx) = tokio::sync::oneshot::channel();
+        handle
+            .pending_permission
+            .lock()
+            .unwrap()
+            .replace(("permission-1".to_string(), permission_tx));
+
+        assert!(!handle.cancel_pending_permission("older-permission"));
+        assert_eq!(
+            handle.pending_permission_id().as_deref(),
+            Some("permission-1")
+        );
+
+        assert!(handle.cancel_pending_permission("permission-1"));
+        assert!(permission_rx.await.is_err());
+        assert!(!handle.has_pending_permission());
+        assert!(matches!(
+            updates.recv().await.unwrap(),
+            AcpUpdate::PermissionResponse { id, option_id }
+                if id == "permission-1" && option_id == "Cancelled"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_request_stops_terminal_wait_without_killing_terminal() {
+        use tokio::io::AsyncWriteExt;
+
+        let key = format!("request-cancel-terminal-test-{}", uuid::Uuid::new_v4());
+        let (handle, _updates, _guard) = new_handle_for_test(&key, "project", "task", "chat");
+        let terminals = Arc::new(Mutex::new(HashMap::new()));
+        let (kill_tx, mut kill_rx) = mpsc::channel(1);
+        terminals.lock().unwrap().insert(
+            "terminal-1".to_string(),
+            TerminalState {
+                kill_tx,
+                output: Vec::new(),
+                truncated: false,
+                output_byte_limit: None,
+                exit_status: None,
+                exit_notify: Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+        let state = client_state_for_test(handle, Arc::clone(&terminals));
+
+        let (client_writer, peer_reader) = tokio::io::duplex(4096);
+        let (mut peer_writer, client_reader) = tokio::io::duplex(4096);
+        let transport = acp::ByteStreams::new(client_writer.compat_write(), client_reader.compat());
+        let client = acp::Client.builder().on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |req: acp::WaitForTerminalExitRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        let cancellation = responder.cancellation();
+                        match handle_wait_for_terminal_exit(&state, req, cancellation).await {
+                            Ok(response) => responder.respond(response),
+                            Err(error) => responder.respond_with_error(error),
+                        }
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+
+        let client_fut = client.connect_with(transport, |_connection| async {
+            futures::future::pending::<acp::Result<()>>().await
+        });
+        let peer_fut = async move {
+            peer_writer
+                .write_all(
+                    concat!(
+                        r#"{"jsonrpc":"2.0","id":"wait-1","method":"terminal/wait_for_exit","params":{"sessionId":"session-test","terminalId":"terminal-1"}}"#,
+                        "\n",
+                        r#"{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":"wait-1"}}"#,
+                        "\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut reader = tokio::io::BufReader::new(peer_reader);
+            let mut line = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reader.read_line(&mut line),
+            )
+            .await
+            .expect("cancelled wait should receive a response")
+            .unwrap();
+            drop(peer_writer);
+            serde_json::from_str::<serde_json::Value>(line.trim()).unwrap()
+        };
+
+        let response = tokio::select! {
+            response = peer_fut => response,
+            result = client_fut => panic!("client connection ended before cancellation response: {result:?}"),
+        };
+        assert_eq!(response["id"], "wait-1");
+        assert_eq!(response["error"]["code"], -32800);
+        assert!(terminals.lock().unwrap().contains_key("terminal-1"));
+        assert!(kill_rx.try_recv().is_err());
     }
 
     #[test]
