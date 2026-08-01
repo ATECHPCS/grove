@@ -350,6 +350,16 @@ pub enum AcpUpdate {
         #[serde(default, rename = "content", skip_serializing)]
         legacy_content: Option<serde_json::Value>,
     },
+    /// Live snapshot for an ACP v1 terminal embedded in a tool call. Snapshots
+    /// are cumulative so reconnect/history replay can restore the latest
+    /// visible output without depending on the terminal still being active.
+    TerminalOutputUpdate {
+        terminal_id: String,
+        output: String,
+        truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_status: Option<TerminalExitStatusData>,
+    },
     /// 权限请求（带选项，等待用户交互）。`id` 是 ACP tool_call.id，
     /// 用于把后续的 PermissionResponse 精确对应到这条 Request；老历史里的
     /// 事件没有这个字段，反序列化时落到空串，reconcile 视为 legacy orphan。
@@ -617,7 +627,22 @@ pub enum ToolCallContentData {
     },
     Terminal {
         terminal_id: String,
+        /// Absent on legacy persisted data that only retained the terminal ID.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_status: Option<TerminalExitStatusData>,
     },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct TerminalExitStatusData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
 }
 
 /// User-facing tool input after Grove removes transport metadata and assigns
@@ -1306,16 +1331,29 @@ fn plugin_mcp_server_name(plugin: &crate::storage::plugins::Plugin) -> String {
 struct TerminalState {
     /// Send to this channel to request process kill
     kill_tx: mpsc::Sender<()>,
-    /// Accumulated stdout+stderr output
-    output: Vec<u8>,
-    /// Whether output was truncated due to byte limit
+    /// Output state remains owned by the driver after `terminal/release`
+    /// removes this ID, allowing trailing output to reach an embedded tool.
+    runtime: Arc<Mutex<TerminalRuntime>>,
+    /// Race-free, multi-waiter exit state. A new subscriber immediately sees
+    /// an exit that happened before it started waiting.
+    exit_tx: tokio::sync::watch::Sender<Option<acp::TerminalExitStatus>>,
+}
+
+struct TerminalRuntime {
+    output: String,
+    stdout_pending_utf8: Vec<u8>,
+    stderr_pending_utf8: Vec<u8>,
     truncated: bool,
-    /// Maximum output bytes to retain (truncate from beginning)
-    output_byte_limit: Option<u64>,
-    /// Exit status once process completes
-    exit_status: Option<acp::TerminalExitStatus>,
-    /// Notified when process exits
-    exit_notify: Arc<tokio::sync::Notify>,
+    output_byte_limit: Option<usize>,
+    /// Set once an Agent embeds this terminal in ToolCallContent. Before that,
+    /// snapshots would have no UI consumer and need not enter chat history.
+    linked_to_tool_call: bool,
+}
+
+#[derive(Clone, Copy)]
+enum TerminalStream {
+    Stdout,
+    Stderr,
 }
 
 /// Grove ACP client 共享状态。
@@ -1492,18 +1530,20 @@ async fn handle_create_terminal(
             .unwrap()
             .as_nanos()
     );
+    if args.cwd.as_ref().is_some_and(|cwd| !cwd.is_absolute()) {
+        return Err(acp::Error::invalid_params().data("Terminal cwd must be an absolute path"));
+    }
     let cwd = args.cwd.unwrap_or_else(|| state.working_dir.clone());
 
-    // Agent 发来的 command 可能是完整 shell 命令字符串(含 &&、|、;、空格参数等)。
-    let shell_cmd = if args.args.is_empty() {
-        args.command.clone()
-    } else {
-        format!("{} {}", args.command, args.args.join(" "))
-    };
+    // Keep compatibility with Agents that send a full shell expression in
+    // `command` when args is empty. For the protocol's command+args shape,
+    // quote every value as one shell word so spaces and metacharacters cannot
+    // change argument boundaries.
+    let shell_cmd = build_terminal_shell_command(&args.command, &args.args);
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
     let mut cmd = tokio::process::Command::new(&shell);
-    cmd.arg("-l").arg("-i").arg("-c").arg(&shell_cmd);
+    cmd.arg("-c").arg(&shell_cmd);
     cmd.current_dir(&cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1517,16 +1557,23 @@ async fn handle_create_terminal(
         acp::Error::internal_error().data(format!("Failed to spawn '{}': {}", shell_cmd, e))
     })?;
 
-    let exit_notify = Arc::new(tokio::sync::Notify::new());
     let (kill_tx, kill_rx) = mpsc::channel(1);
+    let (exit_tx, _exit_rx) = tokio::sync::watch::channel(None);
+    let runtime = Arc::new(Mutex::new(TerminalRuntime {
+        output: String::new(),
+        stdout_pending_utf8: Vec::new(),
+        stderr_pending_utf8: Vec::new(),
+        truncated: false,
+        output_byte_limit: args
+            .output_byte_limit
+            .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX)),
+        linked_to_tool_call: false,
+    }));
 
     let term_state = TerminalState {
         kill_tx,
-        output: Vec::new(),
-        truncated: false,
-        output_byte_limit: args.output_byte_limit,
-        exit_status: None,
-        exit_notify: exit_notify.clone(),
+        runtime: Arc::clone(&runtime),
+        exit_tx: exit_tx.clone(),
     };
 
     state
@@ -1535,12 +1582,12 @@ async fn handle_create_terminal(
         .unwrap()
         .insert(id.clone(), term_state);
 
-    let terminals = state.terminals.clone();
     let term_id = id.clone();
+    let handle = Arc::clone(&state.handle);
     // handler 要求 Send,而 drive_terminal 的 future 也是 Send;用 tokio::spawn
     // 而不是 spawn_local 避免对 LocalSet 的隐式依赖。
     tokio::spawn(async move {
-        drive_terminal(terminals, term_id, child, kill_rx, exit_notify).await;
+        drive_terminal(handle, term_id, runtime, exit_tx, child, kill_rx).await;
     });
 
     Ok(acp::CreateTerminalResponse::new(id))
@@ -1555,10 +1602,10 @@ async fn handle_terminal_output(
     let term = terms
         .get(tid)
         .ok_or_else(|| acp::Error::invalid_params().data("Unknown terminal ID"))?;
-
-    let resp =
-        acp::TerminalOutputResponse::new(String::from_utf8_lossy(&term.output), term.truncated);
-    Ok(if let Some(ref es) = term.exit_status {
+    let runtime = term.runtime.lock().unwrap();
+    let exit_status = term.exit_tx.borrow().clone();
+    let resp = acp::TerminalOutputResponse::new(runtime.output.clone(), runtime.truncated);
+    Ok(if let Some(es) = exit_status {
         resp.exit_status(es.clone())
     } else {
         resp
@@ -1582,30 +1629,28 @@ async fn handle_wait_for_terminal_exit(
     args: acp::WaitForTerminalExitRequest,
     cancellation: acp::RequestCancellation,
 ) -> acp::Result<acp::WaitForTerminalExitResponse> {
-    let notify = {
+    let mut exit_rx = {
         let terms = state.terminals.lock().unwrap();
         let tid = &*args.terminal_id.0;
         let term = terms
             .get(tid)
             .ok_or_else(|| acp::Error::invalid_params().data("Unknown terminal ID"))?;
-        if let Some(ref status) = term.exit_status {
+        let exit_rx = term.exit_tx.subscribe();
+        if let Some(status) = exit_rx.borrow().clone() {
             return Ok(acp::WaitForTerminalExitResponse::new(status.clone()));
         }
-        term.exit_notify.clone()
+        exit_rx
     };
-    tokio::select! {
-        _ = notify.notified() => {}
+    let status = tokio::select! {
+        result = exit_rx.wait_for(|status| status.is_some()) => {
+            result
+                .map_err(|_| acp::Error::internal_error().data("Terminal exit state closed"))?
+                .clone()
+                .ok_or_else(|| acp::Error::internal_error().data("Terminal exited without status"))?
+        }
         _ = cancellation.cancelled() => return Err(acp::Error::request_cancelled()),
-    }
-
-    let terms = state.terminals.lock().unwrap();
-    let tid = &*args.terminal_id.0;
-    let term = terms
-        .get(tid)
-        .ok_or_else(|| acp::Error::invalid_params().data("Unknown terminal ID"))?;
-    Ok(acp::WaitForTerminalExitResponse::new(
-        term.exit_status.clone().unwrap_or_default(),
-    ))
+    };
+    Ok(acp::WaitForTerminalExitResponse::new(status))
 }
 
 async fn handle_kill_terminal(
@@ -1692,6 +1737,7 @@ async fn handle_session_notification(
                 state.adapter.as_ref(),
                 &tool_call.content,
                 tool_call.raw_output.as_ref(),
+                Some(&state.terminals),
             );
             state.handle.emit(AcpUpdate::ToolCallV1 {
                 id: tool_call_id.clone(),
@@ -1845,12 +1891,14 @@ async fn handle_session_notification(
                     state.adapter.as_ref(),
                     blocks,
                     update.fields.raw_output.as_ref(),
+                    Some(&state.terminals),
                 ))
             } else if update.fields.raw_output.is_some() {
                 Some(tool_output_to_data(
                     state.adapter.as_ref(),
                     &[],
                     update.fields.raw_output.as_ref(),
+                    Some(&state.terminals),
                 ))
             } else {
                 fallback_tool_content
@@ -2110,6 +2158,7 @@ fn tool_status_name(status: &acp::ToolCallStatus) -> &'static str {
 fn tool_contents_to_data(
     adapter: &dyn adapter::AgentContentAdapter,
     content: &[acp::ToolCallContent],
+    terminals: Option<&Arc<Mutex<HashMap<String, TerminalState>>>>,
 ) -> Vec<ToolCallContentData> {
     content
         .iter()
@@ -2141,9 +2190,31 @@ fn tool_contents_to_data(
                 new_text: diff.new_text.clone(),
                 display_text: adapter.tool_call_content_to_text(item),
             }),
-            acp::ToolCallContent::Terminal(terminal) => Some(ToolCallContentData::Terminal {
-                terminal_id: terminal.terminal_id.to_string(),
-            }),
+            acp::ToolCallContent::Terminal(terminal) => {
+                let terminal_id = terminal.terminal_id.to_string();
+                let snapshot = terminals.and_then(|terminals| {
+                    let terms = terminals.lock().unwrap();
+                    let term = terms.get(&terminal_id)?;
+                    let mut runtime = term.runtime.lock().unwrap();
+                    runtime.linked_to_tool_call = true;
+                    let exit_status = term
+                        .exit_tx
+                        .borrow()
+                        .clone()
+                        .as_ref()
+                        .map(terminal_exit_status_data);
+                    Some((runtime.output.clone(), runtime.truncated, exit_status))
+                });
+                let (output, truncated, exit_status) = snapshot
+                    .map(|(output, truncated, status)| (Some(output), truncated, status))
+                    .unwrap_or((None, false, None));
+                Some(ToolCallContentData::Terminal {
+                    terminal_id,
+                    output,
+                    truncated,
+                    exit_status,
+                })
+            }
             _ => None,
         })
         .collect()
@@ -2153,8 +2224,9 @@ fn tool_output_to_data(
     adapter: &dyn adapter::AgentContentAdapter,
     content: &[acp::ToolCallContent],
     protocol_output: Option<&serde_json::Value>,
+    terminals: Option<&Arc<Mutex<HashMap<String, TerminalState>>>>,
 ) -> Vec<ToolCallContentData> {
-    let structured = tool_contents_to_data(adapter, content);
+    let structured = tool_contents_to_data(adapter, content, terminals);
     if !structured.is_empty() {
         return structured;
     }
@@ -2217,7 +2289,7 @@ fn tool_output_display_text(output: &[ToolCallContentData]) -> Option<String> {
                 ContentBlockData::Text { text } => text.clone(),
             },
             ToolCallContentData::Diff { display_text, .. } => display_text.clone(),
-            ToolCallContentData::Terminal { terminal_id } => {
+            ToolCallContentData::Terminal { terminal_id, .. } => {
                 format!("Terminal {terminal_id}")
             }
         })
@@ -2701,13 +2773,172 @@ fn to_acp_content_block(block: &ContentBlockData) -> acp::ContentBlock {
     }
 }
 
+fn shell_quote_word(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn build_terminal_shell_command(command: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        return command.to_string();
+    }
+    std::iter::once(shell_quote_word(command))
+        .chain(args.iter().map(|arg| shell_quote_word(arg)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn terminal_exit_status_data(status: &acp::TerminalExitStatus) -> TerminalExitStatusData {
+    TerminalExitStatusData {
+        exit_code: status.exit_code,
+        signal: status.signal.clone(),
+    }
+}
+
+fn terminal_output_update(
+    id: &str,
+    runtime: &TerminalRuntime,
+    exit_status: Option<&acp::TerminalExitStatus>,
+) -> Option<AcpUpdate> {
+    runtime
+        .linked_to_tool_call
+        .then(|| AcpUpdate::TerminalOutputUpdate {
+            terminal_id: id.to_string(),
+            output: runtime.output.clone(),
+            truncated: runtime.truncated,
+            exit_status: exit_status.map(terminal_exit_status_data),
+        })
+}
+
+fn decode_terminal_bytes(pending: &mut Vec<u8>, data: &[u8]) -> String {
+    pending.extend_from_slice(data);
+    let mut decoded = String::new();
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(text) => {
+                decoded.push_str(text);
+                pending.clear();
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    decoded.push_str(
+                        std::str::from_utf8(&pending[..valid_up_to])
+                            .expect("valid_up_to must delimit valid UTF-8"),
+                    );
+                    pending.drain(..valid_up_to);
+                }
+                match error.error_len() {
+                    Some(error_len) => {
+                        decoded.push('\u{fffd}');
+                        pending.drain(..error_len);
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    decoded
+}
+
+fn truncate_terminal_output(runtime: &mut TerminalRuntime) {
+    let Some(limit) = runtime.output_byte_limit else {
+        return;
+    };
+    if runtime.output.len() <= limit {
+        return;
+    }
+    let mut cut = runtime.output.len() - limit;
+    while !runtime.output.is_char_boundary(cut) {
+        cut += 1;
+    }
+    runtime.output.drain(..cut);
+    runtime.truncated = true;
+}
+
+fn append_terminal_output(
+    runtime: &Arc<Mutex<TerminalRuntime>>,
+    stream: TerminalStream,
+    data: &[u8],
+) -> Option<(String, bool)> {
+    let mut runtime = runtime.lock().unwrap();
+    let decoded = match stream {
+        TerminalStream::Stdout => decode_terminal_bytes(&mut runtime.stdout_pending_utf8, data),
+        TerminalStream::Stderr => decode_terminal_bytes(&mut runtime.stderr_pending_utf8, data),
+    };
+    runtime.output.push_str(&decoded);
+    truncate_terminal_output(&mut runtime);
+    runtime
+        .linked_to_tool_call
+        .then(|| (runtime.output.clone(), runtime.truncated))
+}
+
+fn flush_terminal_decoder(runtime: &mut TerminalRuntime, stream: TerminalStream) {
+    let pending = match stream {
+        TerminalStream::Stdout => std::mem::take(&mut runtime.stdout_pending_utf8),
+        TerminalStream::Stderr => std::mem::take(&mut runtime.stderr_pending_utf8),
+    };
+    if !pending.is_empty() {
+        runtime.output.push_str(&String::from_utf8_lossy(&pending));
+        truncate_terminal_output(runtime);
+    }
+}
+
+#[cfg(unix)]
+fn terminal_signal_name(signal: i32) -> String {
+    match signal {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGUSR2 => "SIGUSR2",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGCHLD => "SIGCHLD",
+        libc::SIGCONT => "SIGCONT",
+        libc::SIGSTOP => "SIGSTOP",
+        libc::SIGTSTP => "SIGTSTP",
+        libc::SIGTTIN => "SIGTTIN",
+        libc::SIGTTOU => "SIGTTOU",
+        value => return format!("SIG{value}"),
+    }
+    .to_string()
+}
+
+fn terminal_exit_status(status: std::process::ExitStatus) -> acp::TerminalExitStatus {
+    let mut result = acp::TerminalExitStatus::new();
+    if let Some(code) = status.code().and_then(|code| u32::try_from(code).ok()) {
+        result = result.exit_code(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            result = result.signal(terminal_signal_name(signal));
+        }
+    }
+    result
+}
+
 /// 后台任务：读取 terminal 进程的 stdout/stderr 输出，等待退出
 async fn drive_terminal(
-    terminals: Arc<Mutex<HashMap<String, TerminalState>>>,
+    handle: Arc<AcpSessionHandle>,
     id: String,
+    runtime: Arc<Mutex<TerminalRuntime>>,
+    exit_tx: tokio::sync::watch::Sender<Option<acp::TerminalExitStatus>>,
     mut child: tokio::process::Child,
     mut kill_rx: mpsc::Receiver<()>,
-    exit_notify: Arc<tokio::sync::Notify>,
 ) {
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
@@ -2716,22 +2947,46 @@ async fn drive_terminal(
     let mut stderr_buf = [0u8; 4096];
     let mut stdout_done = false;
     let mut stderr_done = false;
+    let mut kill_requested = false;
 
     loop {
         tokio::select! {
             result = stdout.read(&mut stdout_buf), if !stdout_done => {
                 match result {
                     Ok(0) | Err(_) => stdout_done = true,
-                    Ok(n) => append_terminal_output(&terminals, &id, &stdout_buf[..n]),
+                    Ok(n) => {
+                        if let Some((output, truncated)) =
+                            append_terminal_output(&runtime, TerminalStream::Stdout, &stdout_buf[..n])
+                        {
+                            handle.emit(AcpUpdate::TerminalOutputUpdate {
+                                terminal_id: id.clone(),
+                                output,
+                                truncated,
+                                exit_status: None,
+                            });
+                        }
+                    }
                 }
             }
             result = stderr.read(&mut stderr_buf), if !stderr_done => {
                 match result {
                     Ok(0) | Err(_) => stderr_done = true,
-                    Ok(n) => append_terminal_output(&terminals, &id, &stderr_buf[..n]),
+                    Ok(n) => {
+                        if let Some((output, truncated)) =
+                            append_terminal_output(&runtime, TerminalStream::Stderr, &stderr_buf[..n])
+                        {
+                            handle.emit(AcpUpdate::TerminalOutputUpdate {
+                                terminal_id: id.clone(),
+                                output,
+                                truncated,
+                                exit_status: None,
+                            });
+                        }
+                    }
                 }
             }
-            _ = kill_rx.recv() => {
+            _ = kill_rx.recv(), if !kill_requested => {
+                kill_requested = true;
                 let _ = child.start_kill();
                 // Don't break — continue reading until EOF so output is captured
             }
@@ -2744,44 +2999,19 @@ async fn drive_terminal(
 
     // Wait for child to exit and capture status
     let exit_status = match child.wait().await {
-        Ok(status) => {
-            let mut es = acp::TerminalExitStatus::new();
-            if let Some(code) = status.code() {
-                // `status.code()` returns Some only on clean exit, where the
-                // code is already non-negative on every supported platform.
-                es = es.exit_code(code as u32);
-            }
-            es
-        }
+        Ok(status) => terminal_exit_status(status),
         Err(_) => acp::TerminalExitStatus::default(),
     };
 
-    {
-        let mut terms = terminals.lock().unwrap();
-        if let Some(state) = terms.get_mut(&id) {
-            state.exit_status = Some(exit_status);
-        }
-    }
-    exit_notify.notify_waiters();
-}
-
-/// 追加输出到 terminal 缓冲区，应用字节数限制截断
-fn append_terminal_output(
-    terminals: &Arc<Mutex<HashMap<String, TerminalState>>>,
-    id: &str,
-    data: &[u8],
-) {
-    let mut terms = terminals.lock().unwrap();
-    if let Some(state) = terms.get_mut(id) {
-        state.output.extend_from_slice(data);
-        if let Some(limit) = state.output_byte_limit {
-            let limit = limit as usize;
-            if state.output.len() > limit {
-                let excess = state.output.len() - limit;
-                state.output.drain(..excess);
-                state.truncated = true;
-            }
-        }
+    let final_update = {
+        let mut runtime = runtime.lock().unwrap();
+        flush_terminal_decoder(&mut runtime, TerminalStream::Stdout);
+        flush_terminal_decoder(&mut runtime, TerminalStream::Stderr);
+        terminal_output_update(&id, &runtime, Some(&exit_status))
+    };
+    exit_tx.send_replace(Some(exit_status));
+    if let Some(update) = final_update {
+        handle.emit(update);
     }
 }
 
@@ -7335,6 +7565,141 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn terminal_shell_command_preserves_protocol_argument_boundaries() {
+        assert_eq!(
+            build_terminal_shell_command(
+                "/tmp/tool with spaces",
+                &[
+                    "hello world".to_string(),
+                    "a'b".to_string(),
+                    "$HOME; touch nope".to_string(),
+                ],
+            ),
+            "'/tmp/tool with spaces' 'hello world' 'a'\"'\"'b' '$HOME; touch nope'"
+        );
+        assert_eq!(
+            build_terminal_shell_command("printf 'compatibility command'", &[]),
+            "printf 'compatibility command'"
+        );
+    }
+
+    #[test]
+    fn terminal_output_limit_keeps_utf8_character_boundaries() {
+        let runtime = Arc::new(Mutex::new(TerminalRuntime {
+            output: String::new(),
+            stdout_pending_utf8: Vec::new(),
+            stderr_pending_utf8: Vec::new(),
+            truncated: false,
+            output_byte_limit: Some(4),
+            linked_to_tool_call: true,
+        }));
+        let bytes = "a世界".as_bytes();
+
+        assert!(append_terminal_output(&runtime, TerminalStream::Stdout, &bytes[..2]).is_some());
+        assert!(append_terminal_output(&runtime, TerminalStream::Stdout, &bytes[2..]).is_some());
+
+        let runtime = runtime.lock().unwrap();
+        assert_eq!(runtime.output, "界");
+        assert!(runtime.truncated);
+        assert!(runtime.stdout_pending_utf8.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_create_rejects_relative_working_directory() {
+        let key = format!("terminal-relative-cwd-test-{}", uuid::Uuid::new_v4());
+        let (handle, _updates, _guard) = new_handle_for_test(&key, "project", "task", "chat");
+        let terminals = Arc::new(Mutex::new(HashMap::new()));
+        let state = client_state_for_test(handle, Arc::clone(&terminals));
+        let request = acp::CreateTerminalRequest::new("session-test", "pwd")
+            .cwd(PathBuf::from("relative/path"));
+
+        assert!(handle_create_terminal(&state, request).await.is_err());
+        assert!(terminals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_create_preserves_arguments_and_retains_completed_output() {
+        let key = format!("terminal-create-output-test-{}", uuid::Uuid::new_v4());
+        let (handle, _updates, _guard) = new_handle_for_test(&key, "project", "task", "chat");
+        let terminals = Arc::new(Mutex::new(HashMap::new()));
+        let state = client_state_for_test(handle, Arc::clone(&terminals));
+        let request = acp::CreateTerminalRequest::new("session-test", "printf")
+            .args(vec!["%s".to_string(), "hello world".to_string()]);
+
+        let created = handle_create_terminal(&state, request).await.unwrap();
+        let terminal_id = created.terminal_id.to_string();
+        let embedded = tool_contents_to_data(
+            &adapter::DefaultAdapter,
+            &[acp::ToolCallContent::Terminal(acp::Terminal::new(
+                terminal_id.clone(),
+            ))],
+            Some(&terminals),
+        );
+        assert!(matches!(
+            &embedded[0],
+            ToolCallContentData::Terminal {
+                terminal_id: id,
+                output: Some(_),
+                ..
+            } if id == &terminal_id
+        ));
+
+        // Subscribe after this short command has normally exited. The status
+        // must still be retained for late terminal/output and wait callers.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut exit_rx = terminals
+            .lock()
+            .unwrap()
+            .get(&terminal_id)
+            .unwrap()
+            .exit_tx
+            .subscribe();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            exit_rx.wait_for(|status| status.is_some()),
+        )
+        .await
+        .expect("terminal command should exit")
+        .expect("terminal exit channel should remain open");
+
+        let output = handle_terminal_output(
+            &state,
+            acp::TerminalOutputRequest::new("session-test", terminal_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.output, "hello world");
+        assert_eq!(
+            output.exit_status.and_then(|status| status.exit_code),
+            Some(0)
+        );
+
+        handle_release_terminal(
+            &state,
+            acp::ReleaseTerminalRequest::new("session-test", terminal_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(!terminals.lock().unwrap().contains_key(&terminal_id));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_exit_status_includes_the_terminating_signal() {
+        let status = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("kill -TERM $$")
+            .status()
+            .await
+            .unwrap();
+        let status = terminal_exit_status(status);
+
+        assert_eq!(status.exit_code, None);
+        assert_eq!(status.signal.as_deref(), Some("SIGTERM"));
+    }
+
     #[tokio::test]
     async fn cancel_request_stops_terminal_wait_without_killing_terminal() {
         use tokio::io::AsyncWriteExt;
@@ -7343,15 +7708,20 @@ mod tests {
         let (handle, _updates, _guard) = new_handle_for_test(&key, "project", "task", "chat");
         let terminals = Arc::new(Mutex::new(HashMap::new()));
         let (kill_tx, mut kill_rx) = mpsc::channel(1);
+        let (exit_tx, _exit_rx) = tokio::sync::watch::channel(None);
         terminals.lock().unwrap().insert(
             "terminal-1".to_string(),
             TerminalState {
                 kill_tx,
-                output: Vec::new(),
-                truncated: false,
-                output_byte_limit: None,
-                exit_status: None,
-                exit_notify: Arc::new(tokio::sync::Notify::new()),
+                runtime: Arc::new(Mutex::new(TerminalRuntime {
+                    output: String::new(),
+                    stdout_pending_utf8: Vec::new(),
+                    stderr_pending_utf8: Vec::new(),
+                    truncated: false,
+                    output_byte_limit: None,
+                    linked_to_tool_call: false,
+                })),
+                exit_tx,
             },
         );
         let state = client_state_for_test(handle, Arc::clone(&terminals));
@@ -7599,6 +7969,25 @@ mod tests {
     }
 
     #[test]
+    fn terminal_content_without_snapshot_remains_history_compatible() {
+        let content: ToolCallContentData = serde_json::from_value(serde_json::json!({
+            "type": "terminal",
+            "terminal_id": "legacy-terminal"
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            content,
+            ToolCallContentData::Terminal {
+                terminal_id,
+                output: None,
+                truncated: false,
+                exit_status: None,
+            } if terminal_id == "legacy-terminal"
+        ));
+    }
+
+    #[test]
     fn authentication_accepts_only_advertised_method_ids() {
         let methods = vec![AuthMethodInfo {
             id: "agent-login".to_string(),
@@ -7671,7 +8060,7 @@ mod tests {
             acp::ToolCallContent::Terminal(acp::Terminal::new("terminal-7")),
         ];
 
-        let converted = tool_contents_to_data(&adapter::DefaultAdapter, &content);
+        let converted = tool_contents_to_data(&adapter::DefaultAdapter, &content, None);
 
         assert!(matches!(
             &converted[0],
@@ -7690,7 +8079,7 @@ mod tests {
         ));
         assert!(matches!(
             &converted[2],
-            ToolCallContentData::Terminal { terminal_id } if terminal_id == "terminal-7"
+            ToolCallContentData::Terminal { terminal_id, .. } if terminal_id == "terminal-7"
         ));
     }
 
@@ -7831,7 +8220,7 @@ mod tests {
             )),
         ))];
 
-        assert!(tool_contents_to_data(&adapter::DefaultAdapter, &content).is_empty());
+        assert!(tool_contents_to_data(&adapter::DefaultAdapter, &content, None).is_empty());
     }
 
     #[test]

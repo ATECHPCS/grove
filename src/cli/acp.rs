@@ -234,6 +234,7 @@ pub async fn execute(agent: String, cwd: String) {
                     | AcpUpdate::TerminalExecute { .. }
                     | AcpUpdate::TerminalChunk { .. }
                     | AcpUpdate::TerminalComplete { .. }
+                    | AcpUpdate::TerminalOutputUpdate { .. }
                     | AcpUpdate::ConnectPhase { .. }
                     | AcpUpdate::UsageUpdate { .. }
                     | AcpUpdate::AskForm { .. },

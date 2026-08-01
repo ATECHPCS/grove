@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyToolCallCreated,
   applyToolCallUpdated,
+  applyTerminalOutputUpdate,
   canApplyToolCallUpdate,
   hasReadableToolInput,
   hasReadableToolOutput,
@@ -146,6 +147,51 @@ describe("ACP v1 tool-call reduction", () => {
         status: "completed",
       }),
     ).toBe(false);
+  });
+
+  it("updates only the matching embedded terminal and preserves legacy IDs", () => {
+    const created = applyToolCallCreated(undefined, {
+      type: "tool_call",
+      id: "tool-terminal",
+      title: "Run tests",
+      kind: "execute",
+      status: "in_progress",
+      output: [
+        { type: "terminal", terminal_id: "terminal-1" },
+        { type: "terminal", terminal_id: "terminal-2" },
+      ],
+    });
+
+    const updated = applyTerminalOutputUpdate(created, {
+      type: "terminal_output_update",
+      terminal_id: "terminal-2",
+      output: "all tests passed\n",
+      truncated: true,
+      exit_status: { exit_code: 0 },
+    });
+
+    expect(updated.output).toEqual([
+      { type: "terminal", terminal_id: "terminal-1" },
+      {
+        type: "terminal",
+        terminal_id: "terminal-2",
+        output: "all tests passed\n",
+        truncated: true,
+        exit_status: { exit_code: 0 },
+      },
+    ]);
+
+    const completedAfterRelease = applyToolCallUpdated(updated, {
+      type: "tool_call_update",
+      id: "tool-terminal",
+      protocol_v1: true,
+      status: "completed",
+      output: [
+        { type: "terminal", terminal_id: "terminal-1" },
+        { type: "terminal", terminal_id: "terminal-2" },
+      ],
+    });
+    expect(completedAfterRelease.output?.[1]).toEqual(updated.output?.[1]);
   });
 });
 

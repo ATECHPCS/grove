@@ -171,6 +171,13 @@ enum ServerMessage {
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         protocol_v1: bool,
     },
+    TerminalOutputUpdate {
+        terminal_id: String,
+        output: String,
+        truncated: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exit_status: Option<crate::acp::TerminalExitStatusData>,
+    },
     PermissionRequest {
         id: String,
         description: String,
@@ -643,6 +650,17 @@ impl From<AcpUpdate> for ServerMessage {
             AcpUpdate::TerminalComplete { exit_code } => {
                 ServerMessage::TerminalComplete { exit_code }
             }
+            AcpUpdate::TerminalOutputUpdate {
+                terminal_id,
+                output,
+                truncated,
+                exit_status,
+            } => ServerMessage::TerminalOutputUpdate {
+                terminal_id,
+                output,
+                truncated,
+                exit_status,
+            },
             AcpUpdate::ConnectPhase { phase } => ServerMessage::ConnectPhase { phase },
             AcpUpdate::UsageUpdate { used, size, cost } => {
                 ServerMessage::UsageUpdate { used, size, cost }

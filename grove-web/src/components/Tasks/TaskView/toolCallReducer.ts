@@ -9,7 +9,14 @@ export type ToolCallContentData =
       new_text: string;
       display_text: string;
     }
-  | { type: "terminal"; terminal_id: string };
+  | {
+      type: "terminal";
+      terminal_id: string;
+      /** Absent in legacy history that only persisted the Terminal ID. */
+      output?: string;
+      truncated?: boolean;
+      exit_status?: { exit_code?: number; signal?: string };
+    };
 
 export type ToolCallInputData = { label: string; value: string };
 
@@ -89,6 +96,21 @@ function eventContent(value: unknown): ToolCallContentData[] | undefined {
   return Array.isArray(value) ? (value as ToolCallContentData[]) : undefined;
 }
 
+function preserveTerminalSnapshots(
+  incoming: ToolCallContentData[] | undefined,
+  previous: ToolCallContentData[] | undefined,
+): ToolCallContentData[] | undefined {
+  if (!incoming || !previous) return incoming;
+  return incoming.map((item) => {
+    if (item.type !== "terminal" || item.output !== undefined) return item;
+    const old = previous.find(
+      (candidate): candidate is Extract<ToolCallContentData, { type: "terminal" }> =>
+        candidate.type === "terminal" && candidate.terminal_id === item.terminal_id,
+    );
+    return old?.output !== undefined ? { ...old, ...item, output: old.output } : item;
+  });
+}
+
 function mergeLocations(existing: Location[] | undefined, incoming: Location[] | undefined) {
   if (!incoming || incoming.length === 0) return existing;
   const result = [...(existing ?? [])];
@@ -137,7 +159,7 @@ export function applyToolCallCreated(
   previous: ToolCallMessage | undefined,
   event: ToolEvent,
 ): ToolCallMessage {
-  const structured = eventContent(event.output);
+  const structured = preserveTerminalSnapshots(eventContent(event.output), previous?.output);
   const protocolLocations = structured !== undefined ? (eventLocations(event.locations) ?? []) : previous?.protocolLocations;
   const locations = structured !== undefined
     ? mergeLocations(protocolLocations, contentLocations(structured))
@@ -165,7 +187,7 @@ export function applyToolCallUpdated(
   previous: ToolCallMessage | undefined,
   event: ToolEvent,
 ): ToolCallMessage {
-  const structured = eventContent(event.output);
+  const structured = preserveTerminalSnapshots(eventContent(event.output), previous?.output);
   const protocolV1 = event.protocol_v1 === true;
   const protocolLocations = protocolV1
     ? event.locations_replace === true
@@ -195,4 +217,29 @@ export function applyToolCallUpdated(
     locations,
     protocolLocations,
   };
+}
+
+export function applyTerminalOutputUpdate(
+  message: ToolCallMessage,
+  event: ToolEvent,
+): ToolCallMessage {
+  const terminalId = typeof event.terminal_id === "string" ? event.terminal_id : "";
+  if (!terminalId || !message.output) return message;
+
+  let changed = false;
+  const output = message.output.map((item) => {
+    if (item.type !== "terminal" || item.terminal_id !== terminalId) return item;
+    changed = true;
+    return {
+      ...item,
+      output: typeof event.output === "string" ? event.output : (item.output ?? ""),
+      truncated: event.truncated === true,
+      exit_status:
+        event.exit_status && typeof event.exit_status === "object"
+          ? (event.exit_status as { exit_code?: number; signal?: string })
+          : undefined,
+    };
+  });
+
+  return changed ? { ...message, output } : message;
 }

@@ -57,6 +57,18 @@ fn truncate_string_to_budget(value: &mut String, budget: &mut usize) {
     *budget = 0;
 }
 
+fn truncate_terminal_snapshot(output: &mut String, truncated: &mut bool, limit: usize) {
+    if output.len() <= limit {
+        return;
+    }
+    let mut cut = output.len() - limit;
+    while !output.is_char_boundary(cut) {
+        cut += 1;
+    }
+    output.drain(..cut);
+    *truncated = true;
+}
+
 fn truncate_tool_output(output: &mut [ToolCallContentData]) {
     let mut budget = MAX_TOOL_CONTENT_BYTES;
     for item in output {
@@ -105,7 +117,14 @@ fn truncate_tool_output(output: &mut [ToolCallContentData]) {
                     truncate_string_to_budget(old_text, &mut budget);
                 }
             }
-            ToolCallContentData::Terminal { .. } => {}
+            ToolCallContentData::Terminal {
+                output, truncated, ..
+            } => {
+                if let Some(output) = output {
+                    truncate_terminal_snapshot(output, truncated, budget);
+                    budget = budget.saturating_sub(output.len());
+                }
+            }
         }
     }
 }
@@ -177,6 +196,9 @@ fn prepare_update_for_storage(update: &mut AcpUpdate) {
                 truncate_tool_content(display_content);
             }
         }
+        AcpUpdate::TerminalOutputUpdate {
+            output, truncated, ..
+        } => truncate_terminal_snapshot(output, truncated, MAX_TOOL_CONTENT_BYTES),
         _ => {}
     }
 }
@@ -195,6 +217,19 @@ pub fn history_file_path(project: &str, task_id: &str, chat_id: &str) -> PathBuf
 
 /// 判断事件是否应该持久化
 pub fn should_persist(update: &AcpUpdate) -> bool {
+    // Live terminal snapshots can arrive once per 4 KiB read. Keep them on the
+    // WebSocket/broadcast path, but persist only the final cumulative snapshot
+    // to avoid synchronous history writes for every output chunk. The initial
+    // ToolCallV1 already stores the snapshot visible at embed time.
+    if matches!(
+        update,
+        AcpUpdate::TerminalOutputUpdate {
+            exit_status: None,
+            ..
+        }
+    ) {
+        return false;
+    }
     !matches!(
         update,
         AcpUpdate::Busy { .. }
@@ -1401,6 +1436,39 @@ mod tests {
         };
         assert!(text.len() <= MAX_TOOL_CONTENT_BYTES);
         assert!(text.ends_with(TRUNCATED_MARKER));
+    }
+
+    #[test]
+    fn terminal_history_persists_only_the_bounded_final_snapshot() {
+        let live = AcpUpdate::TerminalOutputUpdate {
+            terminal_id: "terminal-1".into(),
+            output: "live".into(),
+            truncated: false,
+            exit_status: None,
+        };
+        assert!(!should_persist(&live));
+
+        let mut completed = AcpUpdate::TerminalOutputUpdate {
+            terminal_id: "terminal-1".into(),
+            output: "世".repeat(MAX_TOOL_CONTENT_BYTES),
+            truncated: false,
+            exit_status: Some(crate::acp::TerminalExitStatusData {
+                exit_code: Some(0),
+                signal: None,
+            }),
+        };
+        assert!(should_persist(&completed));
+        prepare_update_for_storage(&mut completed);
+
+        let AcpUpdate::TerminalOutputUpdate {
+            output, truncated, ..
+        } = completed
+        else {
+            unreachable!();
+        };
+        assert!(output.len() <= MAX_TOOL_CONTENT_BYTES);
+        assert!(truncated);
+        assert!(output.chars().all(|character| character == '世'));
     }
 
     /// locations 合并：同 (path,line) 去重，不同的累加并保持插入顺序。

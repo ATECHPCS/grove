@@ -134,6 +134,7 @@ import {
 import {
   applyToolCallCreated,
   applyToolCallUpdated,
+  applyTerminalOutputUpdate,
   canApplyToolCallUpdate,
   hasReadableToolInput,
   hasReadableToolOutput,
@@ -1179,7 +1180,12 @@ function getAutoScrollTailSignature(messages: ChatMessage[]): string {
         case "thinking":
           return `thinking:${message.complete ? 1 : 0}:${message.content.length}`;
         case "tool":
-          return `tool:${message.id}:${message.status}:${(message.content ?? "").length}`;
+          return `tool:${message.id}:${message.status}:${(message.content ?? "").length}:${
+            message.output?.reduce(
+              (size, item) => size + (item.type === "terminal" ? (item.output?.length ?? 0) : 0),
+              0,
+            ) ?? 0
+          }`;
         case "ask_form":
           return `ask_form:${message.id}:${message.resolved ? 1 : 0}`;
         case "system":
@@ -2065,6 +2071,12 @@ function reduceHistoryMessages(
       }
       return [...messages, applyToolCallUpdated(undefined, msg)];
     }
+    case "terminal_output_update":
+      return messages.map((message) =>
+        message.type === "tool"
+          ? applyTerminalOutputUpdate(message, msg)
+          : message,
+      );
     case "permission_request":
       return [
         ...messages,
@@ -4689,6 +4701,9 @@ export function TaskChat({
               .catch(() => {});
           }
           break;
+        case "terminal_output_update":
+          setMessages((prev) => reduceHistoryMessages(prev, msg));
+          break;
         case "permission_request":
           setShowPermissionPanel(true);
           setShowPlan(false);
@@ -5044,6 +5059,7 @@ export function TaskChat({
         case "tool_call":
         case "thought_chunk":
         case "tool_call_update":
+        case "terminal_output_update":
         case "permission_request":
         case "permission_response":
         case "complete":
@@ -11801,14 +11817,50 @@ function ToolContentBlocks({ content }: { content: ToolCallContentData[] }) {
         if (item.type === "diff") {
           return <DiffPreview key={index} diff={item.display_text} />;
         }
+        const hasSnapshot = item.output !== undefined || item.exit_status !== undefined;
+        const exitLabel = item.exit_status
+          ? item.exit_status.signal
+            ? `Signal ${item.exit_status.signal}`
+            : item.exit_status.exit_code !== undefined
+              ? `Exit ${item.exit_status.exit_code}`
+              : "Exited"
+          : "Running";
         return (
           <div
             key={index}
-            className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2 text-[11px] text-[var(--color-text-muted)]"
+            className="overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] text-[11px] text-[var(--color-text-muted)]"
           >
-            <Terminal className="h-3.5 w-3.5" />
-            <span>Terminal</span>
-            <code className="text-[var(--color-text)]">{item.terminal_id}</code>
+            <div
+              className={`flex items-center gap-2 px-2.5 py-2 ${
+                hasSnapshot
+                  ? "border-b border-[color-mix(in_srgb,var(--color-border)_55%,transparent)]"
+                  : ""
+              }`}
+            >
+              <Terminal className="h-3.5 w-3.5" />
+              <span>Terminal</span>
+              <code className="min-w-0 flex-1 truncate text-[var(--color-text)]">
+                {item.terminal_id}
+              </code>
+              {hasSnapshot && <span className="shrink-0">{exitLabel}</span>}
+            </div>
+            {hasSnapshot && (
+              <div>
+                {item.truncated && (
+                  <div className="border-b border-[color-mix(in_srgb,var(--color-border)_45%,transparent)] px-2.5 py-1.5 text-[10px]">
+                    Earlier output truncated
+                  </div>
+                )}
+                <pre
+                  className="m-0 max-h-72 overflow-auto whitespace-pre-wrap break-words px-2.5 py-2 font-mono text-[11px] leading-[1.5] text-[var(--color-text)]"
+                  dangerouslySetInnerHTML={{
+                    __html:
+                      ansiToHtml(item.output ?? "") ||
+                      (item.exit_status ? "No output" : "Waiting for output…"),
+                  }}
+                />
+              </div>
+            )}
           </div>
         );
       })}
