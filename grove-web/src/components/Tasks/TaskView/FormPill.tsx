@@ -14,7 +14,7 @@
  *   L4: question controls
  */
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ChevronLeft,
   ChevronRight,
@@ -27,6 +27,7 @@ import { Button } from "../../ui";
 import type {
   AskFormDefinition,
   FormQuestionDef,
+  SurveyAnswers,
 } from "./formPillTypes";
 
 /* ────────────────── Local answer state ───────────────────────────────── */
@@ -55,27 +56,27 @@ function blankAnswer(q: FormQuestionDef): LocalAnswer {
     case "single_choice":
       return {
         type: "single_choice",
-        selectedOption: null,
+        selectedOption: q.default ?? null,
         useCustom: false,
         customText: "",
       };
     case "multi_choice":
       return {
         type: "multi_choice",
-        selectedOptions: [],
+        selectedOptions: q.default ?? [],
         useCustom: false,
         customText: "",
       };
     case "text":
-      return { type: "text", value: "" };
+      return { type: "text", value: q.default ?? "" };
     case "textarea":
-      return { type: "textarea", value: "" };
+      return { type: "textarea", value: q.default ?? "" };
     case "number":
-      return { type: "number", value: "" };
+      return { type: "number", value: q.default?.toString() ?? "" };
     case "rating":
       return { type: "rating", value: 0 };
     case "boolean":
-      return { type: "boolean", value: null };
+      return { type: "boolean", value: q.default ?? null };
   }
 }
 
@@ -163,30 +164,124 @@ function buildSubmittedMarkdown(
   return lines.join("\n");
 }
 
+function answerValue(
+  q: FormQuestionDef,
+  answer: LocalAnswer | undefined,
+): string | number | boolean | string[] | undefined {
+  if (!answer || !isAnswered(answer)) return undefined;
+  switch (answer.type) {
+    case "single_choice":
+      return answer.useCustom ? answer.customText.trim() : answer.selectedOption ?? undefined;
+    case "multi_choice": {
+      const values = [...answer.selectedOptions];
+      if (answer.useCustom && answer.customText.trim()) values.push(answer.customText.trim());
+      return values;
+    }
+    case "text":
+    case "textarea":
+      if (q.type === "text" && q.inputType === "datetime-local") {
+        const date = new Date(answer.value);
+        return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+      }
+      return answer.value;
+    case "number": {
+      const value = q.type === "number" && q.integer
+        ? Number.parseInt(answer.value, 10)
+        : Number(answer.value);
+      return Number.isFinite(value) ? value : undefined;
+    }
+    case "rating":
+      return answer.value;
+    case "boolean":
+      return answer.value ?? undefined;
+  }
+}
+
+function validationError(
+  definition: AskFormDefinition,
+  answers: Record<string, LocalAnswer>,
+): string | null {
+  for (const q of definition.questions) {
+    const answer = answers[q.id];
+    if (q.required && (!answer || !isAnswered(answer))) return `${q.title} is required.`;
+    if (!answer || !isAnswered(answer)) continue;
+    if ((q.type === "text" || q.type === "textarea") && (answer.type === "text" || answer.type === "textarea")) {
+      if (q.minLength != null && answer.value.length < q.minLength) return `${q.title} is too short.`;
+      if (q.maxLength != null && answer.value.length > q.maxLength) return `${q.title} is too long.`;
+      if (q.inputType === "email" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(answer.value)) {
+        return `${q.title} must be a valid email address.`;
+      }
+      if (q.inputType === "url") {
+        try {
+          new URL(answer.value);
+        } catch {
+          return `${q.title} must be a valid URL.`;
+        }
+      }
+      if (q.inputType === "date" && !/^\d{4}-\d{2}-\d{2}$/.test(answer.value)) {
+        return `${q.title} must be a valid date.`;
+      }
+      if (q.inputType === "datetime-local" && Number.isNaN(new Date(answer.value).getTime())) {
+        return `${q.title} must be a valid date and time.`;
+      }
+    }
+    if (q.type === "number" && answer.type === "number") {
+      const value = Number(answer.value);
+      if (!Number.isFinite(value) || q.integer && !Number.isInteger(value)) return `${q.title} must be a valid ${q.integer ? "integer" : "number"}.`;
+      if (q.minimum != null && value < q.minimum) return `${q.title} must be at least ${q.minimum}.`;
+      if (q.maximum != null && value > q.maximum) return `${q.title} must be at most ${q.maximum}.`;
+    }
+    if (q.type === "multi_choice" && answer.type === "multi_choice") {
+      const count = answer.selectedOptions.length + (answer.useCustom && answer.customText.trim() ? 1 : 0);
+      if (q.minItems != null && count < q.minItems) return `Select at least ${q.minItems} options for ${q.title}.`;
+      if (q.maxItems != null && count > q.maxItems) return `Select at most ${q.maxItems} options for ${q.title}.`;
+    }
+  }
+  return null;
+}
+
 /* ────────────────── Component ────────────────────────────────────────── */
 
 interface Props {
   definition: AskFormDefinition;
-  /** User pressed Submit — ship the markdown answer to the agent. */
-  onSubmit: (userPromptMarkdown: string) => void;
-  /** User pressed Cancel / closed the panel — just dismiss, no prompt sent. */
+  onSubmit: (result: { answers: SurveyAnswers; markdown: string }) => void;
   onDismiss: () => void;
+  onDecline?: () => void;
+  agentName?: string;
+  requestMessage?: string;
+  disabled?: boolean;
+  externalError?: string;
+  onChange?: () => void;
 }
 
-export function FormPill({ definition, onSubmit, onDismiss }: Props) {
+export function FormPill({
+  definition,
+  onSubmit,
+  onDismiss,
+  onDecline,
+  agentName,
+  requestMessage,
+  disabled = false,
+  externalError,
+  onChange,
+}: Props) {
   const [currentTab, setCurrentTab] = useState(0);
   const [answers, setAnswers] = useState<Record<string, LocalAnswer>>(() => {
     const init: Record<string, LocalAnswer> = {};
     for (const q of definition.questions) init[q.id] = blankAnswer(q);
     return init;
   });
+  const [error, setError] = useState<string | null>(null);
 
   const completedRef = useRef(false);
+  useEffect(() => {
+    if (externalError) completedRef.current = false;
+  }, [externalError]);
   const fireSubmit = useCallback(
-    (markdown: string) => {
+    (result: { answers: SurveyAnswers; markdown: string }) => {
       if (completedRef.current) return;
       completedRef.current = true;
-      onSubmit(markdown);
+      onSubmit(result);
     },
     [onSubmit],
   );
@@ -195,6 +290,11 @@ export function FormPill({ definition, onSubmit, onDismiss }: Props) {
     completedRef.current = true;
     onDismiss();
   }, [onDismiss]);
+  const fireDecline = useCallback(() => {
+    if (completedRef.current || !onDecline) return;
+    completedRef.current = true;
+    onDecline();
+  }, [onDecline]);
 
   const total = definition.questions.length;
   const currentQuestion = definition.questions[currentTab];
@@ -204,10 +304,23 @@ export function FormPill({ definition, onSubmit, onDismiss }: Props) {
 
   const updateAnswer = useCallback((id: string, next: LocalAnswer) => {
     setAnswers((prev) => ({ ...prev, [id]: next }));
-  }, []);
+    setError(null);
+    onChange?.();
+  }, [onChange]);
 
   const onSubmitClick = useCallback(() => {
-    fireSubmit(buildSubmittedMarkdown(definition, answers));
+    const nextError = validationError(definition, answers);
+    setError(nextError);
+    if (nextError) return;
+    const values: SurveyAnswers = {};
+    for (const question of definition.questions) {
+      const value = answerValue(question, answers[question.id]);
+      if (value !== undefined) values[question.id] = value;
+    }
+    fireSubmit({
+      answers: values,
+      markdown: buildSubmittedMarkdown(definition, answers),
+    });
   }, [definition, answers, fireSubmit]);
 
   /** Enter advances to the next question, or submits on the last one.
@@ -235,19 +348,42 @@ export function FormPill({ definition, onSubmit, onDismiss }: Props) {
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2 min-w-0">
           <ListChecks className="w-4 h-4 text-[var(--color-highlight)] shrink-0" />
-          <span className="text-sm font-semibold text-[var(--color-text)] truncate">
-            {definition.title}
-          </span>
+          <div className="min-w-0">
+            <div className="text-sm font-semibold text-[var(--color-text)] truncate">
+              {agentName ? `${agentName} requests information` : definition.title}
+            </div>
+            {agentName && <div className="text-xs text-[var(--color-text-muted)] truncate">{definition.title}</div>}
+          </div>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          <Button variant="ghost" size="sm" onClick={fireDismiss}>
+          <Button variant="ghost" size="sm" disabled={disabled} onClick={fireDismiss}>
             <X className="w-3.5 h-3.5 mr-1" /> Cancel
           </Button>
-          <Button variant="primary" size="sm" onClick={onSubmitClick}>
+          {onDecline && (
+            <Button variant="ghost" size="sm" disabled={disabled} onClick={fireDecline}>
+              Decline
+            </Button>
+          )}
+          <Button variant="primary" size="sm" disabled={disabled} onClick={onSubmitClick}>
             <Send className="w-3.5 h-3.5 mr-1" /> Submit
           </Button>
         </div>
       </div>
+
+      {requestMessage && (
+        <p className="text-xs text-[var(--color-text-muted)] whitespace-pre-wrap break-words">
+          {requestMessage}
+        </p>
+      )}
+      {definition.description && definition.description !== requestMessage && (
+        <p className="text-xs text-[var(--color-text-muted)] whitespace-pre-wrap break-words">
+          {definition.description}
+        </p>
+      )}
+
+      {(error || externalError) && (
+        <p className="text-xs text-[var(--color-error)]" role="alert">{error || externalError}</p>
+      )}
 
       {currentQuestion && (
         <>
@@ -260,6 +396,9 @@ export function FormPill({ definition, onSubmit, onDismiss }: Props) {
               <span className="text-[15px] font-semibold text-[var(--color-text)]">
                 {currentQuestion.title}
               </span>
+              {currentQuestion.required && (
+                <span className="ml-1 text-xs font-medium text-[var(--color-error)]">Required</span>
+              )}
             </div>
             <div className="flex items-center gap-1 shrink-0">
               <Button
@@ -332,9 +471,12 @@ function QuestionControls({ question, answer, onChange }: ControlProps) {
       const a = answer as Extract<LocalAnswer, { type: "text" }>;
       return (
         <input
-          type="text"
+          type={question.inputType ?? "text"}
           value={a.value}
           onChange={(e) => onChange({ type: "text", value: e.target.value })}
+          required={question.required}
+          minLength={question.minLength}
+          maxLength={question.maxLength}
           className="w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-2 text-sm text-[var(--color-text)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:border-[var(--color-highlight)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--color-highlight)_20%,transparent)] transition-colors"
         />
       );
@@ -348,6 +490,9 @@ function QuestionControls({ question, answer, onChange }: ControlProps) {
             onChange({ type: "textarea", value: e.target.value })
           }
           rows={4}
+          required={question.required}
+          minLength={question.minLength}
+          maxLength={question.maxLength}
           className="w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-2 text-sm text-[var(--color-text)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:border-[var(--color-highlight)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--color-highlight)_20%,transparent)] resize-y transition-colors"
         />
       );
@@ -359,6 +504,10 @@ function QuestionControls({ question, answer, onChange }: ControlProps) {
           type="number"
           value={a.value}
           onChange={(e) => onChange({ type: "number", value: e.target.value })}
+          required={question.required}
+          step={question.integer ? 1 : "any"}
+          min={question.minimum}
+          max={question.maximum}
           className="w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-3 py-2 text-sm text-[var(--color-text)] focus:outline-none focus:border-[var(--color-highlight)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--color-highlight)_20%,transparent)] transition-colors"
         />
       );
@@ -488,7 +637,7 @@ function SingleChoiceControl({
           </label>
         );
       })}
-      <label
+      {question.allowCustom !== false && <label
         className={`flex items-center gap-3 px-3.5 py-2.5 rounded-xl border cursor-text transition-all ${
           answer.useCustom
             ? "border-[var(--color-highlight)] bg-[color-mix(in_srgb,var(--color-highlight)_10%,transparent)] ring-2 ring-[color-mix(in_srgb,var(--color-highlight)_18%,transparent)]"
@@ -522,7 +671,7 @@ function SingleChoiceControl({
           placeholder="Type your answer"
           className="flex-1 min-w-0 bg-transparent border-0 outline-none text-sm text-[var(--color-text)] placeholder:text-[var(--color-text-muted)] py-0.5"
         />
-      </label>
+      </label>}
     </fieldset>
   );
 }
@@ -575,7 +724,7 @@ function MultiChoiceControl({
           </label>
         );
       })}
-      <label
+      {question.allowCustom !== false && <label
         className={`flex items-center gap-3 px-3.5 py-2.5 rounded-xl border cursor-text transition-all ${
           answer.useCustom
             ? "border-[var(--color-highlight)] bg-[color-mix(in_srgb,var(--color-highlight)_10%,transparent)] ring-2 ring-[color-mix(in_srgb,var(--color-highlight)_18%,transparent)]"
@@ -609,7 +758,7 @@ function MultiChoiceControl({
           placeholder="Type your answer"
           className="flex-1 min-w-0 bg-transparent border-0 outline-none text-sm text-[var(--color-text)] placeholder:text-[var(--color-text-muted)] py-0.5"
         />
-      </label>
+      </label>}
     </fieldset>
   );
 }

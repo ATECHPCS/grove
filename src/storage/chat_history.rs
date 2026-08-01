@@ -248,6 +248,10 @@ pub fn should_persist(update: &AcpUpdate) -> bool {
             // as user content); the form definition itself should not write
             // to history — on refresh the FormPill cleanly disappears.
             | AcpUpdate::AskForm { .. }
+            | AcpUpdate::ElicitationRequest { .. }
+            | AcpUpdate::ElicitationResolved { .. }
+            | AcpUpdate::ElicitationValidationError { .. }
+            | AcpUpdate::ElicitationComplete { .. }
     )
 }
 

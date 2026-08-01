@@ -239,7 +239,11 @@ pub async fn execute(agent: String, cwd: String) {
                     | AcpUpdate::TerminalOutputUpdate { .. }
                     | AcpUpdate::ConnectPhase { .. }
                     | AcpUpdate::UsageUpdate { .. }
-                    | AcpUpdate::AskForm { .. },
+                    | AcpUpdate::AskForm { .. }
+                    | AcpUpdate::ElicitationRequest { .. }
+                    | AcpUpdate::ElicitationResolved { .. }
+                    | AcpUpdate::ElicitationValidationError { .. }
+                    | AcpUpdate::ElicitationComplete { .. },
                 ) => continue,
                 Ok(AcpUpdate::SessionEnded) => {
                     eprintln!("Session ended.");

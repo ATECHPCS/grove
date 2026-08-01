@@ -14,9 +14,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::acp::{
-    self, AcpStartConfig, AcpUpdate, ConfigOptionValue, ContentBlockData, PromptCapabilitiesData,
-    QueueMode, QueuedConfig, QueuedMessage, SessionConfigOptionData, ToolCallContentData,
-    ToolCallInputData,
+    self, AcpStartConfig, AcpUpdate, ConfigOptionValue, ContentBlockData,
+    ElicitationRequestSnapshot, ElicitationResponseData, ElicitationResponseResult,
+    PromptCapabilitiesData, QueueMode, QueuedConfig, QueuedMessage, SessionConfigOptionData,
+    ToolCallContentData, ToolCallInputData,
 };
 use crate::storage::{chat_attachments, chat_history, config, tasks, workspace};
 
@@ -48,6 +49,11 @@ enum ClientMessage {
         #[serde(default)]
         id: String,
         option_id: String,
+    },
+    ElicitationResponse {
+        id: String,
+        #[serde(flatten)]
+        response: ElicitationResponseData,
     },
     /// Add a message to the pending queue
     QueueMessage {
@@ -207,6 +213,21 @@ enum ServerMessage {
     AskForm {
         form_id: String,
         definition: crate::agent_graph::ask_form::AskFormInput,
+    },
+    ElicitationRequest {
+        #[serde(flatten)]
+        snapshot: ElicitationRequestSnapshot,
+    },
+    ElicitationResolved {
+        request_id: String,
+        action: String,
+    },
+    ElicitationValidationError {
+        request_id: String,
+        message: String,
+    },
+    ElicitationComplete {
+        elicitation_id: String,
     },
     PermissionResponse {
         id: String,
@@ -617,6 +638,22 @@ impl From<AcpUpdate> for ServerMessage {
                 form_id,
                 definition,
             },
+            AcpUpdate::ElicitationRequest { snapshot } => {
+                ServerMessage::ElicitationRequest { snapshot }
+            }
+            AcpUpdate::ElicitationResolved { request_id, action } => {
+                ServerMessage::ElicitationResolved { request_id, action }
+            }
+            AcpUpdate::ElicitationValidationError {
+                request_id,
+                message,
+            } => ServerMessage::ElicitationValidationError {
+                request_id,
+                message,
+            },
+            AcpUpdate::ElicitationComplete { elicitation_id } => {
+                ServerMessage::ElicitationComplete { elicitation_id }
+            }
             AcpUpdate::Complete {
                 stop_reason,
                 usage,
@@ -1007,6 +1044,19 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
         }
     }
 
+    // Native ACP elicitations are intentionally not written to chat history,
+    // but a browser reconnect must not strand the Agent's live request.
+    let mut elicitation_snapshots = handle.active_url_elicitation_snapshots();
+    if let Some(snapshot) = handle.pending_elicitation_snapshot() {
+        elicitation_snapshots.push(snapshot);
+    }
+    for snapshot in elicitation_snapshots {
+        let msg = ServerMessage::ElicitationRequest { snapshot };
+        if let Ok(json) = serde_json::to_string(&msg) {
+            let _ = ws_sender.send(Message::Text(json.into())).await;
+        }
+    }
+
     // Sync busy state on (re)connect
     if is_existing && handle.is_busy.load(std::sync::atomic::Ordering::Relaxed) {
         let msg = ServerMessage::Busy { value: true };
@@ -1114,6 +1164,24 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                                     handle_for_input.emit(AcpUpdate::Error {
                                         message: "No pending permission request".to_string(),
                                     });
+                                }
+                            }
+                            ClientMessage::ElicitationResponse { id, response } => {
+                                match handle_for_input.respond_elicitation(&id, response) {
+                                    ElicitationResponseResult::Accepted => {}
+                                    ElicitationResponseResult::Stale => {
+                                        handle_for_input.emit(AcpUpdate::Error {
+                                            message: format!(
+                                                "Elicitation request {} is no longer pending",
+                                                id
+                                            ),
+                                        })
+                                    }
+                                    ElicitationResponseResult::Invalid(message) => handle_for_input
+                                        .emit(AcpUpdate::ElicitationValidationError {
+                                            request_id: id,
+                                            message,
+                                        }),
                                 }
                             }
                             ClientMessage::QueueMessage {
@@ -2262,6 +2330,50 @@ mod tests {
         let updated = serde_json::to_value(ServerMessage::from(updated)).unwrap();
         assert_eq!(updated["input"][0]["label"], "Query");
         assert_eq!(updated["output"][0]["content"]["text"], "Useful result");
+    }
+
+    #[test]
+    fn elicitation_messages_keep_structured_content_on_the_wire() {
+        let response: ClientMessage = serde_json::from_value(serde_json::json!({
+            "type": "elicitation_response",
+            "id": "request-1",
+            "action": "accept",
+            "content": {
+                "name": "Ada",
+                "count": 2,
+                "enabled": true,
+                "regions": ["us", "eu"]
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            response,
+            ClientMessage::ElicitationResponse {
+                response: ElicitationResponseData::Accept { .. },
+                ..
+            }
+        ));
+
+        let update: AcpUpdate = serde_json::from_value(serde_json::json!({
+            "type": "elicitation_request",
+            "snapshot": {
+                "request_id": "request-1",
+                "agent_name": "Test Agent",
+                "request": {
+                    "mode": "url",
+                    "sessionId": "session-1",
+                    "elicitationId": "url-1",
+                    "url": "https://example.com/auth",
+                    "message": "Authenticate"
+                }
+            }
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(ServerMessage::from(update)).unwrap();
+        assert_eq!(wire["type"], "elicitation_request");
+        assert_eq!(wire["request_id"], "request-1");
+        assert_eq!(wire["request"]["elicitationId"], "url-1");
+        assert!(wire.get("snapshot").is_none());
     }
 
     fn test_handle() -> (std::sync::Arc<acp::AcpSessionHandle>, acp::TestSessionGuard) {

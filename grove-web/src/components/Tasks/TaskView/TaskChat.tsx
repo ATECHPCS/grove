@@ -86,7 +86,12 @@ import {
 } from "../../../utils/groveMeta";
 import { renderGroveMetaEnvelope } from "./groveMetaRenderers";
 import { FormPill } from "./FormPill";
-import type { AskFormDefinition } from "./formPillTypes";
+import { ElicitationUrlPill } from "./ElicitationUrlPill";
+import {
+  elicitationToSurvey,
+  type AcpElicitationSnapshot,
+  type AskFormDefinition,
+} from "./formPillTypes";
 import {
   agentIconComponent,
   agentIconUrl,
@@ -419,6 +424,14 @@ type AskFormMessage = {
   resolved?: boolean;
 };
 
+type ElicitationMessage = {
+  type: "elicitation";
+  id: string;
+  snapshot: AcpElicitationSnapshot;
+  resolved?: "accept" | "decline" | "cancel" | "complete";
+  error?: string;
+};
+
 type ChatMessage =
   | {
       type: "user";
@@ -446,6 +459,7 @@ type ChatMessage =
   | { type: "thinking"; content: string; collapsed: boolean; complete: boolean }
   | ToolMessage
   | AskFormMessage
+  | ElicitationMessage
   | { type: "system"; content: string }
   | PermissionMessage
   | { type: "terminal_output"; chunks: string[]; exitCode?: number | null }
@@ -1197,6 +1211,12 @@ function extractRenderItemText(item: RenderItem): string {
         ]
           .filter(Boolean)
           .join("\n");
+      case "elicitation":
+        return [
+          m.snapshot.agent_name,
+          m.snapshot.request.message,
+          m.snapshot.request.url ?? "",
+        ].filter(Boolean).join("\n");
       case "permission":
         return m.description;
       case "terminal_output":
@@ -1246,6 +1266,8 @@ function getAutoScrollTailSignature(messages: ChatMessage[]): string {
           }`;
         case "ask_form":
           return `ask_form:${message.id}:${message.resolved ? 1 : 0}`;
+        case "elicitation":
+          return `elicitation:${message.id}:${message.snapshot.opened ? 1 : 0}:${message.resolved ?? ""}`;
         case "system":
           return `system:${message.content.length}`;
         case "permission":
@@ -2166,6 +2188,42 @@ function reduceHistoryMessages(
         },
       ];
     }
+    case "elicitation_request": {
+      const snapshot = msg as AcpElicitationSnapshot & { type: string };
+      if (!snapshot.request_id || !snapshot.request || !snapshot.agent_name) return messages;
+      const existing = messages.findIndex(
+        (message) => message.type === "elicitation" && message.id === snapshot.request_id,
+      );
+      if (existing >= 0) {
+        return messages.map((message, index) =>
+          index === existing && message.type === "elicitation"
+            ? { ...message, snapshot: { ...snapshot, opened: snapshot.opened || message.snapshot.opened } }
+            : message,
+        );
+      }
+      return [...messages, { type: "elicitation", id: snapshot.request_id, snapshot }];
+    }
+    case "elicitation_resolved":
+      return messages.map((message) => {
+        if (message.type !== "elicitation" || message.id !== msg.request_id) return message;
+        if (msg.action === "accept" && message.snapshot.request.mode === "url") {
+          return { ...message, snapshot: { ...message.snapshot, opened: true } };
+        }
+        return { ...message, resolved: msg.action };
+      });
+    case "elicitation_validation_error":
+      return messages.map((message) =>
+        message.type === "elicitation" && message.id === msg.request_id
+          ? { ...message, error: msg.message }
+          : message,
+      );
+    case "elicitation_complete":
+      return messages.map((message) =>
+        message.type === "elicitation"
+          && message.snapshot.request.elicitationId === msg.elicitation_id
+          ? { ...message, resolved: "complete" }
+          : message,
+      );
     case "permission_response":
       return resolveLatestPendingPermission(
         messages,
@@ -2951,14 +3009,15 @@ export function TaskChat({
         ) ?? null,
     [messages],
   );
-  /** Latest unresolved ask_form message. Drives the composer panel + pill. */
-  type AskFormMsg = Extract<ChatMessage, { type: "ask_form" }>;
-  const activeFormMessage = useMemo(
-    () =>
-      [...messages]
-        .reverse()
-        .find((m): m is AskFormMsg => m.type === "ask_form" && !m.resolved) ??
-      null,
+  /** Latest unresolved survey, regardless of whether it came from Grove's
+   * `ask_form` tool or native ACP elicitation. Both use the same panel. */
+  type SurveyMsg = Extract<ChatMessage, { type: "ask_form" | "elicitation" }>;
+  const activeSurveyMessage = useMemo(
+    () => [...messages]
+      .reverse()
+      .find((message): message is SurveyMsg =>
+        (message.type === "ask_form" || message.type === "elicitation") && !message.resolved,
+      ) ?? null,
     [messages],
   );
   /** 最近一条仍在生效的 auth_required(succeeded 视为已结束,自动让位)。
@@ -2993,7 +3052,7 @@ export function TaskChat({
       ? "auth"
       : showPermissionPanel && activePermissionMessage
         ? "permission"
-        : showFormPanel && activeFormMessage
+        : showFormPanel && activeSurveyMessage
           ? "ask_form"
           : showPlan && hasTodoPanel
             ? "todo"
@@ -3028,10 +3087,10 @@ export function TaskChat({
 
   // Same prev-prop pattern for ask_form: auto-open the form panel when a new
   // ask_form message arrives, auto-close when it resolves.
-  const [prevActiveFormMessage, setPrevActiveFormMessage] = useState(activeFormMessage);
-  if (activeFormMessage !== prevActiveFormMessage) {
-    setPrevActiveFormMessage(activeFormMessage);
-    if (activeFormMessage) {
+  const [prevActiveFormMessage, setPrevActiveFormMessage] = useState(activeSurveyMessage);
+  if (activeSurveyMessage !== prevActiveFormMessage) {
+    setPrevActiveFormMessage(activeSurveyMessage);
+    if (activeSurveyMessage) {
       setShowFormPanel(true);
       setShowPlan(false);
       setShowPlanFile(false);
@@ -4933,6 +4992,12 @@ export function TaskChat({
         case "ask_form":
           setMessages((prev) => reduceHistoryMessages(prev, msg));
           break;
+        case "elicitation_request":
+        case "elicitation_resolved":
+        case "elicitation_validation_error":
+        case "elicitation_complete":
+          setMessages((prev) => reduceHistoryMessages(prev, msg));
+          break;
         case "complete":
           setAutoExpandSectionId((prev) => {
             if (prev) {
@@ -5970,6 +6035,8 @@ export function TaskChat({
           ? { ...m, resolved: "Cancelled" }
           : m.type === "ask_form" && !m.resolved
             ? { ...m, resolved: true }
+            : m.type === "elicitation" && !m.resolved
+              ? { ...m, resolved: "cancel" as const }
             : m,
       ),
     );
@@ -6680,6 +6747,31 @@ export function TaskChat({
         m.type === "ask_form" && m.id === id ? { ...m, resolved: true } : m,
       ),
     );
+  }, []);
+
+  const respondElicitation = useCallback(
+    (
+      id: string,
+      action: "accept" | "decline" | "cancel",
+      content?: Record<string, string | number | boolean | string[]>,
+    ) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+      wsRef.current.send(JSON.stringify({
+        type: "elicitation_response",
+        id,
+        action,
+        ...(content ? { content } : {}),
+      }));
+    },
+    [],
+  );
+
+  const clearElicitationError = useCallback((id: string) => {
+    setMessages((prev) => prev.map((message) =>
+      message.type === "elicitation" && message.id === id
+        ? { ...message, error: undefined }
+        : message,
+    ));
   }, []);
 
   /** Respond to a permission request. `requestId` correlates with the server's
@@ -9452,18 +9544,65 @@ export function TaskChat({
                           </div>
                         )}
                       {activeComposerPanel === "ask_form" &&
-                        activeFormMessage && (
-                          <FormPill
-                            key={activeFormMessage.id}
-                            definition={activeFormMessage.definition}
-                            onSubmit={(text) => {
-                              sendFormResponse(text);
-                              resolveAskForm(activeFormMessage.id);
-                            }}
-                            onDismiss={() => {
-                              resolveAskForm(activeFormMessage.id);
-                            }}
-                          />
+                        activeSurveyMessage && (
+                          activeSurveyMessage.type === "ask_form" ? (
+                            <FormPill
+                              key={activeSurveyMessage.id}
+                              definition={activeSurveyMessage.definition}
+                              disabled={!isConnected}
+                              onSubmit={({ markdown }) => {
+                                sendFormResponse(markdown);
+                                resolveAskForm(activeSurveyMessage.id);
+                              }}
+                              onDismiss={() => resolveAskForm(activeSurveyMessage.id)}
+                            />
+                          ) : activeSurveyMessage.snapshot.request.mode === "form" ? (
+                            (() => {
+                              const definition = elicitationToSurvey(activeSurveyMessage.snapshot);
+                              return definition ? (
+                                <FormPill
+                                  key={activeSurveyMessage.id}
+                                  definition={definition}
+                                  agentName={activeSurveyMessage.snapshot.agent_name}
+                                  requestMessage={activeSurveyMessage.snapshot.request.message}
+                                  disabled={!isConnected}
+                                  externalError={activeSurveyMessage.error}
+                                  onChange={() => clearElicitationError(activeSurveyMessage.id)}
+                                  onSubmit={({ answers }) => respondElicitation(
+                                    activeSurveyMessage.id,
+                                    "accept",
+                                    answers,
+                                  )}
+                                  onDecline={() => respondElicitation(activeSurveyMessage.id, "decline")}
+                                  onDismiss={() => respondElicitation(activeSurveyMessage.id, "cancel")}
+                                />
+                              ) : (
+                                <div className="space-y-3 text-sm text-[var(--color-text)]">
+                                  <p>This Agent requested a form Grove cannot safely display.</p>
+                                  <Button variant="ghost" size="sm" onClick={() => respondElicitation(activeSurveyMessage.id, "cancel")}>Cancel</Button>
+                                </div>
+                              );
+                            })()
+                          ) : (
+                            <ElicitationUrlPill
+                              key={activeSurveyMessage.id}
+                              agentName={activeSurveyMessage.snapshot.agent_name}
+                              message={activeSurveyMessage.snapshot.request.message}
+                              url={activeSurveyMessage.snapshot.request.url ?? ""}
+                              opened={!!activeSurveyMessage.snapshot.opened}
+                              disabled={!isConnected && !activeSurveyMessage.snapshot.opened}
+                              onOpen={() => {
+                                const url = activeSurveyMessage.snapshot.request.url;
+                                if (!url) return;
+                                openExternalUrl(url);
+                                if (!activeSurveyMessage.snapshot.opened) {
+                                  respondElicitation(activeSurveyMessage.id, "accept");
+                                }
+                              }}
+                              onDecline={() => respondElicitation(activeSurveyMessage.id, "decline")}
+                              onCancel={() => respondElicitation(activeSurveyMessage.id, "cancel")}
+                            />
+                          )
                         )}
                     </div>
                   </motion.div>
@@ -9754,7 +9893,7 @@ export function TaskChat({
                         <span>Permission Request</span>
                       </button>
                     )}
-                    {activeFormMessage && (
+                    {activeSurveyMessage && (
                       <button
                         onClick={() => {
                           const next = !showFormPanel;
@@ -9779,8 +9918,16 @@ export function TaskChat({
                             : "border border-[color-mix(in_srgb,var(--color-highlight)_24%,transparent)] bg-[color-mix(in_srgb,var(--color-highlight)_6%,transparent)] text-[color-mix(in_srgb,var(--color-highlight)_96%,white_8%)] hover:bg-[color-mix(in_srgb,var(--color-highlight)_12%,transparent)]"
                         }`}
                       >
-                        <ListChecks className="h-3 w-3" />
-                        <span>Survey</span>
+                        {activeSurveyMessage.type === "elicitation"
+                          && activeSurveyMessage.snapshot.request.mode === "url"
+                          ? <ExternalLink className="h-3 w-3" />
+                          : <ListChecks className="h-3 w-3" />}
+                        <span>
+                          {activeSurveyMessage.type === "elicitation"
+                            && activeSurveyMessage.snapshot.request.mode === "url"
+                            ? "External Request"
+                            : "Survey"}
+                        </span>
                       </button>
                     )}
                     {hasPreviewCommentsPanel && (
@@ -11289,6 +11436,7 @@ const MessageItem = memo(function MessageItem({
       // Tools are rendered via ToolSectionView; skip here
       return null;
     case "ask_form":
+    case "elicitation":
       // Rendered in the composer panel (chip + expandable panel above the
       // input), not inline in the message stream.
       return null;

@@ -18,7 +18,7 @@ mod acp {
     };
 }
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
@@ -55,6 +55,13 @@ pub struct AcpSessionHandle {
     pending_permission: Mutex<Option<(String, tokio::sync::oneshot::Sender<String>)>>,
     /// 序列化权限请求：同一时刻只能有一个 permission 等待用户响应
     permission_lock: tokio::sync::Mutex<()>,
+    /// ACP elicitations are presented one at a time. Requests that arrive
+    /// concurrently wait on this lock before they are exposed to the UI.
+    pending_elicitation: Mutex<Option<PendingElicitation>>,
+    elicitation_lock: tokio::sync::Mutex<()>,
+    /// URL elicitations remain visible after the user consents to open them,
+    /// until the Agent sends `elicitation/complete`.
+    active_url_elicitations: Mutex<HashMap<String, ElicitationRequestSnapshot>>,
     /// 项目 key（用于磁盘持久化路径）
     project_key: String,
     /// 任务 ID（用于磁盘持久化路径）
@@ -256,6 +263,59 @@ pub struct SessionListPage {
 
 pub type SessionConfigOptionData = acp::SessionConfigOption;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ElicitationRequestSnapshot {
+    pub request_id: String,
+    pub agent_name: String,
+    pub request: acp::CreateElicitationRequest,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opened: bool,
+}
+
+struct PendingElicitation {
+    snapshot: ElicitationRequestSnapshot,
+    response_tx: tokio::sync::oneshot::Sender<ElicitationResponseData>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ElicitationResponseData {
+    Accept {
+        #[serde(default)]
+        content: Option<BTreeMap<String, ElicitationValueData>>,
+    },
+    Decline,
+    Cancel,
+}
+
+pub enum ElicitationResponseResult {
+    Accepted,
+    Stale,
+    Invalid(String),
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+pub enum ElicitationValueData {
+    String(String),
+    Integer(i64),
+    Number(f64),
+    Boolean(bool),
+    StringArray(Vec<String>),
+}
+
+impl From<ElicitationValueData> for acp::ElicitationContentValue {
+    fn from(value: ElicitationValueData) -> Self {
+        match value {
+            ElicitationValueData::String(value) => Self::String(value),
+            ElicitationValueData::Integer(value) => Self::Integer(value),
+            ElicitationValueData::Number(value) => Self::Number(value),
+            ElicitationValueData::Boolean(value) => Self::Boolean(value),
+            ElicitationValueData::StringArray(value) => Self::StringArray(value),
+        }
+    }
+}
+
 /// 从 agent 接收的流式更新
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -425,6 +485,22 @@ pub enum AcpUpdate {
     AskForm {
         form_id: String,
         definition: crate::agent_graph::ask_form::AskFormInput,
+    },
+    /// Native ACP `elicitation/create`. Kept transient; the live pending
+    /// snapshot is replayed directly when the browser reconnects.
+    ElicitationRequest {
+        snapshot: ElicitationRequestSnapshot,
+    },
+    ElicitationResolved {
+        request_id: String,
+        action: String,
+    },
+    ElicitationValidationError {
+        request_id: String,
+        message: String,
+    },
+    ElicitationComplete {
+        elicitation_id: String,
     },
     /// 用户对权限请求的响应（记录到历史用于回放）
     PermissionResponse {
@@ -1457,6 +1533,7 @@ enum TerminalStream {
 /// 本身就是 `Send + Sync`、要么包在 `Mutex` 里。
 struct AcpClientState {
     handle: Arc<AcpSessionHandle>,
+    configured_agent_name: String,
     working_dir: PathBuf,
     terminals: Arc<Mutex<HashMap<String, TerminalState>>>,
     project_key: String,
@@ -1605,6 +1682,352 @@ async fn handle_request_permission(
             Err(acp::Error::request_cancelled())
         }
     }
+}
+
+fn elicitation_scope_matches_handle(
+    handle: &AcpSessionHandle,
+    scope: &acp::ElicitationScope,
+) -> bool {
+    match scope {
+        acp::ElicitationScope::Request(_) => true,
+        acp::ElicitationScope::Session(scope) => handle
+            .agent_info
+            .read()
+            .ok()
+            .and_then(|info| {
+                info.as_ref()
+                    .map(|(session_id, _, _)| session_id == &scope.session_id.to_string())
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn convert_elicitation_content(
+    schema: &acp::ElicitationSchema,
+    content: BTreeMap<String, ElicitationValueData>,
+) -> acp::Result<BTreeMap<String, acp::ElicitationContentValue>> {
+    for required in schema.required.as_deref().unwrap_or_default() {
+        if !content.contains_key(required) {
+            return Err(acp::Error::invalid_params()
+                .data(format!("Missing required elicitation field '{required}'")));
+        }
+    }
+
+    let mut converted = BTreeMap::new();
+    for (name, value) in content {
+        let property = schema.properties.get(&name).ok_or_else(|| {
+            acp::Error::invalid_params().data(format!("Unknown elicitation field '{name}'"))
+        })?;
+        let value = match (property, value) {
+            (
+                acp::ElicitationPropertySchema::String(property),
+                ElicitationValueData::String(value),
+            ) => {
+                let length = value.chars().count() as u32;
+                if property.min_length.is_some_and(|minimum| length < minimum)
+                    || property.max_length.is_some_and(|maximum| length > maximum)
+                {
+                    return Err(acp::Error::invalid_params()
+                        .data(format!("Elicitation field '{name}' has an invalid length")));
+                }
+                if let Some(pattern) = property.pattern.as_deref() {
+                    let pattern = regex::Regex::new(pattern).map_err(|_| {
+                        acp::Error::invalid_params()
+                            .data(format!("Elicitation field '{name}' has an invalid pattern"))
+                    })?;
+                    if !pattern.is_match(&value) {
+                        return Err(acp::Error::invalid_params().data(format!(
+                            "Elicitation field '{name}' does not match its pattern"
+                        )));
+                    }
+                }
+                let format_valid = match property.format {
+                    Some(acp::StringFormat::Email) => {
+                        let mut parts = value.split('@');
+                        parts.next().is_some_and(|part| !part.is_empty())
+                            && parts.next().is_some_and(|part| part.contains('.'))
+                            && parts.next().is_none()
+                    }
+                    Some(acp::StringFormat::Uri) => url::Url::parse(&value).is_ok(),
+                    Some(acp::StringFormat::Date) => {
+                        chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d").is_ok()
+                    }
+                    Some(acp::StringFormat::DateTime) => {
+                        chrono::DateTime::parse_from_rfc3339(&value).is_ok()
+                    }
+                    None => true,
+                    _ => true,
+                };
+                if !format_valid {
+                    return Err(acp::Error::invalid_params()
+                        .data(format!("Elicitation field '{name}' has an invalid format")));
+                }
+                let allowed = property
+                    .enum_values
+                    .as_ref()
+                    .map(|values| values.iter().any(|candidate| candidate == &value))
+                    .or_else(|| {
+                        property
+                            .one_of
+                            .as_ref()
+                            .map(|options| options.iter().any(|option| option.value == value))
+                    });
+                if allowed == Some(false) {
+                    return Err(acp::Error::invalid_params().data(format!(
+                        "Elicitation field '{name}' is not an advertised option"
+                    )));
+                }
+                acp::ElicitationContentValue::String(value)
+            }
+            (
+                acp::ElicitationPropertySchema::Integer(property),
+                ElicitationValueData::Integer(value),
+            ) => {
+                if property.minimum.is_some_and(|minimum| value < minimum)
+                    || property.maximum.is_some_and(|maximum| value > maximum)
+                {
+                    return Err(acp::Error::invalid_params()
+                        .data(format!("Elicitation field '{name}' is outside its range")));
+                }
+                acp::ElicitationContentValue::Integer(value)
+            }
+            (
+                acp::ElicitationPropertySchema::Number(property),
+                ElicitationValueData::Number(value),
+            ) => {
+                if !value.is_finite()
+                    || property.minimum.is_some_and(|minimum| value < minimum)
+                    || property.maximum.is_some_and(|maximum| value > maximum)
+                {
+                    return Err(acp::Error::invalid_params()
+                        .data(format!("Elicitation field '{name}' is outside its range")));
+                }
+                acp::ElicitationContentValue::Number(value)
+            }
+            (
+                acp::ElicitationPropertySchema::Number(property),
+                ElicitationValueData::Integer(value),
+            ) => {
+                let value = value as f64;
+                if property.minimum.is_some_and(|minimum| value < minimum)
+                    || property.maximum.is_some_and(|maximum| value > maximum)
+                {
+                    return Err(acp::Error::invalid_params()
+                        .data(format!("Elicitation field '{name}' is outside its range")));
+                }
+                acp::ElicitationContentValue::Number(value)
+            }
+            (acp::ElicitationPropertySchema::Boolean(_), ElicitationValueData::Boolean(value)) => {
+                acp::ElicitationContentValue::Boolean(value)
+            }
+            (
+                acp::ElicitationPropertySchema::Array(property),
+                ElicitationValueData::StringArray(value),
+            ) => {
+                let count = value.len() as u64;
+                if property.min_items.is_some_and(|minimum| count < minimum)
+                    || property.max_items.is_some_and(|maximum| count > maximum)
+                {
+                    return Err(acp::Error::invalid_params().data(format!(
+                        "Elicitation field '{name}' has an invalid selection count"
+                    )));
+                }
+                let allowed: Vec<&str> = match &property.items {
+                    acp::MultiSelectItems::String(items) => {
+                        items.values.iter().map(String::as_str).collect()
+                    }
+                    acp::MultiSelectItems::Titled(items) => items
+                        .options
+                        .iter()
+                        .map(|option| option.value.as_str())
+                        .collect(),
+                    acp::MultiSelectItems::Other(_) => {
+                        return Err(acp::Error::invalid_params().data(format!(
+                            "Elicitation field '{name}' uses an unsupported item type"
+                        )));
+                    }
+                    _ => {
+                        return Err(acp::Error::invalid_params().data(format!(
+                            "Elicitation field '{name}' uses an unsupported item type"
+                        )));
+                    }
+                };
+                if value.iter().any(|item| !allowed.contains(&item.as_str())) {
+                    return Err(acp::Error::invalid_params().data(format!(
+                        "Elicitation field '{name}' contains an unadvertised option"
+                    )));
+                }
+                acp::ElicitationContentValue::StringArray(value)
+            }
+            (acp::ElicitationPropertySchema::Other(_), _) => {
+                return Err(acp::Error::invalid_params().data(format!(
+                    "Elicitation field '{name}' uses an unsupported type"
+                )));
+            }
+            _ => {
+                return Err(acp::Error::invalid_params().data(format!(
+                    "Elicitation field '{name}' has the wrong value type"
+                )));
+            }
+        };
+        converted.insert(name, value);
+    }
+    Ok(converted)
+}
+
+fn build_elicitation_response(
+    request: &acp::CreateElicitationRequest,
+    response: ElicitationResponseData,
+) -> acp::Result<acp::CreateElicitationResponse> {
+    let action = match response {
+        ElicitationResponseData::Accept { content } => match &request.mode {
+            acp::ElicitationMode::Form(form) => {
+                let content = convert_elicitation_content(
+                    &form.requested_schema,
+                    content.unwrap_or_default(),
+                )?;
+                acp::ElicitationAction::Accept(acp::ElicitationAcceptAction::new().content(content))
+            }
+            acp::ElicitationMode::Url(_) => {
+                acp::ElicitationAction::Accept(acp::ElicitationAcceptAction::new())
+            }
+            acp::ElicitationMode::Other(_) => {
+                return Err(acp::Error::invalid_params().data("Unsupported elicitation mode"));
+            }
+            _ => {
+                return Err(acp::Error::invalid_params().data("Unsupported elicitation mode"));
+            }
+        },
+        ElicitationResponseData::Decline => acp::ElicitationAction::Decline,
+        ElicitationResponseData::Cancel => acp::ElicitationAction::Cancel,
+    };
+    Ok(acp::CreateElicitationResponse::new(action))
+}
+
+async fn handle_create_elicitation(
+    state: &AcpClientState,
+    request: acp::CreateElicitationRequest,
+    cancellation: acp::RequestCancellation,
+) -> acp::Result<acp::CreateElicitationResponse> {
+    match &request.mode {
+        acp::ElicitationMode::Other(_) => {
+            return Err(acp::Error::invalid_params().data("Unsupported elicitation mode"));
+        }
+        acp::ElicitationMode::Form(form) => {
+            for (name, property) in &form.requested_schema.properties {
+                match property {
+                    acp::ElicitationPropertySchema::Other(_) => {
+                        return Err(acp::Error::invalid_params().data(format!(
+                            "Elicitation field '{name}' uses an unsupported type"
+                        )));
+                    }
+                    acp::ElicitationPropertySchema::Array(array)
+                        if matches!(array.items, acp::MultiSelectItems::Other(_)) =>
+                    {
+                        return Err(acp::Error::invalid_params().data(format!(
+                            "Elicitation field '{name}' uses an unsupported item type"
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(required) = &form.requested_schema.required {
+                if let Some(name) = required
+                    .iter()
+                    .find(|name| !form.requested_schema.properties.contains_key(*name))
+                {
+                    return Err(acp::Error::invalid_params().data(format!(
+                        "Required elicitation field '{name}' is not defined"
+                    )));
+                }
+            }
+        }
+        acp::ElicitationMode::Url(_) => {}
+        _ => {
+            return Err(acp::Error::invalid_params().data("Unsupported elicitation mode"));
+        }
+    }
+    if !elicitation_scope_matches_handle(&state.handle, request.scope()) {
+        return Err(
+            acp::Error::invalid_params().data("Elicitation scope does not match this connection")
+        );
+    }
+    if let acp::ElicitationMode::Url(url) = &request.mode {
+        let parsed = url::Url::parse(&url.url)
+            .map_err(|_| acp::Error::invalid_params().data("Invalid elicitation URL"))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(acp::Error::invalid_params()
+                .data("Elicitation URL must be an absolute HTTP(S) URL"));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(acp::Error::invalid_params()
+                .data("Elicitation URL must not contain embedded credentials"));
+        }
+    }
+
+    let _guard = tokio::select! {
+        guard = state.handle.elicitation_lock.lock() => guard,
+        _ = cancellation.cancelled() => return Err(acp::Error::request_cancelled()),
+    };
+    let request_id = format!("elicitation-{}", uuid::Uuid::new_v4());
+    let agent_name = state
+        .handle
+        .agent_info
+        .read()
+        .ok()
+        .and_then(|info| info.as_ref().map(|(_, name, _)| name.clone()))
+        .unwrap_or_else(|| state.configured_agent_name.clone());
+    let snapshot = ElicitationRequestSnapshot {
+        request_id: request_id.clone(),
+        agent_name,
+        request: request.clone(),
+        opened: false,
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .handle
+        .pending_elicitation
+        .lock()
+        .unwrap()
+        .replace(PendingElicitation {
+            snapshot: snapshot.clone(),
+            response_tx: tx,
+        });
+    state
+        .handle
+        .emit(AcpUpdate::ElicitationRequest { snapshot });
+
+    tokio::select! {
+        result = rx => match result {
+            Ok(response) => build_elicitation_response(&request, response),
+            Err(_) => Ok(acp::CreateElicitationResponse::new(acp::ElicitationAction::Cancel)),
+        },
+        _ = cancellation.cancelled() => {
+            state.handle.cancel_pending_elicitation(&request_id);
+            Err(acp::Error::request_cancelled())
+        }
+    }
+}
+
+fn handle_complete_elicitation(
+    state: &AcpClientState,
+    notification: acp::CompleteElicitationNotification,
+) -> acp::Result<()> {
+    let elicitation_id = notification.elicitation_id.to_string();
+    if state
+        .handle
+        .active_url_elicitations
+        .lock()
+        .unwrap()
+        .remove(&elicitation_id)
+        .is_some()
+    {
+        state
+            .handle
+            .emit(AcpUpdate::ElicitationComplete { elicitation_id });
+    }
+    Ok(())
 }
 
 async fn handle_create_terminal(
@@ -2856,12 +3279,19 @@ fn validated_config_request_value(
 }
 
 fn grove_client_capabilities() -> acp::ClientCapabilities {
-    acp::ClientCapabilities::default().terminal(true).session(
-        acp::ClientSessionCapabilities::new().config_options(
-            acp::SessionConfigOptionsCapabilities::new()
-                .boolean(acp::BooleanConfigOptionCapabilities::new()),
-        ),
-    )
+    acp::ClientCapabilities::default()
+        .terminal(true)
+        .elicitation(
+            acp::ElicitationCapabilities::new()
+                .form(acp::ElicitationFormCapabilities::new())
+                .url(acp::ElicitationUrlCapabilities::new()),
+        )
+        .session(
+            acp::ClientSessionCapabilities::new().config_options(
+                acp::SessionConfigOptionsCapabilities::new()
+                    .boolean(acp::BooleanConfigOptionCapabilities::new()),
+            ),
+        )
 }
 
 /// 将 ContentBlock 转换为文本
@@ -3341,6 +3771,9 @@ pub async fn get_or_start_session(
                     agent_info: std::sync::RwLock::new(None),
                     pending_permission: Mutex::new(None),
                     permission_lock: tokio::sync::Mutex::new(()),
+                    pending_elicitation: Mutex::new(None),
+                    elicitation_lock: tokio::sync::Mutex::new(()),
+                    active_url_elicitations: Mutex::new(HashMap::new()),
                     project_key: config.project_key.clone(),
                     task_id: config.task_id.clone(),
                     chat_id: config.chat_id.clone(),
@@ -3736,6 +4169,7 @@ async fn run_acp_session(
 
     let state = Arc::new(AcpClientState {
         handle: handle.clone(),
+        configured_agent_name: config.agent_name.clone(),
         working_dir: config.working_dir.clone(),
         terminals: Arc::new(Mutex::new(HashMap::new())),
         project_key: config.project_key.clone(),
@@ -3762,6 +4196,15 @@ async fn run_acp_session(
             },
             agent_client_protocol::on_receive_notification!(),
         )
+        .on_receive_notification(
+            {
+                let state = Arc::clone(&state);
+                async move |notification: acp::CompleteElicitationNotification, _cx| {
+                    handle_complete_elicitation(&state, notification)
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
         .on_receive_request(
             {
                 let state = Arc::clone(&state);
@@ -3772,6 +4215,23 @@ async fn run_acp_session(
                         match handle_request_permission(&state, req, cancellation).await {
                             Ok(r) => responder.respond(r),
                             Err(e) => responder.respond_with_error(e),
+                        }
+                    })?;
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = Arc::clone(&state);
+                async move |request: acp::CreateElicitationRequest, responder, cx| {
+                    let state = Arc::clone(&state);
+                    cx.spawn(async move {
+                        let cancellation = responder.cancellation();
+                        match handle_create_elicitation(&state, request, cancellation).await {
+                            Ok(response) => responder.respond(response),
+                            Err(error) => responder.respond_with_error(error),
                         }
                     })?;
                     Ok(())
@@ -5643,6 +6103,105 @@ async fn connect_remote_agent(
 // === 公开 API ===
 
 impl AcpSessionHandle {
+    pub fn pending_elicitation_snapshot(&self) -> Option<ElicitationRequestSnapshot> {
+        self.pending_elicitation
+            .lock()
+            .ok()
+            .and_then(|pending| pending.as_ref().map(|pending| pending.snapshot.clone()))
+    }
+
+    pub fn active_url_elicitation_snapshots(&self) -> Vec<ElicitationRequestSnapshot> {
+        self.active_url_elicitations
+            .lock()
+            .map(|pending| pending.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn respond_elicitation(
+        &self,
+        expected_id: &str,
+        response: ElicitationResponseData,
+    ) -> ElicitationResponseResult {
+        {
+            let slot = self.pending_elicitation.lock().unwrap();
+            let Some(pending) = slot
+                .as_ref()
+                .filter(|pending| pending.snapshot.request_id == expected_id)
+            else {
+                return ElicitationResponseResult::Stale;
+            };
+            if let Err(error) =
+                build_elicitation_response(&pending.snapshot.request, response.clone())
+            {
+                let message = error
+                    .data
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&error.message)
+                    .to_string();
+                return ElicitationResponseResult::Invalid(message);
+            }
+        }
+        let pending = {
+            let mut slot = self.pending_elicitation.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|pending| pending.snapshot.request_id == expected_id)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        let Some(pending) = pending else {
+            return ElicitationResponseResult::Stale;
+        };
+        let action = match &response {
+            ElicitationResponseData::Accept { .. } => "accept",
+            ElicitationResponseData::Decline => "decline",
+            ElicitationResponseData::Cancel => "cancel",
+        };
+        if action == "accept" {
+            if let acp::ElicitationMode::Url(url) = &pending.snapshot.request.mode {
+                let mut snapshot = pending.snapshot.clone();
+                snapshot.opened = true;
+                self.active_url_elicitations
+                    .lock()
+                    .unwrap()
+                    .insert(url.elicitation_id.to_string(), snapshot);
+            }
+        }
+        let _ = pending.response_tx.send(response);
+        self.emit(AcpUpdate::ElicitationResolved {
+            request_id: expected_id.to_string(),
+            action: action.to_string(),
+        });
+        ElicitationResponseResult::Accepted
+    }
+
+    fn cancel_pending_elicitation(&self, expected_id: &str) -> bool {
+        let pending = {
+            let mut slot = self.pending_elicitation.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|pending| pending.snapshot.request_id == expected_id)
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        let Some(pending) = pending else {
+            return false;
+        };
+        drop(pending.response_tx);
+        self.emit(AcpUpdate::ElicitationResolved {
+            request_id: expected_id.to_string(),
+            action: "cancel".to_string(),
+        });
+        true
+    }
+
     /// 是否有待处理的权限请求
     pub fn has_pending_permission(&self) -> bool {
         self.pending_permission.lock().unwrap().is_some()
@@ -6311,6 +6870,15 @@ impl AcpSessionHandle {
             });
         }
 
+        if let Some(pending) = self.pending_elicitation.lock().unwrap().take() {
+            let request_id = pending.snapshot.request_id;
+            drop(pending.response_tx);
+            self.emit(AcpUpdate::ElicitationResolved {
+                request_id,
+                action: "cancel".to_string(),
+            });
+        }
+
         let active_tool_calls: Vec<String> =
             self.active_tool_calls.lock().unwrap().drain().collect();
         for id in active_tool_calls {
@@ -6941,6 +7509,9 @@ pub fn new_handle_for_test(
         ))),
         pending_permission: Mutex::new(None),
         permission_lock: tokio::sync::Mutex::new(()),
+        pending_elicitation: Mutex::new(None),
+        elicitation_lock: tokio::sync::Mutex::new(()),
+        active_url_elicitations: Mutex::new(HashMap::new()),
         project_key: project_key.to_string(),
         task_id: task_id.to_string(),
         chat_id: Some(chat_id.to_string()),
@@ -7860,6 +8431,7 @@ mod tests {
     ) -> Arc<AcpClientState> {
         Arc::new(AcpClientState {
             handle,
+            configured_agent_name: "test".to_string(),
             working_dir: PathBuf::from("/tmp"),
             terminals,
             project_key: "project".to_string(),
@@ -8922,12 +9494,106 @@ mod tests {
     }
 
     #[test]
-    fn client_advertises_boolean_config_options() {
+    fn client_advertises_terminal_elicitation_and_boolean_config_options() {
         let capabilities =
             serde_json::to_value(grove_client_capabilities()).expect("serialize capabilities");
 
         assert_eq!(capabilities["terminal"], true);
         assert!(capabilities["session"]["configOptions"]["boolean"].is_object());
+        assert!(capabilities["elicitation"]["form"].is_object());
+        assert!(capabilities["elicitation"]["url"].is_object());
+    }
+
+    #[test]
+    fn elicitation_content_is_checked_against_the_requested_schema() {
+        let schema = acp::ElicitationSchema::new()
+            .property(
+                "environment",
+                acp::StringPropertySchema::new()
+                    .enum_values(vec!["staging".to_string(), "production".to_string()]),
+                true,
+            )
+            .integer("replicas", 1, 10, true);
+        let content = BTreeMap::from([
+            (
+                "environment".to_string(),
+                ElicitationValueData::String("production".to_string()),
+            ),
+            ("replicas".to_string(), ElicitationValueData::Integer(3)),
+        ]);
+
+        let converted = convert_elicitation_content(&schema, content).expect("valid content");
+        assert_eq!(
+            converted.get("environment"),
+            Some(&acp::ElicitationContentValue::String(
+                "production".to_string()
+            ))
+        );
+        assert_eq!(
+            converted.get("replicas"),
+            Some(&acp::ElicitationContentValue::Integer(3))
+        );
+
+        let invalid = BTreeMap::from([
+            (
+                "environment".to_string(),
+                ElicitationValueData::String("unknown".to_string()),
+            ),
+            ("replicas".to_string(), ElicitationValueData::Integer(3)),
+        ]);
+        assert!(convert_elicitation_content(&schema, invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_elicitation_response_keeps_the_form_pending() {
+        let key = format!("elicitation-response-test-{}", uuid::Uuid::new_v4());
+        let (handle, _updates, _guard) = new_handle_for_test(&key, "project", "task", "chat");
+        let request = acp::CreateElicitationRequest::new(
+            acp::ElicitationFormMode::new(
+                acp::ElicitationSessionScope::new("session-test"),
+                acp::ElicitationSchema::new().string("name", true),
+            ),
+            "Your name",
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handle
+            .pending_elicitation
+            .lock()
+            .unwrap()
+            .replace(PendingElicitation {
+                snapshot: ElicitationRequestSnapshot {
+                    request_id: "request-1".to_string(),
+                    agent_name: "Test Agent".to_string(),
+                    request,
+                    opened: false,
+                },
+                response_tx: tx,
+            });
+
+        let result = handle.respond_elicitation(
+            "request-1",
+            ElicitationResponseData::Accept {
+                content: Some(BTreeMap::new()),
+            },
+        );
+        assert!(matches!(result, ElicitationResponseResult::Invalid(_)));
+        assert!(handle.pending_elicitation_snapshot().is_some());
+
+        let result = handle.respond_elicitation(
+            "request-1",
+            ElicitationResponseData::Accept {
+                content: Some(BTreeMap::from([(
+                    "name".to_string(),
+                    ElicitationValueData::String("Ada".to_string()),
+                )])),
+            },
+        );
+        assert!(matches!(result, ElicitationResponseResult::Accepted));
+        assert!(matches!(
+            rx.await.expect("response delivered"),
+            ElicitationResponseData::Accept { .. }
+        ));
+        assert!(handle.pending_elicitation_snapshot().is_none());
     }
 
     #[test]
