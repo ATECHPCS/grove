@@ -2245,6 +2245,18 @@ async fn handle_create_elicitation(
         .handle
         .emit(AcpUpdate::ElicitationRequest { snapshot });
 
+    if state.chat_id.is_some() {
+        notify_acp_event(
+            &state.project_key,
+            &state.task_id,
+            state.chat_id.as_deref(),
+            "Input Required",
+            &request.message,
+            AcpNotificationEvent::ElicitationRequired,
+            None,
+        );
+    }
+
     tokio::select! {
         result = rx => match result {
             Ok(response) => build_elicitation_response(&request, response),
@@ -8626,6 +8638,8 @@ enum AcpNotificationEvent {
     TurnComplete,
     /// Agent 权限请求
     PermissionRequired,
+    /// Agent requests structured input through ACP Elicitation.
+    ElicitationRequired,
 }
 
 /// 发送 ACP 事件通知。
@@ -8652,6 +8666,7 @@ fn notify_acp_event(
         && match event {
             AcpNotificationEvent::TurnComplete => notif_cfg.notification_show_done,
             AcpNotificationEvent::PermissionRequired => notif_cfg.notification_show_permission,
+            AcpNotificationEvent::ElicitationRequired => notif_cfg.notification_show_elicitation,
         };
 
     if !event_enabled {
@@ -8696,6 +8711,7 @@ fn notify_acp_event(
                 None
             }
         }
+        AcpNotificationEvent::ElicitationRequired => None,
     };
     if let Some(s) = sound {
         hooks::play_sound(s);

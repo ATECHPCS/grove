@@ -106,6 +106,7 @@ export interface NotificationsConfig {
   /** Whether macOS / system notifications fire at all. */
   notification_enabled: boolean;
   notification_show_permission: boolean;
+  notification_show_elicitation: boolean;
   notification_show_done: boolean;
   notification_show_running: boolean;
   /** Global shortcut to show / hide the menubar popover. Empty = disabled. */
