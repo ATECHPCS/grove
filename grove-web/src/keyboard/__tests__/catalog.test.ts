@@ -3,6 +3,7 @@ import { COMMAND_CATALOG } from "../catalog";
 import { parseWhen, WhenParseError } from "../whenExpression";
 import { parseHotkey } from "../keyParser";
 import { detectConflicts } from "../conflict";
+import { REPO_NAV_IDS, STUDIO_NAV_IDS } from "../../data/nav";
 
 describe("Command catalog — integrity", () => {
   it("has a reasonable number of commands", () => {
@@ -73,6 +74,26 @@ describe("Command catalog — integrity", () => {
       }
     }
     expect(bad, `when parse errors: ${bad.join(", ")}`).toEqual([]);
+  });
+
+  it("keeps numbered navigation shortcuts aligned with sidebar order", () => {
+    const assertLayout = (
+      ids: readonly string[],
+      commandIdForItem: (id: string) => string,
+    ) => {
+      ids.forEach((id, index) => {
+        const commandId = commandIdForItem(id);
+        const command = COMMAND_CATALOG.find((candidate) => candidate.id === commandId);
+        expect(command, `missing command for sidebar item '${id}'`).toBeDefined();
+        expect(command?.defaultBindings?.[0]?.key).toBe(`Mod+${index + 1}`);
+      });
+    };
+
+    assertLayout(REPO_NAV_IDS, (id) => `nav.${id}`);
+    assertLayout(
+      STUDIO_NAV_IDS,
+      (id) => id === "tasks" ? "nav.tasks.studio" : `nav.${id}`,
+    );
   });
 
   it("reports binding conflicts (informational)", () => {

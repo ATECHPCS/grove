@@ -132,7 +132,7 @@ function registerGlobalShortcut(
   };
 }
 
-// Main sidebar nav items for Cmd+1-6 and Option+Cmd+Up/Down cycling.
+// Main sidebar nav items for Cmd+1-8 and Option+Cmd+Up/Down cycling.
 // "settings" and "projects" are excluded as they are utility pages, not part of the main nav cycle.
 function AppContent() {
   "use no memo";
@@ -885,6 +885,7 @@ function AppContent() {
   useCommand("nav.tasks", () => setActiveItem("tasks"), []);
   useCommand("nav.tasks.studio", () => setActiveItem("tasks"), []);
   useCommand("nav.resource", () => setActiveItem("resource"), []);
+  useCommand("nav.memory", () => setActiveItem("memory"), []);
   useCommand("nav.automation", () => setActiveItem("automation"), []);
   useCommand("nav.skills", () => setActiveItem("skills"), []);
   useCommand("nav.ai", () => setActiveItem("ai"), []);

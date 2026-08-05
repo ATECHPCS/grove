@@ -46,33 +46,38 @@ export const NAV_COMMANDS: CommandDef[] = [
     passThroughTextInput: true,
   },
   {
+    id: "nav.memory",
+    name: "Go to Memory",
+    category: "Navigation",
+    defaultBindings: [{ key: "Mod+4" }],
+    passThroughTextInput: true,
+  },
+  {
     id: "nav.automation",
     name: "Go to Automation",
     category: "Navigation",
-    // Automation sits at sidebar position 4 in both repo and studio layouts
-    // (see data/nav.ts), so it owns Mod+4; skills/ai/statistics shift down.
-    defaultBindings: [{ key: "Mod+4" }],
+    defaultBindings: [{ key: "Mod+5" }],
     passThroughTextInput: true,
   },
   {
     id: "nav.skills",
     name: "Go to Skills",
     category: "Navigation",
-    defaultBindings: [{ key: "Mod+5" }],
+    defaultBindings: [{ key: "Mod+6" }],
     passThroughTextInput: true,
   },
   {
     id: "nav.ai",
     name: "Go to AI",
     category: "Navigation",
-    defaultBindings: [{ key: "Mod+6" }],
+    defaultBindings: [{ key: "Mod+7" }],
     passThroughTextInput: true,
   },
   {
     id: "nav.statistics",
     name: "Go to Statistics",
     category: "Navigation",
-    defaultBindings: [{ key: "Mod+7" }],
+    defaultBindings: [{ key: "Mod+8" }],
     passThroughTextInput: true,
   },
   {
