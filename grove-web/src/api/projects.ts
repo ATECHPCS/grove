@@ -21,6 +21,7 @@ export interface ProjectListItem {
   exists: boolean;
   /** Project type: "repo" or "studio" */
   project_type: string;
+  archived: boolean;
 }
 
 interface ProjectListResponse {
@@ -44,6 +45,7 @@ export interface ProjectResponse {
   exists: boolean;
   /** Project type: "repo" or "studio" */
   project_type: string;
+  archived: boolean;
 }
 
 interface AddProjectRequest {
@@ -84,8 +86,9 @@ interface BranchesResponse {
 /**
  * List all registered projects
  */
-export async function listProjects(): Promise<ProjectListResponse> {
-  return apiClient.get<ProjectListResponse>('/api/v1/projects');
+export async function listProjects(archived = false): Promise<ProjectListResponse> {
+  const query = archived ? '?archived=true' : '';
+  return apiClient.get<ProjectListResponse>(`/api/v1/projects${query}`);
 }
 
 /**
@@ -147,6 +150,16 @@ export async function deleteProject(id: string): Promise<void> {
 
 export async function renameProject(id: string, name: string): Promise<ProjectResponse> {
   return apiClient.patch<{ name: string }, ProjectResponse>(`/api/v1/projects/${id}`, { name });
+}
+
+/** Hide a project from normal project discovery without changing its tasks. */
+export async function archiveProject(id: string): Promise<void> {
+  return apiClient.post<undefined, void>(`/api/v1/projects/${id}/archive`);
+}
+
+/** Return an archived project to normal project discovery. */
+export async function restoreProject(id: string): Promise<void> {
+  return apiClient.post<undefined, void>(`/api/v1/projects/${id}/restore`);
 }
 
 /**

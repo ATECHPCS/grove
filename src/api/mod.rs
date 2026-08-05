@@ -353,6 +353,14 @@ pub fn create_api_router() -> Router {
         .route("/projects/{id}", get(handlers::projects::get_project))
         .route("/projects/{id}", patch(handlers::projects::rename_project))
         .route("/projects/{id}", delete(handlers::projects::delete_project))
+        .route(
+            "/projects/{id}/archive",
+            post(handlers::projects::archive_project),
+        )
+        .route(
+            "/projects/{id}/restore",
+            post(handlers::projects::restore_project),
+        )
         .route("/projects/{id}/stats", get(handlers::projects::get_stats))
         // Unified read-only file API. Project, Resource and Task routes share
         // the same resolver, access policy and streaming response builder.

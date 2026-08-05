@@ -1,11 +1,12 @@
 import { useState, useRef, useEffect } from "react";
 import { motion } from "framer-motion";
-import { Trash2, AlertCircle, FolderX, Sparkles, Pencil } from "lucide-react";
+import { Trash2, AlertCircle, FolderX, Pencil, Archive, RotateCcw } from "lucide-react";
 import type { Project } from "../../data/types";
 import { getProjectStyle } from "../../utils/projectStyle";
 import { compactPath } from "../../utils/pathUtils";
 import { useTheme } from "../../context";
 import { OptionalPerfProfiler } from "../../perf/profilerShim";
+import { ProjectTypeBadge } from "../ui/ProjectTypeBadge";
 
 interface ProjectCardProps {
   project: Project;
@@ -14,6 +15,8 @@ interface ProjectCardProps {
   onDoubleClick?: () => void;
   onDelete: () => void;
   onRename: (newName: string) => Promise<void>;
+  onArchive?: () => void;
+  onRestore?: () => void;
   compact?: boolean;
 }
 
@@ -25,7 +28,7 @@ export function ProjectCard(props: ProjectCardProps) {
   );
 }
 
-function ProjectCardInner({ project, isSelected, onSelect, onDoubleClick, onDelete, onRename, compact }: ProjectCardProps) {
+function ProjectCardInner({ project, isSelected, onSelect, onDoubleClick, onDelete, onRename, onArchive, onRestore, compact }: ProjectCardProps) {
   const { theme } = useTheme();
   const taskCount = project.taskCount ?? project.tasks.length;
   const { color, Icon } = getProjectStyle(project.id, theme.accentPalette);
@@ -201,6 +204,7 @@ function ProjectCardInner({ project, isSelected, onSelect, onDoubleClick, onDele
       </div>
 
       <div className="flex items-center gap-2 text-xs">
+        {project.archived && <ProjectTypeBadge type={project.projectType} />}
         {isMissing ? (
           <span
             className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-[var(--color-error)]/10 text-[var(--color-error)] border border-[var(--color-error)]/20"
@@ -209,21 +213,7 @@ function ProjectCardInner({ project, isSelected, onSelect, onDoubleClick, onDele
             <FolderX className="w-3 h-3" />
             Missing
           </span>
-        ) : isStudio ? (
-          <>
-            <span
-              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-[var(--color-highlight)]/10 text-[var(--color-highlight)] border border-[var(--color-highlight)]/20"
-            >
-              <Sparkles className="w-3 h-3" />
-              Studio
-            </span>
-            {taskCount > 0 && (
-              <span className="text-[var(--color-text-muted)]">
-                {taskCount} {taskCount === 1 ? "Task" : "Tasks"}
-              </span>
-            )}
-          </>
-        ) : project.isGitRepo ? (
+        ) : isStudio || project.isGitRepo ? (
           <span className="text-[var(--color-text-muted)]">
             {taskCount} {taskCount === 1 ? "Task" : "Tasks"}
           </span>
@@ -246,6 +236,29 @@ function ProjectCardInner({ project, isSelected, onSelect, onDoubleClick, onDele
         >
           <Pencil className="w-3.5 h-3.5" />
         </button>
+        {onRestore ? (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onRestore();
+            }}
+            className="p-1.5 rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-highlight)] hover:bg-[var(--color-highlight)]/10 transition-colors"
+            title="Restore project"
+          >
+            <RotateCcw className="w-4 h-4" />
+          </button>
+        ) : onArchive ? (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onArchive();
+            }}
+            className="p-1.5 rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-highlight)] hover:bg-[var(--color-highlight)]/10 transition-colors"
+            title="Archive project"
+          >
+            <Archive className="w-4 h-4" />
+          </button>
+        ) : null}
         <button
           onPointerDown={() => {
             // Mark before the input loses focus so handleBlur skips

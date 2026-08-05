@@ -46,11 +46,8 @@ pub(crate) fn worktree_to_response(wt: &model::Worktree) -> TaskResponse {
 pub(crate) fn find_project_by_id(
     id: &str,
 ) -> Result<(workspace::RegisteredProject, String), StatusCode> {
-    let projects = workspace::load_projects().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let project = projects
-        .into_iter()
-        .find(|p| workspace::project_hash(&p.path) == id)
+    let project = workspace::load_project_by_hash(id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
     let project_key = workspace::project_hash(&project.path);

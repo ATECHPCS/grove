@@ -2,6 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Project list query. By default only active projects are discoverable.
+#[derive(Debug, Deserialize, Default)]
+pub struct ProjectListQuery {
+    #[serde(default)]
+    pub archived: bool,
+}
+
 /// Project list item (for GET /projects)
 #[derive(Debug, Serialize)]
 pub struct ProjectListItem {
@@ -18,6 +25,7 @@ pub struct ProjectListItem {
     pub exists: bool,
     /// Project type: "repo" or "studio"
     pub project_type: String,
+    pub archived: bool,
 }
 
 /// Project list response
@@ -74,6 +82,7 @@ pub struct ProjectResponse {
     pub exists: bool,
     /// Project type: "repo" or "studio"
     pub project_type: String,
+    pub archived: bool,
 }
 
 /// Rename project request

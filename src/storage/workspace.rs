@@ -54,6 +54,9 @@ pub struct RegisteredProject {
     /// 项目类型
     #[serde(default)]
     pub project_type: ProjectType,
+    /// Whether the project is hidden from normal project discovery.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 fn default_is_git_repo() -> bool {
@@ -109,19 +112,35 @@ fn resolve_project_path(path: &str) -> Result<String> {
     Ok(canonical)
 }
 
-/// 加载所有注册的项目列表
+/// 加载所有注册项目，包括已归档项目。
 pub fn load_projects() -> Result<Vec<RegisteredProject>> {
+    load_projects_by_archived(None)
+}
+
+/// 加载未归档的注册项目列表。
+pub fn load_active_projects() -> Result<Vec<RegisteredProject>> {
+    load_projects_by_archived(Some(false))
+}
+
+/// 加载已归档的注册项目列表。
+pub fn load_archived_projects() -> Result<Vec<RegisteredProject>> {
+    load_projects_by_archived(Some(true))
+}
+
+fn load_projects_by_archived(archived: Option<bool>) -> Result<Vec<RegisteredProject>> {
     let conn = crate::storage::database::connection();
     let mut stmt = conn.prepare(
-        "SELECT hash, name, path, is_git_repo, added_at, project_type FROM projects ORDER BY added_at DESC",
+        "SELECT hash, name, path, is_git_repo, added_at, project_type, archived
+         FROM projects WHERE (?1 IS NULL OR archived = ?1) ORDER BY added_at DESC",
     )?;
     let projects = stmt
-        .query_map(rusqlite::params![], |row| {
+        .query_map(rusqlite::params![archived], |row| {
             let name: String = row.get(1)?;
             let path: String = row.get(2)?;
             let is_git: bool = row.get(3)?;
             let added_at_str: String = row.get(4)?;
             let project_type_str: String = row.get(5)?;
+            let archived: bool = row.get(6)?;
             let added_at = DateTime::parse_from_rfc3339(&added_at_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -131,6 +150,7 @@ pub fn load_projects() -> Result<Vec<RegisteredProject>> {
                 added_at,
                 is_git_repo: is_git,
                 project_type: project_type_str.parse().unwrap_or_default(),
+                archived,
             })
         })?
         .filter_map(|r| r.ok())
@@ -142,7 +162,7 @@ pub fn load_projects() -> Result<Vec<RegisteredProject>> {
 pub fn load_project_by_hash(hash: &str) -> Result<Option<RegisteredProject>> {
     let conn = crate::storage::database::connection();
     let result = conn.query_row(
-        "SELECT name, path, is_git_repo, added_at, project_type FROM projects WHERE hash = ?1",
+        "SELECT name, path, is_git_repo, added_at, project_type, archived FROM projects WHERE hash = ?1",
         rusqlite::params![hash],
         |row| {
             let name: String = row.get(0)?;
@@ -150,6 +170,7 @@ pub fn load_project_by_hash(hash: &str) -> Result<Option<RegisteredProject>> {
             let is_git: bool = row.get(2)?;
             let added_at_str: String = row.get(3)?;
             let project_type_str: String = row.get(4)?;
+            let archived: bool = row.get(5)?;
             let added_at = DateTime::parse_from_rfc3339(&added_at_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -159,6 +180,7 @@ pub fn load_project_by_hash(hash: &str) -> Result<Option<RegisteredProject>> {
                 added_at,
                 is_git_repo: is_git,
                 project_type: project_type_str.parse().unwrap_or_default(),
+                archived,
             })
         },
     );
@@ -512,6 +534,22 @@ pub fn rename_project(hash: &str, new_name: &str) -> Result<()> {
         rusqlite::params![new_name, hash],
     )?;
     if changes == 0 {
+        return Err(crate::error::GroveError::storage("Project not found"));
+    }
+    Ok(())
+}
+
+/// Toggle whether a project appears in normal project discovery.
+///
+/// This updates only the project row. Tasks and every other project-scoped
+/// resource keep their existing state.
+pub fn set_project_archived(hash: &str, archived: bool) -> Result<()> {
+    let conn = crate::storage::database::connection();
+    let changed = conn.execute(
+        "UPDATE projects SET archived = ?1 WHERE hash = ?2",
+        rusqlite::params![archived, hash],
+    )?;
+    if changed == 0 {
         return Err(crate::error::GroveError::storage("Project not found"));
     }
     Ok(())

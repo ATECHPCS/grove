@@ -1,6 +1,6 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { motion } from "framer-motion";
-import { Plus, FolderGit2, Sparkles, Code2 } from "lucide-react";
+import { Plus, FolderGit2, Sparkles, Code2, Archive } from "lucide-react";
 import { Button } from "../ui";
 import { ProjectCard } from "./ProjectCard";
 import { AddProjectDialog } from "./AddProjectDialog";
@@ -10,27 +10,56 @@ import { useIsMobile } from "../../hooks";
 import { filterProjectsByType } from "../../utils/projectFilter";
 import type { Project } from "../../data/types";
 import { OptionalPerfProfiler } from "../../perf/profilerShim";
+import { listProjects, type ProjectListItem } from "../../api";
 
 interface ProjectsPageProps {
   onNavigate?: (page: string) => void;
   initialTab?: "coding" | "studio";
 }
 
+function convertArchivedProject(item: ProjectListItem): Project {
+  return {
+    id: item.id,
+    name: item.name,
+    path: item.path,
+    currentBranch: "",
+    tasks: [],
+    localTask: null,
+    addedAt: new Date(item.added_at),
+    taskCount: item.task_count,
+    isGitRepo: item.is_git_repo,
+    exists: item.exists,
+    projectType: item.project_type === "studio" ? "studio" : "repo",
+    archived: true,
+  };
+}
+
 export function ProjectsPage({ onNavigate, initialTab }: ProjectsPageProps) {
-  const { projects, selectedProject, selectProject, addProject, createNewProject, cloneProject, deleteProject, renameProject, refreshProjects } = useProject();
+  const { projects, selectedProject, selectProject, addProject, createNewProject, cloneProject, deleteProject, renameProject, archiveProject, restoreProject, refreshProjects } = useProject();
   const { isMobile } = useIsMobile();
   const codingProjects = useMemo(() => filterProjectsByType(projects, "coding"), [projects]);
   const studioProjects = useMemo(() => filterProjectsByType(projects, "studio"), [projects]);
-  const [activeTab, setActiveTab] = useState<"studio" | "coding">(
+  const [activeTab, setActiveTab] = useState<"studio" | "coding" | "archived">(
     initialTab ?? (selectedProject?.projectType === "studio" ? "studio" : "coding"),
   );
   const [addDialogMode, setAddDialogMode] = useState<"coding" | "studio">(
     selectedProject?.projectType === "studio" ? "studio" : "coding",
   );
+  const [archivedProjects, setArchivedProjects] = useState<Project[]>([]);
+  const [projectActionId, setProjectActionId] = useState<string | null>(null);
+
+  const refreshArchivedProjects = useCallback(async () => {
+    const response = await listProjects(true);
+    setArchivedProjects(response.projects.map(convertArchivedProject));
+  }, []);
 
   // Refresh project list when navigating to this page
   useEffect(() => {
-    refreshProjects();
+    void refreshProjects();
+    void (async () => {
+      const response = await listProjects(true);
+      setArchivedProjects(response.projects.map(convertArchivedProject));
+    })();
   }, [refreshProjects]);
 
   // Sync activeTab to selectedProject.projectType. Use a "previous selected
@@ -118,8 +147,10 @@ export function ProjectsPage({ onNavigate, initialTab }: ProjectsPageProps) {
       try {
         setIsDeleting(true);
         setError(null);
+        const wasArchived = projectToDelete.archived;
         await deleteProject(projectToDelete.id);
         setProjectToDelete(null);
+        if (wasArchived) await refreshArchivedProjects();
       } catch (err) {
         console.error("Failed to delete project:", err);
         setError("Failed to delete project");
@@ -139,6 +170,35 @@ export function ProjectsPage({ onNavigate, initialTab }: ProjectsPageProps) {
 
   const handleRenameProject = async (project: Project, newName: string) => {
     await renameProject(project.id, newName);
+    if (project.archived) await refreshArchivedProjects();
+  };
+
+  const handleArchiveProject = async (project: Project) => {
+    try {
+      setProjectActionId(project.id);
+      setError(null);
+      await archiveProject(project.id);
+      await refreshArchivedProjects();
+    } catch (err) {
+      console.error("Failed to archive project:", err);
+      setError("Failed to archive project");
+    } finally {
+      setProjectActionId(null);
+    }
+  };
+
+  const handleRestoreProject = async (project: Project) => {
+    try {
+      setProjectActionId(project.id);
+      setError(null);
+      await restoreProject(project.id);
+      await refreshArchivedProjects();
+    } catch (err) {
+      console.error("Failed to restore project:", err);
+      setError("Failed to restore project");
+    } finally {
+      setProjectActionId(null);
+    }
   };
 
   const renderProjectGrid = (items: Project[], sectionKey: string, includeAddCard = false) => (
@@ -152,11 +212,15 @@ export function ProjectsPage({ onNavigate, initialTab }: ProjectsPageProps) {
         >
           <ProjectCard
             project={project}
-            isSelected={selectedProject?.id === project.id}
-            onSelect={() => handleSelectProject(project)}
-            onDoubleClick={() => handleDoubleClick(project)}
+            isSelected={!project.archived && selectedProject?.id === project.id}
+            onSelect={() => {
+              if (!project.archived) handleSelectProject(project);
+            }}
+            onDoubleClick={project.archived ? undefined : () => handleDoubleClick(project)}
             onDelete={() => setProjectToDelete(project)}
             onRename={(newName) => handleRenameProject(project, newName)}
+            onArchive={project.archived || projectActionId === project.id ? undefined : () => void handleArchiveProject(project)}
+            onRestore={!project.archived || projectActionId === project.id ? undefined : () => void handleRestoreProject(project)}
             compact={isMobile}
           />
         </motion.div>
@@ -197,9 +261,16 @@ export function ProjectsPage({ onNavigate, initialTab }: ProjectsPageProps) {
       icon: Sparkles,
       includeAddCard: true,
     },
+    archived: {
+      label: "Archived Projects",
+      items: archivedProjects,
+      icon: Archive,
+      includeAddCard: false,
+    },
   } as const;
 
   const currentTab = tabMeta[activeTab];
+  const primaryTabs = ["coding", "studio"] as const;
 
   return (
     <OptionalPerfProfiler id="ProjectsPage">
@@ -212,7 +283,8 @@ export function ProjectsPage({ onNavigate, initialTab }: ProjectsPageProps) {
       {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <div className="inline-flex rounded-2xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] p-1">
-          {(Object.entries(tabMeta) as Array<[keyof typeof tabMeta, typeof tabMeta[keyof typeof tabMeta]]>).map(([key, tab]) => {
+          {primaryTabs.map((key) => {
+            const tab = tabMeta[key];
             const Icon = tab.icon;
             const isActive = activeTab === key;
             return (
@@ -234,20 +306,55 @@ export function ProjectsPage({ onNavigate, initialTab }: ProjectsPageProps) {
             );
           })}
         </div>
-        {!isMobile && (
-          <Button onClick={() => openAddDialog(activeTab)} size="sm">
-            <Plus className="w-4 h-4 mr-1.5" />
-            Add Project
-          </Button>
-        )}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setActiveTab("archived")}
+            className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors ${
+              activeTab === "archived"
+                ? "border-[var(--color-highlight)]/30 bg-[var(--color-highlight)]/10 text-[var(--color-highlight)]"
+                : "border-transparent text-[var(--color-text-muted)] hover:bg-[var(--color-bg-secondary)] hover:text-[var(--color-text)]"
+            }`}
+          >
+            <Archive className="w-3.5 h-3.5" />
+            <span>Archived</span>
+            {archivedProjects.length > 0 && (
+              <span className={`rounded-full px-1.5 py-0.5 text-[11px] ${
+                activeTab === "archived"
+                  ? "bg-[var(--color-highlight)]/15 text-[var(--color-highlight)]"
+                  : "text-[var(--color-text-muted)]"
+              }`}>
+                {archivedProjects.length}
+              </span>
+            )}
+          </button>
+          {!isMobile && (
+            <Button
+              onClick={() => openAddDialog(
+                activeTab === "archived"
+                  ? (selectedProject?.projectType === "studio" ? "studio" : "coding")
+                  : activeTab
+              )}
+              size="sm"
+            >
+              <Plus className="w-4 h-4 mr-1.5" />
+              Add Project
+            </Button>
+          )}
+        </div>
       </div>
 
+      {error && !showAddDialog && (
+        <div className="mb-4 rounded-lg border border-[var(--color-error)]/20 bg-[var(--color-error)]/10 px-3 py-2 text-sm text-[var(--color-error)]">
+          {error}
+        </div>
+      )}
+
       {/* Projects Grid */}
-      {projects.length === 0 ? (
+      {activeTab !== "archived" && projects.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-16 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
           <FolderGit2 className="w-12 h-12 text-[var(--color-text-muted)] mb-4" />
           <p className="text-[var(--color-text-muted)] mb-4">No projects yet</p>
-          <Button onClick={() => openAddDialog(activeTab)}>
+          <Button onClick={() => openAddDialog(activeTab === "studio" ? "studio" : "coding")}>
             <Plus className="w-4 h-4 mr-1.5" />
             Add Your First Project
           </Button>
@@ -261,7 +368,14 @@ export function ProjectsPage({ onNavigate, initialTab }: ProjectsPageProps) {
                 {currentTab.items.length} {currentTab.items.length === 1 ? "project" : "projects"}
               </div>
             </div>
-            {renderProjectGrid(currentTab.items, activeTab, currentTab.includeAddCard)}
+            {currentTab.items.length === 0 && activeTab === "archived" ? (
+              <div className="flex flex-col items-center justify-center py-16 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
+                <Archive className="w-12 h-12 text-[var(--color-text-muted)] mb-4" />
+                <p className="text-[var(--color-text-muted)]">No archived projects</p>
+              </div>
+            ) : (
+              renderProjectGrid(currentTab.items, activeTab, currentTab.includeAddCard)
+            )}
           </section>
         </div>
       )}

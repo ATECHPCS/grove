@@ -133,7 +133,8 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             path         TEXT NOT NULL UNIQUE,
             is_git_repo  INTEGER NOT NULL DEFAULT 1,
             added_at     TEXT NOT NULL,
-            project_type TEXT NOT NULL DEFAULT 'repo'
+            project_type TEXT NOT NULL DEFAULT 'repo',
+            archived     INTEGER NOT NULL DEFAULT 0
         );
 
         -- Tasks (active + archived, unified)
@@ -710,6 +711,8 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch(
         "ALTER TABLE projects ADD COLUMN project_type TEXT NOT NULL DEFAULT 'repo';",
     );
+    let _ =
+        conn.execute_batch("ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;");
     // chat_id is nullable: pre-migration rows have no chat context, and the
     // notification UI falls back to navigating to the task only when NULL.
     let _ = conn.execute_batch("ALTER TABLE hook_notifications ADD COLUMN chat_id TEXT;");
