@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-08-05
+
+### Added
+
+- **Project memory** — Projects can capture durable logs and entities, organize them into a navigable memory graph, and expose memory workflows to agents and automations.
+- **ACP v1 sessions** — ACP agents now support authentication, reconnect and import flows, session deletion, cancellation, terminals, plans, modes, configuration options, and form or URL elicitation.
+- **Project archive and restore** — Projects can be archived from the project list and restored later without deleting their data.
+
+### Improved
+
+- **Memory organization and agent context** — Memory agents receive clearer project context, safer organization behavior, and dedicated navigation shortcuts.
+- **Full-file previews** — Review and task surfaces now share one full-file renderer for consistent Markdown, HTML, image, and comment behavior.
+
+### Fixed
+
+- **ACP session commands and notifications** — Session-scoped slash commands remain available, and elicitation requests can trigger desktop notifications.
+- **Homebrew hook discovery** — Active base URL lookup is gated correctly on macOS Homebrew installations.
+
 ## [0.11.10] - 2026-07-28
 
 ### Added
