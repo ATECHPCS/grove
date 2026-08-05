@@ -3,7 +3,6 @@ import { lazy, Suspense, useEffect, useRef, useMemo, useState, useId, type React
 import { MarkdownRenderer, MermaidBlock, D2Block } from '../ui/MarkdownRenderer';
 import { PreviewCommentHost, type MarkdownCommentConfig, type MarkdownCommentMarker } from './PreviewCommentHost';
 import { highlightCode as highlightLocal, detectLanguage as detectLanguageLocal } from './syntaxHighlight';
-import type { DiffFile } from '../../api/review';
 import type { DataTable } from './dataTableParsers';
 import type { FileLocation } from '../ui/fileLocation';
 
@@ -30,9 +29,10 @@ async function parseTable(content: string, kind: TableKind): Promise<DataTable> 
 function withCommentHost(
   node: ReactNode,
   previewComment: RenderFullProps['previewComment'] | undefined,
+  fill = false,
 ): ReactNode {
   if (!previewComment) return node;
-  return <PreviewCommentHost previewComment={previewComment}>{node}</PreviewCommentHost>;
+  return <PreviewCommentHost previewComment={previewComment} fill={fill}>{node}</PreviewCommentHost>;
 }
 
 // ============================================================================
@@ -75,6 +75,8 @@ export interface PreviewRenderer {
    *            parses it itself (e.g. .xlsx via SheetJS).
    */
   contentType: 'url' | 'text' | 'binary';
+  /** Whether the renderer owns a bounded viewport or grows like a document. */
+  layout: 'fill' | 'document';
   /**
    * Render full-file preview content.
    * `content` is either a URL or file text depending on `contentType`.
@@ -104,6 +106,7 @@ const markdownRenderer: PreviewRenderer = {
   label: 'Preview markdown',
   match: (path) => /\.(md|markdown)$/i.test(path),
   contentType: 'text',
+  layout: 'document',
   renderFull: ({ content, onImageClick, onSvgClick, previewComment, sketchContext, location }) => (
     <MarkdownRenderer
       content={content}
@@ -126,6 +129,7 @@ const mermaidRenderer: PreviewRenderer = {
   label: 'Preview diagram',
   match: (path) => /\.(mmd|mermaid)$/i.test(path),
   contentType: 'text',
+  layout: 'document',
   renderFull: ({ content, onSvgClick, previewComment }) => withCommentHost(
     <MermaidBlock code={content} onPreviewClick={onSvgClick} />,
     previewComment,
@@ -138,6 +142,7 @@ const svgRenderer: PreviewRenderer = {
   label: 'Preview SVG',
   match: (path) => /\.svg$/i.test(path),
   contentType: 'text',
+  layout: 'document',
   renderFull: ({ content, onSvgClick, previewComment }) => withCommentHost(
     <div
       className={`flex items-center justify-center p-4 [&_svg]:max-w-full [&_svg]:max-h-[70vh]${onSvgClick ? " cursor-pointer hover:opacity-80 transition-opacity" : ""}`}
@@ -160,6 +165,7 @@ const imageRenderer: PreviewRenderer = {
   label: 'Preview image',
   match: (path) => /\.(png|jpe?g|webp|gif|bmp|ico)$/i.test(path),
   contentType: 'url',
+  layout: 'fill',
   renderFull: ({ content, onImageClick, previewComment }) => withCommentHost(
     <div
       className={`flex items-center justify-center h-full p-6${onImageClick ? " cursor-pointer" : ""}`}
@@ -178,6 +184,7 @@ const imageRenderer: PreviewRenderer = {
       <div className="hidden text-sm" style={{ color: "var(--color-text-muted)" }}>Failed to load image</div>
     </div>,
     previewComment,
+    true,
   ),
   supportsDiffSegments: false,
 };
@@ -191,6 +198,7 @@ const htmlRenderer: PreviewRenderer = {
   label: 'Preview HTML',
   match: (path) => /\.(html?|htm)$/i.test(path),
   contentType: 'text',
+  layout: 'fill',
   renderFull: ({ content, previewComment }) => (
     <HtmlPreviewFrame content={content} previewComment={previewComment} />
   ),
@@ -243,6 +251,7 @@ const csvRenderer: PreviewRenderer = {
   label: 'Preview CSV',
   match: (path) => /\.csv$/i.test(path),
   contentType: 'text',
+  layout: 'fill',
   renderFull: ({ content, previewComment }) => withCommentHost(
     <LazyTable content={content} kind="csv" />,
     previewComment,
@@ -255,6 +264,7 @@ const tsvRenderer: PreviewRenderer = {
   label: 'Preview TSV',
   match: (path) => /\.tsv$/i.test(path),
   contentType: 'text',
+  layout: 'fill',
   renderFull: ({ content, previewComment }) => withCommentHost(
     <LazyTable content={content} kind="tsv" />,
     previewComment,
@@ -267,6 +277,7 @@ const jsonlRenderer: PreviewRenderer = {
   label: 'Preview JSONL',
   match: (path) => /\.jsonl$/i.test(path),
   contentType: 'text',
+  layout: 'fill',
   renderFull: ({ content, previewComment }) => withCommentHost(
     <LazyTable content={content} kind="jsonl" />,
     previewComment,
@@ -283,6 +294,7 @@ const xlsxRenderer: PreviewRenderer = {
   label: 'Preview Excel',
   match: (path) => /\.(xlsx|xlsm|xlsb|xls|ods)$/i.test(path),
   contentType: 'binary',
+  layout: 'fill',
   renderFull: ({ downloadUrl, previewComment }) => {
     const node = downloadUrl ? (
       <Suspense fallback={
@@ -314,6 +326,7 @@ const pdfRenderer: PreviewRenderer = {
   label: 'Preview PDF',
   match: (path) => /\.pdf$/i.test(path),
   contentType: 'url',
+  layout: 'fill',
   renderFull: ({ content }) => (
     <iframe
       src={content}
@@ -669,6 +682,7 @@ const d2Renderer: PreviewRenderer = {
   label: 'Preview D2 diagram',
   match: (path) => /\.d2$/i.test(path),
   contentType: 'text',
+  layout: 'document',
   renderFull: ({ content, onSvgClick, previewComment }) => withCommentHost(
     <D2Block code={content} onPreviewClick={onSvgClick} />,
     previewComment,
@@ -681,6 +695,7 @@ const sourceCodeRenderer: PreviewRenderer = {
   label: 'Preview source code',
   match: () => true,
   contentType: 'text',
+  layout: 'document',
   renderFull: (props) => <SourceCodePreview {...props} />,
   supportsDiffSegments: false,
 };
@@ -729,40 +744,4 @@ export function getPreviewRenderer(path: string, viewMode: 'diff' | 'full'): Pre
   if (!renderer) return undefined;
   if (viewMode === 'diff' && !previewableInDiffMode(renderer)) return undefined;
   return renderer;
-}
-
-// ============================================================================
-// Image Preview Component
-// ============================================================================
-
-interface ImagePreviewProps {
-  projectId?: string;
-  taskId?: string;
-  file: DiffFile;
-  onImageClick?: (url: string) => void;
-}
-
-export function ImagePreview({ projectId, taskId, file, onImageClick }: ImagePreviewProps) {
-  if (!projectId || !taskId) {
-    return <div className="preview-loading">Missing project context</div>;
-  }
-
-  const imgUrl = `/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(file.new_path)}`;
-
-  return (
-    <div className="flex flex-col items-center justify-center gap-3 p-4">
-      <img
-        src={imgUrl}
-        alt={file.new_path}
-        className={`max-w-full max-h-[70vh] object-contain rounded-lg border border-[var(--color-border)]${onImageClick ? " cursor-pointer hover:opacity-80 transition-opacity" : ""}`}
-        onClick={onImageClick ? () => onImageClick(imgUrl) : undefined}
-        onError={(e) => {
-          (e.target as HTMLImageElement).style.display = 'none';
-          (e.target as HTMLImageElement).nextElementSibling?.classList.remove('hidden');
-        }}
-      />
-      <div className="hidden text-sm text-[var(--color-text-muted)]">Failed to load image</div>
-      <span className="text-xs text-[var(--color-text-muted)]">{file.new_path}</span>
-    </div>
-  );
 }

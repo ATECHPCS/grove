@@ -9,11 +9,12 @@ import { ChevronRight, ChevronDown, ChevronUp, Copy, Check, List, MessageSquare,
 import { detectLanguage, highlightLines } from './syntaxHighlight';
 import { GutterAvatar } from './AgentAvatar';
 import { useFileMention } from '../../hooks';
-import { FileMentionDropdown } from '../ui';
+import { FileMentionDropdown, FullFilePreview, isVirtualizedMarkdownPreview } from '../ui';
+import type { VirtualizedMarkdownHandle, VirtualizedMarkdownHeading } from '../ui/VirtualizedMarkdownRenderer';
 import { MarkdownRenderer, MermaidBlock } from '../ui/MarkdownRenderer';
 import { TocPanel } from '../ui/MarkdownToc';
 import { extractToc } from '../ui/extractToc';
-import { ImagePreview, type PreviewRenderer, type PreviewCommentMarker } from './previewRenderers';
+import { type PreviewRenderer, type PreviewCommentMarker } from './previewRenderers';
 import { PreviewCommentHost } from './PreviewCommentHost';
 import { PreviewSearchBar } from './PreviewSearchBar';
 import { useDomSearch } from './useDomSearch';
@@ -546,17 +547,35 @@ export function DiffFileView({
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const isIframePreview = previewRenderer?.id === 'html';
-  const dom = useDomSearch(searchRootRef, searchOpen && !isIframePreview ? searchQuery : '', searchOpen && !isIframePreview);
+  const isVirtualizedMarkdown = viewMode === 'full'
+    && !!fullFileContent
+    && isVirtualizedMarkdownPreview(file.new_path, fullFileContent);
+  const previewRawUrl = projectId && taskId
+    ? `/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(file.new_path)}`
+    : undefined;
+  const domSearchEnabled = searchOpen && !isIframePreview && !isVirtualizedMarkdown;
+  const dom = useDomSearch(searchRootRef, domSearchEnabled ? searchQuery : '', domSearchEnabled);
   const [iframeTotal, setIframeTotal] = useState(0);
   const [iframeCurrent, setIframeCurrent] = useState(0);
-  const searchTotal = isIframePreview ? iframeTotal : dom.total;
-  const searchCurrent = isIframePreview ? iframeCurrent : dom.current;
+  const [virtualTotal, setVirtualTotal] = useState(0);
+  const [virtualCurrent, setVirtualCurrent] = useState(0);
+  const virtualMarkdownRef = useRef<VirtualizedMarkdownHandle>(null);
+  const [virtualHeadings, setVirtualHeadings] = useState<VirtualizedMarkdownHeading[]>([]);
+  const [virtualScroller, setVirtualScroller] = useState<HTMLElement | null>(null);
+  const virtualScrollerRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    virtualScrollerRef.current = virtualScroller;
+  }, [virtualScroller]);
+  const searchTotal = isIframePreview ? iframeTotal : isVirtualizedMarkdown ? virtualTotal : dom.total;
+  const searchCurrent = isIframePreview ? iframeCurrent : isVirtualizedMarkdown ? virtualCurrent : dom.current;
   const searchNext = () => {
     if (isIframePreview) setIframeCurrent((c) => (iframeTotal === 0 ? 0 : (c + 1) % iframeTotal));
+    else if (isVirtualizedMarkdown) virtualMarkdownRef.current?.searchNext();
     else dom.next();
   };
   const searchPrev = () => {
     if (isIframePreview) setIframeCurrent((c) => (iframeTotal === 0 ? 0 : (c - 1 + iframeTotal) % iframeTotal));
+    else if (isVirtualizedMarkdown) virtualMarkdownRef.current?.searchPrev();
     else dom.prev();
   };
 
@@ -564,9 +583,15 @@ export function DiffFileView({
   const isMarkdownPreview = previewRenderer?.id === 'markdown';
   const tocEntries = useMemo(() => {
     if (!isMarkdownPreview || !fullFileContent) return [];
+    if (isVirtualizedMarkdown) return virtualHeadings;
     return extractToc(fullFileContent);
-  }, [isMarkdownPreview, fullFileContent]);
+  }, [isMarkdownPreview, fullFileContent, isVirtualizedMarkdown, virtualHeadings]);
   const [showToc, setShowToc] = useState(false);
+
+  useEffect(() => {
+    if (!isVirtualizedMarkdown) return;
+    virtualMarkdownRef.current?.setSearchQuery(searchOpen ? searchQuery : '');
+  }, [isVirtualizedMarkdown, searchOpen, searchQuery]);
 
   // Reset iframe match cursor whenever the search query changes. Using the
   // "store previous value" idiom (https://react.dev/reference/react/useState
@@ -1531,8 +1556,13 @@ export function DiffFileView({
                     <p>This file is planned to be created but doesn't exist yet in the current branch.</p>
                   </div>
                 </div>
-              ) : previewRenderer?.id === 'image' && projectId && taskId ? (
-                <ImagePreview projectId={projectId} taskId={taskId} file={file} onImageClick={setLightboxUrl} />
+              ) : previewRenderer?.id === 'image' && previewRawUrl ? (
+                <FullFilePreview
+                  renderer={previewRenderer}
+                  content={previewRawUrl}
+                  fileName={file.new_path}
+                  onImageClick={setLightboxUrl}
+                />
               ) : file.is_binary ? (
                 <div className="diff-binary">
                   {viewMode === 'full'
@@ -1655,6 +1685,7 @@ export function DiffFileView({
                   style={{
                     position: 'relative',
                     minWidth: 0,
+                    ...(isVirtualizedMarkdown ? { overflow: 'hidden', padding: 0 } : {}),
                     // When there's no real content to show, don't let the content area flex-stretch
                     // to fill the full viewport height — cap it so the drawer stays compact.
                     ...(isPreviewOpen && fullFileContent == null && file.hunks.length === 0
@@ -1677,8 +1708,14 @@ export function DiffFileView({
                       The closed drawer has width:0 but no height limit — rendering heavy content
                       (e.g. MarkdownRenderer) would inflate the flex-row height of diff-file-body. */}
                   {isPreviewOpen && (
-                    previewRenderer && previewRenderer.id === 'image' ? (
-                      <ImagePreview projectId={projectId} taskId={taskId} file={file} onImageClick={setLightboxUrl} />
+                    previewRenderer && previewRenderer.id === 'image' && previewRawUrl ? (
+                      <FullFilePreview
+                        renderer={previewRenderer}
+                        content={previewRawUrl}
+                        fileName={file.new_path}
+                        onImageClick={setLightboxUrl}
+                        previewComment={previewCommentConfig}
+                      />
                     ) : previewRenderer && !previewRenderer.supportsDiffSegments ? (
                       (() => {
                         const content = viewMode === 'full' && fullFileContent != null
@@ -1690,14 +1727,15 @@ export function DiffFileView({
                           path: file.new_path,
                         } : undefined;
                         return content.trim()
-                          ? previewRenderer.renderFull({
-                              content,
-                              fileName: file.new_path,
-                              onImageClick: setLightboxUrl,
-                              onSvgClick: setLightboxSvg,
-                              previewComment: previewCommentConfig,
-                              location,
-                            })
+                          ? <FullFilePreview
+                              renderer={previewRenderer}
+                              content={content}
+                              fileName={file.new_path}
+                              onImageClick={setLightboxUrl}
+                              onSvgClick={setLightboxSvg}
+                              previewComment={previewCommentConfig}
+                              location={location}
+                            />
                           : <div className="preview-loading">No content to render</div>;
                       })()
                     ) : viewMode === 'full' ? (
@@ -1705,18 +1743,26 @@ export function DiffFileView({
                         <div className="preview-loading">Loading content...</div>
                       ) : fullFileContent != null ? (
                         previewRenderer
-                          ? previewRenderer.renderFull({
-                              content: fullFileContent,
-                              fileName: file.new_path,
-                              onImageClick: setLightboxUrl,
-                              onSvgClick: setLightboxSvg,
-                              previewComment: previewCommentConfig,
-                              location: projectId && taskId ? {
+                          ? <FullFilePreview
+                              renderer={previewRenderer}
+                              content={fullFileContent}
+                              fileName={file.new_path}
+                              onImageClick={setLightboxUrl}
+                              onSvgClick={setLightboxSvg}
+                              previewComment={previewCommentConfig}
+                              location={projectId && taskId ? {
                                 projectId,
                                 root: { kind: "task", taskId },
                                 path: file.new_path,
-                              } : undefined,
-                            })
+                              } : undefined}
+                              markdownRef={virtualMarkdownRef}
+                              onMarkdownHeadingsChange={setVirtualHeadings}
+                              onMarkdownSearchStateChange={(total, current) => {
+                                setVirtualTotal(total);
+                                setVirtualCurrent(current);
+                              }}
+                              onMarkdownScrollerRef={setVirtualScroller}
+                            />
                           : <MarkdownRenderer
                               content={fullFileContent}
                               onImageClick={setLightboxUrl}
@@ -1781,8 +1827,12 @@ export function DiffFileView({
                 {showToc && tocEntries.length > 1 && (
                   <TocPanel
                     entries={tocEntries}
-                    scrollRoot={searchRootRef}
+                    scrollRoot={isVirtualizedMarkdown ? virtualScrollerRef : searchRootRef}
                     onEntryClick={(id) => {
+                      if (isVirtualizedMarkdown) {
+                        virtualMarkdownRef.current?.scrollToHeadingId(id);
+                        return;
+                      }
                       const el = searchRootRef.current?.querySelector(`[id="${CSS.escape(id)}"]`);
                       if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
                     }}

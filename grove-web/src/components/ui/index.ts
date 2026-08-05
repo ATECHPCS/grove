@@ -9,6 +9,12 @@ export { AppPicker, ideAppOptions, terminalAppOptions } from "./AppPicker";
 export { AgentPicker, AgentPickerMenuItems, agentOptions } from "./AgentPicker";
 export { CustomAgentModal } from "./CustomAgentModal";
 export { MarkdownRenderer } from "./MarkdownRenderer";
+export { FullFilePreview } from "./FullFilePreview";
+export type { FullFilePreviewProps } from "./FullFilePreview";
+export {
+  isVirtualizedMarkdownPreview,
+  LARGE_MARKDOWN_PREVIEW_THRESHOLD,
+} from "./filePreviewPolicy";
 export { resolveFileReference, resolveRelativeFilePath } from "./fileLocation";
 export type { FileLocation, FileRoot } from "./fileLocation";
 export { TocPanel, type TocEntry } from "./MarkdownToc";

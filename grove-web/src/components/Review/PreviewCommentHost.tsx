@@ -33,6 +33,8 @@ interface ResolvedMarker {
 interface Props {
   previewComment?: MarkdownCommentConfig;
   children: ReactNode;
+  /** Fill a bounded preview viewport. Natural-height markdown leaves this off. */
+  fill?: boolean;
 }
 
 const BLOCK_TAGS = new Set([
@@ -300,7 +302,7 @@ function textRangeForOffsets(element: Element, start: number, end: number): Rang
   return range;
 }
 
-export function PreviewCommentHost({ previewComment, children }: Props) {
+export function PreviewCommentHost({ previewComment, children, fill = false }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const [hoverRects, setHoverRects] = useState<DOMRect[]>([]);
@@ -684,8 +686,8 @@ export function PreviewCommentHost({ previewComment, children }: Props) {
   }, [markersKey, previewId]);
 
   return (
-    <div ref={hostRef} className="relative w-full">
-      <div ref={contentRef} className="w-full">
+    <div ref={hostRef} className={`relative w-full${fill ? " h-full min-h-0" : ""}`}>
+      <div ref={contentRef} className={`w-full${fill ? " h-full min-h-0" : ""}`}>
         {children}
       </div>
       {enabled && hoverRects.length > 0 && hostRect && (() => {

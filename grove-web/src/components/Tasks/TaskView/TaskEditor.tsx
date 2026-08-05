@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import Editor, { type Monaco } from "@monaco-editor/react";
 import { X, FileCode, Eye, Columns2, Loader2, Save, Maximize2, Minimize2, PanelLeftOpen, PanelLeftClose, RefreshCw, AlertCircle, ZoomIn, ZoomOut } from "lucide-react";
-import { Button, getPreviewType, ImageLightbox } from "../../ui";
+import { Button, FullFilePreview, getPreviewType, ImageLightbox, isVirtualizedMarkdownPreview } from "../../ui";
 import { getPreviewRenderer } from "../../Review/previewRenderers";
 
 function rewriteHtmlUrls(html: string, projectId: string, taskId: string, parentDir: string): string {
@@ -1131,7 +1131,8 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
   const breadcrumb = selectedFile ? selectedFile.split('/') : [];
 
   const renderer = selectedFile ? getPreviewRenderer(selectedFile, 'full') : undefined;
-  const isPreviewable = renderer && renderer.id !== 'source' && renderer.id !== 'image';
+  const isPreviewable = renderer && renderer.id !== 'source' && !isReadOnlyPreview(selectedFile ?? '');
+  const isLargeMarkdownPreview = !!selectedFile && isVirtualizedMarkdownPreview(selectedFile, fileContent);
 
   // Calculate relative base path for HTML preview
   const parentDirPath = selectedFile && selectedFile.includes('/')
@@ -1384,58 +1385,37 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
               </div>
             </div>
           ) : selectedFile ? (
-            isReadOnlyPreview(selectedFile) ? (
-              <div 
-                className="flex-1 flex flex-col items-center justify-center overflow-auto p-8 relative"
-                style={{
-                  backgroundColor: "var(--color-bg-secondary)",
-                  backgroundImage: "radial-gradient(var(--color-border) 1px, transparent 1px)",
-                  backgroundSize: "16px 16px",
-                }}
-              >
-                <div className="max-w-full max-h-full flex flex-col items-center justify-center gap-3">
-                  <div className="relative rounded-lg overflow-hidden border border-[var(--color-border)] shadow-md bg-[var(--color-bg)] transition-transform duration-200 hover:scale-[1.01]">
-                    <img
-                      src={rawFileUrl(selectedFile)}
-                      alt={selectedFile}
-                      className="max-w-full max-h-[70vh] object-contain block cursor-pointer hover:opacity-90 transition-opacity"
-                      onClick={() => setLightboxUrl(rawFileUrl(selectedFile))}
-                      onError={(e) => {
-                        (e.target as HTMLImageElement).style.display = 'none';
-                        (e.target as HTMLImageElement).nextElementSibling?.classList.remove('hidden');
-                      }}
-                    />
-                    <div className="hidden flex-col items-center gap-2 p-8 text-sm text-[var(--color-text-muted)] bg-[var(--color-bg-secondary)]">
-                      <AlertCircle className="w-8 h-8" />
-                      <span>Failed to load image</span>
-                    </div>
-                  </div>
-                  <div className="flex flex-col items-center gap-1">
-                    <span className="text-sm font-medium text-[var(--color-text)]">
-                      {selectedFile.split('/').pop()}
-                    </span>
-                    <span className="text-xs text-[var(--color-text-muted)]">
-                      {selectedFile}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            ) : viewMode === 'preview' && isPreviewable ? (
-              <div className="flex-1 overflow-auto bg-[var(--color-bg)] p-6 editor-scroll-container">
-                {renderer?.renderFull({
-                  content: renderer.contentType === 'url'
-                    ? rawFileUrl(selectedFile)
-                    : (renderer.id === 'html' ? rewriteHtmlUrls(fileContent, projectId, taskId, parentDirPath) : fileContent),
-                  fileName: selectedFile,
-                  sketchContext: { projectId, taskId },
-                  location: {
+            isReadOnlyPreview(selectedFile) && renderer ? (
+              <div className="flex-1 min-h-0 overflow-hidden bg-[var(--color-bg)]">
+                <FullFilePreview
+                  renderer={renderer}
+                  fileName={selectedFile}
+                  content={renderer.contentType === 'url' ? rawFileUrl(selectedFile) : ''}
+                  downloadUrl={rawFileUrl(selectedFile)}
+                  onImageClick={setLightboxUrl}
+                  onSvgClick={setLightboxSvg}
+                  location={{
                     projectId,
                     root: { kind: "task", taskId },
                     path: selectedFile,
-                  },
-                  onImageClick: (url) => setLightboxUrl(url),
-                  onSvgClick: (svg) => setLightboxSvg(svg),
-                })}
+                  }}
+                />
+              </div>
+            ) : viewMode === 'preview' && isPreviewable ? (
+              <div className={`flex-1 min-h-0 bg-[var(--color-bg)] editor-scroll-container ${isLargeMarkdownPreview ? 'overflow-hidden' : 'overflow-auto'}`}>
+                <FullFilePreview
+                  renderer={renderer}
+                  content={renderer.id === 'html' ? rewriteHtmlUrls(fileContent, projectId, taskId, parentDirPath) : fileContent}
+                  fileName={selectedFile}
+                  sketchContext={{ projectId, taskId }}
+                  location={{
+                    projectId,
+                    root: { kind: "task", taskId },
+                    path: selectedFile,
+                  }}
+                  onImageClick={setLightboxUrl}
+                  onSvgClick={setLightboxSvg}
+                />
               </div>
             ) : viewMode === 'split' && isPreviewable ? (
               <div className="flex-1 flex min-h-0 min-w-0 divide-x divide-[var(--color-border)] overflow-hidden">
@@ -1502,21 +1482,20 @@ export function TaskEditor({ projectId, taskId, onClose, fullscreen = false, onT
                     }}
                   />
                 </div>
-                <div className="flex-1 min-w-0 h-full overflow-auto bg-[var(--color-bg)] p-6 editor-scroll-container">
-                  {renderer?.renderFull({
-                    content: renderer.contentType === 'url'
-                      ? rawFileUrl(selectedFile)
-                      : (renderer.id === 'html' ? rewriteHtmlUrls(fileContent, projectId, taskId, parentDirPath) : fileContent),
-                    fileName: selectedFile,
-                    sketchContext: { projectId, taskId },
-                    location: {
+                <div className={`flex-1 min-w-0 h-full min-h-0 bg-[var(--color-bg)] editor-scroll-container ${isLargeMarkdownPreview ? 'overflow-hidden' : 'overflow-auto'}`}>
+                  <FullFilePreview
+                    renderer={renderer}
+                    content={renderer.id === 'html' ? rewriteHtmlUrls(fileContent, projectId, taskId, parentDirPath) : fileContent}
+                    fileName={selectedFile}
+                    sketchContext={{ projectId, taskId }}
+                    location={{
                       projectId,
                       root: { kind: "task", taskId },
                       path: selectedFile,
-                    },
-                    onImageClick: (url) => setLightboxUrl(url),
-                    onSvgClick: (svg) => setLightboxSvg(svg),
-                  })}
+                    }}
+                    onImageClick={setLightboxUrl}
+                    onSvgClick={setLightboxSvg}
+                  />
                 </div>
               </div>
             ) : (

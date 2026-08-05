@@ -11,11 +11,11 @@ import { ImageLightbox } from "./ImageLightbox";
 import { TocPanel } from "./MarkdownToc";
 import { extractToc } from "./extractToc";
 import {
-  VirtualizedMarkdownRenderer,
   type VirtualizedMarkdownHandle,
   type VirtualizedMarkdownHeading,
 } from "./VirtualizedMarkdownRenderer";
-import { PreviewCommentHost } from "../Review/PreviewCommentHost";
+import { FullFilePreview } from "./FullFilePreview";
+import { isVirtualizedMarkdownPreview } from "./filePreviewPolicy";
 import type { PreviewCommentLocator, PreviewCommentDraft } from "../../context";
 import { useKeyboardScope, useCommand, useContextKey } from "../../keyboard";
 import type { FileLocation } from "./fileLocation";
@@ -190,11 +190,7 @@ export function FilePreviewDrawer({
   const [editingDraftId, setEditingDraftId] = useState<string | null>(null);
 
   const isMarkdown = fileName.endsWith(".md") || fileName.endsWith(".markdown");
-  // Threshold for switching to block-level virtualization: ~30k chars is
-  // roughly 700 lines of prose or 400 lines of code — past that, the
-  // synchronous react-markdown parse + DOM mount becomes the first-paint
-  // bottleneck, and Cmd+F over the full tree starts to lock the UI.
-  const isLargeMarkdown = isMarkdown && !showSource && content.length > 30000;
+  const isLargeMarkdown = !showSource && isVirtualizedMarkdownPreview(fileName, content);
   const tocEntries = useMemo(
     // Skip the regex pass when virtualization is in charge — it builds its
     // own heading list during mdast parsing.
@@ -645,7 +641,10 @@ export function FilePreviewDrawer({
           </div>
         )}
         <div className="flex-1 flex min-h-0 relative">
-          <div ref={searchRootRef} className="flex-1 overflow-auto relative min-w-0">
+          <div
+            ref={searchRootRef}
+            className={`flex-1 relative min-w-0 min-h-0 ${isLargeMarkdown ? "overflow-hidden" : "overflow-auto"}`}
+          >
           {searchOpen && (
             <PreviewSearchBar
               query={searchQuery}
@@ -673,48 +672,25 @@ export function FilePreviewDrawer({
                 {content}
               </pre>
             );
-          })(          ) : isLargeMarkdown ? (
-            <PreviewCommentHost
-              previewComment={
-                commentable
-                  ? { enabled: commentMode && !pendingLocator, previewId, markers: stableMarkers }
-                  : undefined
-              }
-            >
-              <VirtualizedMarkdownRenderer
-                ref={virtRef}
-                content={content}
-                onImageClick={setLightboxUrl}
-                onMermaidClick={setLightboxSvg}
-                onD2Click={setLightboxSvg}
-                sketchContext={sketchContext}
-                sketchRenderMode="image"
-                location={location}
-                renderMode="document"
-                onHeadingsChange={setVirtHeadings}
-                onSearchStateChange={(t, c) => {
-                  setVirtTotal(t);
-                  setVirtCurrent(c);
-                }}
-                onScrollerRef={(el) => {
-                  setVirtScroller(el);
-                }}
-                style={{ height: "100%" }}
-              />
-            </PreviewCommentHost>
-          ) : renderer ? (
-            <div className={renderer.id === 'image' || renderer.id === 'html' || renderer.id === 'csv' || renderer.id === 'tsv' || renderer.id === 'jsonl' || renderer.id === 'xlsx' ? 'h-full relative' : 'p-5'}>
-              {renderer.renderFull({
-                content,
-                fileName,
-                downloadUrl,
-                onImageClick: setLightboxUrl,
-                onSvgClick: setLightboxSvg,
-                previewComment: commentable ? { enabled: commentMode && !pendingLocator, previewId, markers: stableMarkers } : undefined,
-                sketchContext,
-                location,
-              })}
-            </div>
+          })() : renderer ? (
+            <FullFilePreview
+              renderer={renderer}
+              content={content}
+              fileName={fileName}
+              downloadUrl={downloadUrl}
+              onImageClick={setLightboxUrl}
+              onSvgClick={setLightboxSvg}
+              previewComment={commentable ? { enabled: commentMode && !pendingLocator, previewId, markers: stableMarkers } : undefined}
+              sketchContext={sketchContext}
+              location={location}
+              markdownRef={virtRef}
+              onMarkdownHeadingsChange={setVirtHeadings}
+              onMarkdownSearchStateChange={(t, c) => {
+                setVirtTotal(t);
+                setVirtCurrent(c);
+              }}
+              onMarkdownScrollerRef={setVirtScroller}
+            />
           ) : (() => {
             const lang = detectLanguage(fileName);
             const highlighted = lang ? highlightCode(content, lang) : null;
