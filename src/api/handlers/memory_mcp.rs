@@ -117,9 +117,12 @@ impl ServerHandler for MemoryMcpService {
             McpError::invalid_request("Memory MCP request context is missing".to_string(), None)
         })?;
         let caller = caller_from_parts(parts)?;
-        validate_running_run(&caller.project_id, &caller.run_id)?;
+        let run = running_run(&caller.project_id, &caller.run_id)?;
         let mut tools = self.tool_router.list_all();
         tools.retain(|tool| ORGANIZATION_TOOLS.contains(&tool.name.as_ref()));
+        if !deep_organization_enabled(&run) {
+            tools.retain(|tool| tool.name != "memory_get_recent_chats");
+        }
         Ok(ListToolsResult {
             tools,
             next_cursor: None,
@@ -248,6 +251,13 @@ impl MemoryMcpService {
     ) -> Result<CallToolResult, McpError> {
         let (project_id, run_id) = organization_context(&parts)?;
         let run = running_run(&project_id, &run_id)?;
+        if !deep_organization_enabled(&run) {
+            return Err(McpError::invalid_request(
+                "Recent Chats are not available because Deep organization is disabled for this Run"
+                    .to_string(),
+                None,
+            ));
+        }
         let input_from_at = run
             .input
             .get("input_from_at")
@@ -799,6 +809,13 @@ fn running_run(project_id: &str, run_id: &str) -> Result<automations::Automation
         ));
     }
     Ok(run)
+}
+
+fn deep_organization_enabled(run: &automations::AutomationRun) -> bool {
+    run.input
+        .get("deep_organization")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn validate_running_run(project_id: &str, run_id: &str) -> Result<(), McpError> {

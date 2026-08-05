@@ -83,8 +83,9 @@ pub fn build_persona_instruction(persona_name: &str, system_prompt: &str) -> Str
 }
 
 /// Attach stable Grove operating instructions to the first real prompt of a
-/// fresh ACP session. Grove still renders and persists the original user body;
-/// only the wire prompt sent to the Agent carries this hidden bootstrap.
+/// fresh ACP session. The complete wire prompt is persisted as the ACP
+/// transcript; Grove's frontend interprets the metadata envelope to hide the
+/// bootstrap while continuing to render the original user body.
 pub fn build_session_instruction_prompt(kind: &str, system_prompt: &str, body: &str) -> String {
     let payload = json!({
         "v": 1,

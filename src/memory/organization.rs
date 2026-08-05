@@ -10,7 +10,11 @@ use crate::automation::consumer::{
 use crate::error::{GroveError, Result};
 use crate::storage::{automations, memory, workspace};
 
-pub const ORGANIZATION_PROMPT: &str = "Organize this Project's long-term Memory. Review the available evidence and existing Memory, update only what should change, and publish this Run.";
+pub const ORGANIZATION_PROMPT: &str = r#"Organize the current Project Memory.
+
+Understand the existing Memory and examine all evidence sources made available for this Run. Build the best current long-term representation of the Project and its working context.
+
+Restructure, enrich, consolidate, or extend the Memory wherever the evidence supports a more useful result. Preserve the meaning, scope, and future applicability of the knowledge you retain, then review the complete Memory and publish this Run."#;
 
 pub struct MemoryOrganizationHandler;
 
