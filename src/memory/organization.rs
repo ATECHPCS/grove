@@ -1,0 +1,109 @@
+use std::collections::HashMap;
+use std::time::Duration;
+
+use crate::acp::{LoopbackMcpServer, McpServerPolicy};
+use crate::api::handlers::memory_mcp;
+use crate::automation::consumer::{
+    AbortContext, AfterCommitContext, AutomationHandler, ConcurrencyPolicy, PostActionContext,
+    PreActionContext, RuntimeBindings, RuntimeContext,
+};
+use crate::error::{GroveError, Result};
+use crate::storage::{automations, memory, workspace};
+
+pub const ORGANIZATION_PROMPT: &str = "Organize this Project's long-term Memory. Review the available evidence and existing Memory, update only what should change, and publish this Run.";
+
+pub struct MemoryOrganizationHandler;
+
+impl AutomationHandler for MemoryOrganizationHandler {
+    fn key(&self) -> &'static str {
+        automations::MEMORY_ORGANIZATION_HANDLER
+    }
+
+    fn concurrency_policy(&self, _automation: &automations::Automation) -> ConcurrencyPolicy {
+        ConcurrencyPolicy::SingleFlight
+    }
+
+    fn pre_action(&self, context: PreActionContext<'_>) -> Result<serde_json::Value> {
+        if context.run.automation_id != context.automation.id {
+            return Err(GroveError::invalid_data(
+                "Automation Run does not belong to its handler context",
+            ));
+        }
+        memory::prepare_organization_input(
+            &context.automation.project,
+            &context.automation.id,
+            context.trigger.payload.as_ref(),
+        )
+    }
+
+    fn runtime_bindings(&self, context: RuntimeContext<'_>) -> Result<RuntimeBindings> {
+        let project = workspace::load_project_by_hash(&context.automation.project)?
+            .ok_or_else(|| GroveError::not_found("Project is not registered"))?;
+        let artifact_dir = memory::runs_dir(&context.automation.project)?.join(&context.run.id);
+        std::fs::create_dir_all(&artifact_dir)?;
+
+        let token = uuid::Uuid::new_v4().to_string();
+        memory_mcp::register_organization_token(
+            token.clone(),
+            &context.automation.project,
+            &context.run.id,
+        );
+        let Some(mcp_url) = memory_mcp::build_mcp_url(&token) else {
+            memory_mcp::unregister_token(&token);
+            return Err(GroveError::storage("Memory MCP listener is not running"));
+        };
+        let mut env_vars = HashMap::new();
+        env_vars.insert("GROVE_MCP_TOKEN".to_string(), token);
+        if let Some(port) = crate::api::handlers::agent_graph_mcp::listener_port() {
+            env_vars.insert("GROVE_MCP_PORT".to_string(), port.to_string());
+        }
+        Ok(RuntimeBindings {
+            working_dir: workspace::project_directory(&project),
+            artifact_dir: Some(artifact_dir),
+            env_vars,
+            additional_mcp_servers: vec![LoopbackMcpServer {
+                name: "grove_memory".to_string(),
+                url: mcp_url,
+                route: "memory-mcp".to_string(),
+            }],
+            mcp_server_policy: McpServerPolicy::ExplicitOnly,
+            timeout: Duration::from_secs(30 * 60),
+        })
+    }
+
+    fn post_action(
+        &self,
+        context: PostActionContext<'_>,
+        tx: &rusqlite::Transaction<'_>,
+    ) -> Result<serde_json::Value> {
+        let _ = context.agent_response;
+        let result =
+            memory::commit_organization_on(tx, &context.automation.project, &context.run.id)?;
+        memory_mcp::unregister_organization_run(&context.automation.project, &context.run.id);
+        Ok(result)
+    }
+
+    fn abort(&self, context: AbortContext<'_>) -> Result<()> {
+        let _ = context.reason;
+        memory_mcp::unregister_organization_run(&context.automation.project, &context.run.id);
+        Ok(())
+    }
+
+    fn after_commit(&self, context: AfterCommitContext<'_>) -> Result<()> {
+        if context.run.automation_id != context.automation.id {
+            return Err(GroveError::invalid_data(
+                "Automation Run does not belong to its after-commit context",
+            ));
+        }
+        memory::emit_pending_log_threshold_if_needed(&context.automation.project)?;
+        Ok(())
+    }
+
+    fn remove_run_artifacts(&self, project_id: &str, run_id: &str) -> Result<()> {
+        let path = memory::runs_dir(project_id)?.join(run_id);
+        if path.exists() {
+            std::fs::remove_dir_all(path)?;
+        }
+        Ok(())
+    }
+}

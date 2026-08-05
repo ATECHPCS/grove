@@ -221,6 +221,50 @@ pub fn get(id: &str) -> Result<Option<InstalledAgent>> {
     Ok(row)
 }
 
+/// Last capability set observed from a real ACP session for this installed
+/// agent. It is a fast UI/configuration snapshot only; run-time session
+/// capabilities remain authoritative.
+pub fn get_capability_snapshot(id: &str) -> Result<Option<serde_json::Value>> {
+    let conn = crate::storage::database::connection();
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT capability_snapshot_json FROM installed_agents WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    raw.map(|value| serde_json::from_str(&value).map_err(Into::into))
+        .transpose()
+}
+
+pub fn get_capability_updated_at(id: &str) -> Result<Option<String>> {
+    let conn = crate::storage::database::connection();
+    conn.query_row(
+        "SELECT capability_updated_at FROM installed_agents WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map(Option::flatten)
+    .map_err(Into::into)
+}
+
+pub fn save_capability_snapshot(id: &str, snapshot: &serde_json::Value) -> Result<bool> {
+    let canonical = canonicalize_agent_id(id);
+    let changed = crate::storage::database::connection().execute(
+        "UPDATE installed_agents
+         SET capability_snapshot_json = ?1, capability_updated_at = ?2
+         WHERE id = ?3",
+        params![
+            serde_json::to_string(snapshot)?,
+            Utc::now().to_rfc3339(),
+            canonical,
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
 /// Insert or replace. Caller is responsible for providing a coherent row
 /// (at least one installation, selected_install_method matching one of them).
 pub fn upsert(agent: &InstalledAgent) -> Result<()> {

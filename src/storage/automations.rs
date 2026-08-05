@@ -10,10 +10,13 @@
 //! so the schema doesn't have to evolve every time the new-task form gains a
 //! field.
 
+use once_cell::sync::Lazy;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+
+pub use crate::agent_config::AgentConfigSelection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -55,12 +58,18 @@ pub struct SessionTemplate {
     pub title: Option<String>,
 }
 
+pub const TASK_PROMPT_HANDLER: &str = "builtin.task_prompt";
+pub const MEMORY_ORGANIZATION_HANDLER: &str = "grove.memory.organization";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Automation {
     pub id: String,
     pub project: String,
     pub name: String,
     pub enabled: bool,
+    pub handler_key: String,
+    #[serde(default)]
+    pub agent_config: AgentConfigSelection,
     pub task_mode: TargetMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -73,6 +82,8 @@ pub struct Automation {
     pub session_template: Option<SessionTemplate>,
     pub prompt: String,
     pub schedule_cron: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_triggers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,6 +100,7 @@ pub struct Automation {
 ///
 /// `status` follows the state machine:
 ///   queued → running → success | failed | timeout | cancelled | interrupted
+///                  └→ cancelling → cancelled
 ///
 /// `running` is skipped for pre-pickup terminal transitions (cancel before
 /// the agent took our prompt, or a `resolve_*` / `spawn_acp` failure).
@@ -102,9 +114,16 @@ pub struct AutomationRun {
     pub id: String,
     pub automation_id: String,
     pub trigger_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_payload: Option<serde_json::Value>,
     pub prompt_snapshot: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_snapshot: Option<String>,
+    #[serde(default)]
+    pub agent_config_snapshot: AgentConfigSelection,
+    #[serde(default)]
+    pub input: serde_json::Value,
+    pub execution_scope: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,6 +131,8 @@ pub struct AutomationRun {
     pub triggered_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<i64>,
     pub status: String,
@@ -121,41 +142,151 @@ pub struct AutomationRun {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_response: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
 }
 
-const COLUMNS: &str = "id, project, name, enabled, task_mode, task_id, task_template,
-     session_mode, chat_id, session_template, prompt, schedule_cron,
+#[derive(Debug, Clone, Serialize)]
+pub struct AutomationRunUpdate {
+    pub project: String,
+    pub automation_id: String,
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<AutomationRun>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<serde_json::Value>,
+}
+
+static RUN_UPDATES: Lazy<tokio::sync::broadcast::Sender<AutomationRunUpdate>> = Lazy::new(|| {
+    let (sender, _) = tokio::sync::broadcast::channel(1024);
+    sender
+});
+
+pub fn subscribe_run_updates() -> tokio::sync::broadcast::Receiver<AutomationRunUpdate> {
+    RUN_UPDATES.subscribe()
+}
+
+fn publish_run_update(run_id: &str) {
+    if let Ok(Some(run)) = get_run(run_id) {
+        if let Ok(Some(automation)) = get(&run.automation_id) {
+            let _ = RUN_UPDATES.send(AutomationRunUpdate {
+                project: automation.project,
+                automation_id: run.automation_id.clone(),
+                run_id: run.id.clone(),
+                run: Some(run),
+                event: None,
+            });
+        }
+    }
+}
+
+/// Publish one live event for an Automation Run over the same project-scoped
+/// WebSocket as status updates. The complete event remains on disk; this copy
+/// is bounded so large tool results cannot turn the live channel into a raw
+/// transcript transport.
+pub fn publish_run_event<T: Serialize>(
+    project_id: &str,
+    automation_id: &str,
+    run_id: &str,
+    event: &T,
+) {
+    let Ok(mut event) = serde_json::to_value(event) else {
+        return;
+    };
+    bound_live_value(&mut event);
+    if serde_json::to_vec(&event).is_ok_and(|bytes| bytes.len() > 64 * 1024) {
+        if let serde_json::Value::Object(fields) = &mut event {
+            for field in ["output", "content", "display_content", "raw_input"] {
+                fields.remove(field);
+            }
+            fields.insert(
+                "live_output_truncated".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+    }
+    let _ = RUN_UPDATES.send(AutomationRunUpdate {
+        project: project_id.to_string(),
+        automation_id: automation_id.to_string(),
+        run_id: run_id.to_string(),
+        run: None,
+        event: Some(event),
+    });
+}
+
+fn bound_live_value(value: &mut serde_json::Value) {
+    const MAX_STRING_CHARS: usize = 16 * 1024;
+    const MAX_ARRAY_ITEMS: usize = 100;
+
+    match value {
+        serde_json::Value::String(text) => {
+            if text.chars().count() > MAX_STRING_CHARS {
+                let mut bounded: String = text.chars().take(MAX_STRING_CHARS).collect();
+                bounded.push_str("\n… live output truncated; full output is stored in Run history");
+                *text = bounded;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let original_len = items.len();
+            items.truncate(MAX_ARRAY_ITEMS);
+            for item in items.iter_mut() {
+                bound_live_value(item);
+            }
+            if original_len > MAX_ARRAY_ITEMS {
+                items.push(serde_json::Value::String(format!(
+                    "… {} additional items hidden from live output",
+                    original_len - MAX_ARRAY_ITEMS
+                )));
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for item in fields.values_mut() {
+                bound_live_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+const COLUMNS: &str = "id, project, name, enabled, handler_key, agent_config_json,
+     task_mode, task_id, task_template, session_mode, chat_id, session_template, prompt, schedule_cron,
+     event_triggers_json,
      last_run_at, last_run_status, last_run_error, next_run_at, created_at, updated_at";
 
 fn row_to_automation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Automation> {
-    let task_template: Option<String> = row.get(6)?;
-    let session_template: Option<String> = row.get(9)?;
+    let agent_config_json: String = row.get(5)?;
+    let task_template: Option<String> = row.get(8)?;
+    let session_template: Option<String> = row.get(11)?;
+    let event_triggers_json: String = row.get(14)?;
     let enabled: i64 = row.get(3)?;
-    let task_mode: String = row.get(4)?;
-    let session_mode: String = row.get(7)?;
+    let task_mode: String = row.get(6)?;
+    let session_mode: String = row.get(9)?;
     Ok(Automation {
         id: row.get(0)?,
         project: row.get(1)?,
         name: row.get(2)?,
         enabled: enabled != 0,
+        handler_key: row.get(4)?,
+        agent_config: serde_json::from_str(&agent_config_json).unwrap_or_default(),
         task_mode: TargetMode::parse(&task_mode),
-        task_id: row.get(5)?,
+        task_id: row.get(7)?,
         task_template: task_template
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok()),
         session_mode: TargetMode::parse(&session_mode),
-        chat_id: row.get(8)?,
+        chat_id: row.get(10)?,
         session_template: session_template
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok()),
-        prompt: row.get(10)?,
-        schedule_cron: row.get(11)?,
-        last_run_at: row.get(12)?,
-        last_run_status: row.get(13)?,
-        last_run_error: row.get(14)?,
-        next_run_at: row.get(15)?,
-        created_at: row.get(16)?,
-        updated_at: row.get(17)?,
+        prompt: row.get(12)?,
+        schedule_cron: row.get(13)?,
+        event_triggers: serde_json::from_str(&event_triggers_json).unwrap_or_default(),
+        last_run_at: row.get(15)?,
+        last_run_status: row.get(16)?,
+        last_run_error: row.get(17)?,
+        next_run_at: row.get(18)?,
+        created_at: row.get(19)?,
+        updated_at: row.get(20)?,
     })
 }
 
@@ -184,16 +315,22 @@ pub fn get(id: &str) -> Result<Option<Automation>> {
 
 pub fn insert(a: &Automation) -> Result<()> {
     let conn = super::database::connection();
+    insert_on(&conn, a)
+}
+
+pub(crate) fn insert_on(conn: &rusqlite::Connection, a: &Automation) -> Result<()> {
     conn.execute(
         &format!(
             "INSERT INTO automations ({COLUMNS})
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)"
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)"
         ),
         params![
             a.id,
             a.project,
             a.name,
             a.enabled as i64,
+            a.handler_key,
+            serde_json::to_string(&a.agent_config)?,
             a.task_mode.as_str(),
             a.task_id,
             a.task_template
@@ -206,6 +343,7 @@ pub fn insert(a: &Automation) -> Result<()> {
                 .map(|t| serde_json::to_string(t).unwrap_or_default()),
             a.prompt,
             a.schedule_cron,
+            serde_json::to_string(&a.event_triggers)?,
             a.last_run_at,
             a.last_run_status,
             a.last_run_error,
@@ -219,15 +357,22 @@ pub fn insert(a: &Automation) -> Result<()> {
 
 pub fn update(a: &Automation) -> Result<()> {
     let conn = super::database::connection();
+    update_on(&conn, a)
+}
+
+pub(crate) fn update_on(conn: &rusqlite::Connection, a: &Automation) -> Result<()> {
     conn.execute(
         "UPDATE automations SET
-            name=?1, enabled=?2, task_mode=?3, task_id=?4, task_template=?5,
-            session_mode=?6, chat_id=?7, session_template=?8, prompt=?9,
-            schedule_cron=?10, next_run_at=?11, updated_at=?12
-         WHERE id=?13",
+            name=?1, enabled=?2, handler_key=?3, agent_config_json=?4,
+            task_mode=?5, task_id=?6, task_template=?7,
+            session_mode=?8, chat_id=?9, session_template=?10, prompt=?11,
+            schedule_cron=?12, event_triggers_json=?13, next_run_at=?14, updated_at=?15
+         WHERE id=?16",
         params![
             a.name,
             a.enabled as i64,
+            a.handler_key,
+            serde_json::to_string(&a.agent_config)?,
             a.task_mode.as_str(),
             a.task_id,
             a.task_template
@@ -240,6 +385,7 @@ pub fn update(a: &Automation) -> Result<()> {
                 .map(|t| serde_json::to_string(t).unwrap_or_default()),
             a.prompt,
             a.schedule_cron,
+            serde_json::to_string(&a.event_triggers)?,
             a.next_run_at,
             a.updated_at,
             a.id,
@@ -251,12 +397,15 @@ pub fn update(a: &Automation) -> Result<()> {
 pub fn delete(id: &str) -> Result<()> {
     let conn = super::database::connection();
     let tx = conn.unchecked_transaction()?;
+    let artifacts = collect_run_artifacts(&tx, id, false)?;
     tx.execute(
         "DELETE FROM automation_runs WHERE automation_id = ?1",
         params![id],
     )?;
     tx.execute("DELETE FROM automations WHERE id = ?1", params![id])?;
     tx.commit()?;
+    drop(conn);
+    cleanup_run_artifacts(artifacts);
     Ok(())
 }
 
@@ -315,27 +464,124 @@ pub fn load_due(now: i64) -> Result<Vec<Automation>> {
 /// the response was clipped without pulling chat history.
 pub const AGENT_RESPONSE_MAX_BYTES: usize = 16 * 1024;
 
-const RUN_COLUMNS: &str = "id, automation_id, trigger_kind, prompt_snapshot, agent_snapshot,
-     resolved_task_id, resolved_chat_id, triggered_at, queued_at, completed_at,
-     status, phase, error, agent_response";
+const RUN_COLUMNS: &str = "id, automation_id, trigger_kind, trigger_payload_json,
+     prompt_snapshot, agent_snapshot, agent_config_snapshot_json, input_json, execution_scope,
+     resolved_task_id, resolved_chat_id, triggered_at, queued_at, started_at, completed_at,
+     status, phase, error, agent_response, result_json";
 
 fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRun> {
+    let trigger_payload: Option<String> = row.get(3)?;
+    let agent_config_json: String = row.get(6)?;
+    let input_json: String = row.get(7)?;
+    let result_json: Option<String> = row.get(19)?;
     Ok(AutomationRun {
         id: row.get(0)?,
         automation_id: row.get(1)?,
         trigger_kind: row.get(2)?,
-        prompt_snapshot: row.get(3)?,
-        agent_snapshot: row.get(4)?,
-        resolved_task_id: row.get(5)?,
-        resolved_chat_id: row.get(6)?,
-        triggered_at: row.get(7)?,
-        queued_at: row.get(8)?,
-        completed_at: row.get(9)?,
-        status: row.get(10)?,
-        phase: row.get(11)?,
-        error: row.get(12)?,
-        agent_response: row.get(13)?,
+        trigger_payload: trigger_payload.and_then(|value| serde_json::from_str(&value).ok()),
+        prompt_snapshot: row.get(4)?,
+        agent_snapshot: row.get(5)?,
+        agent_config_snapshot: serde_json::from_str(&agent_config_json).unwrap_or_default(),
+        input: serde_json::from_str(&input_json).unwrap_or_else(|_| serde_json::json!({})),
+        execution_scope: row.get(8)?,
+        resolved_task_id: row.get(9)?,
+        resolved_chat_id: row.get(10)?,
+        triggered_at: row.get(11)?,
+        queued_at: row.get(12)?,
+        started_at: row.get(13)?,
+        completed_at: row.get(14)?,
+        status: row.get(15)?,
+        phase: row.get(16)?,
+        error: row.get(17)?,
+        agent_response: row.get(18)?,
+        result: result_json.and_then(|value| serde_json::from_str(&value).ok()),
     })
+}
+
+#[derive(Debug, Clone)]
+pub enum RunClaim {
+    Created(String),
+    Existing(Box<AutomationRun>),
+}
+
+/// Atomically claim one Automation execution.
+///
+/// SQLite access is serialized through Grove's shared connection, and the
+/// active-run lookup plus insert live in one transaction. `single_flight`
+/// therefore prevents manual, scheduled and event triggers from starting the
+/// same Automation concurrently without a Memory-specific lock or table.
+#[allow(clippy::too_many_arguments)]
+pub fn claim_run(
+    automation_id: &str,
+    trigger_kind: &str,
+    trigger_payload: Option<&serde_json::Value>,
+    prompt_snapshot: &str,
+    agent_snapshot: Option<&str>,
+    agent_config_snapshot: &AgentConfigSelection,
+    input: &serde_json::Value,
+    execution_scope: &str,
+    triggered_at: i64,
+    single_flight: bool,
+) -> Result<RunClaim> {
+    let id = format!("arun-{}", uuid::Uuid::new_v4().simple());
+    let conn = super::database::connection();
+    let tx = conn.unchecked_transaction()?;
+    if single_flight {
+        let existing = tx
+            .query_row(
+                &format!(
+                    "SELECT {RUN_COLUMNS} FROM automation_runs
+                     WHERE automation_id = ?1 AND status IN ('queued','running','cancelling')
+                     ORDER BY triggered_at DESC LIMIT 1"
+                ),
+                params![automation_id],
+                row_to_run,
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            tx.commit()?;
+            return Ok(RunClaim::Existing(Box::new(existing)));
+        }
+    }
+    tx.execute(
+        "INSERT INTO automation_runs
+         (id, automation_id, trigger_kind, trigger_payload_json,
+          prompt_snapshot, agent_snapshot, agent_config_snapshot_json, input_json, execution_scope,
+          resolved_task_id, resolved_chat_id, triggered_at, queued_at, started_at, completed_at,
+          status, phase, error, agent_response, result_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9, NULL, NULL, ?10, NULL, NULL, NULL,
+                 'queued', NULL, NULL, NULL, NULL)",
+        params![
+            id,
+            automation_id,
+            trigger_kind,
+            trigger_payload.map(serde_json::to_string).transpose()?,
+            prompt_snapshot,
+            agent_snapshot,
+            serde_json::to_string(agent_config_snapshot)?,
+            serde_json::to_string(input)?,
+            execution_scope,
+            triggered_at,
+        ],
+    )?;
+    tx.commit()?;
+    drop(conn);
+    publish_run_update(&id);
+    Ok(RunClaim::Created(id))
+}
+
+pub fn update_run_input(run_id: &str, input: &serde_json::Value) -> Result<bool> {
+    let conn = super::database::connection();
+    let changed = conn.execute(
+        "UPDATE automation_runs SET input_json = ?1
+         WHERE id = ?2 AND status IN ('queued','running')",
+        params![serde_json::to_string(input)?, run_id],
+    )? > 0;
+    drop(conn);
+    if changed {
+        publish_run_update(run_id);
+    }
+    Ok(changed)
 }
 
 /// Insert a fresh run in `queued` state. Done before queue_message so the
@@ -345,27 +591,39 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRun> {
 pub fn insert_run(
     automation_id: &str,
     trigger_kind: &str,
+    trigger_payload: Option<&serde_json::Value>,
     prompt_snapshot: &str,
     agent_snapshot: Option<&str>,
+    agent_config_snapshot: &AgentConfigSelection,
+    input: &serde_json::Value,
+    execution_scope: &str,
     triggered_at: i64,
 ) -> Result<String> {
     let id = format!("arun-{}", uuid::Uuid::new_v4().simple());
     let conn = super::database::connection();
     conn.execute(
         "INSERT INTO automation_runs
-         (id, automation_id, trigger_kind, prompt_snapshot, agent_snapshot,
-          resolved_task_id, resolved_chat_id, triggered_at, queued_at, completed_at,
-          status, phase, error, agent_response)
-         VALUES (?1,?2,?3,?4,?5, NULL, NULL, ?6, NULL, NULL, 'queued', NULL, NULL, NULL)",
+         (id, automation_id, trigger_kind, trigger_payload_json,
+          prompt_snapshot, agent_snapshot, agent_config_snapshot_json, input_json, execution_scope,
+          resolved_task_id, resolved_chat_id, triggered_at, queued_at, started_at, completed_at,
+          status, phase, error, agent_response, result_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9, NULL, NULL, ?10, NULL, NULL, NULL,
+                 'queued', NULL, NULL, NULL, NULL)",
         params![
             id,
             automation_id,
             trigger_kind,
+            trigger_payload.map(serde_json::to_string).transpose()?,
             prompt_snapshot,
             agent_snapshot,
+            serde_json::to_string(agent_config_snapshot)?,
+            serde_json::to_string(input)?,
+            execution_scope,
             triggered_at,
         ],
     )?;
+    drop(conn);
+    publish_run_update(&id);
     Ok(id)
 }
 
@@ -388,6 +646,8 @@ pub fn mark_run_resolved(
          WHERE id = ?3",
         params![resolved_task_id, resolved_chat_id, run_id],
     )?;
+    drop(conn);
+    publish_run_update(run_id);
     Ok(())
 }
 
@@ -405,6 +665,8 @@ pub fn mark_run_queued(run_id: &str, queued_at: i64) -> Result<()> {
          WHERE id = ?2 AND status IN ('queued','running')",
         params![queued_at, run_id],
     )?;
+    drop(conn);
+    publish_run_update(run_id);
     Ok(())
 }
 
@@ -414,11 +676,50 @@ pub fn mark_run_queued(run_id: &str, queued_at: i64) -> Result<()> {
 pub fn mark_run_running(run_id: &str) -> Result<()> {
     let conn = super::database::connection();
     conn.execute(
-        "UPDATE automation_runs SET status = 'running'
+        "UPDATE automation_runs SET status = 'running', started_at = COALESCE(started_at, ?2)
          WHERE id = ?1 AND status = 'queued'",
-        params![run_id],
+        params![run_id, chrono::Utc::now().timestamp()],
     )?;
+    drop(conn);
+    publish_run_update(run_id);
     Ok(())
+}
+
+pub fn complete_consumer_run<T, F>(run_id: &str, completed_at: i64, publish: F) -> Result<Option<T>>
+where
+    F: FnOnce(&rusqlite::Transaction<'_>) -> Result<(T, serde_json::Value)>,
+{
+    let conn = super::database::connection();
+    let tx = conn.unchecked_transaction()?;
+    let active: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM automation_runs WHERE id = ?1 AND status = 'running')",
+        params![run_id],
+        |row| row.get(0),
+    )?;
+    if !active {
+        tx.commit()?;
+        return Ok(None);
+    }
+    let (value, result) = publish(&tx)?;
+    let changed = tx.execute(
+        "UPDATE automation_runs
+         SET completed_at = ?1, status = 'success', result_json = ?2
+         WHERE id = ?3 AND status = 'running'",
+        params![completed_at, serde_json::to_string(&result)?, run_id],
+    )?;
+    let trimmed = if changed > 0 {
+        refresh_last_run_from(&tx, run_id)?;
+        trim_history(&tx, run_id)?
+    } else {
+        Vec::new()
+    };
+    tx.commit()?;
+    drop(conn);
+    cleanup_run_artifacts(trimmed);
+    if changed > 0 {
+        publish_run_update(run_id);
+    }
+    Ok((changed > 0).then_some(value))
 }
 
 /// Terminal success — agent completed the prompt. `agent_response` is the
@@ -443,8 +744,11 @@ pub fn mark_run_completed(
         params![completed_at, agent_response, run_id],
     )?;
     refresh_last_run_from(&tx, run_id)?;
-    trim_history(&tx, run_id)?;
+    let trimmed = trim_history(&tx, run_id)?;
     tx.commit()?;
+    drop(conn);
+    cleanup_run_artifacts(trimmed);
+    publish_run_update(run_id);
     Ok(())
 }
 
@@ -459,25 +763,32 @@ pub fn mark_run_completed(
 pub fn mark_run_cancelled(run_id: &str, completed_at: i64, reason: &str) -> Result<()> {
     let conn = super::database::connection();
     let tx = conn.unchecked_transaction()?;
-    tx.execute(
+    let changed = tx.execute(
         "UPDATE automation_runs
          SET status = 'cancelled', completed_at = ?1, error = ?2
          WHERE id = ?3 AND status IN ('queued','running')",
         params![completed_at, reason, run_id],
-    )?;
-    refresh_last_run_from(&tx, run_id)?;
-    trim_history(&tx, run_id)?;
+    )? > 0;
+    let trimmed = if changed {
+        refresh_last_run_from(&tx, run_id)?;
+        trim_history(&tx, run_id)?
+    } else {
+        Vec::new()
+    };
     tx.commit()?;
+    drop(conn);
+    cleanup_run_artifacts(trimmed);
+    if changed {
+        publish_run_update(run_id);
+    }
     Ok(())
 }
 
-/// Atomic claim-and-cancel. Returns the *prior* status (`"queued"` or
-/// `"running"`) if this call was the one that transitioned the row to
-/// `cancelled`, or `None` if the row was already terminal (or didn't
-/// exist). Caller uses the prior status to decide which ACP side-effect
-/// to fire — dequeue (queued) vs cancel turn (running) — without a TOCTOU
-/// window between the read and write.
-pub fn claim_cancel(run_id: &str, completed_at: i64, reason: &str) -> Result<Option<String>> {
+/// Atomically reserve cancellation. Returns the prior active status and moves
+/// the row to `cancelling`, which remains part of the Single Flight window.
+/// The caller performs ACP cancellation and handler cleanup, then calls
+/// [`finish_cancel`] to release the flight by making the row terminal.
+pub fn claim_cancel(run_id: &str, reason: &str) -> Result<Option<String>> {
     let conn = super::database::connection();
     let tx = conn.unchecked_transaction()?;
     let prior: Option<String> = tx
@@ -491,15 +802,40 @@ pub fn claim_cancel(run_id: &str, completed_at: i64, reason: &str) -> Result<Opt
     if prior.is_some() {
         tx.execute(
             "UPDATE automation_runs
-             SET status = 'cancelled', completed_at = ?1, error = ?2
-             WHERE id = ?3",
-            params![completed_at, reason, run_id],
+             SET status = 'cancelling', error = ?1
+             WHERE id = ?2 AND status IN ('queued','running')",
+            params![reason, run_id],
         )?;
-        refresh_last_run_from(&tx, run_id)?;
-        trim_history(&tx, run_id)?;
     }
     tx.commit()?;
     Ok(prior)
+}
+
+/// Complete a previously claimed cancellation after ACP and business abort
+/// cleanup have both finished. This is the point where Single Flight is
+/// released and another trigger may start a new execution.
+pub fn finish_cancel(run_id: &str, completed_at: i64, reason: &str) -> Result<bool> {
+    let conn = super::database::connection();
+    let tx = conn.unchecked_transaction()?;
+    let changed = tx.execute(
+        "UPDATE automation_runs
+         SET status = 'cancelled', completed_at = ?1, error = ?2
+         WHERE id = ?3 AND status = 'cancelling'",
+        params![completed_at, reason, run_id],
+    )? > 0;
+    let trimmed = if changed {
+        refresh_last_run_from(&tx, run_id)?;
+        trim_history(&tx, run_id)?
+    } else {
+        Vec::new()
+    };
+    tx.commit()?;
+    drop(conn);
+    cleanup_run_artifacts(trimmed);
+    if changed {
+        publish_run_update(run_id);
+    }
+    Ok(changed)
 }
 
 /// Terminal failure — set status, phase, and error. `completed_at` is filled
@@ -516,8 +852,11 @@ pub fn mark_run_failed(run_id: &str, completed_at: i64, phase: &str, error: &str
         params![completed_at, phase, error, run_id],
     )?;
     refresh_last_run_from(&tx, run_id)?;
-    trim_history(&tx, run_id)?;
+    let trimmed = trim_history(&tx, run_id)?;
     tx.commit()?;
+    drop(conn);
+    cleanup_run_artifacts(trimmed);
+    publish_run_update(run_id);
     Ok(())
 }
 
@@ -539,12 +878,15 @@ pub fn mark_run_timeout(
         params![completed_at, agent_response, run_id],
     )?;
     refresh_last_run_from(&tx, run_id)?;
-    trim_history(&tx, run_id)?;
+    let trimmed = trim_history(&tx, run_id)?;
     tx.commit()?;
+    drop(conn);
+    cleanup_run_artifacts(trimmed);
+    publish_run_update(run_id);
     Ok(())
 }
 
-/// Startup sweep: any row stuck in `queued` **or `running`** belongs to a
+/// Startup sweep: any row stuck in an active state belongs to a
 /// previous Grove process that died with the watcher subscriber still in
 /// flight. We can't recover that subscriber, so mark the row `interrupted`
 /// and propagate to the parent automation's `last_run_*` columns so the
@@ -558,14 +900,16 @@ pub fn sweep_interrupted_runs(now: i64) -> Result<usize> {
     // last_run snapshot after the bulk UPDATE. SQLite can't `RETURNING` in
     // older versions and the rusqlite API we use here is simpler with a
     // pre-scan.
-    let ids: Vec<String> = {
-        let mut stmt =
-            tx.prepare("SELECT id FROM automation_runs WHERE status IN ('queued','running')")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let affected: Vec<(String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, automation_id FROM automation_runs
+             WHERE status IN ('queued','running','cancelling')",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
-    if ids.is_empty() {
+    if affected.is_empty() {
         tx.commit()?;
         return Ok(0);
     }
@@ -574,19 +918,33 @@ pub fn sweep_interrupted_runs(now: i64) -> Result<usize> {
         "UPDATE automation_runs
          SET status = 'interrupted', completed_at = COALESCE(completed_at, ?1),
              error = 'Grove process exited before agent reported completion'
-         WHERE status IN ('queued','running')",
+         WHERE status IN ('queued','running','cancelling')",
         params![now],
     )?;
 
     // Propagate to each affected parent. Without this, an automation that
     // died mid-run keeps its parent's `last_run_status` at the stale
     // `queued` / `running` value until the next run completes.
-    for id in &ids {
+    for (id, _) in &affected {
         refresh_last_run_from(&tx, id)?;
     }
 
+    let automation_ids = affected
+        .iter()
+        .map(|(_, automation_id)| automation_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut trimmed = Vec::new();
+    for automation_id in automation_ids {
+        trimmed.extend(trim_automation_history(&tx, automation_id)?);
+    }
+
     tx.commit()?;
-    Ok(ids.len())
+    drop(conn);
+    cleanup_run_artifacts(trimmed);
+    for (id, _) in &affected {
+        publish_run_update(id);
+    }
+    Ok(affected.len())
 }
 
 /// Reflect the **latest** run's status / time onto the parent automation row
@@ -627,18 +985,86 @@ fn refresh_last_run_from(tx: &rusqlite::Transaction<'_>, run_id: &str) -> Result
 /// Keep at most 100 rows per automation. Runs older than the cutoff are
 /// dropped. Called from every terminal-state writer so the table never
 /// grows unbounded for a project that runs an hourly automation for years.
-fn trim_history(tx: &rusqlite::Transaction<'_>, run_id: &str) -> Result<()> {
+#[derive(Debug)]
+struct RunArtifact {
+    run_id: String,
+    project_id: String,
+    handler_key: String,
+}
+
+fn collect_run_artifacts(
+    tx: &rusqlite::Transaction<'_>,
+    automation_id: &str,
+    only_trimmed: bool,
+) -> Result<Vec<RunArtifact>> {
+    let mut sql = "SELECT r.id, a.project, a.handler_key
+                   FROM automation_runs r
+                   JOIN automations a ON a.id = r.automation_id
+                   WHERE r.automation_id = ?1"
+        .to_string();
+    if only_trimmed {
+        sql.push_str(
+            " AND r.status NOT IN ('queued','running','cancelling')
+              AND r.id NOT IN (
+                SELECT id FROM automation_runs
+                WHERE automation_id = ?1 AND status NOT IN ('queued','running','cancelling')
+                ORDER BY triggered_at DESC, rowid DESC LIMIT 100
+              )",
+        );
+    }
+    let mut stmt = tx.prepare(&sql)?;
+    let rows = stmt.query_map(params![automation_id], |row| {
+        Ok(RunArtifact {
+            run_id: row.get(0)?,
+            project_id: row.get(1)?,
+            handler_key: row.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn cleanup_run_artifacts(artifacts: Vec<RunArtifact>) {
+    for artifact in artifacts {
+        if let Err(error) = crate::automation::consumer::remove_run_artifacts(
+            &artifact.handler_key,
+            &artifact.project_id,
+            &artifact.run_id,
+        ) {
+            crate::automation::awarn!(
+                "remove artifacts for Automation Run {}: {}",
+                artifact.run_id,
+                error
+            );
+        }
+    }
+}
+
+fn trim_history(tx: &rusqlite::Transaction<'_>, run_id: &str) -> Result<Vec<RunArtifact>> {
+    let automation_id: String = tx.query_row(
+        "SELECT automation_id FROM automation_runs WHERE id = ?1",
+        params![run_id],
+        |row| row.get(0),
+    )?;
+    trim_automation_history(tx, &automation_id)
+}
+
+fn trim_automation_history(
+    tx: &rusqlite::Transaction<'_>,
+    automation_id: &str,
+) -> Result<Vec<RunArtifact>> {
+    let artifacts = collect_run_artifacts(tx, automation_id, true)?;
     tx.execute(
         "DELETE FROM automation_runs
-         WHERE automation_id = (SELECT automation_id FROM automation_runs WHERE id = ?1)
+         WHERE automation_id = ?1
+           AND status NOT IN ('queued','running','cancelling')
            AND id NOT IN (
                SELECT id FROM automation_runs
-               WHERE automation_id = (SELECT automation_id FROM automation_runs WHERE id = ?1)
-               ORDER BY triggered_at DESC LIMIT 100
+               WHERE automation_id = ?1 AND status NOT IN ('queued','running','cancelling')
+               ORDER BY triggered_at DESC, rowid DESC LIMIT 100
            )",
-        params![run_id],
+        params![automation_id],
     )?;
-    Ok(())
+    Ok(artifacts)
 }
 
 pub fn get_run(run_id: &str) -> Result<Option<AutomationRun>> {
@@ -664,6 +1090,151 @@ pub fn list_runs(automation_id: &str, limit: usize) -> Result<Vec<AutomationRun>
         .query_map(params![automation_id, limit as i64], row_to_run)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+pub fn has_active_run(automation_id: &str) -> Result<bool> {
+    let conn = super::database::connection();
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM automation_runs
+            WHERE automation_id = ?1 AND status IN ('queued','running','cancelling')
+         )",
+        params![automation_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Delete one terminal Automation Run and its usage/artifacts. Active runs
+/// must go through cancellation so their executor cannot write into a row
+/// that disappeared underneath it.
+pub fn delete_finished_run(automation_id: &str, run_id: &str) -> Result<bool> {
+    let conn = super::database::connection();
+    let tx = conn.unchecked_transaction()?;
+    let artifact = tx
+        .query_row(
+            "SELECT r.id, a.project, a.handler_key, r.status
+             FROM automation_runs r
+             JOIN automations a ON a.id = r.automation_id
+             WHERE r.automation_id = ?1 AND r.id = ?2",
+            params![automation_id, run_id],
+            |row| {
+                Ok((
+                    RunArtifact {
+                        run_id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        handler_key: row.get(2)?,
+                    },
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((artifact, status)) = artifact else {
+        return Ok(false);
+    };
+    if matches!(status.as_str(), "queued" | "running" | "cancelling") {
+        return Err(crate::error::GroveError::invalid_data(
+            "active Automation Runs must be cancelled before deletion",
+        ));
+    }
+
+    // Older databases derived the Memory input checkpoint from the latest
+    // successful Run. Preserve that durable cursor before allowing history
+    // deletion, otherwise removing the newest success could replay old chats.
+    let checkpoint_input: Option<String> = tx
+        .query_row(
+            "SELECT input_json FROM automation_runs
+             WHERE automation_id = ?1 AND execution_scope = 'project_run'
+               AND status = 'success'
+             ORDER BY completed_at DESC, triggered_at DESC, rowid DESC LIMIT 1",
+            params![automation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(input_through_at) = checkpoint_input
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|value| {
+            value
+                .get("input_through_at")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+    {
+        tx.execute(
+            "UPDATE memory_project_configs
+             SET last_input_through_at = COALESCE(last_input_through_at, ?1),
+                 updated_at = ?2
+             WHERE organization_automation_id = ?3
+               AND last_input_through_at IS NULL",
+            params![
+                input_through_at,
+                chrono::Utc::now().to_rfc3339(),
+                automation_id
+            ],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM chat_token_usage WHERE automation_run_id = ?1",
+        params![run_id],
+    )?;
+    tx.execute(
+        "DELETE FROM automation_runs WHERE automation_id = ?1 AND id = ?2",
+        params![automation_id, run_id],
+    )?;
+    tx.execute(
+        "UPDATE automations
+         SET last_run_at = (
+                 SELECT COALESCE(completed_at, queued_at, triggered_at)
+                 FROM automation_runs
+                 WHERE automation_id = ?1
+                 ORDER BY triggered_at DESC, rowid DESC LIMIT 1
+             ),
+             last_run_status = (
+                 SELECT status FROM automation_runs
+                 WHERE automation_id = ?1
+                 ORDER BY triggered_at DESC, rowid DESC LIMIT 1
+             ),
+             last_run_error = (
+                 SELECT error FROM automation_runs
+                 WHERE automation_id = ?1
+                 ORDER BY triggered_at DESC, rowid DESC LIMIT 1
+             ),
+             updated_at = strftime('%s','now')
+         WHERE id = ?1",
+        params![automation_id],
+    )?;
+    tx.commit()?;
+    drop(conn);
+    cleanup_run_artifacts(vec![artifact]);
+    Ok(true)
+}
+
+/// Input upper-bound from the latest successfully published project Run.
+/// Consumers use this as the next Run's exclusive lower-bound; failed or
+/// interrupted runs never advance the input window.
+pub fn latest_successful_input_through(automation_id: &str) -> Result<Option<String>> {
+    let conn = super::database::connection();
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT input_json FROM automation_runs
+             WHERE automation_id = ?1 AND execution_scope = 'project_run'
+               AND status = 'success'
+             ORDER BY completed_at DESC, triggered_at DESC LIMIT 1",
+            params![automation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(raw
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|value| {
+            value
+                .get("input_through_at")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        }))
 }
 
 pub fn generate_id() -> String {

@@ -68,6 +68,10 @@ pub struct AcpSessionHandle {
     task_id: String,
     /// Chat ID（磁盘持久化必需）
     chat_id: Option<String>,
+    /// Non-Task session artifact directory used by Automation consumers.
+    artifact_dir: Option<PathBuf>,
+    /// Canonical installed-agent id used to refresh its capability snapshot.
+    configured_agent_id: String,
     /// load_session 期间抑制 emit（只恢复 agent 内部状态，不转发回放通知）
     suppress_emit: std::sync::atomic::AtomicBool,
     /// Import 的 session/load 回放需要保留 Agent 发回的用户消息。普通会话
@@ -862,6 +866,11 @@ pub struct QueuedConfig {
     /// Config option id for thought-level（agent 自定义，e.g. "effort_level"）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thought_level_config_id: Option<String>,
+    /// Arbitrary ACP v1 Session Config Options keyed by the agent-advertised
+    /// SessionConfigId. String values are Select value ids; booleans are
+    /// Boolean config values. Applied in the agent-advertised option order.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub config_options: std::collections::BTreeMap<String, ConfigOptionValue>,
 }
 
 /// 队列中的待发送消息（支持附件）
@@ -1005,6 +1014,124 @@ pub enum SessionAccess {
 }
 
 /// ACP 启动配置
+#[derive(Debug, Clone)]
+pub struct LoopbackMcpServer {
+    pub name: String,
+    pub url: String,
+    pub route: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpServerPolicy {
+    /// Grove's normal working-session MCPs plus any explicitly supplied servers.
+    WorkingSession,
+    /// Only the servers explicitly supplied by the caller.
+    ExplicitOnly,
+}
+
+const WORKING_GROVE_INSTRUCTION: &str = r#"You are a Working Agent running inside Grove.
+
+Use the current Project as durable shared context and the current Task as the execution boundary for this work. Read Task notes before substantive work.
+
+Use Grove capabilities when they materially improve the result. Do not complete, merge, archive, or otherwise finalize the Task unless the user explicitly requests it."#;
+
+const WORKING_AGENT_RUNTIME_INSTRUCTION: &str = r#"At the start of a new Session, understand the user's primary intent, then use `set_title` to give the Session a concise, descriptive title. Update it only when the primary intent materially changes.
+
+Use `graph_contacts` to understand reachable or spawnable Sessions. Use `graph_spawn` only for concrete, independently executable work, and use `graph_send` or `graph_reply` to coordinate existing work. Use `ask_form` when several structured decisions need to be collected together."#;
+
+const WORKING_CODING_INSTRUCTION: &str = r#"This is a Coding Task in an isolated working tree. Inspect Grove review feedback when continuing or reviewing an existing change."#;
+
+const WORKING_STUDIO_INSTRUCTION: &str = r#"This is a Studio Task. Follow the workspace contract in the local `AGENTS.md` and the project guidance in `instructions.md`. Use Grove Sketch capabilities when visual collaboration is more useful than a textual description."#;
+
+const WORKING_BROWSER_INSTRUCTION: &str = r#"Grove Browser Control is enabled. Use it when the work depends on the user's current browser state or requires visible browser interaction."#;
+
+const WORKING_MEMORY_INSTRUCTION: &str = r#"Project Memory is enabled. Use `memory_recall` when earlier Project decisions, preferences, non-obvious facts, or reusable conventions may affect the current work. Recall returns summaries: use `memory_read` before relying on a Memory's full contents. It also returns a few related summaries; follow a useful connection with `memory_read` and its Relation id, or use `memory_get_related` to explore further. Use `memory_get_recent_logs` when the latest unorganized observations may matter, and treat those Logs as short-term evidence rather than established knowledge.
+
+When the current work establishes durable Project knowledge, use `memory_append_log` to preserve it with a concise title, relevant tags, and enough description for later organization. Do not record transient progress, guesses, or details useful only to the current Task."#;
+
+const MEMORY_ORGANIZATION_INSTRUCTION: &str = r#"You are Grove's Project Memory Organizer. Your only Grove MCP server is `grove_memory`. Use it to discover pending Memory Logs, recent Chats, the managed Entity directory, and Relations. Native filesystem tools may read and edit Markdown only inside the managed Entity directory returned by Grove. Create and delete Entities through `grove_memory`, and keep durable Project knowledge concise. Use structured Tag objects and integer Entity/Relation base scores from 0 through 80 inclusive. Submit Relation operations as JSON objects, not JSON-encoded strings. Before completing a successful Run, call `memory_mark_organization_finished` once to submit the final summary and Entity base scores. Grove publishes that submission only after your Session completes successfully; a plain text response alone does not publish the Run."#;
+
+fn working_project_kind_instruction(project_key: &str) -> Option<&'static str> {
+    crate::storage::workspace::load_project_by_hash(project_key)
+        .ok()
+        .flatten()
+        .map(|project| match project.project_type {
+            crate::storage::workspace::ProjectType::Studio => WORKING_STUDIO_INSTRUCTION,
+            crate::storage::workspace::ProjectType::Repo => WORKING_CODING_INSTRUCTION,
+        })
+}
+
+fn build_working_session_instruction(
+    config: &AcpStartConfig,
+    agent_runtime_available: bool,
+) -> String {
+    let mut grove_sections = vec![WORKING_GROVE_INSTRUCTION];
+    if let Some(task_kind) = working_project_kind_instruction(&config.project_key) {
+        grove_sections.push(task_kind);
+    }
+    if agent_runtime_available {
+        grove_sections.push(WORKING_AGENT_RUNTIME_INSTRUCTION);
+        if crate::storage::config::load_config()
+            .browser_control
+            .enabled
+        {
+            grove_sections.push(WORKING_BROWSER_INSTRUCTION);
+        }
+        if crate::storage::memory::project_memory_enabled(&config.project_key).unwrap_or(false) {
+            grove_sections.push(WORKING_MEMORY_INSTRUCTION);
+        }
+    }
+
+    let mut instruction = format!(
+        "<grove-instructions>\n{}\n</grove-instructions>",
+        grove_sections.join("\n\n")
+    );
+    if let Some(persona) = config.persona_injection.as_ref() {
+        if !persona.system_prompt.trim().is_empty() {
+            instruction.push_str("\n\n");
+            instruction.push_str(&crate::agent_graph::inject::build_persona_instruction(
+                &persona.persona_name,
+                &persona.system_prompt,
+            ));
+        }
+    }
+    instruction
+}
+
+fn session_bootstrap_instruction(
+    config: &AcpStartConfig,
+    agent_runtime_available: bool,
+) -> Option<(&'static str, String)> {
+    if config.mcp_server_policy == McpServerPolicy::WorkingSession && config.chat_id.is_some() {
+        return Some((
+            "working_session",
+            build_working_session_instruction(config, agent_runtime_available),
+        ));
+    }
+    if config
+        .additional_mcp_servers
+        .iter()
+        .any(|server| server.name == "grove_memory")
+    {
+        return Some((
+            "memory_organization",
+            MEMORY_ORGANIZATION_INSTRUCTION.to_string(),
+        ));
+    }
+    if let Some(persona) = config.persona_injection.as_ref() {
+        if !persona.system_prompt.trim().is_empty() {
+            return Some((
+                "persona",
+                crate::agent_graph::inject::build_persona_instruction(
+                    &persona.persona_name,
+                    &persona.system_prompt,
+                ),
+            ));
+        }
+    }
+    None
+}
+
 pub struct AcpStartConfig {
     pub agent_command: String,
     /// Agent logical name — used for adapter routing.
@@ -1018,6 +1145,15 @@ pub struct AcpStartConfig {
     pub task_id: String,
     /// Chat ID（multi-chat 支持，为空时使用旧的 task 级 session_id）
     pub chat_id: Option<String>,
+    /// Optional non-Task artifact directory. Automation consumers use this
+    /// for history.jsonl, session.json and agent.log while retaining the same
+    /// ACP lifecycle implementation as Task chats.
+    pub artifact_dir: Option<PathBuf>,
+    /// Additional loopback MCP servers supplied by an Automation consumer.
+    pub additional_mcp_servers: Vec<LoopbackMcpServer>,
+    /// Controls whether Grove's normal working-session MCPs and plugin MCPs are
+    /// included alongside `additional_mcp_servers`.
+    pub mcp_server_policy: McpServerPolicy,
     /// Agent 类型: "local" | "remote"
     pub agent_type: String,
     /// Remote WebSocket URL
@@ -1032,26 +1168,27 @@ pub struct AcpStartConfig {
     pub suppress_initial_connecting: bool,
     /// True only for the WebSocket opened directly by the Import action.
     pub import_session: bool,
-    /// Custom Agent (persona) seed: injected as the first prompt on **create**
-    /// path only. Resume / Load paths intentionally skip this — the prompt is
-    /// already in chat history. Wrapped in a `<grove-meta>` envelope of type
-    /// `custom_agent_init` (see `agent_graph::inject::build_custom_agent_init_prompt`).
+    /// Custom Agent (persona) settings and prompt. Settings are applied on the
+    /// fresh create path; the prompt is concatenated with Grove's instructions
+    /// on the first real user request. Resume / Load paths skip both because
+    /// they are already represented by the existing ACP session.
     pub persona_injection: Option<PersonaInjection>,
 }
 
-/// Custom Agent (persona) identity bundle injected once per fresh session.
+/// Custom Agent (persona) identity, preferred ACP settings, and user-authored
+/// instructions applied once per fresh session.
 ///
-/// `model` / `mode` / `effort` are user-typed free-text matched against the
-/// session's `available_models` / `available_modes` / `available_thought_levels`
-/// (case-insensitive: exact id/name first, then substring; first match wins,
-/// no match → keep the agent's default). Applied BEFORE the system prompt is
-/// sent so the persona's chosen settings are in effect from message #1.
+/// `agent_config` is the capability-snapshot-backed selection used by new
+/// clients. The fixed `model` / `mode` / `effort` fields remain as a fallback
+/// for personas created before that schema existed. Configuration is applied
+/// BEFORE the system prompt is sent so it is in effect from message #1.
 #[derive(Debug, Clone)]
 pub struct PersonaInjection {
     pub persona_id: String,
     pub persona_name: String,
     pub base_agent: String,
     pub system_prompt: String,
+    pub agent_config: crate::agent_config::AgentConfigSelection,
     pub model: Option<String>,
     pub mode: Option<String>,
     pub effort: Option<String>,
@@ -1080,11 +1217,9 @@ fn grove_mcp_server(env_vars: &HashMap<String, String>) -> crate::error::Result<
 
 /// Build the `mcp_servers` list for `NewSessionRequest` / `LoadSessionRequest`.
 ///
-/// Always includes the existing stdio `grove mcp` (orchestrator tools). When
-/// `agent_graph_token` is `Some` and the in-process listener is running, also
-/// appends the agent_graph MCP using the Agent's advertised transport: direct
-/// Streamable HTTP when supported, otherwise the mandatory stdio transport
-/// through `grove mcp-bridge`. The exposed tools are identical either way.
+/// Working sessions include the existing stdio `grove mcp`, the task-scoped
+/// `grove_agent` server when available, and installed plugin MCPs. Isolated
+/// consumers receive only their explicitly supplied servers.
 ///
 /// The agent_graph entry is silently skipped when the listener hasn't booted (e.g.
 /// `grove acp` standalone mode, tests). In that case the agent only sees
@@ -1094,48 +1229,95 @@ fn build_mcp_servers(
     env_vars: &HashMap<String, String>,
     agent_graph_token: Option<&str>,
     supports_http: bool,
+    additional: &[LoopbackMcpServer],
+    policy: McpServerPolicy,
 ) -> crate::error::Result<Vec<acp::McpServer>> {
-    let mut servers = vec![grove_mcp_server(env_vars)?];
-    if let Some(token) = agent_graph_token {
-        if let Some(url) = crate::api::handlers::agent_graph_mcp::build_mcp_url(token) {
-            if supports_http {
-                servers.push(acp::McpServer::Http(acp::McpServerHttp::new(
-                    "grove_agent",
-                    url,
-                )));
-            } else {
-                // Stdio is mandatory for every ACP Agent. When Streamable HTTP
-                // is unavailable, expose the same agent_graph service through
-                // Grove's stdio-to-HTTP bridge instead.
-                let exe = std::env::current_exe().map_err(|e| {
-                    crate::error::GroveError::Session(format!(
-                        "Failed to resolve Grove MCP bridge executable: {}",
-                        e
-                    ))
-                })?;
-                let command = exe.canonicalize().unwrap_or(exe);
-                let env = env_vars
-                    .iter()
-                    .filter(|(name, _)| {
-                        matches!(
-                            name.as_str(),
-                            "GROVE_MCP_TOKEN" | "GROVE_MCP_PORT" | "GROVE_MCP_BRIDGE_TIMEOUT_SECS"
-                        )
-                    })
-                    .map(|(name, value)| acp::EnvVariable::new(name.clone(), value.clone()))
-                    .collect();
-                servers.push(acp::McpServer::Stdio(
-                    acp::McpServerStdio::new("grove_agent", command)
-                        .args(vec!["mcp-bridge".to_string()])
-                        .env(env),
-                ));
+    let mut servers = Vec::new();
+    if policy == McpServerPolicy::WorkingSession {
+        servers.push(grove_mcp_server(env_vars)?);
+        if let Some(token) = agent_graph_token {
+            if let Some(url) = crate::api::handlers::agent_graph_mcp::build_mcp_url(token) {
+                if supports_http {
+                    servers.push(acp::McpServer::Http(acp::McpServerHttp::new(
+                        "grove_agent",
+                        url,
+                    )));
+                } else {
+                    // Stdio is mandatory for every ACP Agent. When Streamable HTTP
+                    // is unavailable, expose the same agent_graph service through
+                    // Grove's stdio-to-HTTP bridge instead.
+                    let exe = std::env::current_exe().map_err(|e| {
+                        crate::error::GroveError::Session(format!(
+                            "Failed to resolve Grove MCP bridge executable: {}",
+                            e
+                        ))
+                    })?;
+                    let command = exe.canonicalize().unwrap_or(exe);
+                    let env = env_vars
+                        .iter()
+                        .filter(|(name, _)| {
+                            matches!(
+                                name.as_str(),
+                                "GROVE_MCP_TOKEN"
+                                    | "GROVE_MCP_PORT"
+                                    | "GROVE_MCP_BRIDGE_TIMEOUT_SECS"
+                            )
+                        })
+                        .map(|(name, value)| acp::EnvVariable::new(name.clone(), value.clone()))
+                        .collect();
+                    servers.push(acp::McpServer::Stdio(
+                        acp::McpServerStdio::new("grove_agent", command)
+                            .args(vec![
+                                "mcp-bridge".to_string(),
+                                "--route".to_string(),
+                                "mcp".to_string(),
+                            ])
+                            .env(env),
+                    ));
+                }
             }
         }
     }
-    // Inject stdio MCP servers contributed by installed plugins, forwarding the
-    // task/project context env (so a plugin's MCP server has the same "current
-    // context" the panel gets from host.getInfo).
-    servers.extend(load_plugin_mcp_servers(env_vars));
+    for server in additional {
+        if supports_http {
+            servers.push(acp::McpServer::Http(acp::McpServerHttp::new(
+                server.name.clone(),
+                server.url.clone(),
+            )));
+        } else {
+            let exe = std::env::current_exe().map_err(|error| {
+                crate::error::GroveError::Session(format!(
+                    "Failed to resolve Grove MCP bridge executable: {error}"
+                ))
+            })?;
+            let command = exe.canonicalize().unwrap_or(exe);
+            let env = env_vars
+                .iter()
+                .filter(|(name, _)| {
+                    matches!(
+                        name.as_str(),
+                        "GROVE_MCP_TOKEN" | "GROVE_MCP_PORT" | "GROVE_MCP_BRIDGE_TIMEOUT_SECS"
+                    )
+                })
+                .map(|(name, value)| acp::EnvVariable::new(name.clone(), value.clone()))
+                .collect();
+            servers.push(acp::McpServer::Stdio(
+                acp::McpServerStdio::new(server.name.clone(), command)
+                    .args(vec![
+                        "mcp-bridge".to_string(),
+                        "--route".to_string(),
+                        server.route.clone(),
+                    ])
+                    .env(env),
+            ));
+        }
+    }
+    if policy == McpServerPolicy::WorkingSession {
+        // Inject stdio MCP servers contributed by installed plugins, forwarding the
+        // task/project context env (so a plugin's MCP server has the same "current
+        // context" the panel gets from host.getInfo).
+        servers.extend(load_plugin_mcp_servers(env_vars));
+    }
     Ok(servers)
 }
 
@@ -1656,15 +1838,17 @@ async fn handle_request_permission(
         options: options.clone(),
     });
 
-    notify_acp_event(
-        &state.project_key,
-        &state.task_id,
-        state.chat_id.as_deref(),
-        "Permission Required",
-        &desc,
-        AcpNotificationEvent::PermissionRequired,
-        Some(&options),
-    );
+    if state.chat_id.is_some() {
+        notify_acp_event(
+            &state.project_key,
+            &state.task_id,
+            state.chat_id.as_deref(),
+            "Permission Required",
+            &desc,
+            AcpNotificationEvent::PermissionRequired,
+            Some(&options),
+        );
+    }
 
     tokio::select! {
         result = rx => match result {
@@ -3238,6 +3422,28 @@ fn replace_config_snapshot(
     config_options: Vec<acp::SessionConfigOption>,
 ) {
     store_config_snapshot(handle, &config_options);
+    let mut snapshot =
+        crate::storage::installed_agents::get_capability_snapshot(&handle.configured_agent_id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "agent_id": crate::storage::installed_agents::canonicalize_agent_id(
+                        &handle.configured_agent_id
+                    )
+                })
+            });
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert(
+            "config_options".to_string(),
+            serde_json::to_value(&config_options).unwrap_or_else(|_| serde_json::json!([])),
+        );
+        object.insert("uses_config_options".to_string(), serde_json::json!(true));
+        let _ = crate::storage::installed_agents::save_capability_snapshot(
+            &handle.configured_agent_id,
+            &snapshot,
+        );
+    }
     handle.emit(AcpUpdate::ConfigOptionsUpdate { config_options });
 }
 
@@ -3249,13 +3455,19 @@ fn validated_config_request_value(
     let advertised = handle
         .current_config_options
         .lock()
-        .ok()
-        .and_then(|options| {
-            options
-                .iter()
-                .find(|option| option.id.to_string() == config_id)
-                .cloned()
-        });
+        .map(|options| options.clone())
+        .unwrap_or_default();
+    config_request_value(&advertised, config_id, value)
+}
+
+fn config_request_value(
+    advertised: &[acp::SessionConfigOption],
+    config_id: &str,
+    value: ConfigOptionValue,
+) -> Result<acp::SessionConfigOptionValue, String> {
+    let advertised = advertised
+        .iter()
+        .find(|option| option.id.to_string() == config_id);
     match (advertised.as_ref().map(|option| &option.kind), value) {
         (Some(acp::SessionConfigKind::Select(select)), ConfigOptionValue::Select(value))
             if flatten_select_options(select)
@@ -3777,6 +3989,8 @@ pub async fn get_or_start_session(
                     project_key: config.project_key.clone(),
                     task_id: config.task_id.clone(),
                     chat_id: config.chat_id.clone(),
+                    artifact_dir: config.artifact_dir.clone(),
+                    configured_agent_id: config.agent_name.clone(),
                     suppress_emit: std::sync::atomic::AtomicBool::new(false),
                     replay_user_messages: std::sync::atomic::AtomicBool::new(
                         config.import_session,
@@ -4120,11 +4334,17 @@ async fn run_acp_session(
 
         // Redirect agent stderr to log file instead of inheriting parent's stderr
         if let Some(stderr) = proc.stderr.take() {
-            let log_path = agent_log_path(
-                &config.project_key,
-                &config.task_id,
-                config.chat_id.as_deref(),
-            );
+            let log_path = config
+                .artifact_dir
+                .as_ref()
+                .map(|dir| dir.join("agent.log"))
+                .unwrap_or_else(|| {
+                    agent_log_path(
+                        &config.project_key,
+                        &config.task_id,
+                        config.chat_id.as_deref(),
+                    )
+                });
             tokio::task::spawn_local(drain_stderr_to_file(stderr, log_path));
         }
 
@@ -4137,11 +4357,17 @@ async fn run_acp_session(
     // 每个 chat 的 agent.log（与 stderr 合用同一文件），方向用 `>>`(出) /
     // `<<`(入) 标记。release 永远不开。
     if acp_debug_enabled() {
-        let log_path = agent_log_path(
-            &config.project_key,
-            &config.task_id,
-            config.chat_id.as_deref(),
-        );
+        let log_path = config
+            .artifact_dir
+            .as_ref()
+            .map(|dir| dir.join("agent.log"))
+            .unwrap_or_else(|| {
+                agent_log_path(
+                    &config.project_key,
+                    &config.task_id,
+                    config.chat_id.as_deref(),
+                )
+            });
         if let Some(file) = open_acp_log(&log_path) {
             if let Ok(mut f) = file.lock() {
                 use std::io::Write;
@@ -4436,8 +4662,14 @@ async fn drive_session(
     // the agent's environment (`GROVE_MCP_TOKEN`) — needed by `grove mcp-bridge`
     // children. We just read it back from env_vars here. The lifetime/cleanup
     // of the registration is owned by `run_acp_session`'s EarlyTokenGuard.
-    let agent_graph_token: Option<&str> =
-        config.env_vars.get("GROVE_MCP_TOKEN").map(String::as_str);
+    // Only Task/Chat sessions receive `grove_agent`. Automation consumers may
+    // reuse GROVE_MCP_TOKEN for their own loopback bridge, but have no Chat
+    // identity and must not accidentally expose the Task-scoped server.
+    let agent_graph_token: Option<&str> = config
+        .chat_id
+        .as_ref()
+        .and_then(|_| config.env_vars.get("GROVE_MCP_TOKEN"))
+        .map(String::as_str);
 
     // 初始化连接
     let init_resp = conn
@@ -4589,6 +4821,7 @@ async fn drive_session(
     let mut thought_level_config_id;
     let mut config_options;
     let mut uses_config_options;
+    let mut pending_session_bootstrap: Option<(&'static str, String)> = None;
 
     /// Pause a pre-session request after `auth_required`, drive the advertised
     /// Agent authentication flow, then return so the caller can retry the exact
@@ -4797,12 +5030,17 @@ async fn drive_session(
                         cid,
                     );
                 }
+                if let Some(ref artifact_dir) = config.artifact_dir {
+                    let _ = std::fs::remove_file(artifact_dir.join("history.jsonl"));
+                }
             }
             let mcp_servers =
                 build_mcp_servers(
                     &config.env_vars,
                     agent_graph_token,
                     supports_mcp_http,
+                    &config.additional_mcp_servers,
+                    config.mcp_server_policy,
                 )
                 .map_err(to_acp_err)?;
             // 重试循环:session/new 在用户没登录时(claude-code-acp / codex 都
@@ -4868,16 +5106,81 @@ async fn drive_session(
                 }};
             }
 
-            // Custom Agent (persona): apply the persona's preferred
-            // model/mode/effort BEFORE injecting the system prompt, so the
-            // first turn (and the system prompt itself) runs under those
-            // settings. Resume path skips both blocks — it goes through
-            // LoadSession instead.
+            // Custom Agent (persona): apply preferred model/mode/effort before
+            // the first real user request. The Persona prompt itself is
+            // concatenated with Grove's session instructions below, avoiding a
+            // separate acknowledgement turn. Resume skips both paths.
             if let Some(p) = config.persona_injection.as_ref() {
                 let sid_arc = acp::SessionId::new(&*sid);
 
+                let uses_capability_config = match &p.agent_config {
+                    crate::agent_config::AgentConfigSelection::ConfigOptions { values, .. } => {
+                        // Apply exact option ids and values selected from the persisted
+                        // capability snapshot. Best-effort keeps a stale snapshot from
+                        // blocking Persona startup when an Agent changes capabilities.
+                        for option in config_options.clone() {
+                            let config_id = option.id.to_string();
+                            let Some(value) = values.get(&config_id).cloned() else {
+                                continue;
+                            };
+                            let Ok(request_value) =
+                                config_request_value(&config_options, &config_id, value)
+                            else {
+                                continue;
+                            };
+                            if let Ok(response) = conn
+                                .send_request(acp::SetSessionConfigOptionRequest::new(
+                                    sid_arc.clone(),
+                                    acp::SessionConfigId::new(config_id),
+                                    request_value,
+                                ))
+                                .block_task()
+                                .await
+                            {
+                                accept_config_response!(response);
+                                persona_mode_config_id = extract_config_select(
+                                    &config_options,
+                                    acp::SessionConfigOptionCategory::Mode,
+                                    &["mode"],
+                                )
+                                .2;
+                            }
+                        }
+                        true
+                    }
+                    crate::agent_config::AgentConfigSelection::Modes { mode_id, .. } => {
+                        if let Some(config_id) = persona_mode_config_id.clone() {
+                            if let Ok(response) = conn
+                                .send_request(acp::SetSessionConfigOptionRequest::new(
+                                    sid_arc.clone(),
+                                    acp::SessionConfigId::new(config_id),
+                                    acp::SessionConfigValueId::new(mode_id.clone()),
+                                ))
+                                .block_task()
+                                .await
+                            {
+                                accept_config_response!(response);
+                            }
+                        } else if conn
+                            .send_request(acp::SetSessionModeRequest::new(
+                                sid_arc.clone(),
+                                acp::SessionModeId::new(mode_id.clone()),
+                            ))
+                            .block_task()
+                            .await
+                            .is_ok()
+                        {
+                            current_mode_id = Some(mode_id.clone());
+                        }
+                        true
+                    }
+                    crate::agent_config::AgentConfigSelection::Default { .. } => false,
+                };
+
                 // Fuzzy match by lowercase id-or-name: exact first, then
-                // substring. No match → leave default.
+                // substring. This is only the compatibility path for personas
+                // created before structured Agent configuration was available.
+                if !uses_capability_config {
                 if let Some(query) = p.model.as_deref() {
                     if let (Some(id), Some(config_id)) = (
                         fuzzy_pick_id(query, &available_models),
@@ -4947,23 +5250,13 @@ async fn drive_session(
                         }
                     }
                 }
-
-                if !p.system_prompt.trim().is_empty() {
-                    let body = crate::agent_graph::inject::build_custom_agent_init_prompt(
-                        &p.persona_id,
-                        &p.persona_name,
-                        &p.base_agent,
-                        &p.system_prompt,
-                    );
-                    let inject = conn
-                        .send_request(acp::PromptRequest::new(sid_arc, vec![body.into()]))
-                        .block_task()
-                        .await;
-                    if let Err(e) = inject {
-                        eprintln!("[ACP] Persona system prompt injection failed: {:?}", e);
-                    }
                 }
             }
+            let agent_runtime_available = agent_graph_token
+                .and_then(crate::api::handlers::agent_graph_mcp::build_mcp_url)
+                .is_some();
+            pending_session_bootstrap =
+                session_bootstrap_instruction(&config, agent_runtime_available);
             sid
         }};
     }
@@ -4977,9 +5270,14 @@ async fn drive_session(
         // Import is the only path that intentionally exposes session/load replay.
         // It is selected by an ephemeral flag on this WebSocket connection only.
         (Some(saved_id), _, true, true) => {
-            let mcp_servers =
-                build_mcp_servers(&config.env_vars, agent_graph_token, supports_mcp_http)
-                    .map_err(to_acp_err)?;
+            let mcp_servers = build_mcp_servers(
+                &config.env_vars,
+                agent_graph_token,
+                supports_mcp_http,
+                &config.additional_mcp_servers,
+                config.mcp_server_policy,
+            )
+            .map_err(to_acp_err)?;
             let resp = conn
                 .send_request(
                     acp::LoadSessionRequest::new(
@@ -5010,9 +5308,14 @@ async fn drive_session(
         // 完全不需要 suppress_emit + 300ms 那套抛弃 agent 回放的机制 — 直接发
         // ResumeSessionRequest,Grove 照常从磁盘加载自己的历史。
         (Some(saved_id), true, _, false) => {
-            let mcp_servers =
-                build_mcp_servers(&config.env_vars, agent_graph_token, supports_mcp_http)
-                    .map_err(to_acp_err)?;
+            let mcp_servers = build_mcp_servers(
+                &config.env_vars,
+                agent_graph_token,
+                supports_mcp_http,
+                &config.additional_mcp_servers,
+                config.mcp_server_policy,
+            )
+            .map_err(to_acp_err)?;
             let resp = loop {
                 match conn
                     .send_request(
@@ -5060,9 +5363,14 @@ async fn drive_session(
             handle
                 .suppress_emit
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            let mcp_servers =
-                build_mcp_servers(&config.env_vars, agent_graph_token, supports_mcp_http)
-                    .map_err(to_acp_err)?;
+            let mcp_servers = build_mcp_servers(
+                &config.env_vars,
+                agent_graph_token,
+                supports_mcp_http,
+                &config.additional_mcp_servers,
+                config.mcp_server_policy,
+            )
+            .map_err(to_acp_err)?;
             let resp = loop {
                 match conn
                     .send_request(
@@ -5154,6 +5462,29 @@ async fn drive_session(
         }
     }
 
+    let installed = crate::storage::installed_agents::get(&config.agent_name)
+        .ok()
+        .flatten();
+    let selected = installed
+        .as_ref()
+        .and_then(|agent| agent.selected_installation());
+    let capability_snapshot = serde_json::json!({
+        "agent_id": crate::storage::installed_agents::canonicalize_agent_id(&config.agent_name),
+        "agent_version": agent_version,
+        "install_method": installed.as_ref().map(|agent| agent.selected_install_method.as_str()),
+        "install_version": selected.map(|installation| installation.version.as_str()),
+        "config_options": config_options,
+        "uses_config_options": uses_config_options,
+        "modes": {
+            "available": available_modes,
+            "current": current_mode_id,
+        }
+    });
+    let _ = crate::storage::installed_agents::save_capability_snapshot(
+        &config.agent_name,
+        &capability_snapshot,
+    );
+
     handle.emit(AcpUpdate::SessionReady {
         session_id,
         agent_name: agent_name.clone(),
@@ -5239,13 +5570,71 @@ async fn drive_session(
                 // or proceed.
                 if let Some(ref cfg) = prompt_config {
                     let mut applied: Vec<String> = Vec::new();
-                    let mut failure: Option<(&'static str, String)> = None;
+                    let mut failure: Option<(String, String)> = None;
 
-                    if let Some(ref mode_id) = cfg.mode {
-                        let current = handle.current_mode_id.lock().unwrap().clone();
-                        if current.as_deref() != Some(mode_id.as_str()) {
-                            let mode_cfg_id =
-                                handle
+                    if !cfg.config_options.is_empty() {
+                        let advertised = handle
+                            .current_config_options
+                            .lock()
+                            .map(|options| options.clone())
+                            .unwrap_or_default();
+                        let advertised_ids = advertised
+                            .iter()
+                            .map(|option| option.id.to_string())
+                            .collect::<std::collections::HashSet<_>>();
+                        if let Some(missing) = cfg
+                            .config_options
+                            .keys()
+                            .find(|id| !advertised_ids.contains(*id))
+                        {
+                            failure = Some((
+                                missing.clone(),
+                                "agent did not advertise this config option".to_string(),
+                            ));
+                        }
+                        if failure.is_none() {
+                            for option in advertised {
+                                let config_id = option.id.to_string();
+                                let Some(value) = cfg.config_options.get(&config_id).cloned()
+                                else {
+                                    continue;
+                                };
+                                let request_value = match validated_config_request_value(
+                                    &handle, &config_id, value,
+                                ) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        failure = Some((config_id.clone(), error));
+                                        break;
+                                    }
+                                };
+                                match conn
+                                    .send_request(acp::SetSessionConfigOptionRequest::new(
+                                        session_id_arc.clone(),
+                                        acp::SessionConfigId::new(config_id.clone()),
+                                        request_value,
+                                    ))
+                                    .block_task()
+                                    .await
+                                {
+                                    Ok(response) => {
+                                        replace_config_snapshot(&handle, response.config_options);
+                                        applied.push(config_id);
+                                    }
+                                    Err(error) => {
+                                        failure = Some((config_id, error.to_string()));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if failure.is_none() {
+                        if let Some(ref mode_id) = cfg.mode {
+                            let current = handle.current_mode_id.lock().unwrap().clone();
+                            if current.as_deref() != Some(mode_id.as_str()) {
+                                let mode_cfg_id = handle
                                     .current_config_options
                                     .lock()
                                     .ok()
@@ -5257,39 +5646,50 @@ async fn drive_session(
                                         )
                                         .2
                                     });
-                            let resp: Result<(), String> = if let Some(config_id) = mode_cfg_id {
-                                conn.send_request(acp::SetSessionConfigOptionRequest::new(
-                                    session_id_arc.clone(),
-                                    acp::SessionConfigId::new(config_id),
-                                    acp::SessionConfigValueId::new(mode_id.clone()),
-                                ))
-                                .block_task()
-                                .await
-                                .map(|response| {
-                                    replace_config_snapshot(&handle, response.config_options)
-                                })
-                                .map_err(|error| error.to_string())
-                            } else {
-                                conn.send_request(acp::SetSessionModeRequest::new(
-                                    session_id_arc.clone(),
-                                    acp::SessionModeId::new(mode_id.clone()),
-                                ))
-                                .block_task()
-                                .await
-                                .map(|_| {
-                                    *handle.current_mode_id.lock().unwrap() = Some(mode_id.clone());
-                                    handle.emit(AcpUpdate::ModeChanged {
-                                        mode_id: mode_id.clone(),
-                                    });
-                                })
-                                .map_err(|error| error.to_string())
-                            };
-                            match resp {
-                                Ok(_) => {
-                                    applied.push(format!("mode={}", mode_id));
-                                }
-                                Err(e) => {
-                                    failure = Some(("mode", format!("{}: {}", mode_id, e)));
+                                let uses_config_options = handle
+                                    .uses_config_options
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                let resp: Result<(), String> = if let Some(config_id) = mode_cfg_id
+                                {
+                                    conn.send_request(acp::SetSessionConfigOptionRequest::new(
+                                        session_id_arc.clone(),
+                                        acp::SessionConfigId::new(config_id),
+                                        acp::SessionConfigValueId::new(mode_id.clone()),
+                                    ))
+                                    .block_task()
+                                    .await
+                                    .map(|response| {
+                                        replace_config_snapshot(&handle, response.config_options)
+                                    })
+                                    .map_err(|error| error.to_string())
+                                } else if uses_config_options {
+                                    Err("agent did not advertise a Mode config option".to_string())
+                                } else {
+                                    conn.send_request(acp::SetSessionModeRequest::new(
+                                        session_id_arc.clone(),
+                                        acp::SessionModeId::new(mode_id.clone()),
+                                    ))
+                                    .block_task()
+                                    .await
+                                    .map(|_| {
+                                        *handle.current_mode_id.lock().unwrap() =
+                                            Some(mode_id.clone());
+                                        handle.emit(AcpUpdate::ModeChanged {
+                                            mode_id: mode_id.clone(),
+                                        });
+                                    })
+                                    .map_err(|error| error.to_string())
+                                };
+                                match resp {
+                                    Ok(_) => {
+                                        applied.push(format!("mode={}", mode_id));
+                                    }
+                                    Err(e) => {
+                                        failure = Some((
+                                            "mode".to_string(),
+                                            format!("{}: {}", mode_id, e),
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -5321,7 +5721,10 @@ async fn drive_session(
                                         applied.push(format!("model={}", model_id));
                                     }
                                     Err(e) => {
-                                        failure = Some(("model", format!("{}: {}", model_id, e)));
+                                        failure = Some((
+                                            "model".to_string(),
+                                            format!("{}: {}", model_id, e),
+                                        ));
                                     }
                                 }
                             }
@@ -5347,8 +5750,10 @@ async fn drive_session(
                                         applied.push(format!("thought_level={}", value_id));
                                     }
                                     Err(e) => {
-                                        failure =
-                                            Some(("thought_level", format!("{}: {}", value_id, e)));
+                                        failure = Some((
+                                            "thought_level".to_string(),
+                                            format!("{}: {}", value_id, e),
+                                        ));
                                     }
                                 }
                             }
@@ -5360,6 +5765,13 @@ async fn drive_session(
                         } else {
                             applied.join(", ")
                         };
+                        // Task Automations claim the session's busy slot
+                        // before enqueueing this Prompt. Config failure occurs
+                        // before the normal Busy=true/false pair, so release
+                        // that claim explicitly or the Chat remains stuck.
+                        handle
+                            .is_busy
+                            .store(false, std::sync::atomic::Ordering::Release);
                         handle.emit(AcpUpdate::Error {
                             message: format!(
                                 "Prompt not sent — {} rejected by agent ({}). Already applied before failure: {}. Session state reflects the applied settings; retry after fixing the rejected value.",
@@ -5390,9 +5802,19 @@ async fn drive_session(
                     .pending_text_separator
                     .store(false, std::sync::atomic::Ordering::Relaxed);
 
+                let wire_text =
+                    if let Some((kind, instruction)) = pending_session_bootstrap.as_ref() {
+                        crate::agent_graph::inject::build_session_instruction_prompt(
+                            kind,
+                            instruction,
+                            &text,
+                        )
+                    } else {
+                        text.clone()
+                    };
                 let mut content_blocks: Vec<acp::ContentBlock> = Vec::new();
-                if !text.is_empty() {
-                    content_blocks.push(text.into());
+                if !wire_text.is_empty() {
+                    content_blocks.push(wire_text.into());
                 }
                 for block in &attachments {
                     content_blocks.push(to_acp_content_block(block));
@@ -5566,6 +5988,7 @@ async fn drive_session(
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 match result {
                     Ok(resp) => {
+                        pending_session_bootstrap = None;
                         // Prompt 成功 = agent 当前认账户已登录,任何 stale 的
                         // pending_auth(用户在 grove 外部完成登录后回来)清掉,
                         // 否则 WS 重连仍会重发假 banner。pending_auth_retry 同理 —
@@ -5587,15 +6010,17 @@ async fn drive_session(
                             .map(|buf| truncate_chars(&buf, 80))
                             .filter(|s| !s.is_empty())
                             .unwrap_or_else(|| "Agent finished responding".to_string());
-                        notify_acp_event(
-                            &config.project_key,
-                            &config.task_id,
-                            config.chat_id.as_deref(),
-                            "Task Complete",
-                            &summary,
-                            AcpNotificationEvent::TurnComplete,
-                            None,
-                        );
+                        if config.chat_id.is_some() {
+                            notify_acp_event(
+                                &config.project_key,
+                                &config.task_id,
+                                config.chat_id.as_deref(),
+                                "Task Complete",
+                                &summary,
+                                AcpNotificationEvent::TurnComplete,
+                                None,
+                            );
+                        }
                         handle.emit(AcpUpdate::Busy { value: false });
                         let turn_end_ts = chrono::Utc::now().timestamp();
                         let turn_usage = resp.usage.as_ref().map(|usage| TurnUsage {
@@ -5611,15 +6036,18 @@ async fn drive_session(
                             .lock()
                             .ok()
                             .and_then(|g| g.as_ref().and_then(|s| s.cost.clone()));
-                        if let (Some(usage), Some(chat_id)) =
-                            (&turn_usage, config.chat_id.as_deref())
-                        {
+                        if let Some(usage) = &turn_usage {
                             let model_owned =
                                 handle.current_model_id.lock().ok().and_then(|g| g.clone());
+                            let automation_run_id = config
+                                .artifact_dir
+                                .as_ref()
+                                .map(|_| config.task_id.as_str());
                             let rec = crate::storage::token_usage::TokenUsageRecord {
                                 project_key: &config.project_key,
-                                task_id: &config.task_id,
-                                chat_id,
+                                task_id: config.chat_id.as_ref().map(|_| config.task_id.as_str()),
+                                chat_id: config.chat_id.as_deref(),
+                                automation_run_id,
                                 agent: &config.agent_name,
                                 model: model_owned.as_deref(),
                                 input_tokens: usage.input_tokens,
@@ -5933,6 +6361,8 @@ async fn drive_session(
                         &config.env_vars,
                         agent_graph_token,
                         supports_mcp_http,
+                        &config.additional_mcp_servers,
+                        config.mcp_server_policy,
                     ) {
                         Ok(mcp_servers) => {
                             match conn
@@ -6497,29 +6927,54 @@ impl AcpSessionHandle {
                     &update,
                 );
             }
+            if let Some(ref artifact_dir) = self.artifact_dir {
+                crate::storage::chat_history::append_event_to_path(
+                    &artifact_dir.join("history.jsonl"),
+                    &update,
+                );
+            }
+        }
+        if let (Some(artifact_dir), AcpUpdate::SessionReady { session_id, .. }) =
+            (self.artifact_dir.as_ref(), &update)
+        {
+            let path = artifact_dir.join("session.json");
+            let _ = std::fs::create_dir_all(artifact_dir);
+            let payload = serde_json::json!({
+                "pid": std::process::id(),
+                "session_id": session_id,
+                "agent": update,
+            });
+            if let Ok(data) = serde_json::to_vec_pretty(&payload) {
+                let tmp = path.with_extension("json.tmp");
+                if std::fs::write(&tmp, data).is_ok() {
+                    let _ = std::fs::rename(tmp, path);
+                }
+            }
         }
 
         // 跟踪 busy 状态，并通知 Radio 客户端
         if let AcpUpdate::Busy { value } = &update {
             self.is_busy
                 .store(*value, std::sync::atomic::Ordering::Relaxed);
-            use crate::api::handlers::walkie_talkie::{broadcast_radio_event, RadioEvent};
-            // Tag the busy=true edge with a wall-clock timestamp so menubar
-            // tray can render an elapsed-time meter without polling. `prompt`
-            // stays None at this layer — enrichment will be wired in a later
-            // commit when send_prompt() starts caching the latest user text.
-            let started_at = if *value {
-                Some(chrono::Utc::now().timestamp_millis())
-            } else {
-                None
-            };
-            broadcast_radio_event(RadioEvent::TaskBusy {
-                project_id: self.project_key.clone(),
-                task_id: self.task_id.clone(),
-                busy: *value,
-                prompt: None,
-                started_at,
-            });
+            if self.chat_id.is_some() {
+                use crate::api::handlers::walkie_talkie::{broadcast_radio_event, RadioEvent};
+                // Tag the busy=true edge with a wall-clock timestamp so menubar
+                // tray can render an elapsed-time meter without polling. `prompt`
+                // stays None at this layer — enrichment will be wired in a later
+                // commit when send_prompt() starts caching the latest user text.
+                let started_at = if *value {
+                    Some(chrono::Utc::now().timestamp_millis())
+                } else {
+                    None
+                };
+                broadcast_radio_event(RadioEvent::TaskBusy {
+                    project_id: self.project_key.clone(),
+                    task_id: self.task_id.clone(),
+                    busy: *value,
+                    prompt: None,
+                    started_at,
+                });
+            }
         }
 
         // Chat-grained status push for the agent graph view. Anchored at the
@@ -7198,6 +7653,7 @@ impl AcpSessionHandle {
             mode: self.current_mode_id.lock().unwrap().clone(),
             thought_level: self.current_thought_level_id.lock().unwrap().clone(),
             thought_level_config_id: self.thought_level_config_id.lock().unwrap().clone(),
+            config_options: std::collections::BTreeMap::new(),
         }
     }
 
@@ -7515,6 +7971,8 @@ pub fn new_handle_for_test(
         project_key: project_key.to_string(),
         task_id: task_id.to_string(),
         chat_id: Some(chat_id.to_string()),
+        artifact_dir: None,
+        configured_agent_id: "test-agent".to_string(),
         suppress_emit: std::sync::atomic::AtomicBool::new(false),
         replay_user_messages: std::sync::atomic::AtomicBool::new(false),
         pending_queue: Mutex::new(Vec::new()),
@@ -9317,6 +9775,7 @@ mod tests {
                     mode: Some("plan".into()),
                     thought_level: None,
                     thought_level_config_id: None,
+                    config_options: std::collections::BTreeMap::new(),
                 }),
             },
             SocketCommand::Cancel,

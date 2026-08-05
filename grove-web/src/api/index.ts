@@ -19,7 +19,7 @@ export type {
 
 export { checkAllDependencies, checkCommands } from './env';
 
-export { listProjects, getProject, addProject, deleteProject, renameProject, getProjectStats, getBranches, getRemotes, openIDE, openTerminal, initGitRepo, createNewProject, cloneProject, listResources, uploadResource, deleteResource, previewResource, resourceDownloadUrl, openResourceFile, revealResourceFile, getInstructions, updateInstructions, getMemory, updateMemory, listResourceWorkdirs, addResourceWorkdir, deleteResourceWorkdir, openResourceWorkdir, createResourceFolder, moveResource, createResourceLink, updateResourceLink } from './projects';
+export { listProjects, getProject, addProject, deleteProject, renameProject, getProjectStats, getBranches, getRemotes, openIDE, openTerminal, initGitRepo, createNewProject, cloneProject, listResources, uploadResource, deleteResource, previewResource, resourceDownloadUrl, openResourceFile, revealResourceFile, getInstructions, updateInstructions, getMemory, migrateMemory, listResourceWorkdirs, addResourceWorkdir, deleteResourceWorkdir, openResourceWorkdir, createResourceFolder, moveResource, createResourceLink, updateResourceLink } from './projects';
 export type {
   ProjectListItem,
   ProjectResponse,

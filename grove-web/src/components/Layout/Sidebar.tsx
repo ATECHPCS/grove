@@ -21,6 +21,7 @@ import {
   X,
   Plus,
   Settings2,
+  Brain,
 } from "lucide-react";
 import type { Plugin } from "../../api/plugins";
 import { PluginIcon } from "../Plugins/PluginIcon";
@@ -88,6 +89,7 @@ const ALL_NAV_ITEMS: Record<string, NavItem> = {
   work: { id: "work", label: "Work", icon: Laptop },
   tasks: { id: "tasks", label: "Tasks", icon: ListTodo },
   resource: { id: "resource", label: "Studio", icon: Layers },
+  memory: { id: "memory", label: "Memory", icon: Brain, beta: true },
   automation: { id: "automation", label: "Automation", icon: Repeat },
   skills: { id: "skills", label: "Skills", icon: Blocks },
   ai: { id: "ai", label: "AI", icon: Sparkles },

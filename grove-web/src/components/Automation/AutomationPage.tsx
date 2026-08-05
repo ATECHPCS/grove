@@ -32,6 +32,8 @@ import {
   PauseCircle,
   X,
   RotateCcw,
+  LockKeyhole,
+  Settings2,
 } from "lucide-react";
 import { useProject } from "../../context";
 import { useCommand, useContextKey } from "../../keyboard";
@@ -54,9 +56,26 @@ interface AutomationPageProps {
   /** Open the chat session that an automation run resolved to. Wired up
    *  from App.tsx via setActiveItem("tasks") + setNavigationData. */
   onOpenChat?: (taskId: string, chatId: string) => void;
+  /** Open the feature that owns a system-managed Automation. */
+  onOpenManagedAutomation?: (handlerKey: string) => void;
 }
 
-export function AutomationPage({ onOpenChat }: AutomationPageProps = {}) {
+const USER_AUTOMATION_HANDLER = "builtin.task_prompt";
+const MEMORY_AUTOMATION_HANDLER = "grove.memory.organization";
+
+function isSystemManagedAutomation(automation: Automation) {
+  return automation.handler_key !== USER_AUTOMATION_HANDLER;
+}
+
+function managedAutomationOwner(handlerKey: string) {
+  if (handlerKey === MEMORY_AUTOMATION_HANDLER) return "Memory";
+  return "Grove";
+}
+
+export function AutomationPage({
+  onOpenChat,
+  onOpenManagedAutomation,
+}: AutomationPageProps = {}) {
   const { selectedProject } = useProject();
   const projectId = selectedProject?.id ?? null;
 
@@ -173,6 +192,7 @@ export function AutomationPage({ onOpenChat }: AutomationPageProps = {}) {
       const payload: AutomationUpsert = {
         name: a.name,
         enabled: !a.enabled,
+        agent_config: a.agent_config,
         task_mode: a.task_mode,
         task_id: a.task_id,
         task_template: a.task_template,
@@ -181,6 +201,7 @@ export function AutomationPage({ onOpenChat }: AutomationPageProps = {}) {
         session_template: a.session_template,
         prompt: a.prompt,
         schedule_cron: a.schedule_cron,
+        event_triggers: a.event_triggers,
       };
       await updateAutomation(projectId, a.id, payload);
       void refresh();
@@ -202,11 +223,21 @@ export function AutomationPage({ onOpenChat }: AutomationPageProps = {}) {
     [projectId],
   );
 
-  // The expanded row is the "current" automation for edit / delete / run —
-  // those commands gate on `automationSelected`. Expanding a card selects it.
+  const userAutomations = useMemo(
+    () => automations.filter((automation) => !isSystemManagedAutomation(automation)),
+    [automations],
+  );
+  const systemAutomations = useMemo(
+    () => automations.filter(isSystemManagedAutomation),
+    [automations],
+  );
+
+  // Only a user-created row can become the current editable Automation.
+  // System-managed rows may still expand their history, but keyboard commands
+  // must never route them into the generic edit/delete/run surfaces.
   const expandedAutomation = useMemo(
-    () => automations.find((a) => a.id === expandedId) ?? null,
-    [automations, expandedId],
+    () => userAutomations.find((a) => a.id === expandedId) ?? null,
+    [userAutomations, expandedId],
   );
   useContextKey("automationSelected", !!expandedAutomation);
   useCommand(
@@ -257,8 +288,7 @@ export function AutomationPage({ onOpenChat }: AutomationPageProps = {}) {
               Automation
             </h1>
             <p className="text-sm text-[var(--color-text-muted)] mt-1">
-              Cron-driven prompts injected into a chat session. Only fires while
-              Grove is running.
+              Create your own Automations and monitor schedules managed by Grove.
             </p>
           </div>
         </div>
@@ -306,30 +336,87 @@ export function AutomationPage({ onOpenChat }: AutomationPageProps = {}) {
         // `pt-1.5` carves out the 1-2px lift `whileHover { y: -1 }` does on
         // each card so the top row doesn't clip into the page header on
         // hover. Without this the first card visually loses its top border.
-        <div className="space-y-2 overflow-y-auto flex-1 pr-1 pt-1.5">
-          {automations.map((a) => (
-            <AutomationCard
-              key={a.id}
-              automation={a}
-              projectId={projectId}
-              expanded={expandedId === a.id}
-              refreshTick={runsRefreshTick}
-              triggering={triggeringId === a.id}
-              onToggleExpand={() =>
-                setExpandedId((prev) => (prev === a.id ? null : a.id))
-              }
-              onEdit={() => {
-                setEditing(a);
-                setDialogOpen(true);
-              }}
-              onTrigger={() => handleTrigger(a.id)}
-              onDelete={() => setDeletingTarget(a)}
-              onToggleEnabled={() => handleToggleEnabled(a)}
-              onOpenChat={onOpenChat}
-              onCancelRun={(runId) => handleCancelRun(a.id, runId)}
-              onRerun={() => handleRerun(a.id)}
-            />
-          ))}
+        <div className="space-y-6 overflow-y-auto flex-1 pr-1 pt-1.5">
+          {userAutomations.length > 0 && (
+            <section aria-labelledby="user-automations-heading">
+              <SectionHeader
+                id="user-automations-heading"
+                title="Your Automations"
+                count={userAutomations.length}
+                description="Created and configured by you."
+              />
+              <div className="space-y-2">
+                {userAutomations.map((a) => (
+                  <AutomationCard
+                    key={a.id}
+                    automation={a}
+                    projectId={projectId}
+                    expanded={expandedId === a.id}
+                    refreshTick={runsRefreshTick}
+                    triggering={triggeringId === a.id}
+                    onToggleExpand={() =>
+                      setExpandedId((prev) => (prev === a.id ? null : a.id))
+                    }
+                    onEdit={() => {
+                      setEditing(a);
+                      setDialogOpen(true);
+                    }}
+                    onTrigger={() => handleTrigger(a.id)}
+                    onDelete={() => setDeletingTarget(a)}
+                    onToggleEnabled={() => handleToggleEnabled(a)}
+                    onOpenChat={onOpenChat}
+                    onCancelRun={(runId) => handleCancelRun(a.id, runId)}
+                    onRerun={() => handleRerun(a.id)}
+                  />
+                ))}
+              </div>
+            </section>
+          )}
+
+          {systemAutomations.length > 0 && (
+            <section aria-labelledby="system-automations-heading">
+              <SectionHeader
+                id="system-automations-heading"
+                title="System Automations"
+                count={systemAutomations.length}
+                description="Created by Grove features. View status and history here; configure them in the feature that owns them."
+                managed
+              />
+              <div className="space-y-2">
+                {systemAutomations.map((a) => {
+                  const owner = managedAutomationOwner(a.handler_key);
+                  return (
+                    <AutomationCard
+                      key={a.id}
+                      automation={a}
+                      projectId={projectId}
+                      expanded={expandedId === a.id}
+                      refreshTick={runsRefreshTick}
+                      triggering={false}
+                      readOnly
+                      ownerLabel={owner}
+                      onOpenOwner={
+                        onOpenManagedAutomation &&
+                        a.handler_key === MEMORY_AUTOMATION_HANDLER
+                          ? () => onOpenManagedAutomation(a.handler_key)
+                          : undefined
+                      }
+                      onToggleExpand={() =>
+                        setExpandedId((prev) => (prev === a.id ? null : a.id))
+                      }
+                      onEdit={() => {}}
+                      onTrigger={() => {}}
+                      onDelete={() => {}}
+                      onToggleEnabled={() => {}}
+                      onOpenChat={onOpenChat}
+                      onCancelRun={() => {}}
+                      onRerun={() => {}}
+                    />
+                  );
+                })}
+              </div>
+            </section>
+          )}
         </div>
       )}
 
@@ -369,6 +456,43 @@ export function AutomationPage({ onOpenChat }: AutomationPageProps = {}) {
 
 // ──────────────────────────────────────────────────────────────────────
 
+function SectionHeader({
+  id,
+  title,
+  count,
+  description,
+  managed = false,
+}: {
+  id: string;
+  title: string;
+  count: number;
+  description: string;
+  managed?: boolean;
+}) {
+  return (
+    <div className="flex items-start gap-2.5 mb-2 px-1">
+      {managed && (
+        <div className="mt-0.5 w-7 h-7 rounded-lg flex items-center justify-center bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)] flex-shrink-0">
+          <LockKeyhole className="w-3.5 h-3.5" />
+        </div>
+      )}
+      <div className="min-w-0">
+        <div className="flex items-center gap-2">
+          <h2 id={id} className="text-sm font-semibold text-[var(--color-text)]">
+            {title}
+          </h2>
+          <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]">
+            {count}
+          </span>
+        </div>
+        <p className="mt-0.5 text-xs text-[var(--color-text-muted)]">
+          {description}
+        </p>
+      </div>
+    </div>
+  );
+}
+
 interface CardProps {
   automation: Automation;
   projectId: string;
@@ -383,6 +507,9 @@ interface CardProps {
   onOpenChat?: (taskId: string, chatId: string) => void;
   onCancelRun: (runId: string) => void;
   onRerun: () => void;
+  readOnly?: boolean;
+  ownerLabel?: string;
+  onOpenOwner?: () => void;
 }
 
 function AutomationCard({
@@ -399,6 +526,9 @@ function AutomationCard({
   onOpenChat,
   onCancelRun,
   onRerun,
+  readOnly = false,
+  ownerLabel,
+  onOpenOwner,
 }: CardProps) {
   let scheduleDescription = automation.schedule_cron;
   try {
@@ -428,7 +558,16 @@ function AutomationCard({
       }`}
     >
       <div className="flex items-start gap-3 px-4 py-3.5">
-        <ToggleSwitch value={automation.enabled} onChange={onToggleEnabled} />
+        {readOnly ? (
+          <div
+            className="mt-0.5 w-9 h-9 rounded-lg flex items-center justify-center bg-[var(--color-bg)] border border-[var(--color-border)] text-[var(--color-text-muted)] flex-shrink-0"
+            title="System managed"
+          >
+            <LockKeyhole className="w-4 h-4" />
+          </div>
+        ) : (
+          <ToggleSwitch value={automation.enabled} onChange={onToggleEnabled} />
+        )}
 
         <div className="flex-1 min-w-0">
           {/* Title row */}
@@ -436,9 +575,25 @@ function AutomationCard({
             <h3 className="text-sm font-semibold text-[var(--color-text)] truncate">
               {automation.name}
             </h3>
+            {readOnly && (
+              <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-md bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]">
+                System managed
+              </span>
+            )}
+            {readOnly && (
+              <span
+                className={`text-[10px] font-medium px-1.5 py-0.5 rounded-md ${
+                  automation.enabled
+                    ? "bg-[var(--color-highlight)]/10 text-[var(--color-highlight)]"
+                    : "bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]"
+                }`}
+              >
+                {automation.enabled ? "Enabled" : "Paused"}
+              </span>
+            )}
             <StatusBadge status={automation.last_run_status} />
-            <ModeChip text={taskTargetLabel(automation)} />
-            <ModeChip text={sessionTargetLabel(automation)} />
+            {!readOnly && <ModeChip text={taskTargetLabel(automation)} />}
+            {!readOnly && <ModeChip text={sessionTargetLabel(automation)} />}
           </div>
 
           {/* Schedule */}
@@ -473,25 +628,45 @@ function AutomationCard({
               {automation.last_run_error}
             </div>
           )}
+
+          {readOnly && (
+            <p className="mt-2 text-[11px] text-[var(--color-text-muted)]">
+              Managed by {ownerLabel ?? "Grove"}. Configuration is read-only on
+              this page.
+            </p>
+          )}
         </div>
 
         {/* Actions — always visible when expanded so the user can act on
             the history they're inspecting without hover gymnastics. */}
-        <div
-          className={`flex items-center gap-0.5 flex-shrink-0 transition-opacity ${
-            expanded ? "opacity-100" : "opacity-0 group-hover:opacity-100"
-          }`}
-        >
-          <IconButton title="Run now" onClick={onTrigger} disabled={triggering}>
-            <Play className="w-3.5 h-3.5" />
-          </IconButton>
-          <IconButton title="Edit" onClick={onEdit}>
-            <Pencil className="w-3.5 h-3.5" />
-          </IconButton>
-          <IconButton title="Delete" onClick={onDelete} danger>
-            <Trash2 className="w-3.5 h-3.5" />
-          </IconButton>
-        </div>
+        {readOnly ? (
+          onOpenOwner && (
+            <button
+              type="button"
+              onClick={onOpenOwner}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-[var(--color-highlight)] hover:bg-[var(--color-highlight)]/10 transition-colors flex-shrink-0"
+            >
+              <Settings2 className="w-3.5 h-3.5" />
+              Configure in {ownerLabel ?? "owner"}
+            </button>
+          )
+        ) : (
+          <div
+            className={`flex items-center gap-0.5 flex-shrink-0 transition-opacity ${
+              expanded ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+            }`}
+          >
+            <IconButton title="Run now" onClick={onTrigger} disabled={triggering}>
+              <Play className="w-3.5 h-3.5" />
+            </IconButton>
+            <IconButton title="Edit" onClick={onEdit}>
+              <Pencil className="w-3.5 h-3.5" />
+            </IconButton>
+            <IconButton title="Delete" onClick={onDelete} danger>
+              <Trash2 className="w-3.5 h-3.5" />
+            </IconButton>
+          </div>
+        )}
 
         {/* Expand toggle */}
         <button
@@ -526,6 +701,7 @@ function AutomationCard({
               onOpenChat={onOpenChat}
               onCancelRun={onCancelRun}
               onRerun={onRerun}
+              readOnly={readOnly}
             />
           </motion.div>
         )}
@@ -543,6 +719,7 @@ interface RunsPanelProps {
   onOpenChat?: (taskId: string, chatId: string) => void;
   onCancelRun: (runId: string) => void;
   onRerun: () => void;
+  readOnly?: boolean;
 }
 
 function RunsPanel({
@@ -552,6 +729,7 @@ function RunsPanel({
   onOpenChat,
   onCancelRun,
   onRerun,
+  readOnly = false,
 }: RunsPanelProps) {
   const [runs, setRuns] = useState<AutomationRun[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -650,8 +828,14 @@ function RunsPanel({
   if (runs.length === 0) {
     return (
       <div className="px-4 py-4 text-xs text-[var(--color-text-muted)] text-center">
-        No runs yet. Click <Play className="inline w-3 h-3 mx-0.5" /> to trigger
-        this automation now.
+        {readOnly ? (
+          "No runs have been recorded yet."
+        ) : (
+          <>
+            No runs yet. Click <Play className="inline w-3 h-3 mx-0.5" /> to
+            trigger this automation now.
+          </>
+        )}
       </div>
     );
   }
@@ -670,6 +854,7 @@ function RunsPanel({
             onOpenChat={onOpenChat}
             onCancel={() => onCancelRun(r.id)}
             onRerun={onRerun}
+            readOnly={readOnly}
           />
         ))}
       </div>
@@ -682,11 +867,13 @@ function RunRow({
   onOpenChat,
   onCancel,
   onRerun,
+  readOnly = false,
 }: {
   run: AutomationRun;
   onOpenChat?: (taskId: string, chatId: string) => void;
   onCancel: () => void;
   onRerun: () => void;
+  readOnly?: boolean;
 }) {
   useNow(); // re-render every 60s so the relative time stays fresh
   const triggeredAt = new Date(run.triggered_at * 1000);
@@ -742,7 +929,7 @@ function RunRow({
           </span>
         )}
         <div className="ml-auto inline-flex items-center gap-2">
-          {inFlight && (
+          {!readOnly && inFlight && (
             <RowAction
               variant="danger"
               icon={<X className="w-3 h-3" />}
@@ -751,7 +938,7 @@ function RunRow({
               Cancel
             </RowAction>
           )}
-          {reRunnable && (
+          {!readOnly && reRunnable && (
             <RowAction
               variant="primary"
               icon={<RotateCcw className="w-3 h-3" />}

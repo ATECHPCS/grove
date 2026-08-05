@@ -1,9 +1,11 @@
 import { apiClient } from './client';
+import type { AgentConfigSelection } from './agentConfig';
 
 export interface CustomAgent {
   id: string;
   name: string;
   base_agent: string;
+  agent_config: AgentConfigSelection;
   model?: string;
   mode?: string;
   effort?: string;
@@ -16,6 +18,7 @@ export interface CustomAgent {
 export interface CustomAgentInput {
   name: string;
   base_agent: string;
+  agent_config?: AgentConfigSelection;
   model?: string | null;
   mode?: string | null;
   effort?: string | null;
@@ -26,6 +29,7 @@ export interface CustomAgentInput {
 export interface CustomAgentPatch {
   name?: string;
   base_agent?: string;
+  agent_config?: AgentConfigSelection;
   model?: string | null;
   mode?: string | null;
   effort?: string | null;

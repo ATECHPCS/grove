@@ -33,7 +33,27 @@ export interface InstalledAgentView {
   selected_install_method: InstallMethod;
   args_override: string[];
   env_override: Record<string, string>;
+  capability_snapshot: AgentCapabilitySnapshot | null;
+  capability_updated_at: string | null;
   hidden: boolean;
+}
+
+export interface AgentCapabilitySnapshot {
+  agent_id?: string;
+  agent_version?: string;
+  uses_config_options?: boolean;
+  config_options?: import("./tasks").SessionConfigOption[];
+  modes?: {
+    available?: [string, string][];
+    current?: string | null;
+  };
+}
+
+export interface InstalledAgentConfig {
+  id: string;
+  name: string;
+  capability_snapshot: AgentCapabilitySnapshot | null;
+  capability_updated_at: string | null;
 }
 
 /** Concrete executable grove would spawn for this agent. */
@@ -91,6 +111,13 @@ export interface PatchAgentRequest {
 
 export async function listMarketplace(): Promise<MarketplaceResponse> {
   return apiClient.get<MarketplaceResponse>("/api/v1/agents/marketplace");
+}
+
+export async function listInstalledAgentConfigs(): Promise<InstalledAgentConfig[]> {
+  const response = await apiClient.get<{ agents: InstalledAgentConfig[] }>(
+    "/api/v1/agents/installed",
+  );
+  return response.agents;
 }
 
 export async function refreshRegistry(): Promise<MarketplaceResponse> {

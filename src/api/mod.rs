@@ -305,6 +305,10 @@ pub fn create_api_router() -> Router {
             get(handlers::marketplace::list_marketplace),
         )
         .route(
+            "/agents/installed",
+            get(handlers::marketplace::list_installed_agents),
+        )
+        .route(
             "/agents/marketplace/refresh",
             post(handlers::marketplace::refresh_registry),
         )
@@ -414,9 +418,10 @@ pub fn create_api_router() -> Router {
             "/projects/{id}/instructions",
             get(handlers::projects::get_instructions).put(handlers::projects::update_instructions),
         )
+        .route("/projects/{id}/memory", get(handlers::projects::get_memory))
         .route(
-            "/projects/{id}/memory",
-            get(handlers::projects::get_memory).put(handlers::projects::update_memory),
+            "/projects/{id}/memory/migrate",
+            post(handlers::projects::migrate_memory),
         )
         .route(
             "/statistics/global",
@@ -887,6 +892,46 @@ pub fn create_api_router() -> Router {
             "/projects/{id}/automations/{aid}/runs/{run_id}/cancel",
             post(handlers::automations::cancel_run),
         )
+        .route(
+            "/projects/{id}/automation-runs/ws",
+            get(handlers::automations::run_updates_ws),
+        )
+        .route(
+            "/projects/{id}/memory/config",
+            get(handlers::memory::get_config).put(handlers::memory::update_config),
+        )
+        .route(
+            "/projects/{id}/memory/overview",
+            get(handlers::memory::overview),
+        )
+        .route(
+            "/projects/{id}/memory/entities",
+            get(handlers::memory::list_entities),
+        )
+        .route(
+            "/projects/{id}/memory/entities/{entity_id}",
+            get(handlers::memory::get_entity).delete(handlers::memory::delete_entity),
+        )
+        .route(
+            "/projects/{id}/memory/logs",
+            get(handlers::memory::list_logs),
+        )
+        .route(
+            "/projects/{id}/memory/logs/delete",
+            post(handlers::memory::delete_logs),
+        )
+        .route(
+            "/projects/{id}/memory/relations",
+            get(handlers::memory::list_relations),
+        )
+        .route(
+            "/projects/{id}/memory/runs/{run_id}/history",
+            get(handlers::memory::run_history),
+        )
+        .route(
+            "/projects/{id}/memory/runs/{run_id}",
+            delete(handlers::memory::delete_run),
+        )
         // Walkie-Talkie / Radio
         .route(
             "/radio/connect-info",
@@ -1122,6 +1167,10 @@ pub fn create_proxy_router(remote: String) -> Router {
         )
         .route(
             "/api/v1/projects/{id}/tasks/{taskId}/sketches/ws",
+            any(ws_proxy_handler),
+        )
+        .route(
+            "/api/v1/projects/{id}/automation-runs/ws",
             any(ws_proxy_handler),
         )
         // Map all other HTTP requests
@@ -1516,6 +1565,25 @@ fn display_host_for(bind_host: &str, lan_ip: Option<&str>) -> String {
         .unwrap_or_else(|| "localhost".to_string())
 }
 
+/// Start the Automation runtime shared by Web and the local desktop server.
+/// Callers own the surrounding server lifecycle, so this is invoked once per
+/// local Grove process before Automation endpoints can receive traffic.
+pub fn start_automation_runtime() {
+    crate::memory::register_automation_handlers();
+
+    let sweep_now = chrono::Utc::now().timestamp();
+    match crate::storage::automations::sweep_interrupted_runs(sweep_now) {
+        Ok(n) if n > 0 => {
+            crate::automation::awarn!("swept {n} stale queued run(s) → interrupted");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            crate::automation::awarn!("startup sweep failed: {e}");
+        }
+    }
+    crate::automation::scheduler::spawn();
+}
+
 /// Start the web server (API + static files)
 pub async fn start_server(
     host: &str,
@@ -1590,17 +1658,7 @@ pub async fn start_server(
     // Sweep any `queued` runs left over from a previous Grove process (whose
     // ACP subscriber died with the process) into `interrupted` first, so
     // the run-history UI doesn't display them as "still running forever".
-    let sweep_now = chrono::Utc::now().timestamp();
-    match crate::storage::automations::sweep_interrupted_runs(sweep_now) {
-        Ok(n) if n > 0 => {
-            crate::automation::awarn!("swept {n} stale queued run(s) → interrupted");
-        }
-        Ok(_) => {}
-        Err(e) => {
-            crate::automation::awarn!("startup sweep failed: {e}");
-        }
-    }
-    crate::automation::scheduler::spawn();
+    start_automation_runtime();
 
     // Start the in-process agent_graph MCP listener (loopback-only). Failure to
     // bind is non-fatal — the rest of the server still boots; ACP sessions will

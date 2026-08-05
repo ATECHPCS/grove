@@ -24,6 +24,7 @@ import { HelpOverlay } from "./components/Tasks/HelpOverlay";
 import { SkillsPage } from "./components/Skills";
 import { AIPage, GlobalAudioRecorder, GlobalVoiceControlRecorder } from "./components/AI";
 import { AutomationPage } from "./components/Automation/AutomationPage";
+import { MemoryPage } from "./components/Memory";
 import { ProjectStatsPage } from "./components/Stats/ProjectStatsPage";
 import { UpdateBanner } from "./components/ui/UpdateBanner";
 import { CommandPalette } from "./components/ui/CommandPalette";
@@ -1223,6 +1224,11 @@ function AppContent() {
       case "automation":
         return (
           <AutomationPage
+            onOpenManagedAutomation={(handlerKey) => {
+              if (handlerKey === "grove.memory.organization") {
+                setActiveItem("memory");
+              }
+            }}
             onOpenChat={(taskId, chatId) => {
               // Mirror the tray's deep-link handoff (this same file,
               // `handleNavigate` around line 552). Two paths exist:
@@ -1257,6 +1263,8 @@ function AppContent() {
             }}
           />
         );
+      case "memory":
+        return <MemoryPage />;
       case "skills":
         return <SkillsPage />;
       case "ai":
@@ -1298,6 +1306,7 @@ function AppContent() {
     activeItem === "skills" ||
     activeItem === "ai" ||
     activeItem === "resource" ||
+    activeItem === "memory" ||
     activeItem === "automation" ||
     activeItem === "statistics" ||
     activeItem.startsWith("plugin:");

@@ -67,7 +67,24 @@ pub struct InstalledAgentView {
     pub selected_install_method: InstallMethod,
     pub args_override: Vec<String>,
     pub env_override: HashMap<String, String>,
+    /// Last real ACP capability declaration, cached on the installed Agent so
+    /// configuration UIs do not need to launch a 10–20 second probe Session.
+    pub capability_snapshot: Option<serde_json::Value>,
+    pub capability_updated_at: Option<String>,
     pub hidden: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InstalledAgentConfigView {
+    pub id: String,
+    pub name: String,
+    pub capability_snapshot: Option<serde_json::Value>,
+    pub capability_updated_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InstalledAgentsResponse {
+    pub agents: Vec<InstalledAgentConfigView>,
 }
 
 impl From<&InstalledAgent> for InstalledAgentView {
@@ -77,9 +94,58 @@ impl From<&InstalledAgent> for InstalledAgentView {
             selected_install_method: a.selected_install_method,
             args_override: a.args_override.clone(),
             env_override: a.env_override.clone(),
+            capability_snapshot: installed_agents::get_capability_snapshot(&a.id)
+                .ok()
+                .flatten(),
+            capability_updated_at: installed_agents::get_capability_updated_at(&a.id)
+                .ok()
+                .flatten(),
             hidden: a.hidden,
         }
     }
+}
+
+/// Fast local-only view for configuration pickers.
+///
+/// Unlike the Marketplace catalog endpoint, this never refreshes the remote
+/// registry, scans PATH, or probes an Agent. Capability data is the last real
+/// ACP snapshot already persisted with the installed Agent.
+pub async fn list_installed_agents() -> Result<Json<InstalledAgentsResponse>, MarketplaceError> {
+    let names = agent_registry::get()
+        .agents
+        .into_iter()
+        .map(|agent| (agent.id, agent.name))
+        .collect::<HashMap<_, _>>();
+    let mut agents = installed_agents::list()
+        .map_err(|error| MarketplaceError::internal(format!("list installed agents: {error}")))?
+        .into_iter()
+        .filter(|agent| {
+            !agent.hidden
+                && agent
+                    .selected_installation()
+                    .is_some_and(|installation| installation.status == InstallStatus::Installed)
+        })
+        .map(|agent| InstalledAgentConfigView {
+            name: names
+                .get(&agent.id)
+                .cloned()
+                .unwrap_or_else(|| agent.id.clone()),
+            capability_snapshot: installed_agents::get_capability_snapshot(&agent.id)
+                .ok()
+                .flatten(),
+            capability_updated_at: installed_agents::get_capability_updated_at(&agent.id)
+                .ok()
+                .flatten(),
+            id: agent.id,
+        })
+        .collect::<Vec<_>>();
+    agents.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(Json(InstalledAgentsResponse { agents }))
 }
 
 fn terminal_channel_exposed(reg: &RegistryAgent) -> bool {

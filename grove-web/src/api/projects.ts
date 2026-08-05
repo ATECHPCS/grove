@@ -299,8 +299,11 @@ export async function getMemory(id: string): Promise<{ content: string }> {
   return apiClient.get<{ content: string }>(`/api/v1/projects/${id}/memory`);
 }
 
-export async function updateMemory(id: string, content: string): Promise<{ content: string }> {
-  return apiClient.put<{ content: string }, { content: string }>(`/api/v1/projects/${id}/memory`, { content });
+export async function migrateMemory(id: string): Promise<{ log_id: string }> {
+  return apiClient.post<Record<string, never>, { log_id: string }>(
+    `/api/v1/projects/${id}/memory/migrate`,
+    {},
+  );
 }
 
 // ============================================================================

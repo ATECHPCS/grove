@@ -1,6 +1,6 @@
-//! Run a single Automation.
+//! Run a single Automation through its registered handler.
 //!
-//! Pipeline:
+//! `builtin.task_prompt` keeps the existing Task/Chat pipeline:
 //! 1. Insert an `automation_runs` row in `queued` state (caught by the
 //!    startup-sweep if Grove dies before completion).
 //! 2. Resolve target Task (existing → check; new → spawn worktree + row).
@@ -18,20 +18,24 @@
 //!    text, then close out on the next `Complete` / `Error` / `SessionEnded`
 //!    — or a 30-minute timeout. Truncate the accumulated text to 16 KB and
 //!    persist as the final `agent_response`.
+//!
+//! Registered project handlers use the same Automation-owned dedicated ACP
+//! driver. Handlers contribute only concurrency, business pre/post actions and
+//! runtime bindings.
 
 use std::time::Duration;
 
 use chrono::Utc;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::acp::{AcpUpdate, QueuedMessage};
+use crate::acp::{AcpStartConfig, AcpUpdate, QueuedMessage};
 use crate::agent_graph::tools::ensure_target_handle;
 use crate::storage::{
-    automations::{self, Automation, TargetMode},
+    automations::{self, Automation, AutomationRun, RunClaim, TargetMode},
     config, installed_agents, tasks, workspace,
 };
 
-use super::{awarn, cron_util};
+use super::{awarn, consumer, cron_util};
 
 /// Cap on how long a single automation run waits for the agent's `Complete`
 /// notification. The cron scheduler won't re-fire the same automation
@@ -69,6 +73,41 @@ pub struct RunOutcome {
     pub resolved_chat_id: Option<String>,
 }
 
+impl RunOutcome {
+    pub fn failed(error: impl Into<String>) -> Self {
+        Self::failed_run("", error, None, None)
+    }
+
+    pub fn failed_run(
+        run_id: impl Into<String>,
+        error: impl Into<String>,
+        resolved_task_id: Option<String>,
+        resolved_chat_id: Option<String>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            status: "failed".to_string(),
+            error: Some(error.into()),
+            resolved_task_id,
+            resolved_chat_id,
+        }
+    }
+
+    pub fn queued(
+        run_id: impl Into<String>,
+        resolved_task_id: Option<String>,
+        resolved_chat_id: Option<String>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            status: "queued".to_string(),
+            error: None,
+            resolved_task_id,
+            resolved_chat_id,
+        }
+    }
+}
+
 fn now() -> i64 {
     Utc::now().timestamp()
 }
@@ -81,15 +120,35 @@ fn now() -> i64 {
 /// The eventual success/failure of the agent's actual work lands in the
 /// `automation_runs` row asynchronously.
 pub async fn run(automation: &Automation, trigger_kind: &str) -> RunOutcome {
+    run_with_payload(automation, trigger_kind, None).await
+}
+
+pub async fn run_with_payload(
+    automation: &Automation,
+    trigger_kind: &str,
+    trigger_payload: Option<serde_json::Value>,
+) -> RunOutcome {
+    if automation.handler_key != automations::TASK_PROMPT_HANDLER {
+        let trigger = consumer::TriggerContext {
+            kind: trigger_kind.to_string(),
+            payload: trigger_payload,
+        };
+        return run_handler(automation, trigger).await;
+    }
+
     let triggered_at = now();
 
     let run_id = match automations::insert_run(
         &automation.id,
         trigger_kind,
+        trigger_payload.as_ref(),
         &automation.prompt,
         Some(agent_snapshot(automation))
             .filter(|s| !s.is_empty())
             .as_deref(),
+        &automation.agent_config,
+        &serde_json::json!({}),
+        "task_chat",
         triggered_at,
     ) {
         Ok(id) => id,
@@ -184,7 +243,10 @@ pub async fn run(automation: &Automation, trigger_kind: &str) -> RunOutcome {
     //    pending queue only on `Complete`, so an idle session would hold
     //    a queued prompt forever (Bug 1). If we lose (something else is
     //    running), enqueue and let the end-of-turn drain pick it up.
-    let snapshot = handle.snapshot_config();
+    let snapshot = automation
+        .agent_config
+        .queued_config()
+        .unwrap_or_else(|| handle.snapshot_config());
     let sender = format!("automation:{}", run_id);
     let claimed = handle
         .is_busy
@@ -264,6 +326,403 @@ pub async fn run(automation: &Automation, trigger_kind: &str) -> RunOutcome {
         resolved_task_id: Some(task_id),
         resolved_chat_id: Some(chat_id),
     }
+}
+
+async fn run_handler(automation: &Automation, trigger: consumer::TriggerContext) -> RunOutcome {
+    let Some(handler) = consumer::get(&automation.handler_key) else {
+        return RunOutcome::failed(format!(
+            "unsupported Automation handler: {}",
+            automation.handler_key
+        ));
+    };
+    let single_flight =
+        handler.concurrency_policy(automation) == consumer::ConcurrencyPolicy::SingleFlight;
+    let agent_snapshot = automation
+        .agent_config
+        .agent_id()
+        .map(installed_agents::canonicalize_agent_id);
+    let run_id = match automations::claim_run(
+        &automation.id,
+        &trigger.kind,
+        trigger.payload.as_ref(),
+        &automation.prompt,
+        agent_snapshot.as_deref(),
+        &automation.agent_config,
+        &serde_json::json!({}),
+        "project_run",
+        now(),
+        single_flight,
+    ) {
+        Ok(RunClaim::Created(run_id)) => run_id,
+        Ok(RunClaim::Existing(run)) => {
+            return RunOutcome {
+                run_id: run.id,
+                status: run.status,
+                error: None,
+                resolved_task_id: run.resolved_task_id,
+                resolved_chat_id: run.resolved_chat_id,
+            }
+        }
+        Err(error) => return RunOutcome::failed(format!("claim Automation Run: {error}")),
+    };
+    let mut run = match automations::get_run(&run_id) {
+        Ok(Some(run)) => run,
+        Ok(None) => return RunOutcome::failed("claimed Automation Run disappeared"),
+        Err(error) => {
+            return fail_handler(
+                automation,
+                handler.as_ref(),
+                &run_id,
+                "prepare",
+                &error.to_string(),
+            )
+        }
+    };
+    let input = match handler.pre_action(consumer::PreActionContext {
+        automation,
+        run: &run,
+        trigger: &trigger,
+    }) {
+        Ok(input) => input,
+        Err(error) => {
+            return fail_handler(
+                automation,
+                handler.as_ref(),
+                &run_id,
+                "pre_action",
+                &error.to_string(),
+            )
+        }
+    };
+    match automations::update_run_input(&run_id, &input) {
+        Ok(true) => {}
+        Ok(false) => {
+            return fail_handler(
+                automation,
+                handler.as_ref(),
+                &run_id,
+                "pre_action",
+                "Automation Run stopped before preparation completed",
+            )
+        }
+        Err(error) => {
+            return fail_handler(
+                automation,
+                handler.as_ref(),
+                &run_id,
+                "pre_action",
+                &error.to_string(),
+            )
+        }
+    }
+    run = match automations::get_run(&run_id) {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            return RunOutcome::failed_run(
+                &run_id,
+                "prepared Automation Run disappeared",
+                None,
+                None,
+            )
+        }
+        Err(error) => {
+            return fail_handler(
+                automation,
+                handler.as_ref(),
+                &run_id,
+                "pre_action",
+                &error.to_string(),
+            )
+        }
+    };
+    let bindings = match handler.runtime_bindings(consumer::RuntimeContext {
+        automation,
+        run: &run,
+    }) {
+        Ok(bindings) => bindings,
+        Err(error) => {
+            return fail_handler(
+                automation,
+                handler.as_ref(),
+                &run_id,
+                "runtime_bindings",
+                &error.to_string(),
+            )
+        }
+    };
+    let agent_id = match run.agent_config_snapshot.agent_id() {
+        Some(agent_id) if !agent_id.trim().is_empty() => {
+            installed_agents::canonicalize_agent_id(agent_id)
+        }
+        _ => {
+            return fail_handler(
+                automation,
+                handler.as_ref(),
+                &run_id,
+                "resolve_agent",
+                "Automation requires agent_config.agent_id",
+            )
+        }
+    };
+    let Some(resolved_agent) = crate::acp::resolve_agent(&agent_id) else {
+        return fail_handler(
+            automation,
+            handler.as_ref(),
+            &run_id,
+            "resolve_agent",
+            &format!("Agent is not available: {agent_id}"),
+        );
+    };
+    let session_key = format!("automation-run:{run_id}");
+    let start_config = AcpStartConfig {
+        agent_command: resolved_agent.command,
+        agent_name: resolved_agent.agent_name,
+        agent_args: resolved_agent.args,
+        working_dir: bindings.working_dir,
+        env_vars: bindings.env_vars,
+        project_key: automation.project.clone(),
+        task_id: run_id.clone(),
+        chat_id: None,
+        artifact_dir: bindings.artifact_dir,
+        additional_mcp_servers: bindings.additional_mcp_servers,
+        mcp_server_policy: bindings.mcp_server_policy,
+        agent_type: resolved_agent.agent_type,
+        remote_url: resolved_agent.url,
+        remote_auth: resolved_agent.auth_header,
+        suppress_initial_connecting: true,
+        import_session: false,
+        persona_injection: None,
+    };
+    let (handle, rx) =
+        match crate::acp::get_or_start_session(session_key.clone(), start_config).await {
+            Ok(value) => value,
+            Err(error) => {
+                return fail_handler(
+                    automation,
+                    handler.as_ref(),
+                    &run_id,
+                    "spawn_acp",
+                    &format!("start Automation Agent Session: {error}"),
+                )
+            }
+        };
+    if let Err(error) = automations::mark_run_running(&run_id) {
+        let _ = handle.kill().await;
+        return fail_handler(
+            automation,
+            handler.as_ref(),
+            &run_id,
+            "start_run",
+            &error.to_string(),
+        );
+    }
+    if !matches!(automations::get_run(&run_id), Ok(Some(ref active)) if active.status == "running")
+    {
+        let _ = handle.kill().await;
+        handler
+            .abort(consumer::AbortContext {
+                automation,
+                run: &run,
+                reason: "Run stopped before Agent start",
+            })
+            .ok();
+        return RunOutcome::queued(run_id, None, None);
+    }
+    let send_result = tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.send_prompt(
+            run.prompt_snapshot.clone(),
+            Vec::new(),
+            Some(format!("automation:{run_id}")),
+            false,
+            run.agent_config_snapshot.queued_config(),
+        ),
+    )
+    .await;
+    match send_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = handle.kill().await;
+            return fail_handler(
+                automation,
+                handler.as_ref(),
+                &run_id,
+                "queue",
+                &format!("send Automation prompt: {error}"),
+            );
+        }
+        Err(_) => {
+            let _ = handle.kill().await;
+            return fail_handler(
+                automation,
+                handler.as_ref(),
+                &run_id,
+                "queue",
+                "send Automation prompt timeout (10s)",
+            );
+        }
+    }
+    if let Err(error) = automations::mark_run_queued(&run_id, now()) {
+        awarn!("mark_run_queued for {run_id}: {error}");
+    }
+    let task_automation = automation.clone();
+    let task_run = run;
+    let task_handler = handler;
+    tokio::spawn(async move {
+        wait_for_handler_completion(
+            task_handler,
+            task_automation,
+            task_run,
+            session_key,
+            bindings.timeout,
+            rx,
+        )
+        .await;
+    });
+    RunOutcome::queued(run_id, None, None)
+}
+
+fn fail_handler(
+    automation: &Automation,
+    handler: &dyn consumer::AutomationHandler,
+    run_id: &str,
+    phase: &str,
+    error: &str,
+) -> RunOutcome {
+    if let Ok(Some(run)) = automations::get_run(run_id) {
+        if let Err(abort_error) = handler.abort(consumer::AbortContext {
+            automation,
+            run: &run,
+            reason: error,
+        }) {
+            awarn!("abort handler for {run_id}: {abort_error}");
+        }
+    }
+    if let Err(mark_error) = automations::mark_run_failed(run_id, now(), phase, error) {
+        awarn!("mark_run_failed for {run_id}: {mark_error}");
+    }
+    RunOutcome::failed_run(run_id, error, None, None)
+}
+
+async fn wait_for_handler_completion(
+    handler: std::sync::Arc<dyn consumer::AutomationHandler>,
+    automation: Automation,
+    initial_run: AutomationRun,
+    session_key: String,
+    timeout: Duration,
+    mut rx: tokio::sync::broadcast::Receiver<AcpUpdate>,
+) {
+    let mut response = String::new();
+    let terminal = tokio::time::timeout(timeout, async {
+        loop {
+            match rx.recv().await {
+                Ok(update) => {
+                    automations::publish_run_event(
+                        &automation.project,
+                        &automation.id,
+                        &initial_run.id,
+                        &update,
+                    );
+                    match update {
+                        AcpUpdate::MessageChunk { text } => response.push_str(&text),
+                        AcpUpdate::Complete { .. } => break Ok(()),
+                        AcpUpdate::Error { message } => break Err(message),
+                        AcpUpdate::SessionEnded => {
+                            break Err(
+                                "Automation Agent Session ended before completion".to_string()
+                            )
+                        }
+                        _ => continue,
+                    }
+                }
+                Err(RecvError::Lagged(skipped)) => {
+                    awarn!(
+                        "broadcast lagged for run {}: skipped {skipped} events",
+                        initial_run.id
+                    );
+                }
+                Err(RecvError::Closed) => {
+                    break Err("Automation Agent Session closed before completion".to_string())
+                }
+            }
+        }
+    })
+    .await;
+
+    let latest = automations::get_run(&initial_run.id)
+        .ok()
+        .flatten()
+        .unwrap_or(initial_run);
+    match terminal {
+        Ok(Ok(())) if latest.status == "running" => {
+            let truncated =
+                (!response.is_empty()).then(|| automations::truncate_agent_response(&response));
+            let committed = automations::complete_consumer_run(&latest.id, now(), |tx| {
+                let result = handler.post_action(
+                    consumer::PostActionContext {
+                        automation: &automation,
+                        run: &latest,
+                        agent_response: truncated.as_deref(),
+                    },
+                    tx,
+                )?;
+                tx.execute(
+                    "UPDATE automation_runs SET agent_response = ?1 WHERE id = ?2",
+                    rusqlite::params![truncated, latest.id],
+                )?;
+                Ok(((), result))
+            });
+            match committed {
+                Ok(Some(())) => {
+                    if let Err(error) = handler.after_commit(consumer::AfterCommitContext {
+                        automation: &automation,
+                        run: &latest,
+                    }) {
+                        awarn!("after_commit for run {}: {error}", latest.id);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = handler.abort(consumer::AbortContext {
+                        automation: &automation,
+                        run: &latest,
+                        reason: &error.to_string(),
+                    });
+                    let _ = automations::mark_run_failed(
+                        &latest.id,
+                        now(),
+                        "post_action",
+                        &error.to_string(),
+                    );
+                }
+            }
+        }
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = handler.abort(consumer::AbortContext {
+                automation: &automation,
+                run: &latest,
+                reason: &error,
+            });
+            let phase = if error.starts_with("Prompt not sent") {
+                "apply_agent_config"
+            } else {
+                "agent_run"
+            };
+            let _ = automations::mark_run_failed(&latest.id, now(), phase, &error);
+        }
+        Err(_) => {
+            let _ = handler.abort(consumer::AbortContext {
+                automation: &automation,
+                run: &latest,
+                reason: "Agent completion timeout",
+            });
+            let truncated =
+                (!response.is_empty()).then(|| automations::truncate_agent_response(&response));
+            let _ = automations::mark_run_timeout(&latest.id, now(), truncated.as_deref());
+        }
+    }
+    let _ = crate::acp::kill_session(&session_key);
 }
 
 fn fail(
@@ -360,10 +819,11 @@ async fn wait_for_completion(
                 break WatchOutcome::Timeout(response);
             }
             Ok(Err(RecvError::Closed)) => {
-                break WatchOutcome::Failed(
-                    "ACP broadcast closed before completion".to_string(),
+                break WatchOutcome::Failed {
+                    phase: "agent_run",
+                    error: "ACP broadcast closed before completion".to_string(),
                     response,
-                );
+                };
             }
             Ok(Err(RecvError::Lagged(n))) => {
                 // Broadcast buffer (256 events) overran. We may have missed
@@ -403,21 +863,34 @@ async fn wait_for_completion(
                     break WatchOutcome::Completed(response);
                 }
                 AcpUpdate::Error { message } if started => {
-                    break WatchOutcome::Failed(message, response);
+                    break WatchOutcome::Failed {
+                        phase: "agent_run",
+                        error: message,
+                        response,
+                    };
+                }
+                AcpUpdate::Error { message } if message.starts_with("Prompt not sent") => {
+                    break WatchOutcome::Failed {
+                        phase: "apply_agent_config",
+                        error: message,
+                        response,
+                    };
                 }
                 AcpUpdate::SessionEnded if started => {
-                    break WatchOutcome::Failed(
-                        "ACP session ended before completion".to_string(),
+                    break WatchOutcome::Failed {
+                        phase: "agent_run",
+                        error: "ACP session ended before completion".to_string(),
                         response,
-                    );
+                    };
                 }
                 // SessionEnded before we ever picked up means the agent
                 // died while a prior prompt was running. Surface that.
                 AcpUpdate::SessionEnded => {
-                    break WatchOutcome::Failed(
-                        "ACP session ended before agent picked up the prompt".to_string(),
+                    break WatchOutcome::Failed {
+                        phase: "agent_run",
+                        error: "ACP session ended before agent picked up the prompt".to_string(),
                         response,
-                    );
+                    };
                 }
                 // State sync with the chat UI: the user may trash-click
                 // our queued message. But cmd_loop's normal end-of-turn
@@ -452,7 +925,11 @@ async fn wait_for_completion(
 
 enum WatchOutcome {
     Completed(String),
-    Failed(String, String),
+    Failed {
+        phase: &'static str,
+        error: String,
+        response: String,
+    },
     Timeout(String),
     Cancelled(String),
 }
@@ -464,9 +941,11 @@ async fn persist(run_id: &str, outcome: WatchOutcome) {
             let truncated = (!text.is_empty()).then(|| automations::truncate_agent_response(&text));
             automations::mark_run_completed(run_id, finished_at, truncated.as_deref())
         }
-        WatchOutcome::Failed(error, _text) => {
-            automations::mark_run_failed(run_id, finished_at, "agent_run", &error)
-        }
+        WatchOutcome::Failed {
+            phase,
+            error,
+            response: _response,
+        } => automations::mark_run_failed(run_id, finished_at, phase, &error),
         WatchOutcome::Timeout(text) => {
             let truncated = (!text.is_empty()).then(|| automations::truncate_agent_response(&text));
             automations::mark_run_timeout(run_id, finished_at, truncated.as_deref())

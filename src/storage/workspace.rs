@@ -371,6 +371,36 @@ pub fn remove_project(path: &str) -> Result<()> {
             rusqlite::params![&hash],
         )?;
 
+        // Project-level Automations and Memory have no FK to `projects`.
+        // Remove the Memory-owned association first (it intentionally
+        // RESTRICTs deleting its linked Automation), then the generic Runs
+        // and Automations, followed by the remaining Memory projections/logs.
+        tx.execute(
+            "DELETE FROM memory_project_configs WHERE project_id = ?1",
+            rusqlite::params![&hash],
+        )?;
+        tx.execute(
+            "DELETE FROM automation_runs
+             WHERE automation_id IN (SELECT id FROM automations WHERE project = ?1)",
+            rusqlite::params![&hash],
+        )?;
+        tx.execute(
+            "DELETE FROM automations WHERE project = ?1",
+            rusqlite::params![&hash],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_relations WHERE project_id = ?1",
+            rusqlite::params![&hash],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_entities WHERE project_id = ?1",
+            rusqlite::params![&hash],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_logs WHERE project_id = ?1",
+            rusqlite::params![&hash],
+        )?;
+
         tx.execute(
             "DELETE FROM projects WHERE hash = ?1",
             rusqlite::params![&hash],

@@ -687,6 +687,7 @@ fn query_top_tasks(project_key: &str, from_ts: i64, to_ts: i64) -> Vec<TopItem> 
                           COALESCE(SUM(cost_amount), 0.0)
                    FROM chat_token_usage
                    WHERE end_ts BETWEEN ?1 AND ?2 AND project_key = ?3
+                     AND automation_run_id IS NULL
                    GROUP BY task_id
                    ORDER BY 3 DESC
                    LIMIT 10";
@@ -774,6 +775,7 @@ fn query_agent_split_for_task(
         "SELECT agent, COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(cost_amount), 0.0)
                FROM chat_token_usage
                WHERE end_ts BETWEEN ?1 AND ?2 AND project_key = ?3 AND task_id = ?4
+                 AND automation_run_id IS NULL
                GROUP BY agent
                ORDER BY 3 DESC";
     let mut stmt = match conn.prepare(sql) {

@@ -14,8 +14,9 @@ use crate::error::Result;
 #[derive(Debug, Clone)]
 pub struct TokenUsageRecord<'a> {
     pub project_key: &'a str,
-    pub task_id: &'a str,
-    pub chat_id: &'a str,
+    pub task_id: Option<&'a str>,
+    pub chat_id: Option<&'a str>,
+    pub automation_run_id: Option<&'a str>,
     pub agent: &'a str,
     pub model: Option<&'a str>,
     pub input_tokens: u64,
@@ -34,14 +35,15 @@ pub fn insert(rec: &TokenUsageRecord<'_>) -> Result<()> {
     let conn = database::connection();
     conn.execute(
         "INSERT INTO chat_token_usage (
-            project_key, task_id, chat_id, agent, model,
+            project_key, task_id, chat_id, automation_run_id, agent, model,
             input_tokens, cached_read_tokens, output_tokens, total_tokens,
             start_ts, end_ts, cost_amount, cost_currency
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         rusqlite::params![
             rec.project_key,
             rec.task_id,
             rec.chat_id,
+            rec.automation_run_id,
             rec.agent,
             rec.model,
             rec.input_tokens as i64,

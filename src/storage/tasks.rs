@@ -241,12 +241,19 @@ pub fn archive_task(project: &str, task_id: &str) -> Result<Option<Task>> {
         return Ok(None);
     }
     let now = Utc::now().to_rfc3339();
-    {
+    let changed = {
         let conn = crate::storage::database::connection();
         conn.execute(
             "UPDATE tasks SET status = 'archived', updated_at = ?1, archived_at = ?1 WHERE project = ?2 AND id = ?3 AND status = 'active'",
             params![now, project, task_id],
-        )?;
+        )?
+    };
+    if changed > 0 {
+        crate::automation::events::emit(
+            project.to_string(),
+            "task.finished",
+            serde_json::json!({ "task_id": task_id }),
+        );
     }
     // `conn` released; `get_task_any` re-acquires the global mutex.
     // std::sync::Mutex is not reentrant — without the scope above,

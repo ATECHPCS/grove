@@ -608,22 +608,11 @@ fn create_task_inner(
             let _ = crate::fs_link::create_link(&project_instructions, &instructions_link);
         }
 
-        // Symlink memory.md → project memory.md (read-write)
-        let memory_link = task_dir.join("memory.md");
-        let project_memory = studio_dir.join("memory.md");
-        // Ensure the target file exists so the link has a valid target
-        if !project_memory.exists() {
-            let _ = std::fs::write(&project_memory, "");
-        }
-        if !memory_link.exists() {
-            let _ = crate::fs_link::create_link(&project_memory, &memory_link);
-        }
-
         // Generate AGENTS.md
         let agents_md = format!(
-            "# Studio Task: {task_name}\n\
-             You are an AI agent working inside a Grove Studio task workspace.\n\
-             This workspace is isolated for this task only. Follow the rules below carefully.\n\n\
+            "<!-- grove-studio-task-contract:v2 -->\n\
+             # Studio Task: {task_name}\n\
+             This is an isolated Grove Studio task workspace. Follow this file contract and the user-authored guidance in `instructions.md`.\n\n\
              ## Directory Structure\n\
              \n\
              ```\n\
@@ -634,18 +623,15 @@ fn create_task_inner(
              ├── scripts/         # Place any scripts you create or use here.\n\
              ├── resource/        # Read-only shared project resources (symlink). Do not modify.\n\
              ├── instructions.md  # Read-only project-level instructions (symlink). Read this first.\n\
-             ├── memory.md        # Read-write shared project memory (symlink). Read on start, update on finish.\n\
              └── AGENTS.md        # This file.\n\
              ```\n\
              ## Getting Started\n\
              \n\
-             1. **Analyze user intent and rename session immediately**: First, read the user\'s chat message to identify their primary goal or intent. You **MUST** immediately call the `grove_agent_set_title` MCP tool to rename this chat session to a concise, descriptive title (e.g., \"Refactor Auth\", \"Fix memory leak\") reflecting that intent. Do not start work under a generic or default title.\n\
-             2. Read `instructions.md` for project-level context and guidelines.\n\
-             3. Read `memory.md` for accumulated project knowledge from past sessions.\n\
-             4. Browse `input/` and `resource/` for any material the user references.\n\
-             5. Write final results and deliverables to `output/`.\n\
-             6. Use `internal/` for intermediate files, scratch work, and working data.\n\
-             7. Place any scripts in `scripts/`.\n\n\
+             1. Read `instructions.md` for project-level context and guidelines.\n\
+             2. Browse `input/` and `resource/` for any material the user references.\n\
+             3. Write final results and deliverables to `output/`.\n\
+             4. Use `internal/` for intermediate files, scratch work, and working data.\n\
+             5. Place any scripts in `scripts/`.\n\n\
              ## Rules\n\
              \n\
              - ALWAYS read `instructions.md` before starting work.\n\
@@ -656,65 +642,12 @@ fn create_task_inner(
              - NEVER modify files in `resource/` — it is a read-only symlink to the project vault.\n\
              - NEVER modify files in `input/` unless the user explicitly asks you to.\n\
              - NEVER modify `instructions.md` — it is a read-only symlink.\n\
-             - Keep `output/` organized. Use subdirectories if you produce many files.\n\
-             - **CRITICAL Session Renaming Rule (MANDATORY)**: You **MUST** ensure this chat session has a descriptive, concise title.\n\
-               1. **On Start**: Immediately upon reading the user\'s initial prompt and identifying their goal, rename the session using the `grove_agent_set_title` MCP tool.\n\
-               2. **During the Turn**: If the conversation topic shifts, a new subtask is identified, or the user requests it, you **MUST** call `grove_agent_set_title` again to update the title to keep the workspace task graph organized.\n\
-               Do NOT leave the chat session with a generic or default title. Adherence to this renaming rule is a hard requirement.\n\
-             \n\
-             ## Memory\n\
-             \n\
-             `memory.md` is a shared project memory file. It persists across all tasks and\n\
-             accumulates knowledge that would otherwise be lost between sessions.\n\
-             \n\
-             ### CRITICAL rules — read carefully\n\
-             \n\
-             1. **This `memory.md` is the ONLY memory file you should read or write.** Do NOT\n\
-                read or write your own built-in memory files (e.g. Claude's\n\
-                `~/.claude/.../MEMORY.md`, Gemini's personal memory, or any other\n\
-                agent-private memory system). All memory for this project lives in the\n\
-                `memory.md` shown here. If your tooling would normally write to a private\n\
-                memory location, redirect that content into this file instead.\n\
-             \n\
-             2. **NEVER overwrite `memory.md` with a Write/full-file-replace operation.**\n\
-                The file may already contain an index structure, links to other notes, and\n\
-                entries written by past sessions — a full overwrite will silently destroy\n\
-                that structure. ALWAYS update it with Edit (targeted string replacement) or\n\
-                Append (adding new content at the end). If you need to restructure it, read\n\
-                the full current content first, then make surgical Edits — do not regenerate\n\
-                it from scratch.\n\
-             \n\
-             ### On start\n\
-             Read `memory.md` before doing anything else. Use it to understand:\n\
-             - Project conventions and patterns the team uses\n\
-             - Known issues, gotchas, and their root causes\n\
-             - Past decisions and the reasons behind them\n\
-             - User preferences and working style\n\
-             \n\
-             ### On finish\n\
-             Before ending your session, reflect on what you learned. Update `memory.md` if any\n\
-             of the following apply:\n\
-             - You discovered a non-obvious project convention\n\
-             - You hit a bug or gotcha that would slow down a future agent\n\
-             - You made a significant architectural or design decision\n\
-             - You learned something about the user's preferences\n\
-             \n\
-             Write concisely. Append new insights (or Edit existing entries in place) — do\n\
-             NOT rewrite the whole file, and do not delete entries unless they are clearly\n\
-             outdated or wrong.\n\n\
-             ## Presentation Guidelines\n\
+             - Keep `output/` organized. Use subdirectories if you produce many files.\n\n\
+             ## Output Defaults\n\
              \n\
              - **Documentation**: Write in Markdown format.\n\
              - **Diagrams**: Use [Mermaid](https://mermaid.js.org/) for flowcharts and sequence diagrams; use [D2](https://d2lang.com/) for architecture and system diagrams.\n\
-             - **Sketches**: When you want to show the user a visual — a system diagram, a UI mock, a whiteboard-style explanation — prefer the Grove sketch tools (`grove_sketch_read_me` once, then `grove_sketch_draw`) over ASCII art or lengthy prose descriptions. After drawing, reference the sketch in your chat reply with `sketch://<sketch-id>` (the full id returned by the draw call). Grove renders this as a clickable chip the user can open to see the canvas.\n\
-             - **Demos**: Use JSX/React components for interactive demos and visual presentations.\n\
-             \n\
-             ## Asking the User (Structured Forms)\n\
-             \n\
-             When you need several answers from the user at once — an interview, a design brief, scoping a piece of work, picking among multiple knobs — **call the `ask_form` MCP tool** instead of dumping a numbered list of questions into chat. A structured form is far easier for the user to scan and fill than a wall of inline questions, and prevents partial-answer drift (the user replies to the first item and skips the rest).\n\
-             \n\
-             - **When to use**: interview / discovery, requirements gathering, design intake, persona / brand briefs, any decision involving 3+ knobs, or anywhere you'd otherwise write \"I have a few questions: 1)… 2)… 3)…\" in chat.\n\
-             - **When NOT to use**: a single clarifying question (just ask in chat), or a yes/no inside a fast back-and-forth — forms have weight, only reach for one when question count or structure earns it.\n",
+             - **Demos**: Use JSX/React components for interactive demos and visual presentations.\n",
         );
         std::fs::write(task_dir.join("AGENTS.md"), &agents_md)?;
 

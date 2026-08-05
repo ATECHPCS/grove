@@ -42,7 +42,11 @@ pub enum Commands {
     /// own MCP config; the bridge inherits `GROVE_MCP_TOKEN` / `GROVE_MCP_PORT`
     /// from the parent agent process and forwards stdio JSON-RPC to the
     /// running Grove server's HTTP MCP listener.
-    McpBridge,
+    McpBridge {
+        /// Loopback MCP route to proxy (for example `mcp` or `memory-mcp`).
+        #[arg(long, default_value = "mcp")]
+        route: String,
+    },
     /// Interactive file picker using fzf
     Fp,
     /// Start the web UI server (API + frontend)

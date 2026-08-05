@@ -19,6 +19,8 @@ pub mod hooks;
 pub mod keymap;
 pub mod libraries;
 pub mod marketplace;
+pub mod memory;
+pub mod memory_mcp;
 #[cfg(feature = "perf-monitor")]
 pub mod perf;
 pub mod plugins;

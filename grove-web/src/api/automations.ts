@@ -6,6 +6,9 @@
 // _mode is "new".
 
 import { apiClient } from './client';
+import type { AgentConfigSelection } from './agentConfig';
+
+export type { AgentConfigSelection, ConfigOptionValue } from './agentConfig';
 
 export type TargetMode = 'new' | 'existing';
 
@@ -25,6 +28,8 @@ export interface Automation {
   project: string;
   name: string;
   enabled: boolean;
+  handler_key: string;
+  agent_config: AgentConfigSelection;
   task_mode: TargetMode;
   task_id?: string;
   task_template?: TaskTemplate;
@@ -33,6 +38,7 @@ export interface Automation {
   session_template?: SessionTemplate;
   prompt: string;
   schedule_cron: string;
+  event_triggers?: string[];
   last_run_at?: number;
   last_run_status?: string;
   last_run_error?: string;
@@ -45,24 +51,31 @@ export interface AutomationRun {
   id: string;
   automation_id: string;
   trigger_kind: string;            // 'cron' | 'manual'
+  trigger_payload?: unknown;
   prompt_snapshot: string;
   agent_snapshot?: string;
+  agent_config_snapshot: AgentConfigSelection;
+  input: Record<string, unknown>;
+  execution_scope: string;
   resolved_task_id?: string;
   resolved_chat_id?: string;
   // Three-stage timeline
   triggered_at: number;
   queued_at?: number;
+  started_at?: number;
   completed_at?: number;
   // Result
   status: string;                  // 'queued' | 'running' | 'success' | 'failed' | 'timeout' | 'interrupted' | 'cancelled'
   phase?: string;                  // 'resolve_task' | 'resolve_session' | 'spawn_acp' | 'queue' | 'agent_run'
   error?: string;
   agent_response?: string;         // last_assistant_text truncated to 16KB; absent when agent ran tools only
+  result?: Record<string, unknown>;
 }
 
 export interface AutomationUpsert {
   name: string;
   enabled: boolean;
+  agent_config: AgentConfigSelection;
   task_mode: TargetMode;
   task_id?: string;
   task_template?: TaskTemplate;
@@ -71,6 +84,7 @@ export interface AutomationUpsert {
   session_template?: SessionTemplate;
   prompt: string;
   schedule_cron: string;
+  event_triggers?: string[];
 }
 
 export interface TriggerResult {

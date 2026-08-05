@@ -635,6 +635,7 @@ pub async fn grove_agent_spawn(
                     persona_name: persona.name.clone(),
                     base_agent: persona.base_agent.clone(),
                     system_prompt: persona.system_prompt.clone(),
+                    agent_config: persona.agent_config.clone(),
                     model: persona.model.clone(),
                     mode: persona.mode.clone(),
                     effort: persona.effort.clone(),
@@ -705,6 +706,9 @@ pub async fn grove_agent_spawn(
         project_key: project_key.clone(),
         task_id: task_id.clone(),
         chat_id: Some(new_chat_id.clone()),
+        artifact_dir: None,
+        additional_mcp_servers: Vec::new(),
+        mcp_server_policy: crate::acp::McpServerPolicy::WorkingSession,
         agent_type: resolved.agent_type,
         remote_url: resolved.url,
         remote_auth: resolved.auth_header,
@@ -928,6 +932,7 @@ async fn deliver_to_session(
             mode: cfg.mode.clone(),
             thought_level: cfg.thought_level.clone(),
             thought_level_config_id,
+            config_options: std::collections::BTreeMap::new(),
         })
     } else {
         None
@@ -1098,6 +1103,7 @@ pub(crate) async fn ensure_target_handle(
                     persona_name: persona.name.clone(),
                     base_agent: persona.base_agent.clone(),
                     system_prompt: persona.system_prompt.clone(),
+                    agent_config: persona.agent_config.clone(),
                     model: persona.model.clone(),
                     mode: persona.mode.clone(),
                     effort: persona.effort.clone(),
@@ -1125,6 +1131,9 @@ pub(crate) async fn ensure_target_handle(
         project_key: project_key.to_string(),
         task_id: task_id.to_string(),
         chat_id: Some(target_chat_id.to_string()),
+        artifact_dir: None,
+        additional_mcp_servers: Vec::new(),
+        mcp_server_policy: crate::acp::McpServerPolicy::WorkingSession,
         agent_type: resolved.agent_type,
         remote_url: resolved.url,
         remote_auth: resolved.auth_header,

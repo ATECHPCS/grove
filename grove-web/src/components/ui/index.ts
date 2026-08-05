@@ -1,4 +1,5 @@
 export { Button } from "./Button";
+export { Switch } from "./Switch";
 export { Input } from "./Input";
 export { Combobox } from "./Combobox";
 export type { ComboboxOption } from "./Combobox";

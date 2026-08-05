@@ -1,4 +1,5 @@
 mod acp;
+mod agent_config;
 mod agent_graph;
 mod agent_usage;
 mod api;
@@ -20,6 +21,7 @@ mod event;
 mod fs_link;
 mod git;
 mod hooks;
+mod memory;
 mod model;
 #[cfg(not(windows))]
 mod notification_state;
@@ -395,8 +397,8 @@ fn main() -> io::Result<()> {
                     }
                 });
         }
-        Commands::McpBridge => {
-            std::process::exit(cli::mcp_bridge::run());
+        Commands::McpBridge { route } => {
+            std::process::exit(cli::mcp_bridge::run(route));
         }
         Commands::Fp => {
             #[cfg(windows)]

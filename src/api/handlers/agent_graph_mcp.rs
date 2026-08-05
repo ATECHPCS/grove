@@ -1,7 +1,8 @@
-//! Streamable HTTP MCP listener — exposes the `agent_graph` tools to ACP agents.
+//! Streamable HTTP MCP listener — exposes trusted chat-bound tools to agents.
 //!
-//! WO-006 part 2 of 4. This module is the HTTP transport layer; the tool logic
-//! lives in `crate::agent_graph::tools` and is transport-agnostic.
+//! WO-006 part 2 of 4. This module is the HTTP transport layer. Agent-graph
+//! logic lives in `crate::agent_graph::tools`; other chat-bound tools delegate
+//! to their owning storage/runtime modules.
 //!
 //! ## Design (方案 A)
 //!
@@ -17,8 +18,9 @@
 //!   When that agent calls a tool, the handler reads the token out of
 //!   `RequestContext.extensions[Parts]` and looks up the caller — no env var
 //!   dependency, no `acp:` URL hacks, no Proxy / Conductor.
-//! - Two MCP servers run in parallel for each ACP agent: this HTTP one (agent
-//!   graph tools) and the existing `grove mcp` stdio (orchestrator tools).
+//! - Two MCP servers run in parallel for each ACP agent: this HTTP one
+//!   (`grove_agent`, for chat-bound runtime tools) and the existing `grove mcp`
+//!   stdio server (task/orchestrator utilities).
 //!   Tool names don't collide.
 //!
 //! Commit 3 will start this listener at Grove boot, store the chosen port via
@@ -52,7 +54,8 @@ use crate::agent_graph::tools::{
     grove_agent_set_title, grove_agent_spawn, CapabilityInput, ContactsInput, ReplyInput,
     SendInput, SetTitleInput, SpawnInput, ToolContext,
 };
-use crate::storage::config;
+use crate::error::GroveError;
+use crate::storage::{config, memory, tasks};
 
 // ─── Token map (token → caller_chat_id) ───────────────────────────────────────
 
@@ -239,35 +242,6 @@ impl AgentGraphMcpService {
     }
 }
 
-const MCP_INSTRUCTIONS: &str = r#"
-Agent-to-agent communication tools within a Grove task.
-
-Caller identity is derived from the URL token bound at session spawn — you do
-not need to pass it. All tools operate within the caller's task only.
-
-- grove_agent_spawn:   create a new sibling session and auto-establish caller→child edge
-- grove_agent_send:    deliver a message to a session you have an outgoing edge to
-                       (optional `auto_remind` seconds re-nudges a stalled ally to reply)
-- grove_agent_reply:   reply to a pending message you received
-- grove_agent_contacts: list who you can reach, pending messages, and all spawnable targets
-- grove_agent_capability: inspect models / modes / thought_levels of any session in your task
-
-Spawning agents (grove_agent_contacts.can_spawn[]):
-- `grove_agent_contacts` returns a `can_spawn[]` list covering every target you can pass to
-  `grove_agent_spawn.agent`: built-in base agents, user-configured custom ACP servers, and
-  user-defined personas (base agents pre-seeded with a system prompt).
-- To spawn any of them, pass the entry's `id` as `grove_agent_spawn.agent`.
-- Persona entries include a `duty` field (the persona's pre-set duty) and never expose the
-  system prompt.
-- Personas are user-scoped (per Grove install), not task-scoped — by design, so a persona
-  created in one task can be reused elsewhere.
-
-Constraints:
-- send requires an existing edge (no_edge if missing); single-in-flight per A→B
-- duty is locked once set; pass `duty` only when the target has none
-- reply consumes the ticket; no edge required
-"#;
-
 impl ServerHandler for AgentGraphMcpService {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
@@ -278,7 +252,6 @@ impl ServerHandler for AgentGraphMcpService {
             impl_info.website_url = Some("https://github.com/GarrickZ2/grove".to_string());
             impl_info
         };
-        info.instructions = Some(MCP_INSTRUCTIONS.trim().to_string());
         info
     }
 
@@ -294,12 +267,23 @@ impl ServerHandler for AgentGraphMcpService {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let mut tools = self.tool_router.list_all();
         // Hide browser tools when the user has disabled browser control in Settings.
         if !config::load_config().browser_control.enabled {
-            tools.retain(|t| !t.name.starts_with("grove_browser_"));
+            tools.retain(|tool| !tool.name.starts_with("browser_"));
+        }
+        // Memory is project-configured. Keep the advertised tool surface and
+        // server-side permission check driven by the same durable flag.
+        let memory_enabled = context
+            .extensions
+            .get::<Parts>()
+            .and_then(|parts| caller_session_from_parts(parts).ok())
+            .and_then(|(project_id, _, _)| memory::project_memory_enabled(&project_id).ok())
+            .unwrap_or(false);
+        if !memory_enabled {
+            tools.retain(|tool| !WORKING_MEMORY_TOOLS.contains(&tool.name.as_ref()));
         }
         Ok(ListToolsResult {
             tools,
@@ -309,10 +293,147 @@ impl ServerHandler for AgentGraphMcpService {
     }
 }
 
+const WORKING_MEMORY_TOOLS: &[&str] = &[
+    "memory_append_log",
+    "memory_recall",
+    "memory_read",
+    "memory_get_related",
+    "memory_get_recent_logs",
+];
+
 // ─── Tool implementations ─────────────────────────────────────────────────────
 
 #[tool_router]
 impl AgentGraphMcpService {
+    #[tool(
+        name = "memory_append_log",
+        description = "Append one immutable short-term Memory Log from the current Grove task/chat. Use it for durable learnings such as decisions, corrections, user preferences, non-obvious project knowledge, or reusable experience. Supply title, tags, and description only; Grove derives the trusted project, task, chat, and agent identity from this MCP connection. Multiple logs may be appended from one task.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<AppendMemoryLogOutput>()
+    )]
+    async fn grove_memory_append_log_tool(
+        &self,
+        Parameters(input): Parameters<AppendMemoryLogInput>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let (project_id, task_id, chat) = caller_session_from_parts(&parts)?;
+        if !memory::project_memory_enabled(&project_id).map_err(memory_mcp_error)? {
+            return Err(McpError::invalid_request(
+                "Project Memory is not enabled for this project".to_string(),
+                None,
+            ));
+        }
+        memory::append_log(&memory::NewMemoryLog {
+            project_id: &project_id,
+            task_id: &task_id,
+            chat_id: Some(&chat.id),
+            agent: Some(&chat.agent),
+            title: &input.title,
+            tags: &input.tags,
+            description: &input.description,
+        })
+        .map_err(memory_mcp_error)?;
+        memory_json_success(&AppendMemoryLogOutput { saved: true })
+    }
+
+    #[tool(
+        name = "memory_recall",
+        description = "Find relevant long-term Project Memory summaries by query terms, structured tags, or current score. Query text is split on spaces and common list punctuation; it is not semantic or embedding search. Any term may match title, description, or tags, and results rank by the number of distinct matched terms. This returns metadata only and never changes access counts. Call memory_read before relying on full contents.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<memory::Page<MemoryRecallItem>>()
+    )]
+    async fn grove_memory_recall_tool(
+        &self,
+        Parameters(input): Parameters<MemoryRecallInput>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let project_id = working_memory_project(&parts)?;
+        let tags = input
+            .tags
+            .into_iter()
+            .map(|tag| memory::MemoryTagFilter {
+                key: tag.key,
+                value: tag.value,
+            })
+            .collect::<Vec<_>>();
+        let page = memory::recall_entities(
+            &project_id,
+            input.query.as_deref(),
+            &tags,
+            input.cursor.as_deref(),
+            memory_bounded_limit(input.limit, 10, 50, "limit")?,
+        )
+        .map_err(memory_mcp_error)?;
+        memory_json_success(&map_memory_page(page, MemoryRecallItem::from))
+    }
+
+    #[tool(
+        name = "memory_read",
+        description = "Read one long-term Memory's full Markdown body. Every successful read increments that Entity's access count. related_limit defaults to 3 and accepts 0 through 10; returned related Memories contain summaries only and are not reinforced. If via_relation_id names a Relation connected to this Entity, that Relation's access count also increments; an invalid or unrelated id is ignored and never blocks the read.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<MemoryReadOutput>()
+    )]
+    async fn grove_memory_read_tool(
+        &self,
+        Parameters(input): Parameters<MemoryReadInput>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let project_id = working_memory_project(&parts)?;
+        let result = memory::read_entity(
+            &project_id,
+            &input.entity_id,
+            input.via_relation_id.as_deref(),
+            memory_bounded_limit_allow_zero(input.related_limit, 3, 10, "related_limit")?,
+        )
+        .map_err(memory_mcp_error)?
+        .ok_or_else(|| {
+            McpError::invalid_request(
+                format!("Memory Entity {} was not found", input.entity_id),
+                None,
+            )
+        })?;
+        memory_json_success(&MemoryReadOutput::from(result))
+    }
+
+    #[tool(
+        name = "memory_get_related",
+        description = "Page through summary-only Memories related to one Entity, ordered by Relation score. Candidate discovery does not change Entity or Relation access counts; call memory_read with the returned entity_id and Relation id only when following a useful connection. cursor is opaque; limit defaults to 10 and accepts 1 through 50.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<memory::Page<RelatedMemoryItem>>()
+    )]
+    async fn grove_memory_get_related_tool(
+        &self,
+        Parameters(input): Parameters<MemoryRelatedInput>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let project_id = working_memory_project(&parts)?;
+        let page = memory::list_related_memories(
+            &project_id,
+            &input.entity_id,
+            input.cursor.as_deref(),
+            memory_bounded_limit(input.limit, 10, 50, "limit")?,
+        )
+        .map_err(memory_mcp_error)?;
+        memory_json_success(&map_memory_page(page, RelatedMemoryItem::from))
+    }
+
+    #[tool(
+        name = "memory_get_recent_logs",
+        description = "Page through recent unorganized short-term Memory Logs. Optional query text is split on spaces and common list punctuation; it is not semantic or embedding search. Any term may match title, description, or tags, and results rank by distinct matched terms before recency. Reading results does not change access counts. Treat Logs as recent evidence rather than established long-term Memory. limit defaults to 20 and accepts 1 through 100.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<memory::Page<MemoryLogItem>>()
+    )]
+    async fn grove_memory_get_recent_logs_tool(
+        &self,
+        Parameters(input): Parameters<MemoryRecentLogsInput>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let project_id = working_memory_project(&parts)?;
+        let page = memory::list_logs(
+            &project_id,
+            input.query.as_deref(),
+            input.cursor.as_deref(),
+            memory_bounded_limit(input.limit, 20, 100, "limit")?,
+        )
+        .map_err(memory_mcp_error)?;
+        memory_json_success(&map_memory_page(page, MemoryLogItem::from))
+    }
+
     #[tool(
         name = "graph_spawn",
         description = "Create a new sibling Session in your task and auto-establish caller→child edge. Blocks until the spawned ACP agent is ready (90s timeout). Returns session_id + capabilities."
@@ -617,7 +738,178 @@ impl AgentGraphMcpService {
     }
 }
 
-// ─── Browser tool parameter types ─────────────────────────────────────────────
+// ─── Tool parameter types ─────────────────────────────────────────────────────
+
+#[derive(Debug, serde::Serialize, JsonSchema)]
+struct AppendMemoryLogOutput {
+    /// True when Grove persisted the Log.
+    saved: bool,
+}
+
+#[derive(Debug, serde::Serialize, JsonSchema)]
+struct MemoryRecallItem {
+    /// Stable id to pass to memory_read or memory_get_related.
+    entity_id: String,
+    /// Concise Memory title.
+    title: String,
+    /// Summary for deciding whether the full Memory is relevant.
+    description: String,
+}
+
+impl From<memory::MemoryEntity> for MemoryRecallItem {
+    fn from(entity: memory::MemoryEntity) -> Self {
+        Self {
+            entity_id: entity.entity_id,
+            title: entity.title,
+            description: entity.description,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize, JsonSchema)]
+struct MemoryLogItem {
+    /// Concise short-term observation title.
+    title: String,
+    /// Flat topic labels supplied with the Log.
+    tags: Vec<String>,
+    /// Short-term observation details.
+    description: String,
+}
+
+impl From<memory::MemoryLog> for MemoryLogItem {
+    fn from(log: memory::MemoryLog) -> Self {
+        Self {
+            title: log.title,
+            tags: log.tags,
+            description: log.description,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize, JsonSchema)]
+struct RelatedMemoryItem {
+    /// Stable id to pass to memory_read.
+    entity_id: String,
+    /// Relation id to pass as via_relation_id when following this connection.
+    relation_id: String,
+    /// Concise related Memory title.
+    title: String,
+    /// Summary for deciding whether to read the full related Memory.
+    description: String,
+}
+
+impl From<memory::RelatedMemory> for RelatedMemoryItem {
+    fn from(related: memory::RelatedMemory) -> Self {
+        Self {
+            entity_id: related.entity.entity_id,
+            relation_id: related.relation.id,
+            title: related.entity.title,
+            description: related.entity.description,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize, JsonSchema)]
+struct MemoryReadOutput {
+    /// Memory title.
+    title: String,
+    /// Full Markdown body without frontmatter.
+    content: String,
+    /// Highest-ranked related Memory summaries. Read one with its entity_id and relation_id.
+    related_memories: Vec<RelatedMemoryItem>,
+}
+
+impl From<memory::MemoryReadResult> for MemoryReadOutput {
+    fn from(result: memory::MemoryReadResult) -> Self {
+        Self {
+            title: result.entity.entity.title,
+            content: result.entity.body,
+            related_memories: result
+                .related
+                .into_iter()
+                .map(RelatedMemoryItem::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppendMemoryLogInput {
+    /// Concise title for the learned fact, decision, preference, or experience.
+    #[schemars(length(min = 1))]
+    pub title: String,
+    /// Initial topic labels. Grove trims empty values and removes duplicates.
+    pub tags: Vec<String>,
+    /// What happened or was learned, with enough context for later consolidation.
+    #[schemars(length(min = 1))]
+    pub description: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryTagFilterInput {
+    /// Structured tag category, matched case-insensitively and exactly.
+    #[schemars(length(min = 1))]
+    pub key: String,
+    /// Optional structured tag value, matched case-insensitively and exactly.
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRecallInput {
+    /// Optional concepts matched independently against title, description, and tags.
+    /// Separate concepts with spaces or common list punctuation.
+    pub query: Option<String>,
+    /// Optional structured tag filters. Every supplied filter must match.
+    #[serde(default)]
+    pub tags: Vec<MemoryTagFilterInput>,
+    /// Opaque cursor returned by the previous call.
+    pub cursor: Option<String>,
+    /// Number of summaries to return. Defaults to 10 and is capped at 50.
+    #[schemars(range(min = 1, max = 50))]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryReadInput {
+    /// Entity id returned by memory_recall or memory_get_related.
+    #[schemars(length(min = 1))]
+    pub entity_id: String,
+    /// Relation followed to reach this Entity. Invalid or unrelated ids are ignored.
+    pub via_relation_id: Option<String>,
+    /// Related summaries to include. Defaults to 3 and is capped at 10; use 0 to omit.
+    #[schemars(range(min = 0, max = 10))]
+    pub related_limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRelatedInput {
+    /// Entity whose Relation neighborhood should be explored.
+    #[schemars(length(min = 1))]
+    pub entity_id: String,
+    /// Opaque cursor returned by the previous call.
+    pub cursor: Option<String>,
+    /// Number of related summaries to return. Defaults to 10 and is capped at 50.
+    #[schemars(range(min = 1, max = 50))]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRecentLogsInput {
+    /// Optional concepts matched independently against title, description, and tags.
+    /// Separate concepts with spaces or common list punctuation.
+    pub query: Option<String>,
+    /// Opaque cursor returned by the previous call.
+    pub cursor: Option<String>,
+    /// Number of Logs to return. Defaults to 20 and is capped at 100.
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: Option<usize>,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BrowserOpenInput {
@@ -660,6 +952,75 @@ pub struct BrowserScreenshotInput {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Resolve the token-bound caller to its trusted project/task/chat identity.
+fn caller_session_from_parts(
+    parts: &Parts,
+) -> Result<(String, String, tasks::ChatSession), McpError> {
+    let cx = caller_context_from_parts(parts)?;
+    tasks::find_chat_session(&cx.caller_chat_id)
+        .map_err(|e| McpError::internal_error(format!("caller lookup failed: {e}"), None))?
+        .ok_or_else(|| {
+            McpError::invalid_request(
+                format!(
+                    "caller_unknown: chat_id {} is not bound to any task",
+                    cx.caller_chat_id
+                ),
+                None,
+            )
+        })
+}
+
+fn working_memory_project(parts: &Parts) -> Result<String, McpError> {
+    let (project_id, _, _) = caller_session_from_parts(parts)?;
+    if !memory::project_memory_enabled(&project_id).map_err(memory_mcp_error)? {
+        return Err(McpError::invalid_request(
+            "Project Memory is not enabled for this project".to_string(),
+            None,
+        ));
+    }
+    Ok(project_id)
+}
+
+fn memory_mcp_error(error: GroveError) -> McpError {
+    match error {
+        GroveError::InvalidData(message) => McpError::invalid_params(message, None),
+        GroveError::NotFound(message) => McpError::invalid_request(message, None),
+        other => McpError::internal_error(other.to_string(), None),
+    }
+}
+
+fn memory_bounded_limit(
+    value: Option<usize>,
+    default: usize,
+    max: usize,
+    field: &str,
+) -> Result<usize, McpError> {
+    let value = value.unwrap_or(default);
+    if !(1..=max).contains(&value) {
+        return Err(McpError::invalid_params(
+            format!("{field} must be an integer from 1 through {max} inclusive"),
+            None,
+        ));
+    }
+    Ok(value)
+}
+
+fn memory_bounded_limit_allow_zero(
+    value: Option<usize>,
+    default: usize,
+    max: usize,
+    field: &str,
+) -> Result<usize, McpError> {
+    let value = value.unwrap_or(default);
+    if value > max {
+        return Err(McpError::invalid_params(
+            format!("{field} must be an integer from 0 through {max} inclusive"),
+            None,
+        ));
+    }
+    Ok(value)
+}
 
 /// 从 caller chat_id 反查 task name（用作 Chrome Tab Group 标题）。
 ///
@@ -710,6 +1071,21 @@ fn json_success<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpErr
     let json = serde_json::to_string_pretty(value)
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
     Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+/// Memory tools advertise output schemas, so return the same JSON as both
+/// human-readable text and MCP structured content.
+fn memory_json_success<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpError> {
+    let value = serde_json::to_value(value)
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+    Ok(CallToolResult::structured(value))
+}
+
+fn map_memory_page<T, U>(page: memory::Page<T>, map: impl FnMut(T) -> U) -> memory::Page<U> {
+    memory::Page {
+        items: page.items.into_iter().map(map).collect(),
+        next_cursor: page.next_cursor,
+    }
 }
 
 /// Map an `AgentGraphError` to an MCP CallToolResult with `isError = true`.
@@ -833,14 +1209,190 @@ pub fn build_router() -> Router {
     // Mount under `/mcp/{token}` and the trailing-slash variant. rmcp's service
     // doesn't read the URL path itself; we read it inside the tool handlers.
     let svc_clone = svc.clone();
+    let memory_svc = super::memory_mcp::streamable_service();
+    let memory_svc_clone = memory_svc.clone();
     Router::new()
         .route_service("/mcp/{token}", svc)
         .route_service("/mcp/{token}/", svc_clone)
+        .route_service("/memory-mcp/{token}", memory_svc)
+        .route_service("/memory-mcp/{token}/", memory_svc_clone)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn schema_fields(
+        schema: &serde_json::Map<String, serde_json::Value>,
+    ) -> std::collections::HashSet<String> {
+        fn collect(value: &serde_json::Value, fields: &mut std::collections::HashSet<String>) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    if let Some(properties) =
+                        object.get("properties").and_then(|value| value.as_object())
+                    {
+                        fields.extend(properties.keys().cloned());
+                    }
+                    for value in object.values() {
+                        collect(value, fields);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        collect(value, fields);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut fields = std::collections::HashSet::new();
+        collect(&serde_json::Value::Object(schema.clone()), &mut fields);
+        fields
+    }
+
+    #[test]
+    fn working_memory_tools_expose_complete_contracts() {
+        let service = AgentGraphMcpService::new();
+        let tools = service.tool_router.list_all();
+        for name in WORKING_MEMORY_TOOLS {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == *name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            assert!(
+                tool.description
+                    .as_deref()
+                    .is_some_and(|description| !description.trim().is_empty()),
+                "{name} must have a description"
+            );
+            assert!(
+                tool.output_schema.is_some(),
+                "{name} must expose output_schema"
+            );
+        }
+
+        let read = tools
+            .iter()
+            .find(|tool| tool.name == "memory_read")
+            .expect("read tool");
+        let input_schema = serde_json::to_string(read.input_schema.as_ref()).expect("schema");
+        assert!(input_schema.contains("\"minimum\":0"), "{input_schema}");
+        assert!(input_schema.contains("\"maximum\":10"), "{input_schema}");
+
+        let append = tools
+            .iter()
+            .find(|tool| tool.name == "memory_append_log")
+            .expect("append tool");
+        let append_output =
+            serde_json::to_string(append.output_schema.as_ref().expect("output schema"))
+                .expect("schema");
+        let append_fields = schema_fields(append.output_schema.as_deref().expect("output schema"));
+        assert!(append_fields.contains("saved"), "{append_output}");
+        for hidden in ["project_id", "task_id", "chat_id", "agent", "created_at"] {
+            assert!(!append_fields.contains(hidden), "{append_output}");
+        }
+
+        let recall = tools
+            .iter()
+            .find(|tool| tool.name == "memory_recall")
+            .expect("recall tool");
+        let recall_output =
+            serde_json::to_string(recall.output_schema.as_ref().expect("output schema"))
+                .expect("schema");
+        let recall_fields = schema_fields(recall.output_schema.as_deref().expect("output schema"));
+        for visible in ["entity_id", "title", "description"] {
+            assert!(recall_fields.contains(visible), "{recall_output}");
+        }
+        for hidden in [
+            "project_id",
+            "file_path",
+            "tags",
+            "base_score",
+            "access_count",
+            "score",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(!recall_fields.contains(hidden), "{recall_output}");
+        }
+
+        let read_output =
+            serde_json::to_string(read.output_schema.as_ref().expect("output schema"))
+                .expect("schema");
+        let read_fields = schema_fields(read.output_schema.as_deref().expect("output schema"));
+        for visible in [
+            "title",
+            "content",
+            "related_memories",
+            "entity_id",
+            "relation_id",
+            "description",
+        ] {
+            assert!(read_fields.contains(visible), "{read_output}");
+        }
+        for hidden in [
+            "project_id",
+            "file_path",
+            "tags",
+            "base_score",
+            "access_count",
+            "score",
+            "created_at",
+            "updated_at",
+            "relation_access_recorded",
+        ] {
+            assert!(!read_fields.contains(hidden), "{read_output}");
+        }
+
+        let related = tools
+            .iter()
+            .find(|tool| tool.name == "memory_get_related")
+            .expect("related tool");
+        let related_output =
+            serde_json::to_string(related.output_schema.as_ref().expect("output schema"))
+                .expect("schema");
+        let related_fields =
+            schema_fields(related.output_schema.as_deref().expect("output schema"));
+        for visible in ["entity_id", "relation_id", "title", "description"] {
+            assert!(related_fields.contains(visible), "{related_output}");
+        }
+        for hidden in [
+            "relation_type",
+            "project_id",
+            "file_path",
+            "tags",
+            "base_score",
+            "access_count",
+            "score",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(!related_fields.contains(hidden), "{related_output}");
+        }
+
+        let logs = tools
+            .iter()
+            .find(|tool| tool.name == "memory_get_recent_logs")
+            .expect("logs tool");
+        let logs_output =
+            serde_json::to_string(logs.output_schema.as_ref().expect("output schema"))
+                .expect("schema");
+        let logs_fields = schema_fields(logs.output_schema.as_deref().expect("output schema"));
+        for visible in ["title", "tags", "description"] {
+            assert!(logs_fields.contains(visible), "{logs_output}");
+        }
+        for hidden in [
+            "id",
+            "project_id",
+            "task_id",
+            "chat_id",
+            "agent",
+            "created_at",
+        ] {
+            assert!(!logs_fields.contains(hidden), "{logs_output}");
+        }
+    }
 
     #[test]
     fn token_map_register_and_lookup() {
@@ -942,7 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn list_tools_returns_graph_tools() {
+    fn list_tools_returns_agent_tools() {
         let svc = AgentGraphMcpService::new();
         let names: Vec<String> = svc
             .tool_router
@@ -950,6 +1502,9 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
+        for tool in WORKING_MEMORY_TOOLS {
+            assert!(names.contains(&tool.to_string()), "missing {tool}");
+        }
         assert!(names.contains(&"graph_spawn".to_string()));
         assert!(names.contains(&"graph_send".to_string()));
         assert!(names.contains(&"graph_reply".to_string()));
@@ -962,7 +1517,7 @@ mod tests {
         assert!(names.contains(&"browser_screenshot".to_string()));
         assert!(names.contains(&"set_title".to_string()));
         assert!(names.contains(&"ask_form".to_string()));
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 17);
     }
 
     /// End-to-end test of the HTTP transport: real axum listener bound on a
@@ -1145,6 +1700,12 @@ mod tests {
             "graph_capability",
         ] {
             assert!(list_body.contains(tool), "tools/list missing {tool}");
+        }
+        for tool in WORKING_MEMORY_TOOLS {
+            assert!(
+                !list_body.contains(tool),
+                "disabled Project Memory must not advertise {tool} in {list_body}"
+            );
         }
 
         // ── 3. tools/call grove_agent_contacts ───────────────────────────

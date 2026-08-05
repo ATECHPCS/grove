@@ -162,7 +162,14 @@ pub struct InstructionsResponse {
     pub content: String,
 }
 
-/// Instructions/memory update request
+/// Result of moving one legacy Studio `memory.md` into the new Memory Log
+/// lifecycle. The full migrated content remains in the created Log.
+#[derive(Debug, Serialize)]
+pub struct LegacyMemoryMigrationResponse {
+    pub log_id: String,
+}
+
+/// Workspace Instructions update request
 #[derive(Debug, Deserialize)]
 pub struct InstructionsUpdateRequest {
     pub content: String,

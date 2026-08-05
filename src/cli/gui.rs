@@ -460,6 +460,10 @@ pub async fn execute(port: u16, remote_url: Option<String>) {
             // Initialize FileWatchers for all live tasks
             api::init_file_watchers();
 
+            // The desktop server owns the same Automation runtime as `grove web`.
+            // Register built-in consumers before Run Now or event triggers can fire.
+            api::start_automation_runtime();
+
             // Start the agent_graph MCP listener (loopback-only). Non-fatal on failure.
             match api::handlers::agent_graph_mcp::start_listener(
                 api::handlers::agent_graph_mcp::DEFAULT_BASE_PORT,

@@ -66,80 +66,11 @@ without affecting other tasks or the main codebase.
 
 "#;
 
-const CODING_EXECUTION_INSTRUCTIONS: &str = r#"
-# Grove - Coding Task (Git Worktree)
+const CODING_EXECUTION_INSTRUCTIONS: &str =
+    "Project-scoped Grove utilities for the current Coding Task.";
 
-You are running inside a **Coding** Grove task: an isolated git worktree + tmux session for parallel development.
-
-## Available Tools
-
-1. **grove_status** - Get task context (task_id, branch, target_branch, project)
-2. **grove_read_notes** - Read user-written notes containing context and requirements
-3. **grove_read_review** - Read code review comments with IDs and status
-4. **grove_reply_review** - Reply to review comments (supports batch)
-5. **grove_add_comment** - Create review comments (supports batch). Three levels:
-   - **Inline**: Comment on specific code lines (e.g., "extract this function")
-   - **File**: Comment on entire file (e.g., "file too large, split modules")
-   - **Project**: Overall feedback (e.g., "add integration tests")
-   Use to review code, raise questions, suggest improvements, or **visualize implementation plans** by marking key points.
-6. **grove_complete_task** - Complete task: commit → sync (rebase) → merge. **ONLY call when the user explicitly asks.**
-
-## Recommended Workflow
-
-1. Call `grove_status` first to verify the task context
-2. Call `grove_read_notes` to understand user requirements and context
-3. Call `grove_read_review` to check for code review feedback
-4. After addressing review comments, use `grove_reply_review` to respond
-5. When the user explicitly requests, call `grove_complete_task` to finalize
-
-## Completing a Task
-
-**IMPORTANT**: ONLY call `grove_complete_task` when the user explicitly asks. NEVER call it automatically or proactively.
-- Provide a commit message summarizing your changes
-- The tool will: commit → fetch & rebase target → merge into target branch
-- If rebase conflicts occur, resolve them and call `grove_complete_task` again
-"#;
-
-const STUDIO_EXECUTION_INSTRUCTIONS: &str = r#"
-# Grove - Studio Task
-
-You are running inside a **Studio** Grove task. Studio tasks are not git worktrees; they give you a persistent working directory with conventional subfolders:
-
-- `input/`    — user-provided input files (read-only starting point)
-- `output/`   — your work products
-- `resource/` — shared project resources (symlink to project-level resource/)
-- `scripts/`  — helper scripts
-- `sketch/`   — Excalidraw sketches (see sketch tools below)
-
-## Available Tools
-
-1. **grove_status** — task context (task_id, project_id, project_name)
-2. **grove_read_notes** — user-written notes (context, requirements)
-3. **grove_sketch_read_me()** — one-time format reference for sketch drawing (CALL ONCE before first draw)
-4. **grove_sketch_list()** — list sketches in this task
-5. **grove_sketch_read(sketch, detail_full?)** — read a sketch by name; returns summary + fresh checkpoint_id
-6. **grove_sketch_draw(sketch, elements)** — draw / modify a sketch; auto-creates if name is new; returns new checkpoint_id
-
-## Sketch Workflow
-
-The sketch tool surface is **checkpoint-driven** — a single `grove_sketch_draw` is both create and update. You never pass whole scenes; you pass an ordered array of element objects (plus optional pseudo-elements) that tell Grove how to merge with prior state.
-
-1. Call `grove_sketch_read_me` once to learn the element format.
-2. For a fresh drawing: `grove_sketch_draw(sketch="my-diagram", elements=[...elements])` — the sketch is created.
-3. Save the returned `checkpoint_id`.
-4. To add more: `grove_sketch_draw(sketch="my-diagram", elements=[{"type":"restoreCheckpoint","id":"<cp>"}, ...new elements])`.
-5. To inspect an existing sketch first: `grove_sketch_read("my-diagram")` — returns a summary and a fresh checkpoint_id.
-
-Checkpoints are retained for the most recent 50 draws per sketch (per-sketch LRU). Checkpoints are scoped to the sketch they were created in — passing a `checkpoint_id` from a different sketch will fail.
-
-## Recommended Workflow
-
-1. `grove_status` to verify task context
-2. `grove_read_notes` to understand requirements
-3. Read `input/` for user-provided files
-4. Work in `output/` and, if visual, the sketch canvas via the tools above
-5. When collaborating on a visual design, prefer sketch tools over describing shapes textually
-"#;
+const STUDIO_EXECUTION_INSTRUCTIONS: &str =
+    "Project-scoped Grove utilities for the current Studio Task.";
 
 /// Element-format reference returned by `grove_sketch_read_me`. Adapted from
 /// the excalidraw-mcp "cheat sheet" (MIT) with Grove-specific pseudo-elements.
@@ -1134,7 +1065,7 @@ impl GroveMcpServer {
     /// Check if running inside a Grove task and get task context
     #[tool(
         name = "status",
-        description = "CALL THIS FIRST before using any other Grove tools. Checks if you are running inside a Grove task environment. Returns task context including task_id, branch name, target branch, and project name. If in_grove_task is false, do NOT use other Grove tools."
+        description = "Return the authoritative current Grove task context, including task id and name, project name, branch, and target branch. Use it when task identity or branch context needs to be verified."
     )]
     async fn grove_status(&self) -> Result<CallToolResult, McpError> {
         let result = match get_task_context() {
@@ -1511,7 +1442,7 @@ impl GroveMcpServer {
     /// Read user-written notes for the current task
     #[tool(
         name = "read_notes",
-        description = "Read user-written notes for the current Grove task. Notes contain important context, requirements, and instructions set by the user. Call grove_status first to ensure you are in a Grove task."
+        description = "Read user-written notes for the current Grove task. Notes contain important context, requirements, and instructions set by the user."
     )]
     async fn grove_read_notes(&self) -> Result<CallToolResult, McpError> {
         let (task_id, project_path) = get_task_context()
@@ -1534,7 +1465,7 @@ impl GroveMcpServer {
     /// Read review comments for the current task
     #[tool(
         name = "read_review",
-        description = "Read code review comments for the current Grove task. Returns comments with IDs, locations, content, and status (open/resolved/outdated). Use grove_reply_review to respond to comments. Call grove_status first to ensure you are in a Grove task."
+        description = "Read code review comments for the current Grove task. Returns comments with IDs, locations, content, and status (open/resolved/outdated). Use grove_reply_review to respond to comments."
     )]
     async fn grove_read_review(
         &self,
@@ -1900,7 +1831,7 @@ impl GroveMcpServer {
     /// Complete the current task: commit, sync (rebase), and merge
     #[tool(
         name = "complete_task",
-        description = "Complete the current Grove task in one operation. This will: (1) commit all changes with your message, (2) sync with target branch via rebase, (3) merge into target branch. If rebase conflicts occur, resolve them and call this tool again. IMPORTANT: ONLY call this tool when the user explicitly requests task completion. NEVER call it automatically or proactively. Call grove_status first to ensure you are in a Grove task."
+        description = "Complete the current Grove task in one operation. This will: (1) commit all changes with your message, (2) sync with target branch via rebase, (3) merge into target branch. If rebase conflicts occur, resolve them and call this tool again. IMPORTANT: ONLY call this tool when the user explicitly requests task completion. NEVER call it automatically or proactively."
     )]
     async fn grove_complete_task(
         &self,
@@ -2819,6 +2750,9 @@ async fn start_chat_impl(p: StartChatParams) -> Result<CallToolResult, McpError>
         project_key: project_key.clone(),
         task_id: p.task_id.clone(),
         chat_id: Some(chat_id.clone()),
+        artifact_dir: None,
+        additional_mcp_servers: Vec::new(),
+        mcp_server_policy: acp::McpServerPolicy::WorkingSession,
         agent_type: resolved.agent_type,
         remote_url: resolved.url,
         remote_auth: resolved.auth_header,
@@ -2875,6 +2809,9 @@ async fn resolve_session_access(
         project_key: project_key.to_string(),
         task_id: task.id.clone(),
         chat_id: Some(chat_id.to_string()),
+        artifact_dir: None,
+        additional_mcp_servers: Vec::new(),
+        mcp_server_policy: acp::McpServerPolicy::WorkingSession,
         agent_type: resolved.agent_type,
         remote_url: resolved.url,
         remote_auth: resolved.auth_header,
@@ -3002,6 +2939,7 @@ fn build_queued_config(
         mode: mode_id,
         thought_level: thought_level_value_id,
         thought_level_config_id,
+        config_options: std::collections::BTreeMap::new(),
     }))
 }
 

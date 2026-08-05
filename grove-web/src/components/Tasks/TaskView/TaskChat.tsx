@@ -9158,11 +9158,7 @@ export function TaskChat({
                     animate={{ opacity: 1, y: 0, height: "auto" }}
                     exit={{ opacity: 0, y: 8, height: 0 }}
                     transition={{ duration: 0.2, ease: "easeOut" }}
-                    className={
-                      activeComposerPanel === "pending"
-                        ? "mb-2 overflow-hidden rounded-xl border border-[color-mix(in_srgb,var(--color-border)_38%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_48%,transparent)]"
-                        : "mb-3 overflow-hidden rounded-2xl border border-[color-mix(in_srgb,var(--color-border)_62%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_92%,transparent)] shadow-[0_12px_32px_rgba(0,0,0,0.14)] backdrop-blur-md"
-                    }
+                    className="mb-3 overflow-hidden rounded-2xl border border-[color-mix(in_srgb,var(--color-border)_62%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_92%,transparent)] shadow-[0_12px_32px_rgba(0,0,0,0.14)] backdrop-blur-md"
                   >
                     <div className={`max-h-[min(360px,48vh)] overflow-y-auto overscroll-contain ${activeComposerPanel === "previewComments" ? "" : activeComposerPanel === "pending" ? "px-2.5 py-1.5" : "px-3 py-3"}`}>
                       {activeComposerPanel === "todo" && (

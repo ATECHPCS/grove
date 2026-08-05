@@ -8,7 +8,7 @@
 
 use std::fs;
 use std::io::{BufRead, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
@@ -263,11 +263,15 @@ pub fn should_persist(update: &AcpUpdate) -> bool {
 /// write，两次之间会被别的线程插入）。
 pub fn append_event(project: &str, task_id: &str, chat_id: &str, event: &AcpUpdate) {
     let path = history_file_path(project, task_id, chat_id);
+    append_event_to_path(&path, event);
+}
+
+pub fn append_event_to_path(path: &Path, event: &AcpUpdate) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
 
-    match fs::OpenOptions::new().create(true).append(true).open(&path) {
+    match fs::OpenOptions::new().create(true).append(true).open(path) {
         Ok(mut f) => {
             append_json_line(&mut f, event);
         }

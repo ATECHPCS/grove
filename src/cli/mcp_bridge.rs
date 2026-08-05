@@ -39,7 +39,7 @@ const ACCEPT_HEADER: &str = "application/json, text/event-stream";
 /// if a custom agent takes longer to come up. `0` disables the timeout.
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
-pub fn run() -> i32 {
+pub fn run(route: String) -> i32 {
     // multi_thread runtime so that long SSE responses don't starve other
     // pipelined requests when we tokio::spawn each one.
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -53,11 +53,11 @@ pub fn run() -> i32 {
             return 1;
         }
     };
-    rt.block_on(async_main())
+    rt.block_on(async_main(&route))
 }
 
-async fn async_main() -> i32 {
-    let url = match resolve_endpoint() {
+async fn async_main(route: &str) -> i32 {
+    let url = match resolve_endpoint(route) {
         Ok(u) => u,
         Err(msg) => {
             eprintln!("[mcp-bridge] {}", msg);
@@ -274,7 +274,7 @@ async fn close_session(
 /// Build the full MCP HTTP URL by combining the listener port (env →
 /// `mcp.port` file) with the per-session token (env). Returns a human-readable
 /// error if neither source yields what we need.
-fn resolve_endpoint() -> Result<String, String> {
+fn resolve_endpoint(route: &str) -> Result<String, String> {
     let token = std::env::var("GROVE_MCP_TOKEN").map_err(|_| {
         "GROVE_MCP_TOKEN not set — mcp-bridge must be spawned by an agent that \
          was launched by Grove (the parent agent process inherits the token \
@@ -290,7 +290,10 @@ fn resolve_endpoint() -> Result<String, String> {
             .map_err(|e| format!("no GROVE_MCP_PORT in env and port file unusable: {}", e))?
     };
 
-    Ok(format!("http://127.0.0.1:{}/mcp/{}", port, token))
+    if route.is_empty() || route.contains('/') || route.contains('\\') || route.contains("..") {
+        return Err("invalid MCP bridge route".to_string());
+    }
+    Ok(format!("http://127.0.0.1:{}/{}/{}", port, route, token))
 }
 
 /// Read a `text/event-stream` body byte-by-byte, decode lines as UTF-8 (so
