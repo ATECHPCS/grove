@@ -244,7 +244,7 @@ enum AcpCommand {
     },
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum ConfigOptionValue {
     Select(String),
@@ -1019,6 +1019,9 @@ pub struct LoopbackMcpServer {
     pub name: String,
     pub url: String,
     pub route: String,
+    /// Optional usage guidance appended to the first Session instruction when
+    /// this explicit server is present for the Run.
+    pub session_instruction: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1171,15 +1174,19 @@ fn session_bootstrap_instruction(
             build_working_session_instruction(config, agent_runtime_available),
         ));
     }
-    if config
+    if let Some(memory_server) = config
         .additional_mcp_servers
         .iter()
-        .any(|server| server.name == "grove_memory")
+        .find(|server| server.name == "grove_memory")
     {
-        return Some((
-            "memory_organization",
-            MEMORY_ORGANIZATION_INSTRUCTION.to_string(),
-        ));
+        let mut instruction = MEMORY_ORGANIZATION_INSTRUCTION.to_string();
+        if let Some(additional) = memory_server.session_instruction.as_deref() {
+            if !additional.trim().is_empty() {
+                instruction.push_str("\n\n");
+                instruction.push_str(additional);
+            }
+        }
+        return Some(("memory_organization", instruction));
     }
     if let Some(persona) = config.persona_injection.as_ref() {
         if !persona.system_prompt.trim().is_empty() {
@@ -5629,11 +5636,11 @@ async fn drive_session(
                 );
 
                 // ── Pre-prompt config application ───────────────────────────
-                // Apply mode/model/thought_level via ACP requests BEFORE emitting
-                // Busy=true / UserMessage. If any rejected by agent, surface
-                // Error and skip this prompt entirely (haven't emitted Busy yet
-                // so no need to flip it back). Replaces the old standalone
-                // SetMode/SetModel/SetThoughtLevel AcpCommand variants.
+                // Reconcile and apply settings via ACP requests BEFORE emitting
+                // Busy=true / UserMessage. Generic configOptions are explicit
+                // overrides: stale/invalid values are skipped in favor of the
+                // live Agent defaults. Legacy mode/model/thought fields retain
+                // their strict failure behavior for old persisted sessions.
                 //
                 // Failure reporting: applies are sequential (mode → model →
                 // thought_level). When request N fails, requests 1..N-1 may
@@ -5657,49 +5664,61 @@ async fn drive_session(
                             .iter()
                             .map(|option| option.id.to_string())
                             .collect::<std::collections::HashSet<_>>();
-                        if let Some(missing) = cfg
+                        for missing in cfg
                             .config_options
                             .keys()
-                            .find(|id| !advertised_ids.contains(*id))
+                            .filter(|id| !advertised_ids.contains(*id))
                         {
-                            failure = Some((
-                                missing.clone(),
-                                "agent did not advertise this config option".to_string(),
-                            ));
+                            handle.emit(AcpUpdate::ConfigOptionError {
+                                config_id: missing.clone(),
+                                message: format!(
+                                    "Skipped saved config option '{missing}' because the Agent no longer advertises it; using the Agent's current value."
+                                ),
+                            });
                         }
-                        if failure.is_none() {
-                            for option in advertised {
-                                let config_id = option.id.to_string();
-                                let Some(value) = cfg.config_options.get(&config_id).cloned()
-                                else {
+                        for option in advertised {
+                            let config_id = option.id.to_string();
+                            let Some(value) = cfg.config_options.get(&config_id).cloned() else {
+                                continue;
+                            };
+                            if crate::agent_config::config_option_has_current_value(&option, &value)
+                            {
+                                continue;
+                            }
+                            let request_value = match validated_config_request_value(
+                                &handle, &config_id, value,
+                            ) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    handle.emit(AcpUpdate::ConfigOptionError {
+                                        config_id: config_id.clone(),
+                                        message: format!(
+                                            "Skipped saved config option '{config_id}' because it is not valid for the current Agent session; using the Agent's current value. {error}"
+                                        ),
+                                    });
                                     continue;
-                                };
-                                let request_value = match validated_config_request_value(
-                                    &handle, &config_id, value,
-                                ) {
-                                    Ok(value) => value,
-                                    Err(error) => {
-                                        failure = Some((config_id.clone(), error));
-                                        break;
-                                    }
-                                };
-                                match conn
-                                    .send_request(acp::SetSessionConfigOptionRequest::new(
-                                        session_id_arc.clone(),
-                                        acp::SessionConfigId::new(config_id.clone()),
-                                        request_value,
-                                    ))
-                                    .block_task()
-                                    .await
-                                {
-                                    Ok(response) => {
-                                        replace_config_snapshot(&handle, response.config_options);
-                                        applied.push(config_id);
-                                    }
-                                    Err(error) => {
-                                        failure = Some((config_id, error.to_string()));
-                                        break;
-                                    }
+                                }
+                            };
+                            match conn
+                                .send_request(acp::SetSessionConfigOptionRequest::new(
+                                    session_id_arc.clone(),
+                                    acp::SessionConfigId::new(config_id.clone()),
+                                    request_value,
+                                ))
+                                .block_task()
+                                .await
+                            {
+                                Ok(response) => {
+                                    replace_config_snapshot(&handle, response.config_options);
+                                    applied.push(config_id);
+                                }
+                                Err(error) => {
+                                    handle.emit(AcpUpdate::ConfigOptionError {
+                                        config_id: config_id.clone(),
+                                        message: format!(
+                                            "Could not apply saved config option '{config_id}'; continuing with the Agent's current value. {error}"
+                                        ),
+                                    });
                                 }
                             }
                         }

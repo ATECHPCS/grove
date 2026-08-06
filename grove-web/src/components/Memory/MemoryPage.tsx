@@ -70,7 +70,7 @@ import {
   type InstalledAgentConfig,
   listInstalledAgentConfigs,
 } from "../../api/marketplace";
-import { configForAgent } from "../../utils/agentConfig";
+import { configForAgent, reconcileAgentConfig } from "../../utils/agentConfig";
 import { appendHmacToUrl, getApiHost } from "../../api/client";
 import {
   applyToolCallCreated,
@@ -190,7 +190,7 @@ export function MemoryPage() {
 
   useEffect(() => {
     void Promise.resolve().then(loadAgents);
-  }, [loadAgents]);
+  }, [loadAgents, tab]);
 
   useEffect(() => {
     void Promise.resolve().then(() => {
@@ -335,9 +335,25 @@ function OverviewTab({
 
   useEffect(() => {
     const next = configToDraft(config);
-    if (!config && agents[0]) next.agent_config = configForAgent(agents[0]);
     void Promise.resolve().then(() => setDraft(next));
-  }, [config, agents]);
+  }, [config]);
+
+  useEffect(() => {
+    if (agents.length === 0) return;
+    void Promise.resolve().then(() => setDraft((current) => {
+      const agentId = current.agent_config.agent_id;
+      const agent = agents.find((candidate) => candidate.id === agentId) ?? (
+        !agentId && !config ? agents[0] : undefined
+      );
+      if (!agent) return current;
+      return {
+        ...current,
+        agent_config: agentId
+          ? reconcileAgentConfig(current.agent_config, agent)
+          : configForAgent(agent),
+      };
+    }));
+  }, [agents, config]);
 
   useEffect(() => {
     if (agentsError) {
@@ -370,7 +386,12 @@ function OverviewTab({
     return () => { disposed = true; };
   }, [projectId, overview.entity_count, overview.last_organized_at]);
 
-  const savedDraft = useMemo(() => configToDraft(config), [config]);
+  const savedDraft = useMemo(() => {
+    const saved = configToDraft(config);
+    const agent = agents.find((candidate) => candidate.id === saved.agent_config.agent_id);
+    if (agent) saved.agent_config = reconcileAgentConfig(saved.agent_config, agent);
+    return saved;
+  }, [agents, config]);
   const isDirty = useMemo(() => !sameMemoryConfig(draft, savedDraft), [draft, savedDraft]);
 
   const selectedAgentId = draft.agent_config.agent_id ?? "";

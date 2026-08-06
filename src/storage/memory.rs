@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -223,6 +223,15 @@ pub struct RecentChatFile {
     pub path: String,
     /// RFC 3339 file modification timestamp.
     pub modified_at: String,
+    /// Human-readable Task name for evidence orientation.
+    pub task_name: String,
+    /// Human-readable Session title for evidence orientation.
+    pub session_name: String,
+    /// One-based line where evidence after the previous successful
+    /// organization begins. This is a dynamic reading hint, not a cursor.
+    pub new_content_start_line: usize,
+    /// Current JSONL line count, useful for choosing an efficient read method.
+    pub total_lines: usize,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1620,6 +1629,15 @@ pub fn list_recent_chat_files(
     cursor: Option<&str>,
     limit: usize,
 ) -> Result<Page<RecentChatFile>> {
+    struct Candidate {
+        task_id: String,
+        chat_id: String,
+        path: PathBuf,
+        modified: chrono::DateTime<Utc>,
+        task_name: String,
+        session_name: String,
+    }
+
     let offset = parse_offset(cursor)?;
     let limit = limit.clamp(1, 100);
     let from = parse_optional_time(from_at)?;
@@ -1634,12 +1652,22 @@ pub fn list_recent_chat_files(
     if tasks_dir.is_dir() {
         for task in fs::read_dir(tasks_dir)? {
             let task = task?;
+            let task_id = task.file_name().to_string_lossy().into_owned();
             let chats_dir = task.path().join("chats");
             if !chats_dir.is_dir() {
                 continue;
             }
+            let task_name = super::tasks::get_task(project_id, &task_id)?
+                .or(super::tasks::get_archived_task(project_id, &task_id)?)
+                .map(|task| task.name)
+                .unwrap_or_else(|| "Untitled Task".to_string());
+            let session_names = super::tasks::load_chat_sessions(project_id, &task_id)?
+                .into_iter()
+                .map(|session| (session.id, session.title))
+                .collect::<HashMap<_, _>>();
             for chat in fs::read_dir(chats_dir)? {
                 let chat = chat?;
+                let chat_id = chat.file_name().to_string_lossy().into_owned();
                 let path = chat.path().join("history.jsonl");
                 if !path.is_file() {
                     continue;
@@ -1648,20 +1676,84 @@ pub fn list_recent_chat_files(
                 if from.is_some_and(|from| modified <= from) || modified > through {
                     continue;
                 }
-                files.push(RecentChatFile {
-                    task_id: task.file_name().to_string_lossy().into_owned(),
-                    chat_id: chat.file_name().to_string_lossy().into_owned(),
-                    path: path.to_string_lossy().into_owned(),
-                    modified_at: modified.to_rfc3339(),
+                files.push(Candidate {
+                    task_id: task_id.clone(),
+                    chat_id: chat_id.clone(),
+                    path,
+                    modified,
+                    task_name: task_name.clone(),
+                    session_name: session_names
+                        .get(&chat_id)
+                        .cloned()
+                        .unwrap_or_else(|| "Untitled Session".to_string()),
                 });
             }
         }
     }
-    files.sort_by(|a, b| a.modified_at.cmp(&b.modified_at).then(a.path.cmp(&b.path)));
+    files.sort_by(|a, b| a.modified.cmp(&b.modified).then(a.path.cmp(&b.path)));
     let end = (offset + limit).min(files.len());
-    let items = files.get(offset..end).unwrap_or_default().to_vec();
+    let items = files
+        .get(offset..end)
+        .unwrap_or_default()
+        .iter()
+        .map(|candidate| {
+            let (new_content_start_line, total_lines) =
+                history_line_hint(&candidate.path, from.as_ref())?;
+            let absolute_path =
+                fs::canonicalize(&candidate.path).unwrap_or_else(|_| candidate.path.clone());
+            Ok(RecentChatFile {
+                task_id: candidate.task_id.clone(),
+                chat_id: candidate.chat_id.clone(),
+                path: absolute_path.to_string_lossy().into_owned(),
+                modified_at: candidate.modified.to_rfc3339(),
+                task_name: candidate.task_name.clone(),
+                session_name: candidate.session_name.clone(),
+                new_content_start_line,
+                total_lines,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let next_cursor = (end < files.len()).then(|| end.to_string());
     Ok(Page { items, next_cursor })
+}
+
+fn history_line_hint(
+    path: &Path,
+    review_after: Option<&chrono::DateTime<Utc>>,
+) -> Result<(usize, usize)> {
+    let mut reader = std::io::BufReader::new(fs::File::open(path)?);
+    let mut line = String::new();
+    let mut total_lines = 0usize;
+    let mut candidate_start_line = 1usize;
+    let mut first_new_turn_line = review_after.is_none().then_some(1usize);
+
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        total_lines += 1;
+        if review_after.is_none() || !line.contains(r#""type":"complete""#) {
+            continue;
+        }
+        let end_ts = serde_json::from_str::<serde_json::Value>(&line)
+            .ok()
+            .and_then(|event| event.get("end_ts").and_then(serde_json::Value::as_i64));
+        match end_ts {
+            Some(end_ts) if end_ts > review_after.expect("checked above").timestamp() => {
+                first_new_turn_line.get_or_insert(candidate_start_line);
+            }
+            Some(_) => candidate_start_line = total_lines + 1,
+            // Old histories may not have a timestamp. Keep the earlier
+            // candidate so the hint remains conservative and loses no context.
+            None => {}
+        }
+    }
+
+    Ok((
+        first_new_turn_line.unwrap_or(candidate_start_line),
+        total_lines,
+    ))
 }
 
 fn list_all_entities_on(

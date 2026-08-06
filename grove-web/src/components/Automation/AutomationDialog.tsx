@@ -38,7 +38,7 @@ import {
   listInstalledAgentConfigs,
   type InstalledAgentConfig,
 } from "../../api/marketplace";
-import { configForAgent } from "../../utils/agentConfig";
+import { configForAgent, reconcileAgentConfig } from "../../utils/agentConfig";
 import { useCommand, useKeyboardScope } from "../../keyboard";
 import type {
   AgentConfigSelection,
@@ -513,15 +513,7 @@ export function AutomationDialog({
     : [];
   const legacyModes = selectedCapability?.modes?.available ?? [];
   const effectiveAgentConfig = selectedInstalledAgent
-    ? selectedCapability?.uses_config_options && configOptions.length > 0
-      ? agentConfig.source === "config_options"
-        ? agentConfig
-        : configForAgent(selectedInstalledAgent)
-      : legacyModes.length > 0
-        ? agentConfig.source === "modes"
-          ? agentConfig
-          : configForAgent(selectedInstalledAgent)
-        : agentConfig
+    ? reconcileAgentConfig(agentConfig, selectedInstalledAgent)
     : agentConfig;
 
   function configSelectionForAgentId(agentId: string): AgentConfigSelection {

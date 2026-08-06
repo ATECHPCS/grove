@@ -62,6 +62,7 @@ import {
   ArrowRightLeft,
   SlidersHorizontal,
   Box,
+  Database,
 } from "lucide-react";
 import { iconUrlForFile } from "../../ui/iconUrl";
 import {
@@ -181,6 +182,7 @@ import { useAgentQuota, useRadioEvents } from "../../../hooks";
 import { AgentQuotaPopover } from "./AgentQuotaPopover";
 import { ContextUsagePill } from "./ContextUsagePill";
 import { TurnUsageMeta } from "./TurnUsageMeta";
+import { collectCurrentTurnRecalledMemories } from "./memoryRecall";
 import {
   quotaBadgePercent,
   quotaBatteryIcon,
@@ -2688,6 +2690,7 @@ export function TaskChat({
   const [showPermissionPanel, setShowPermissionPanel] = useState(false);
   const [showFormPanel, setShowFormPanel] = useState(false);
   const [showAuthPanel, setShowAuthPanel] = useState(false);
+  const [showMemoryPanel, setShowMemoryPanel] = useState(false);
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [showSlashMenu, setShowSlashMenu] = useState(false);
   const [slashFilter, setSlashFilter] = useState("");
@@ -3000,6 +3003,11 @@ export function TaskChat({
   const hasTodoPanel = planEntries.length > 0;
   const hasPlanPanel = !!planFileContent;
   const hasPendingPanel = pendingMessages.length > 0;
+  const recalledMemories = useMemo(
+    () => collectCurrentTurnRecalledMemories(messages),
+    [messages],
+  );
+  const hasMemoryPanel = recalledMemories.length > 0;
   const activePermissionMessage = useMemo(
     () =>
       [...messages]
@@ -3054,15 +3062,17 @@ export function TaskChat({
         ? "permission"
         : showFormPanel && activeSurveyMessage
           ? "ask_form"
-          : showPlan && hasTodoPanel
-            ? "todo"
-            : showPlanFile && hasPlanPanel
-              ? "plan"
-              : showPendingQueue && hasPendingPanel
-                ? "pending"
-                : showPreviewComments && hasPreviewCommentsPanel
-                  ? "previewComments"
-                  : null;
+          : showMemoryPanel && hasMemoryPanel
+            ? "memory"
+            : showPlan && hasTodoPanel
+              ? "todo"
+              : showPlanFile && hasPlanPanel
+                ? "plan"
+                : showPendingQueue && hasPendingPanel
+                  ? "pending"
+                  : showPreviewComments && hasPreviewCommentsPanel
+                    ? "previewComments"
+                    : null;
   const composerPanelOpen = activeComposerPanel !== null;
 
   // When a permission message appears, force the permission panel open and
@@ -3080,6 +3090,7 @@ export function TaskChat({
       setShowPlanFile(false);
       setShowPendingQueue(false);
       setShowPreviewComments(false);
+      setShowMemoryPanel(false);
     } else {
       setShowPermissionPanel(false);
     }
@@ -3096,6 +3107,7 @@ export function TaskChat({
       setShowPlanFile(false);
       setShowPendingQueue(false);
       setShowPreviewComments(false);
+      setShowMemoryPanel(false);
     } else {
       setShowFormPanel(false);
     }
@@ -3113,6 +3125,7 @@ export function TaskChat({
       setShowPlanFile(false);
       setShowPendingQueue(false);
       setShowPreviewComments(false);
+      setShowMemoryPanel(false);
     } else {
       setShowAuthPanel(false);
     }
@@ -4016,6 +4029,7 @@ export function TaskChat({
 
   /** Restore chat state from cache */
   const restoreChatState = useCallback((chatId: string) => {
+    setShowMemoryPanel(false);
     const cached = perChatStateRef.current.get(chatId);
     if (cached) {
       setMessages(cached.messages);
@@ -6376,6 +6390,7 @@ export function TaskChat({
       setShowPendingQueue(true);
       setShowPlan(false);
       setShowPlanFile(false);
+      setShowMemoryPanel(false);
       onUserMessageSent?.();
       el.focus();
     } else {
@@ -6440,6 +6455,7 @@ export function TaskChat({
     setShowPendingQueue(isBusy);
     setShowPlan(false);
     setShowPlanFile(false);
+    setShowMemoryPanel(false);
     // Part B: 删乐观 updateBusy — 等后端事件
     onUserMessageSent?.();
   }, [
@@ -9195,6 +9211,56 @@ export function TaskChat({
                         </div>
                       )}
 
+                      {activeComposerPanel === "memory" && (
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-2 px-0.5">
+                            <Database className="h-3.5 w-3.5 text-[var(--color-highlight)]" />
+                            <div className="text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
+                              Recalled Memory · {recalledMemories.length}
+                            </div>
+                          </div>
+                          <div className="space-y-1.5">
+                            {recalledMemories.map((memory) => (
+                              <div
+                                key={memory.entityId || memory.title}
+                                className="rounded-xl border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] bg-[color-mix(in_srgb,var(--color-bg)_72%,transparent)] px-3 py-2.5"
+                              >
+                                <div className="flex min-w-0 items-start justify-between gap-3">
+                                  <div className="min-w-0 text-sm font-medium leading-5 text-[var(--color-text)]">
+                                    {memory.title}
+                                  </div>
+                                  {memory.entityId && (
+                                    <span
+                                      className="max-w-28 shrink-0 truncate font-mono text-[9px] text-[var(--color-text-muted)] opacity-60"
+                                      title={memory.entityId}
+                                    >
+                                      {memory.entityId}
+                                    </span>
+                                  )}
+                                </div>
+                                {memory.description && (
+                                  <div className="mt-1 line-clamp-2 text-[11px] leading-4 text-[var(--color-text-muted)]">
+                                    {memory.description}
+                                  </div>
+                                )}
+                                {memory.tags.length > 0 && (
+                                  <div className="mt-2 flex flex-wrap gap-1">
+                                    {memory.tags.slice(0, 6).map((tag) => (
+                                      <span
+                                        key={tag}
+                                        className="rounded-full bg-[color-mix(in_srgb,var(--color-highlight)_10%,transparent)] px-1.5 py-0.5 text-[9px] text-[var(--color-highlight)]"
+                                      >
+                                        {tag}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
                       {activeComposerPanel === "plan" && (
                         <div className="space-y-2">
                           <div className="flex items-center justify-between">
@@ -9791,6 +9857,33 @@ export function TaskChat({
                     )}
                   </div>
                   <div className="flex items-center gap-1.5 shrink-0 select-none">
+                    {hasMemoryPanel && (
+                      <button
+                        onClick={() => {
+                          const next = !showMemoryPanel;
+                          setShowMemoryPanel(next);
+                          if (next) {
+                            setShowAuthPanel(false);
+                            setShowPermissionPanel(false);
+                            setShowFormPanel(false);
+                            setShowPlan(false);
+                            setShowPlanFile(false);
+                            setShowPendingQueue(false);
+                            setShowPreviewComments(false);
+                          }
+                        }}
+                        className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
+                          activeComposerPanel === "memory"
+                            ? "bg-[color-mix(in_srgb,var(--color-highlight)_14%,transparent)] text-[var(--color-highlight)]"
+                            : "bg-[var(--color-bg)] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+                        }`}
+                        title="Memory recalled by the agent in this turn"
+                      >
+                        <Database className="h-3 w-3" />
+                        <span>Memory</span>
+                        <span className="opacity-70">{recalledMemories.length}</span>
+                      </button>
+                    )}
                     {hasTodoPanel && (
                       <button
                         onClick={() => {
@@ -9802,6 +9895,7 @@ export function TaskChat({
                             setShowPlanFile(false);
                             setShowPendingQueue(false);
                             setShowPreviewComments(false);
+                            setShowMemoryPanel(false);
                           }
                         }}
                         className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
@@ -9832,6 +9926,7 @@ export function TaskChat({
                             setShowPlan(false);
                             setShowPendingQueue(false);
                             setShowPreviewComments(false);
+                            setShowMemoryPanel(false);
                           }
                         }}
                         className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
@@ -9855,6 +9950,7 @@ export function TaskChat({
                             setShowPlan(false);
                             setShowPlanFile(false);
                             setShowPreviewComments(false);
+                            setShowMemoryPanel(false);
                           }
                         }}
                         className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
@@ -9877,6 +9973,7 @@ export function TaskChat({
                             setShowPlanFile(false);
                             setShowPendingQueue(false);
                             setShowPreviewComments(false);
+                            setShowMemoryPanel(false);
                           }
                         }}
                         className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
@@ -9906,6 +10003,7 @@ export function TaskChat({
                             setShowPlanFile(false);
                             setShowPendingQueue(false);
                             setShowPreviewComments(false);
+                            setShowMemoryPanel(false);
                           }
                         }}
                         className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
@@ -9937,6 +10035,7 @@ export function TaskChat({
                             setShowPlan(false);
                             setShowPlanFile(false);
                             setShowPendingQueue(false);
+                            setShowMemoryPanel(false);
                           }
                         }}
                         className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${

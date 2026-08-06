@@ -94,9 +94,18 @@ pub async fn get_config(
     let config = memory::get_project_config(&project_key)
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "Memory is not configured".into()))?;
-    let automation = automations::get(&config.organization_automation_id)
+    let mut automation = automations::get(&config.organization_automation_id)
         .map_err(internal)?
         .ok_or((StatusCode::CONFLICT, "linked Automation is missing".into()))?;
+    let reconciled = automation
+        .agent_config
+        .reconciled_with_installed_snapshot()
+        .map_err(internal)?;
+    if reconciled != automation.agent_config {
+        automation.agent_config = reconciled;
+        automation.updated_at = Utc::now().timestamp();
+        automations::update(&automation).map_err(internal)?;
+    }
     Ok(Json(to_response(config, automation)))
 }
 
@@ -163,7 +172,10 @@ pub async fn update_config(
     };
     let pending_log_threshold = input.pending_log_threshold.filter(|value| *value > 0);
     automation.enabled = input.enabled && input.organization_enabled;
-    automation.agent_config = input.agent_config;
+    automation.agent_config = input
+        .agent_config
+        .reconciled_with_installed_snapshot()
+        .map_err(internal)?;
     automation.prompt = ORGANIZATION_PROMPT.to_string();
     automation.schedule_cron = input.schedule_cron;
     let mut event_triggers = normalize_events(input.event_triggers)?;

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum AgentConfigSelection {
     Default {
@@ -61,5 +61,177 @@ impl AgentConfigSelection {
                 config_options: BTreeMap::new(),
             }),
         }
+    }
+
+    /// Keep only explicit overrides that the current ACP Session still
+    /// advertises and accepts. Agent capability snapshots are authoritative:
+    /// removed options and values fall back to the Agent's current default.
+    pub fn reconciled_with(
+        &self,
+        advertised: &[agent_client_protocol::schema::v1::SessionConfigOption],
+    ) -> Self {
+        let Self::ConfigOptions { agent_id, values } = self else {
+            return self.clone();
+        };
+        Self::ConfigOptions {
+            agent_id: agent_id.clone(),
+            values: values
+                .iter()
+                .filter(|(id, value)| {
+                    advertised.iter().any(|option| {
+                        option.id.to_string() == id.as_str() && config_option_accepts(option, value)
+                    })
+                })
+                .map(|(id, value)| (id.clone(), value.clone()))
+                .collect(),
+        }
+    }
+
+    /// Reconcile persisted overrides against the latest installed-Agent
+    /// capability snapshot. A snapshot that explicitly uses configOptions is
+    /// a full replacement; absent snapshots remain non-authoritative.
+    pub fn reconciled_with_installed_snapshot(&self) -> crate::error::Result<Self> {
+        let Some(agent_id) = self.agent_id() else {
+            return Ok(self.clone());
+        };
+        let canonical_agent_id = crate::storage::installed_agents::canonicalize_agent_id(agent_id);
+        let Some(snapshot) =
+            crate::storage::installed_agents::get_capability_snapshot(&canonical_agent_id)?
+        else {
+            return Ok(self.clone());
+        };
+        let Some(uses_config_options) = snapshot
+            .get("uses_config_options")
+            .and_then(serde_json::Value::as_bool)
+        else {
+            return Ok(self.clone());
+        };
+        if !matches!(self, Self::ConfigOptions { .. }) {
+            return Ok(self.clone());
+        }
+        if !uses_config_options {
+            return Ok(Self::ConfigOptions {
+                agent_id: Some(agent_id.to_string()),
+                values: BTreeMap::new(),
+            });
+        }
+        let Some(raw_options) = snapshot.get("config_options").cloned() else {
+            return Ok(self.clone());
+        };
+        let Ok(advertised) = serde_json::from_value::<
+            Vec<agent_client_protocol::schema::v1::SessionConfigOption>,
+        >(raw_options) else {
+            // A stale or future snapshot shape must not make configuration
+            // pages unsavable. The live runtime remains authoritative.
+            return Ok(self.clone());
+        };
+        Ok(self.reconciled_with(&advertised))
+    }
+}
+
+pub fn config_option_accepts(
+    option: &agent_client_protocol::schema::v1::SessionConfigOption,
+    value: &crate::acp::ConfigOptionValue,
+) -> bool {
+    use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigSelectOptions};
+
+    match (&option.kind, value) {
+        (SessionConfigKind::Boolean(_), crate::acp::ConfigOptionValue::Boolean(_)) => true,
+        (SessionConfigKind::Select(select), crate::acp::ConfigOptionValue::Select(value)) => {
+            match &select.options {
+                SessionConfigSelectOptions::Ungrouped(options) => options
+                    .iter()
+                    .any(|option| option.value.to_string() == *value),
+                SessionConfigSelectOptions::Grouped(groups) => groups.iter().any(|group| {
+                    group
+                        .options
+                        .iter()
+                        .any(|option| option.value.to_string() == *value)
+                }),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+pub fn config_option_has_current_value(
+    option: &agent_client_protocol::schema::v1::SessionConfigOption,
+    value: &crate::acp::ConfigOptionValue,
+) -> bool {
+    use agent_client_protocol::schema::v1::SessionConfigKind;
+
+    match (&option.kind, value) {
+        (SessionConfigKind::Boolean(current), crate::acp::ConfigOptionValue::Boolean(value)) => {
+            current.current_value == *value
+        }
+        (SessionConfigKind::Select(current), crate::acp::ConfigOptionValue::Select(value)) => {
+            current.current_value.to_string() == *value
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_client_protocol::schema::v1::{
+        SessionConfigOption, SessionConfigSelectGroup, SessionConfigSelectOption,
+    };
+
+    #[test]
+    fn reconcile_drops_removed_and_invalid_overrides() {
+        let config = AgentConfigSelection::ConfigOptions {
+            agent_id: Some("agent".into()),
+            values: BTreeMap::from([
+                (
+                    "model".into(),
+                    crate::acp::ConfigOptionValue::Select("old".into()),
+                ),
+                ("fast".into(), crate::acp::ConfigOptionValue::Boolean(false)),
+                (
+                    "removed".into(),
+                    crate::acp::ConfigOptionValue::Boolean(true),
+                ),
+            ]),
+        };
+        let advertised = vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                "new",
+                vec![SessionConfigSelectOption::new("new", "New")],
+            ),
+            SessionConfigOption::boolean("fast", "Fast", true),
+        ];
+
+        assert_eq!(
+            config.reconciled_with(&advertised),
+            AgentConfigSelection::ConfigOptions {
+                agent_id: Some("agent".into()),
+                values: BTreeMap::from([(
+                    "fast".into(),
+                    crate::acp::ConfigOptionValue::Boolean(false),
+                )]),
+            }
+        );
+    }
+
+    #[test]
+    fn grouped_select_override_remains_valid() {
+        let option = SessionConfigOption::select(
+            "effort",
+            "Effort",
+            "medium",
+            vec![SessionConfigSelectGroup::new(
+                "levels",
+                "Levels",
+                vec![SessionConfigSelectOption::new("high", "High")],
+            )],
+        );
+        assert!(config_option_accepts(
+            &option,
+            &crate::acp::ConfigOptionValue::Select("high".into()),
+        ));
     }
 }

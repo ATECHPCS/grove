@@ -1279,7 +1279,11 @@ export function ResourcePage() {
               Grove will preserve the current <span className="font-mono">memory.md</span> content as one Memory Log,
               then remove the legacy shared file from this Studio.
             </p>
-            <p>Existing Studio tasks are not rewritten.</p>
+            <p>
+              Existing Studio tasks will remove their legacy <span className="font-mono">memory.md</span> entry and refresh
+              <span className="font-mono"> AGENTS.md</span>, <span className="font-mono">CLAUDE.md</span>, and
+              <span className="font-mono"> GEMINI.md</span> to the current task contract.
+            </p>
           </div>
         )}
         confirmLabel={isMigratingMemory ? "Migrating..." : "Migrate"}

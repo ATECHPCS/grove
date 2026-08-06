@@ -316,7 +316,9 @@ pub async fn create(
                     .session_template
                     .as_ref()
                     .map(|template| template.agent.clone()),
-            }),
+            })
+            .reconciled_with_installed_snapshot()
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
         task_mode,
         task_id: req.task_id,
         task_template: req.task_template,
@@ -377,7 +379,9 @@ pub async fn update(
     existing.name = req.name;
     existing.enabled = req.enabled;
     if let Some(agent_config) = req.agent_config {
-        existing.agent_config = agent_config;
+        existing.agent_config = agent_config
+            .reconciled_with_installed_snapshot()
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     }
     existing.task_mode = task_mode;
     existing.task_id = req.task_id;

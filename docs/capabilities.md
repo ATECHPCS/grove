@@ -248,7 +248,7 @@ Terminal · Chat · Review · Editor · Stats · Git · Notes · Comments · Art
 - Task Notes markdown editor, auto-save on navigation
 - `GROVE_*` env vars exported into the task's tmux/Zellij session (`GROVE_PROJECT`, `GROVE_TASK_ID`, `GROVE_TASK_NAME`, `GROVE_BRANCH`, `GROVE_TARGET`, `GROVE_PROJECT_NAME`)
 - Agents read their own spec via MCP `grove_status` + `grove_read_notes`
-- For Studio tasks, per-project `memory.md` and `instructions.md` are symlinked into every task as the living spec
+- For Studio tasks, per-project `instructions.md` is linked into every task; Project Memory is exposed through the managed Memory lifecycle rather than a shared writable `memory.md`
 
 ### 9.2 Develop
 - **Chat mode** — unified chat UI for every agent

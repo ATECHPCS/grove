@@ -241,8 +241,8 @@ impl MemoryMcpService {
 
     #[tool(
         name = "memory_get_recent_chats",
-        description = "Page through task chat-history files captured in this Run's fixed time window. Returns only readable JSONL file paths; inspect selected files with filesystem tools. cursor is opaque; limit defaults to 50 and accepts 1 through 100.",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<memory::Page<RecentChatItem>>()
+        description = "List task chat-history files relevant to this Deep organization Run. Each item provides human-readable Task and Session names, an absolute JSONL path, a one-based suggested line where evidence since the previous successful organization begins, and the current total line count. Start at new_content_start_line for efficiency, but freely read earlier context and use rg, jq, sed, scripts, or other filesystem tools as appropriate. review_window explains the time range in plain language. cursor is opaque; limit defaults to 50 and accepts 1 through 100.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<RecentChatsOutput>()
     )]
     async fn get_recent_chats(
         &self,
@@ -281,7 +281,19 @@ impl MemoryMcpService {
             bounded_limit(input.limit, 50, 100, "limit")?,
         )
         .map_err(storage_error)?;
-        json_success(&map_memory_page(page, RecentChatItem::from))
+        json_success(&RecentChatsOutput {
+            review_window: RecentChatsReviewWindow {
+                mode: if input_from_at.is_some() {
+                    "since_last_successful_organization".to_string()
+                } else {
+                    "all_history".to_string()
+                },
+                review_messages_after: input_from_at.map(ToOwned::to_owned),
+                review_messages_until: input_through_at.to_string(),
+            },
+            items: page.items.into_iter().map(RecentChatItem::from).collect(),
+            next_cursor: page.next_cursor,
+        })
     }
 
     #[tool(
@@ -683,16 +695,47 @@ impl From<memory::MemoryLog> for MemoryLogItem {
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct RecentChatItem {
-    /// Absolute JSONL history path for filesystem reading.
-    file_path: String,
+    /// Human-readable Task name that provides the work context.
+    task_name: String,
+    /// Human-readable Session title that describes the conversation.
+    session_name: String,
+    /// Absolute JSONL history path, independent of the Agent working directory.
+    absolute_history_path: String,
+    /// One-based suggested line where evidence after the previous successful organization begins.
+    new_content_start_line: usize,
+    /// Current number of lines in the JSONL file.
+    total_lines: usize,
 }
 
 impl From<memory::RecentChatFile> for RecentChatItem {
     fn from(chat: memory::RecentChatFile) -> Self {
         Self {
-            file_path: chat.path,
+            task_name: chat.task_name,
+            session_name: chat.session_name,
+            absolute_history_path: chat.path,
+            new_content_start_line: chat.new_content_start_line,
+            total_lines: chat.total_lines,
         }
     }
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct RecentChatsReviewWindow {
+    /// all_history for the first Run; otherwise since_last_successful_organization.
+    mode: String,
+    /// Review messages after this time. Null means review all history.
+    review_messages_after: Option<String>,
+    /// This Run covers messages through this time.
+    review_messages_until: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct RecentChatsOutput {
+    /// Human-readable evidence window for this Run.
+    review_window: RecentChatsReviewWindow,
+    items: Vec<RecentChatItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1017,8 +1060,20 @@ mod tests {
             serde_json::to_string(chats.output_schema.as_ref().expect("output schema"))
                 .expect("schema");
         let chats_fields = schema_fields(chats.output_schema.as_deref().expect("output schema"));
-        assert!(chats_fields.contains("file_path"), "{chats_output}");
-        for hidden in ["task_id", "chat_id", "modified_at"] {
+        for visible in [
+            "review_window",
+            "mode",
+            "review_messages_after",
+            "review_messages_until",
+            "task_name",
+            "session_name",
+            "absolute_history_path",
+            "new_content_start_line",
+            "total_lines",
+        ] {
+            assert!(chats_fields.contains(visible), "{chats_output}");
+        }
+        for hidden in ["task_id", "chat_id", "agent_name", "modified_at"] {
             assert!(!chats_fields.contains(hidden), "{chats_output}");
         }
 

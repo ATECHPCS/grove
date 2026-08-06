@@ -4,7 +4,7 @@ use axum::{extract::Path, http::StatusCode, Json};
 use uuid::Uuid;
 
 use crate::api::error::ApiError;
-use crate::storage::memory;
+use crate::storage::{memory, tasks};
 
 use super::crud::resolve_studio_dir;
 use super::types::*;
@@ -152,6 +152,39 @@ pub async fn migrate_memory(
             ));
         }
     };
+
+    // Existing Studio tasks predate the new project Memory lifecycle. Remove
+    // their shared legacy Memory entry and replace their generated agent
+    // contracts with the same contract used for newly-created Studio tasks.
+    let active_tasks = tasks::load_tasks(&id).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!(
+                    "Legacy Memory Log was created, but Studio tasks could not be loaded for contract migration: {error}"
+                ),
+            }),
+        )
+    })?;
+    for task in active_tasks {
+        let task_dir = studio_dir.join("tasks").join(&task.id);
+        if !task_dir.is_dir() {
+            continue;
+        }
+
+        crate::operations::tasks::migrate_legacy_studio_task_contract(&task_dir, &task.name)
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError {
+                        error: format!(
+                            "Legacy Memory Log was created, but failed to migrate task agent contracts in {}: {error}",
+                            task_dir.display()
+                        ),
+                    }),
+                )
+            })?;
+    }
 
     // The canonical legacy path is already gone. A failed cleanup leaves only
     // a hidden recoverable copy and must not invite a duplicate migration.

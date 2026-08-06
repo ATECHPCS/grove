@@ -548,6 +548,94 @@ pub fn create_studio_task(
     )
 }
 
+/// Replace a Studio task's generated agent contract with the current version.
+///
+/// This is shared by task creation and legacy Memory migration so existing
+/// tasks receive the same contract as newly-created tasks. Generated aliases
+/// are recreated because Windows uses hard links for files while Unix uses
+/// symlinks.
+pub fn write_studio_task_contract(task_dir: &std::path::Path, task_name: &str) -> Result<()> {
+    let agents_md = format!(
+        "<!-- grove-studio-task-contract:v2 -->\n\
+         # Studio Task: {task_name}\n\
+         This is an isolated Grove Studio task workspace. Follow this file contract and the user-authored guidance in `instructions.md`.\n\n\
+         ## Directory Structure\n\
+         \n\
+         ```\n\
+         ./\n\
+         ├── input/           # User-provided material files. Browse when looking for task inputs.\n\
+         ├── output/          # Final deliverables shown to the user. Write results here.\n\
+         ├── internal/        # Your private workspace. Store intermediate files and working data here.\n\
+         ├── scripts/         # Place any scripts you create or use here.\n\
+         ├── resource/        # Read-only shared project resources (symlink). Do not modify.\n\
+         ├── instructions.md  # Read-only project-level instructions (symlink). Read this first.\n\
+         └── AGENTS.md        # This file.\n\
+         ```\n\
+         ## Getting Started\n\
+         \n\
+         1. Read `instructions.md` for project-level context and guidelines.\n\
+         2. Browse `input/` and `resource/` for any material the user references.\n\
+         3. Write final results and deliverables to `output/`.\n\
+         4. Use `internal/` for intermediate files, scratch work, and working data.\n\
+         5. Place any scripts in `scripts/`.\n\n\
+         ## Rules\n\
+         \n\
+         - ALWAYS read `instructions.md` before starting work.\n\
+         - Browse `input/` and `resource/` when you need material relevant to your task — do not bulk-read all files upfront.\n\
+         - ALWAYS write final results and deliverables to `output/`.\n\
+         - Use `internal/` for intermediate files and working data — keep `output/` for finished work only.\n\
+         - ALWAYS place scripts in `scripts/`.\n\
+         - NEVER modify files in `resource/` — it is a read-only symlink to the project vault.\n\
+         - NEVER modify files in `input/` unless the user explicitly asks you to.\n\
+         - NEVER modify `instructions.md` — it is a read-only symlink.\n\
+         - Keep `output/` organized. Use subdirectories if you produce many files.\n\n\
+         ## Output Defaults\n\
+         \n\
+         - **Documentation**: Write in Markdown format.\n\
+         - **Diagrams**: Use [Mermaid](https://mermaid.js.org/) for flowcharts and sequence diagrams; use [D2](https://d2lang.com/) for architecture and system diagrams.\n\
+         - **Demos**: Use JSX/React components for interactive demos and visual presentations.\n",
+    );
+
+    let agents_path = task_dir.join("AGENTS.md");
+    remove_studio_task_contract_file(&agents_path)?;
+    std::fs::write(&agents_path, agents_md)?;
+
+    for alias in ["CLAUDE.md", "GEMINI.md"] {
+        let alias_path = task_dir.join(alias);
+        remove_studio_task_contract_file(&alias_path)?;
+        crate::fs_link::create_link(&agents_path, &alias_path)?;
+    }
+
+    Ok(())
+}
+
+/// Remove the legacy shared Memory entry and install the current generated
+/// agent contract in an existing Studio task.
+pub fn migrate_legacy_studio_task_contract(
+    task_dir: &std::path::Path,
+    task_name: &str,
+) -> Result<()> {
+    remove_studio_task_contract_file(&task_dir.join("memory.md"))?;
+    write_studio_task_contract(task_dir, task_name)
+}
+
+fn remove_studio_task_contract_file(path: &std::path::Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            Err(GroveError::invalid_data(format!(
+                "Cannot replace generated Studio task contract '{}': path is a directory",
+                path.display()
+            )))
+        }
+        Ok(_) => {
+            std::fs::remove_file(path)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_task_inner(
     repo_path: &str,
@@ -608,61 +696,8 @@ fn create_task_inner(
             let _ = crate::fs_link::create_link(&project_instructions, &instructions_link);
         }
 
-        // Generate AGENTS.md
-        let agents_md = format!(
-            "<!-- grove-studio-task-contract:v2 -->\n\
-             # Studio Task: {task_name}\n\
-             This is an isolated Grove Studio task workspace. Follow this file contract and the user-authored guidance in `instructions.md`.\n\n\
-             ## Directory Structure\n\
-             \n\
-             ```\n\
-             ./\n\
-             ├── input/           # User-provided material files. Browse when looking for task inputs.\n\
-             ├── output/          # Final deliverables shown to the user. Write results here.\n\
-             ├── internal/        # Your private workspace. Store intermediate files and working data here.\n\
-             ├── scripts/         # Place any scripts you create or use here.\n\
-             ├── resource/        # Read-only shared project resources (symlink). Do not modify.\n\
-             ├── instructions.md  # Read-only project-level instructions (symlink). Read this first.\n\
-             └── AGENTS.md        # This file.\n\
-             ```\n\
-             ## Getting Started\n\
-             \n\
-             1. Read `instructions.md` for project-level context and guidelines.\n\
-             2. Browse `input/` and `resource/` for any material the user references.\n\
-             3. Write final results and deliverables to `output/`.\n\
-             4. Use `internal/` for intermediate files, scratch work, and working data.\n\
-             5. Place any scripts in `scripts/`.\n\n\
-             ## Rules\n\
-             \n\
-             - ALWAYS read `instructions.md` before starting work.\n\
-             - Browse `input/` and `resource/` when you need material relevant to your task — do not bulk-read all files upfront.\n\
-             - ALWAYS write final results and deliverables to `output/`.\n\
-             - Use `internal/` for intermediate files and working data — keep `output/` for finished work only.\n\
-             - ALWAYS place scripts in `scripts/`.\n\
-             - NEVER modify files in `resource/` — it is a read-only symlink to the project vault.\n\
-             - NEVER modify files in `input/` unless the user explicitly asks you to.\n\
-             - NEVER modify `instructions.md` — it is a read-only symlink.\n\
-             - Keep `output/` organized. Use subdirectories if you produce many files.\n\n\
-             ## Output Defaults\n\
-             \n\
-             - **Documentation**: Write in Markdown format.\n\
-             - **Diagrams**: Use [Mermaid](https://mermaid.js.org/) for flowcharts and sequence diagrams; use [D2](https://d2lang.com/) for architecture and system diagrams.\n\
-             - **Demos**: Use JSX/React components for interactive demos and visual presentations.\n",
-        );
-        std::fs::write(task_dir.join("AGENTS.md"), &agents_md)?;
-
-        // Symlink CLAUDE.md and GEMINI.md → AGENTS.md
-        {
-            let agents_path = task_dir.join("AGENTS.md");
-            let claude_md = task_dir.join("CLAUDE.md");
-            let gemini_md = task_dir.join("GEMINI.md");
-            if !claude_md.exists() {
-                let _ = crate::fs_link::create_link(&agents_path, &claude_md);
-            }
-            if !gemini_md.exists() {
-                let _ = crate::fs_link::create_link(&agents_path, &gemini_md);
-            }
-        }
+        // Generate AGENTS.md and its agent-specific aliases.
+        write_studio_task_contract(&task_dir, &task_name)?;
 
         (task_dir.to_string_lossy().to_string(), String::new())
     } else {
