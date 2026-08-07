@@ -8,11 +8,11 @@
 
 use std::fs;
 use std::io::{BufRead, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
-use crate::acp::AcpUpdate;
+use crate::acp::{AcpUpdate, ContentBlockData, ToolCallContentData};
 
 /// 单个 `ToolCallUpdate.content` 写入/读取时的最大字节数。超过的部分硬截断。
 const MAX_TOOL_CONTENT_BYTES: usize = 32 * 1024;
@@ -38,19 +38,169 @@ fn truncate_tool_content(content: &mut Option<String>) {
     }
 }
 
-/// 对事件做原地截断（目前只处理 `ToolCallUpdate.content`）。
-fn truncate_update_in_place(update: &mut AcpUpdate) {
-    if let AcpUpdate::ToolCallUpdate { content, .. } = update {
-        truncate_tool_content(content);
+fn truncate_string_to_budget(value: &mut String, budget: &mut usize) {
+    if value.len() <= *budget {
+        *budget -= value.len();
+        return;
+    }
+    if *budget <= TRUNCATED_MARKER.len() {
+        value.clear();
+        *budget = 0;
+        return;
+    }
+    let mut cut = *budget - TRUNCATED_MARKER.len();
+    while cut > 0 && !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    value.truncate(cut);
+    value.push_str(TRUNCATED_MARKER);
+    *budget = 0;
+}
+
+fn truncate_terminal_snapshot(output: &mut String, truncated: &mut bool, limit: usize) {
+    if output.len() <= limit {
+        return;
+    }
+    let mut cut = output.len() - limit;
+    while !output.is_char_boundary(cut) {
+        cut += 1;
+    }
+    output.drain(..cut);
+    *truncated = true;
+}
+
+fn truncate_tool_output(output: &mut [ToolCallContentData]) {
+    let mut budget = MAX_TOOL_CONTENT_BYTES;
+    for item in output {
+        match item {
+            ToolCallContentData::Content { content } => match content {
+                ContentBlockData::Text { text } => truncate_string_to_budget(text, &mut budget),
+                ContentBlockData::Image { data, .. } | ContentBlockData::Audio { data, .. } => {
+                    if data.len() > budget {
+                        *content = ContentBlockData::Text {
+                            text:
+                                "Binary tool output exceeded the history limit and was not stored."
+                                    .to_string(),
+                        };
+                        if let ContentBlockData::Text { text } = content {
+                            truncate_string_to_budget(text, &mut budget);
+                        }
+                    } else {
+                        budget -= data.len();
+                    }
+                }
+                ContentBlockData::Resource { text, blob, .. } => {
+                    if let Some(text) = text {
+                        truncate_string_to_budget(text, &mut budget);
+                    }
+                    if let Some(blob) = blob {
+                        truncate_string_to_budget(blob, &mut budget);
+                    }
+                }
+                ContentBlockData::ResourceLink { description, .. } => {
+                    if let Some(description) = description {
+                        truncate_string_to_budget(description, &mut budget);
+                    }
+                }
+            },
+            ToolCallContentData::Diff {
+                old_text,
+                new_text,
+                display_text,
+                ..
+            } => {
+                // History renders display_text. Preserve it before retaining
+                // optional source snapshots within the remaining event budget.
+                truncate_string_to_budget(display_text, &mut budget);
+                truncate_string_to_budget(new_text, &mut budget);
+                if let Some(old_text) = old_text {
+                    truncate_string_to_budget(old_text, &mut budget);
+                }
+            }
+            ToolCallContentData::Terminal {
+                output, truncated, ..
+            } => {
+                if let Some(output) = output {
+                    truncate_terminal_snapshot(output, truncated, budget);
+                    budget = budget.saturating_sub(output.len());
+                }
+            }
+        }
     }
 }
 
-/// 判断事件是否需要截断（超大 content）。用来决定是否 clone。
-fn needs_truncation(update: &AcpUpdate) -> bool {
-    matches!(
-        update,
-        AcpUpdate::ToolCallUpdate { content: Some(c), .. } if c.len() > MAX_TOOL_CONTENT_BYTES
-    )
+/// Convert compatibility-only old v1 fields to Grove's processed Input/Output
+/// before serialization, then apply the same history limit as legacy tools.
+fn prepare_update_for_storage(update: &mut AcpUpdate) {
+    match update {
+        AcpUpdate::ToolCallUpdate { content, .. } => truncate_tool_content(content),
+        AcpUpdate::ToolCallV1 {
+            content,
+            input,
+            legacy_raw_input,
+            legacy_raw_output,
+            output,
+            ..
+        } => {
+            if input.is_empty() {
+                *input = crate::acp::tool_input_to_data(legacy_raw_input.as_ref());
+            }
+            if output.is_empty() {
+                if let Some(migrated) =
+                    crate::acp::legacy_tool_output_to_data(None, legacy_raw_output.as_ref())
+                {
+                    *output = migrated;
+                }
+            }
+            *legacy_raw_input = None;
+            *legacy_raw_output = None;
+            if output.is_empty() {
+                truncate_tool_content(content);
+            } else {
+                // Avoid storing a second display copy of structured output.
+                *content = None;
+                truncate_tool_output(output);
+            }
+        }
+        AcpUpdate::ToolCallUpdateV1 {
+            output,
+            display_content,
+            input,
+            legacy_raw_input,
+            legacy_raw_output,
+            legacy_content,
+            ..
+        } => {
+            if input.is_none() {
+                *input = legacy_raw_input
+                    .as_ref()
+                    .map(|value| crate::acp::tool_input_to_data(Some(value)));
+            }
+            if output.is_none() {
+                *output = crate::acp::legacy_tool_output_to_data(
+                    legacy_content.as_ref(),
+                    legacy_raw_output.as_ref(),
+                );
+            }
+            *legacy_raw_input = None;
+            *legacy_raw_output = None;
+            *legacy_content = None;
+            if let Some(output) = output {
+                if output.is_empty() {
+                    truncate_tool_content(display_content);
+                } else {
+                    *display_content = None;
+                    truncate_tool_output(output);
+                }
+            } else {
+                truncate_tool_content(display_content);
+            }
+        }
+        AcpUpdate::TerminalOutputUpdate {
+            output, truncated, ..
+        } => truncate_terminal_snapshot(output, truncated, MAX_TOOL_CONTENT_BYTES),
+        _ => {}
+    }
 }
 
 /// 获取 history.jsonl 路径
@@ -67,6 +217,19 @@ pub fn history_file_path(project: &str, task_id: &str, chat_id: &str) -> PathBuf
 
 /// 判断事件是否应该持久化
 pub fn should_persist(update: &AcpUpdate) -> bool {
+    // Live terminal snapshots can arrive once per 4 KiB read. Keep them on the
+    // WebSocket/broadcast path, but persist only the final cumulative snapshot
+    // to avoid synchronous history writes for every output chunk. The initial
+    // ToolCallV1 already stores the snapshot visible at embed time.
+    if matches!(
+        update,
+        AcpUpdate::TerminalOutputUpdate {
+            exit_status: None,
+            ..
+        }
+    ) {
+        return false;
+    }
     !matches!(
         update,
         AcpUpdate::Busy { .. }
@@ -76,11 +239,19 @@ pub fn should_persist(update: &AcpUpdate) -> bool {
             | AcpUpdate::AvailableCommands { .. }
             | AcpUpdate::QueueUpdate { .. }
             | AcpUpdate::ConnectPhase { .. }
+            | AcpUpdate::AuthRequired { .. }
+            | AcpUpdate::AuthSucceeded
+            | AcpUpdate::AuthFailed { .. }
+            | AcpUpdate::AuthLoggedOut
             // Forms are transient UI dispatched by the `ask_form` MCP tool.
             // The user's answers come back as a regular user prompt (persisted
             // as user content); the form definition itself should not write
             // to history — on refresh the FormPill cleanly disappears.
             | AcpUpdate::AskForm { .. }
+            | AcpUpdate::ElicitationRequest { .. }
+            | AcpUpdate::ElicitationResolved { .. }
+            | AcpUpdate::ElicitationValidationError { .. }
+            | AcpUpdate::ElicitationComplete { .. }
     )
 }
 
@@ -92,19 +263,17 @@ pub fn should_persist(update: &AcpUpdate) -> bool {
 /// write，两次之间会被别的线程插入）。
 pub fn append_event(project: &str, task_id: &str, chat_id: &str, event: &AcpUpdate) {
     let path = history_file_path(project, task_id, chat_id);
+    append_event_to_path(&path, event);
+}
+
+pub fn append_event_to_path(path: &Path, event: &AcpUpdate) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
 
-    match fs::OpenOptions::new().create(true).append(true).open(&path) {
+    match fs::OpenOptions::new().create(true).append(true).open(path) {
         Ok(mut f) => {
-            if needs_truncation(event) {
-                let mut owned = event.clone();
-                truncate_update_in_place(&mut owned);
-                append_json_line(&mut f, &owned);
-            } else {
-                append_json_line(&mut f, event);
-            }
+            append_json_line(&mut f, event);
         }
         Err(e) => {
             eprintln!("[chat_history] Failed to open {}: {}", path.display(), e);
@@ -116,7 +285,9 @@ pub fn append_event(project: &str, task_id: &str, chat_id: &str, event: &AcpUpda
 /// `write_all` 落盘。`O_APPEND` 保证单次 write 原子写到文件尾部，并发 append
 /// 不会让两条 JSON 撞在同一行。
 fn append_json_line(f: &mut fs::File, event: &AcpUpdate) {
-    if let Ok(mut json) = serde_json::to_string(event) {
+    let mut owned = event.clone();
+    prepare_update_for_storage(&mut owned);
+    if let Ok(mut json) = serde_json::to_string(&owned) {
         json.push('\n');
         let _ = f.write_all(json.as_bytes());
     }
@@ -171,7 +342,7 @@ pub fn load_history(project: &str, task_id: &str, chat_id: &str) -> Vec<AcpUpdat
         for item in stream {
             match item {
                 Ok(mut update) => {
-                    truncate_update_in_place(&mut update);
+                    prepare_update_for_storage(&mut update);
                     history.push(update);
                     parsed_any = true;
                 }
@@ -212,6 +383,18 @@ pub fn cancel_unresolved_events(project: &str, task_id: &str, chat_id: &str) -> 
             AcpUpdate::ToolCall { id, locations, .. } => {
                 unresolved_tools.insert(id.clone(), locations.clone());
             }
+            AcpUpdate::ToolCallV1 {
+                id,
+                status,
+                locations,
+                ..
+            } => {
+                if matches!(status.as_str(), "completed" | "failed") {
+                    unresolved_tools.remove(id);
+                } else {
+                    unresolved_tools.insert(id.clone(), locations.clone());
+                }
+            }
             AcpUpdate::ToolCallUpdate { id, status, .. }
                 if matches!(
                     status.as_str(),
@@ -219,6 +402,23 @@ pub fn cancel_unresolved_events(project: &str, task_id: &str, chat_id: &str) -> 
                 ) =>
             {
                 unresolved_tools.remove(id);
+            }
+            AcpUpdate::ToolCallUpdateV1 {
+                id,
+                status,
+                locations,
+                ..
+            } => {
+                if let Some(locations) = locations {
+                    if let Some(current) = unresolved_tools.get_mut(id) {
+                        *current = locations.clone();
+                    }
+                }
+                if status.as_deref().is_some_and(|value| {
+                    matches!(value, "completed" | "failed" | "error" | "cancelled")
+                }) {
+                    unresolved_tools.remove(id);
+                }
             }
             AcpUpdate::TerminalExecute { .. } => unresolved_terminals += 1,
             AcpUpdate::TerminalComplete { .. } if unresolved_terminals > 0 => {
@@ -349,7 +549,9 @@ fn write_history(project: &str, task_id: &str, chat_id: &str, events: &[AcpUpdat
 
     let mut writer = std::io::BufWriter::new(file);
     for event in events {
-        if let Ok(json) = serde_json::to_string(event) {
+        let mut owned = event.clone();
+        prepare_update_for_storage(&mut owned);
+        if let Ok(json) = serde_json::to_string(&owned) {
             let _ = writeln!(writer, "{}", json);
         }
     }
@@ -522,9 +724,10 @@ pub fn compact_events(events: Vec<AcpUpdate>) -> Vec<AcpUpdate> {
                     if !status.is_empty() {
                         state.status = status.clone();
                     }
-                    // 按 ACP 规范：content block 是增量下发的，后续 update 是对
-                    // 之前的补充而非替换。拼接而不是覆盖，避免最终只剩下最后
-                    // 一条（例如把 bash 命令行覆盖成执行结果）。
+                    // Legacy Grove history flattened tool content into strings and
+                    // treated those strings as deltas. Preserve that historical
+                    // behavior here only. New ACP v1 events use ToolCallUpdateV1,
+                    // whose structured collections are replacement snapshots.
                     //
                     // 但要处理三种 agent 行为：
                     //   1. 纯增量（每次只发 delta）→ 直接拼接
@@ -588,6 +791,73 @@ pub fn compact_events(events: Vec<AcpUpdate>) -> Vec<AcpUpdate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_preserves_v1_tool_replacement_events() {
+        let events = vec![
+            AcpUpdate::ToolCallV1 {
+                id: "tool-v1".to_string(),
+                title: "Read".to_string(),
+                kind: "read".to_string(),
+                status: "in_progress".to_string(),
+                content: Some("first".to_string()),
+                input: Vec::new(),
+                legacy_raw_input: None,
+                legacy_raw_output: None,
+                output: vec![crate::acp::ToolCallContentData::Content {
+                    content: crate::acp::ContentBlockData::Text {
+                        text: "first".to_string(),
+                    },
+                }],
+                locations: vec![("/repo/a.ts".to_string(), Some(2))],
+                timestamp: None,
+            },
+            AcpUpdate::ToolCallUpdateV1 {
+                id: "tool-v1".to_string(),
+                title: None,
+                kind: None,
+                status: Some("completed".to_string()),
+                output: Some(Vec::new()),
+                display_content: None,
+                locations: Some(Vec::new()),
+                input: None,
+                legacy_raw_input: None,
+                legacy_raw_output: None,
+                legacy_content: None,
+            },
+        ];
+
+        let compacted = compact_events(events);
+        assert_eq!(compacted.len(), 2);
+        assert!(matches!(
+            &compacted[1],
+            AcpUpdate::ToolCallUpdateV1 {
+                status: Some(status),
+                output: Some(content),
+                locations: Some(locations),
+                ..
+            } if status == "completed" && content.is_empty() && locations.is_empty()
+        ));
+    }
+
+    #[test]
+    fn authentication_state_is_transient() {
+        let methods = vec![crate::acp::AuthMethodInfo {
+            id: "agent-login".to_string(),
+            name: "Agent login".to_string(),
+            description: None,
+        }];
+
+        assert!(!should_persist(&AcpUpdate::AuthRequired {
+            methods,
+            agent_name: Some("agent".to_string()),
+        }));
+        assert!(!should_persist(&AcpUpdate::AuthSucceeded));
+        assert!(!should_persist(&AcpUpdate::AuthFailed {
+            message: "failed".to_string(),
+        }));
+        assert!(!should_persist(&AcpUpdate::AuthLoggedOut));
+    }
 
     fn perm_req(id: &str) -> AcpUpdate {
         AcpUpdate::PermissionRequest {
@@ -717,6 +987,43 @@ mod tests {
             AcpUpdate::MessageChunk { text } => assert_eq!(text, "Hello World"),
             _ => panic!("Expected MessageChunk"),
         }
+    }
+
+    #[test]
+    fn test_compact_preserves_structured_message_order() {
+        let events = vec![
+            AcpUpdate::MessageChunk {
+                text: "before".into(),
+            },
+            AcpUpdate::MessageContentChunk {
+                content: crate::acp::ContentBlockData::Image {
+                    data: "image-data".into(),
+                    mime_type: "image/png".into(),
+                    uri: None,
+                    label: None,
+                },
+            },
+            AcpUpdate::MessageChunk {
+                text: "after".into(),
+            },
+        ];
+
+        let result = compact_events(events);
+        assert_eq!(result.len(), 3);
+        assert!(matches!(
+            &result[0],
+            AcpUpdate::MessageChunk { text } if text == "before"
+        ));
+        assert!(matches!(
+            &result[1],
+            AcpUpdate::MessageContentChunk {
+                content: crate::acp::ContentBlockData::Image { .. }
+            }
+        ));
+        assert!(matches!(
+            &result[2],
+            AcpUpdate::MessageChunk { text } if text == "after"
+        ));
     }
 
     #[test]
@@ -1067,32 +1374,109 @@ mod tests {
         assert!(prefix.chars().all(|c| c == '世'));
     }
 
-    /// `needs_truncation` 只在 ToolCallUpdate.content 超阈值时返回 true。
     #[test]
-    fn test_needs_truncation_detects_only_oversize_tool_content() {
-        let small = AcpUpdate::ToolCallUpdate {
+    fn prepare_storage_migrates_legacy_v1_fields_before_serialization() {
+        let mut update = AcpUpdate::ToolCallV1 {
             id: "t1".into(),
+            title: "Set title".into(),
+            kind: "mcp".into(),
             status: "completed".into(),
-            content: Some("tiny".into()),
+            content: None,
+            input: vec![],
+            legacy_raw_input: Some(serde_json::json!({
+                "session_id": "internal",
+                "title": "Readable title"
+            })),
+            legacy_raw_output: Some(serde_json::json!({
+                "session_id": "internal",
+                "old_title": "Old title",
+                "new_title": "Readable title"
+            })),
+            output: vec![],
             locations: vec![],
-            raw_input: None,
+            timestamp: None,
         };
-        assert!(!needs_truncation(&small));
+        prepare_update_for_storage(&mut update);
 
-        let big = AcpUpdate::ToolCallUpdate {
+        let json = serde_json::to_value(update).unwrap();
+        assert!(json.get("raw_input").is_none());
+        assert!(json.get("raw_output").is_none());
+        assert_eq!(json["input"][0]["label"], "Title");
+        assert!(json["output"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Readable title"));
+    }
+
+    #[test]
+    fn prepare_storage_truncates_structured_v1_output() {
+        let mut update = AcpUpdate::ToolCallUpdateV1 {
             id: "t1".into(),
-            status: "completed".into(),
-            content: Some("x".repeat(MAX_TOOL_CONTENT_BYTES + 1)),
-            locations: vec![],
-            raw_input: None,
+            title: None,
+            kind: None,
+            status: Some("completed".into()),
+            output: Some(vec![ToolCallContentData::Content {
+                content: ContentBlockData::Text {
+                    text: "世".repeat(MAX_TOOL_CONTENT_BYTES),
+                },
+            }]),
+            display_content: None,
+            locations: None,
+            input: None,
+            legacy_raw_input: None,
+            legacy_raw_output: None,
+            legacy_content: None,
         };
-        assert!(needs_truncation(&big));
+        prepare_update_for_storage(&mut update);
 
-        // 其他类型的事件即使带长字符串，也不触发（当前只针对 tool content）
-        let long_msg = AcpUpdate::MessageChunk {
-            text: "x".repeat(MAX_TOOL_CONTENT_BYTES + 1),
+        let AcpUpdate::ToolCallUpdateV1 {
+            output: Some(output),
+            ..
+        } = update
+        else {
+            panic!("expected structured v1 output");
         };
-        assert!(!needs_truncation(&long_msg));
+        let ToolCallContentData::Content {
+            content: ContentBlockData::Text { text },
+        } = &output[0]
+        else {
+            panic!("expected text output");
+        };
+        assert!(text.len() <= MAX_TOOL_CONTENT_BYTES);
+        assert!(text.ends_with(TRUNCATED_MARKER));
+    }
+
+    #[test]
+    fn terminal_history_persists_only_the_bounded_final_snapshot() {
+        let live = AcpUpdate::TerminalOutputUpdate {
+            terminal_id: "terminal-1".into(),
+            output: "live".into(),
+            truncated: false,
+            exit_status: None,
+        };
+        assert!(!should_persist(&live));
+
+        let mut completed = AcpUpdate::TerminalOutputUpdate {
+            terminal_id: "terminal-1".into(),
+            output: "世".repeat(MAX_TOOL_CONTENT_BYTES),
+            truncated: false,
+            exit_status: Some(crate::acp::TerminalExitStatusData {
+                exit_code: Some(0),
+                signal: None,
+            }),
+        };
+        assert!(should_persist(&completed));
+        prepare_update_for_storage(&mut completed);
+
+        let AcpUpdate::TerminalOutputUpdate {
+            output, truncated, ..
+        } = completed
+        else {
+            unreachable!();
+        };
+        assert!(output.len() <= MAX_TOOL_CONTENT_BYTES);
+        assert!(truncated);
+        assert!(output.chars().all(|character| character == '世'));
     }
 
     /// locations 合并：同 (path,line) 去重，不同的累加并保持插入顺序。

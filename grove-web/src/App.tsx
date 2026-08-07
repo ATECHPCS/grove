@@ -26,6 +26,7 @@ import { HelpOverlay } from "./components/Tasks/HelpOverlay";
 import { SkillsPage } from "./components/Skills";
 import { AIPage, GlobalAudioRecorder, GlobalVoiceControlRecorder } from "./components/AI";
 import { AutomationPage } from "./components/Automation/AutomationPage";
+import { MemoryPage } from "./components/Memory";
 import { ProjectStatsPage } from "./components/Stats/ProjectStatsPage";
 import { UpdateBanner } from "./components/ui/UpdateBanner";
 import { CommandPalette } from "./components/ui/CommandPalette";
@@ -133,7 +134,7 @@ function registerGlobalShortcut(
   };
 }
 
-// Main sidebar nav items for Cmd+1-6 and Option+Cmd+Up/Down cycling.
+// Main sidebar nav items for Cmd+1-8 and Option+Cmd+Up/Down cycling.
 // "settings" and "projects" are excluded as they are utility pages, not part of the main nav cycle.
 function AppContent() {
   "use no memo";
@@ -886,6 +887,7 @@ function AppContent() {
   useCommand("nav.tasks", () => setActiveItem("tasks"), []);
   useCommand("nav.tasks.studio", () => setActiveItem("tasks"), []);
   useCommand("nav.resource", () => setActiveItem("resource"), []);
+  useCommand("nav.memory", () => setActiveItem("memory"), []);
   useCommand("nav.automation", () => setActiveItem("automation"), []);
   useCommand("nav.skills", () => setActiveItem("skills"), []);
   useCommand("nav.ai", () => setActiveItem("ai"), []);
@@ -1225,6 +1227,11 @@ function AppContent() {
       case "automation":
         return (
           <AutomationPage
+            onOpenManagedAutomation={(handlerKey) => {
+              if (handlerKey === "grove.memory.organization") {
+                setActiveItem("memory");
+              }
+            }}
             onOpenChat={(taskId, chatId) => {
               // Mirror the tray's deep-link handoff (this same file,
               // `handleNavigate` around line 552). Two paths exist:
@@ -1259,6 +1266,8 @@ function AppContent() {
             }}
           />
         );
+      case "memory":
+        return <MemoryPage />;
       case "skills":
         return <SkillsPage />;
       case "ai":
@@ -1300,6 +1309,7 @@ function AppContent() {
     activeItem === "skills" ||
     activeItem === "ai" ||
     activeItem === "resource" ||
+    activeItem === "memory" ||
     activeItem === "automation" ||
     activeItem === "statistics" ||
     activeItem.startsWith("plugin:");

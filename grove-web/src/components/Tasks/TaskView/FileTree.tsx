@@ -2,7 +2,7 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import { ChevronRight, ChevronDown, Loader2, ShieldOff } from "lucide-react";
 import type { FileTreeNode } from "../../../utils/fileTree";
 import type { DirEntry } from "../../../api";
-import { VSCodeIcon } from "../../ui";
+import { ExternalFileDragHandle, VSCodeIcon, type TaskFileDragLocation } from "../../ui";
 
 interface FileTreeProps {
   nodes: FileTreeNode[];
@@ -19,6 +19,8 @@ interface FileTreeProps {
   onUploadFile?: (parentPath: string, file: File) => void;
   /** Bumped to re-fetch expanded directories in place (preserves expansion). */
   refreshSignal?: number;
+  /** Enables native Desktop drag-out for files without changing internal moves. */
+  dragLocation?: Omit<TaskFileDragLocation, "path">;
 }
 
 export function FileTree({
@@ -34,6 +36,7 @@ export function FileTree({
   onMoveFile,
   onUploadFile,
   refreshSignal,
+  dragLocation,
 }: FileTreeProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [isTreeDragOver, setIsTreeDragOver] = useState(false);
@@ -119,6 +122,7 @@ export function FileTree({
           onMoveFile={onMoveFile}
           onUploadFile={onUploadFile}
           refreshSignal={refreshSignal}
+          dragLocation={dragLocation}
         />
       ))}
     </div>
@@ -191,6 +195,7 @@ interface FileTreeItemProps {
   onMoveFile?: (source: string, destination: string) => void;
   onUploadFile?: (parentPath: string, file: File) => void;
   refreshSignal?: number;
+  dragLocation?: Omit<TaskFileDragLocation, "path">;
 }
 
 function FileTreeItem({
@@ -208,6 +213,7 @@ function FileTreeItem({
   onMoveFile,
   onUploadFile,
   refreshSignal,
+  dragLocation,
 }: FileTreeItemProps) {
   // Lazy mode: always start collapsed (load on first click).
   // Static mode: auto-expand root level (depth < 1).
@@ -375,7 +381,7 @@ function FileTreeItem({
         onDrop={handleDrop}
         title={expandError ?? undefined}
         className={`
-          flex items-center gap-1 w-full text-left px-2 py-0.5 hover:bg-[var(--color-bg-tertiary)] transition-all duration-150 relative
+          group flex items-center gap-1 w-full text-left px-2 py-0.5 hover:bg-[var(--color-bg-tertiary)] transition-all duration-150 relative
           ${isSelected ? "bg-[var(--color-highlight)]/15 text-[var(--color-highlight)]" : "text-[var(--color-text)] opacity-80 hover:opacity-100"}
           ${isDragOver ? "bg-[var(--color-highlight)]/10 border-l-2 border-[var(--color-highlight)] text-[var(--color-highlight)] pl-3" : ""}
           ${isContextTarget && !isSelected ? "bg-[var(--color-highlight)]/10 ring-1 ring-inset ring-[var(--color-highlight)]/40" : ""}
@@ -413,6 +419,9 @@ function FileTreeItem({
         />
 
         <span className={`truncate text-xs ${expandError ? "opacity-50" : ""}`}>{node.name}</span>
+        {!node.isDir && dragLocation && (
+          <ExternalFileDragHandle location={{ ...dragLocation, path: node.path }} />
+        )}
       </button>
 
       {node.isDir && expanded && (
@@ -444,6 +453,7 @@ function FileTreeItem({
               onMoveFile={onMoveFile}
               onUploadFile={onUploadFile}
               refreshSignal={refreshSignal}
+              dragLocation={dragLocation}
             />
           ))}
         </>

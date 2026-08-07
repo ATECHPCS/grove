@@ -1,12 +1,19 @@
-import { useState, useRef, useEffect } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { MoreHorizontal } from "lucide-react";
+import { ChevronLeft, ChevronRight, MoreHorizontal } from "lucide-react";
 
 interface DropdownItem {
   id: string;
   label: string;
+  description?: string;
   icon?: React.ComponentType<{ className?: string }>;
-  onClick: () => void;
+  onClick?: () => void;
+  children?: DropdownItem[];
+  onOpen?: () => void;
+  keepOpenOnClick?: boolean;
+  wideChildren?: boolean;
+  listAction?: boolean;
   variant?: "default" | "warning" | "danger";
   disabled?: boolean;
 }
@@ -15,17 +22,52 @@ interface DropdownMenuProps {
   items: DropdownItem[];
   trigger?: React.ReactNode;
   align?: "left" | "right";
+  triggerClassName?: string;
+  ariaLabel?: string;
+  /** Match the compact, viewport-aware New Session picker surface. */
+  portal?: boolean;
+  compact?: boolean;
 }
 
-export function DropdownMenu({ items, trigger, align = "right" }: DropdownMenuProps) {
+export function DropdownMenu({
+  items,
+  trigger,
+  align = "right",
+  triggerClassName,
+  ariaLabel = "More actions",
+  portal = false,
+  compact = false,
+}: DropdownMenuProps) {
   const [isOpen, setIsOpen] = useState(false);
+  const [activeSubmenuId, setActiveSubmenuId] = useState<string | null>(null);
+  const [portalAnchor, setPortalAnchor] = useState<{
+    top: number;
+    left: number;
+  } | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const activeSubmenu = items.find(
+    (item) => item.id === activeSubmenuId && item.children?.length,
+  );
+  const visibleItems = activeSubmenu?.children ?? items;
+  const submenuIsWide = !!activeSubmenu?.wideChildren;
+  const menuWidth = submenuIsWide ? 360 : 192;
+  const menuMaxHeight = submenuIsWide ? 420 : 256;
+
+  const closeMenu = useCallback(() => {
+    setIsOpen(false);
+    setActiveSubmenuId(null);
+  }, []);
 
   // Close on click outside
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
-        setIsOpen(false);
+      const target = event.target as Node;
+      if (
+        !menuRef.current?.contains(target) &&
+        !triggerRef.current?.contains(target)
+      ) {
+        closeMenu();
       }
     };
 
@@ -35,13 +77,17 @@ export function DropdownMenu({ items, trigger, align = "right" }: DropdownMenuPr
     return () => {
       document.removeEventListener("mousedown", handleClickOutside);
     };
-  }, [isOpen]);
+  }, [closeMenu, isOpen]);
 
   // Close on escape
   useEffect(() => {
     const handleEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        setIsOpen(false);
+        if (activeSubmenuId) {
+          setActiveSubmenuId(null);
+        } else {
+          closeMenu();
+        }
       }
     };
 
@@ -51,7 +97,22 @@ export function DropdownMenu({ items, trigger, align = "right" }: DropdownMenuPr
     return () => {
       document.removeEventListener("keydown", handleEscape);
     };
-  }, [isOpen]);
+  }, [activeSubmenuId, closeMenu, isOpen]);
+
+  useEffect(() => {
+    if (!isOpen || !portal) return;
+    const handleResize = () => closeMenu();
+    const handleScroll = (event: Event) => {
+      if (event.target instanceof Node && menuRef.current?.contains(event.target)) return;
+      closeMenu();
+    };
+    window.addEventListener("resize", handleResize);
+    window.addEventListener("scroll", handleScroll, true);
+    return () => {
+      window.removeEventListener("resize", handleResize);
+      window.removeEventListener("scroll", handleScroll, true);
+    };
+  }, [closeMenu, isOpen, portal]);
 
   const getVariantClass = (variant: DropdownItem["variant"]) => {
     switch (variant) {
@@ -64,54 +125,165 @@ export function DropdownMenu({ items, trigger, align = "right" }: DropdownMenuPr
     }
   };
 
+  const updatePortalAnchor = useCallback((width: number, maxHeight: number) => {
+    if (portal && triggerRef.current) {
+      const viewportMargin = 8;
+      const rect = triggerRef.current.getBoundingClientRect();
+      setPortalAnchor({
+        top: Math.max(
+          viewportMargin,
+          Math.min(
+            rect.top,
+            window.innerHeight - maxHeight - viewportMargin,
+          ),
+        ),
+        left: Math.max(
+          viewportMargin,
+          Math.min(
+            rect.right + viewportMargin,
+            window.innerWidth - width - viewportMargin,
+          ),
+        ),
+      });
+    }
+  }, [portal]);
+
+  const openMenu = () => {
+    updatePortalAnchor(192, 256);
+    setIsOpen(true);
+  };
+
+  useEffect(() => {
+    if (!isOpen || !portal) return;
+    updatePortalAnchor(menuWidth, menuMaxHeight);
+  }, [activeSubmenuId, isOpen, menuMaxHeight, menuWidth, portal, updatePortalAnchor]);
+
+  const renderItem = (item: DropdownItem) => {
+    const Icon = item.icon;
+    const hasChildren = !!item.children?.length;
+    return (
+      <button
+        key={item.id}
+        type="button"
+        onClick={() => {
+          if (item.disabled) return;
+          if (hasChildren) {
+            item.onOpen?.();
+            setActiveSubmenuId(item.id);
+          } else {
+            item.onClick?.();
+            if (!item.keepOpenOnClick) closeMenu();
+          }
+        }}
+        disabled={item.disabled}
+        className={`w-full flex items-center text-left transition-colors focus:outline-none ${
+          item.listAction
+            ? "justify-center border-t border-[var(--color-border)] px-3 py-2 text-xs font-medium text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+            : compact
+            ? "gap-2 px-2.5 py-1.5 text-[12.5px]"
+            : item.description
+              ? "gap-2.5 px-3 py-2 text-sm"
+              : "gap-2 px-3 py-1.5 text-sm"
+        } ${item.listAction ? "" : getVariantClass(item.variant)} ${
+          item.disabled ? "cursor-not-allowed opacity-50" : ""
+        }`}
+      >
+        {Icon && (
+          <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+            <Icon className={compact ? "h-3.5 w-3.5" : "h-4 w-4"} />
+          </span>
+        )}
+        <span className={item.listAction ? "min-w-0" : "min-w-0 flex-1"}>
+          <span className="block truncate">{item.label}</span>
+          {item.description && (
+            <span className="mt-0.5 block truncate text-xs font-normal text-[var(--color-text-muted)]">
+              {item.description}
+            </span>
+          )}
+        </span>
+        {hasChildren && <ChevronRight className={compact ? "h-3.5 w-3.5" : "h-4 w-4"} />}
+      </button>
+    );
+  };
+
+  const menuItems = (
+    <div style={{ maxHeight: menuMaxHeight }} className="flex min-h-0 flex-col overflow-hidden">
+      {activeSubmenu && (
+        <button
+          type="button"
+          onClick={() => setActiveSubmenuId(null)}
+          className={`flex w-full shrink-0 items-center border-b border-[var(--color-border)] text-left font-medium text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)] ${compact ? "gap-2 px-2.5 py-1.5 text-[12.5px]" : "gap-2 px-3 py-1.5 text-sm"}`}
+        >
+          <ChevronLeft className={compact ? "h-3.5 w-3.5" : "h-4 w-4"} />
+          <span>{activeSubmenu.label}</span>
+        </button>
+      )}
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain py-1" onWheel={(event) => event.stopPropagation()}>
+        {visibleItems.map(renderItem)}
+      </div>
+    </div>
+  );
+
   return (
-    <div ref={menuRef} className="relative">
+    <div className="relative">
       {/* Trigger */}
       <button
-        onClick={() => setIsOpen(!isOpen)}
-        className="flex items-center justify-center p-1.5 rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
+        ref={triggerRef}
+        type="button"
+        onClick={() => {
+          if (isOpen) closeMenu();
+          else openMenu();
+        }}
+        aria-label={ariaLabel}
+        aria-expanded={isOpen}
+        className={
+          triggerClassName ??
+          "flex items-center justify-center p-1.5 rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
+        }
       >
         {trigger || <MoreHorizontal className="w-4 h-4" />}
       </button>
 
       {/* Dropdown */}
-      <AnimatePresence>
-        {isOpen && (
+      {!portal && (
+        <AnimatePresence>
+          {isOpen && (
           <motion.div
+            ref={menuRef}
             initial={{ opacity: 0, y: -8, scale: 0.95 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: -8, scale: 0.95 }}
             transition={{ duration: 0.15 }}
-            className={`absolute z-50 mt-1 min-w-[140px] py-1 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg ${
+            className={`absolute z-50 mt-1 ${submenuIsWide ? "w-[360px]" : activeSubmenu ? "min-w-[220px]" : "min-w-[140px]"} max-h-[420px] overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg ${
               align === "right" ? "right-0" : "left-0"
             }`}
           >
-            {items.map((item) => {
-              const Icon = item.icon;
-              return (
-                <button
-                  key={item.id}
-                  onClick={() => {
-                    if (!item.disabled) {
-                      item.onClick();
-                      setIsOpen(false);
-                    }
-                  }}
-                  disabled={item.disabled}
-                  className={`
-                    w-full flex items-center gap-2 px-3 py-1.5 text-sm transition-colors
-                    ${getVariantClass(item.variant)}
-                    ${item.disabled ? "opacity-50 cursor-not-allowed" : ""}
-                  `}
-                >
-                  {Icon && <Icon className="w-4 h-4" />}
-                  <span>{item.label}</span>
-                </button>
-              );
-            })}
+            {menuItems}
           </motion.div>
+          )}
+        </AnimatePresence>
+      )}
+      {portal &&
+        isOpen &&
+        portalAnchor &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            ref={menuRef}
+            style={{
+              position: "fixed",
+              top: portalAnchor.top,
+              left: portalAnchor.left,
+              width: menuWidth,
+              maxHeight: menuMaxHeight,
+              zIndex: 1000,
+            }}
+            className="overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg"
+          >
+            {menuItems}
+          </div>,
+          document.body,
         )}
-      </AnimatePresence>
     </div>
   );
 }

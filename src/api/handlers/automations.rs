@@ -9,17 +9,38 @@
 //!   POST   /api/v1/projects/{id}/automations/{aid}/trigger         — run now
 //!   GET    /api/v1/projects/{id}/automations/{aid}/runs            — history
 
-use axum::{extract::Path, http::StatusCode, Json};
+use std::time::Duration;
+
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path,
+    },
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::automation::cron_util;
 use crate::automation::executor;
 use crate::storage::automations::{
-    self, Automation, AutomationRun, SessionTemplate, TargetMode, TaskTemplate,
+    self, AgentConfigSelection, Automation, AutomationRun, SessionTemplate, TargetMode,
+    TaskTemplate, TASK_PROMPT_HANDLER,
 };
 
 use super::common::find_project_by_id;
+
+fn ensure_user_managed(automation: &Automation) -> Result<(), (StatusCode, String)> {
+    if automation.handler_key == TASK_PROMPT_HANDLER {
+        return Ok(());
+    }
+    Err((
+        StatusCode::CONFLICT,
+        "system-managed automation; configure it from the feature that created it".into(),
+    ))
+}
 
 #[derive(Debug, Serialize)]
 pub struct AutomationDto {
@@ -27,6 +48,8 @@ pub struct AutomationDto {
     pub project: String,
     pub name: String,
     pub enabled: bool,
+    pub handler_key: String,
+    pub agent_config: AgentConfigSelection,
     pub task_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -39,6 +62,7 @@ pub struct AutomationDto {
     pub session_template: Option<SessionTemplate>,
     pub prompt: String,
     pub schedule_cron: String,
+    pub event_triggers: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_run_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -58,6 +82,8 @@ impl From<Automation> for AutomationDto {
             project: a.project,
             name: a.name,
             enabled: a.enabled,
+            handler_key: a.handler_key,
+            agent_config: a.agent_config,
             task_mode: target_mode_str(a.task_mode),
             task_id: a.task_id,
             task_template: a.task_template,
@@ -66,6 +92,7 @@ impl From<Automation> for AutomationDto {
             session_template: a.session_template,
             prompt: a.prompt,
             schedule_cron: a.schedule_cron,
+            event_triggers: a.event_triggers,
             last_run_at: a.last_run_at,
             last_run_status: a.last_run_status,
             last_run_error: a.last_run_error,
@@ -111,6 +138,10 @@ pub struct UpsertAutomation {
     pub session_template: Option<SessionTemplate>,
     pub prompt: String,
     pub schedule_cron: String,
+    #[serde(default)]
+    pub agent_config: Option<AgentConfigSelection>,
+    #[serde(default)]
+    pub event_triggers: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -137,6 +168,47 @@ pub struct TriggerResponse {
     pub resolved_task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_chat_id: Option<String>,
+}
+
+/// Generic live Automation Run stream. Memory and future consumers share the
+/// same event rather than creating domain-specific Run channels.
+pub async fn run_updates_ws(ws: WebSocketUpgrade, Path(id): Path<String>) -> Response {
+    let project_key = match find_project_by_id(&id) {
+        Ok((_project, key)) => key,
+        Err(status) => return status.into_response(),
+    };
+    ws.on_upgrade(move |socket| stream_run_updates(socket, project_key))
+}
+
+async fn stream_run_updates(mut socket: WebSocket, project_key: String) {
+    let mut updates = automations::subscribe_run_updates();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            update = updates.recv() => match update {
+                Ok(update) if update.project == project_key => {
+                    if let Ok(text) = serde_json::to_string(&update) {
+                        if socket.send(Message::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+            _ = heartbeat.tick() => {
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            },
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => {}
+                Some(Err(_)) => break,
+            },
+        }
+    }
 }
 
 fn validate_input(
@@ -236,6 +308,17 @@ pub async fn create(
         project: project_key,
         name: req.name,
         enabled: req.enabled,
+        handler_key: TASK_PROMPT_HANDLER.to_string(),
+        agent_config: req
+            .agent_config
+            .unwrap_or_else(|| AgentConfigSelection::Default {
+                agent_id: req
+                    .session_template
+                    .as_ref()
+                    .map(|template| template.agent.clone()),
+            })
+            .reconciled_with_installed_snapshot()
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
         task_mode,
         task_id: req.task_id,
         task_template: req.task_template,
@@ -244,6 +327,7 @@ pub async fn create(
         session_template: req.session_template,
         prompt: req.prompt,
         schedule_cron: req.schedule_cron,
+        event_triggers: req.event_triggers,
         last_run_at: None,
         last_run_status: None,
         last_run_error: None,
@@ -282,6 +366,7 @@ pub async fn update(
     if existing.project != project_key {
         return Err((StatusCode::NOT_FOUND, "automation not found".into()));
     }
+    ensure_user_managed(&existing)?;
     let (task_mode, session_mode) = validate_input(&req)?;
 
     let cron_changed = existing.schedule_cron != req.schedule_cron;
@@ -293,6 +378,11 @@ pub async fn update(
     let needs_revival = existing.next_run_at.is_none() && req.enabled;
     existing.name = req.name;
     existing.enabled = req.enabled;
+    if let Some(agent_config) = req.agent_config {
+        existing.agent_config = agent_config
+            .reconciled_with_installed_snapshot()
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    }
     existing.task_mode = task_mode;
     existing.task_id = req.task_id;
     existing.task_template = req.task_template;
@@ -301,6 +391,7 @@ pub async fn update(
     existing.session_template = req.session_template;
     existing.prompt = req.prompt;
     existing.schedule_cron = req.schedule_cron;
+    existing.event_triggers = req.event_triggers;
     existing.updated_at = Utc::now().timestamp();
     if cron_changed || needs_revival {
         existing.next_run_at = cron_util::next_unix(&existing.schedule_cron)
@@ -325,6 +416,7 @@ pub async fn delete(
         automations::get(&id).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     match automation {
         Some(a) if a.project == project_key => {
+            ensure_user_managed(&a)?;
             automations::delete(&id)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             Ok(StatusCode::NO_CONTENT)
@@ -367,18 +459,17 @@ pub struct CancelRunResponse {
 ///
 /// User-initiated cancel of an in-flight or queued automation run.
 ///
-/// We claim the terminal state in one atomic transaction (`claim_cancel`),
-/// then dispatch the ACP side-effect based on the **prior** status we won
-/// the row from:
+/// We first claim a non-terminal `cancelling` state in one atomic transaction,
+/// then dispatch the ACP side-effect based on the **prior** status we won the
+/// row from:
 ///   queued  → drop every pending ACP message tagged `automation:<run_id>`,
 ///             then emit `QueueUpdate` so the chat-session UI refreshes.
 ///   running → fire ACP `Cancel` to abort the current agent turn.
 ///
-/// Doing the DB transition first closes the read→write TOCTOU window where
+/// The intermediate state closes the read→write TOCTOU window where
 /// the watcher could otherwise promote the row queued→running between our
-/// status check and our dequeue call (Bug H2). The watcher's own terminal
-/// writes are conditional on `queued`/`running`, so once we've marked the
-/// row `cancelled` they become no-ops.
+/// status check and our dequeue call. It also remains active for Single Flight
+/// until ACP cancellation and the business handler's abort cleanup are done.
 pub async fn cancel_run(
     Path((project_id, _automation_id, run_id)): Path<(String, String, String)>,
 ) -> Result<Json<CancelRunResponse>, (StatusCode, String)> {
@@ -401,9 +492,8 @@ pub async fn cancel_run(
     // Claim the cancellation atomically. Whoever wins this race owns the
     // ACP side-effects — the watcher's UPDATE will no-op against the
     // resulting `cancelled` status.
-    let prior_status =
-        automations::claim_cancel(&run_id, Utc::now().timestamp(), "Cancelled by user")
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let prior_status = automations::claim_cancel(&run_id, "Cancelled by user")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let prior_status = match prior_status {
         Some(s) => s,
@@ -419,16 +509,19 @@ pub async fn cancel_run(
     // the executor may have stamped via `mark_run_resolved` between our
     // initial read and `claim_cancel`. Without this re-read, a cancel
     // racing the executor's resolve step would skip the ACP side-effect
-    // entirely (the agent would keep running while the DB showed
-    // "cancelled") — Bugs H2 / M5.
+    // entirely (the agent would keep running while the DB showed an active
+    // cancellation) — Bugs H2 / M5.
     let run = automations::get_run(&run_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .unwrap_or(initial_run);
 
-    // Best-effort ACP side-effect. We don't surface failures because the
-    // DB row is already `cancelled` — telling the client the cancel failed
-    // would lie about visible state.
-    if let (Some(task_id), Some(chat_id)) = (
+    // Best-effort ACP side-effect. The DB remains in `cancelling` until both
+    // this and the handler abort hook have had a chance to clean up.
+    if run.execution_scope == "project_run" {
+        // Consumer Runs own a dedicated ACP Session, so cancellation can
+        // terminate it outright without risking an unrelated user turn.
+        let _ = crate::acp::kill_session(&format!("automation-run:{run_id}"));
+    } else if let (Some(task_id), Some(chat_id)) = (
         run.resolved_task_id.as_deref(),
         run.resolved_chat_id.as_deref(),
     ) {
@@ -467,6 +560,19 @@ pub async fn cancel_run(
             }
         }
     }
+
+    if let Some(handler) = crate::automation::consumer::get(&parent.handler_key) {
+        if let Err(error) = handler.abort(crate::automation::consumer::AbortContext {
+            automation: &parent,
+            run: &run,
+            reason: "Cancelled by user",
+        }) {
+            crate::automation::awarn!("abort handler for cancelled run {run_id}: {error}");
+        }
+    }
+
+    automations::finish_cancel(&run_id, Utc::now().timestamp(), "Cancelled by user")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(CancelRunResponse {
         status: "cancelled".into(),

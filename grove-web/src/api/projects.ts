@@ -21,6 +21,7 @@ export interface ProjectListItem {
   exists: boolean;
   /** Project type: "repo" or "studio" */
   project_type: string;
+  archived: boolean;
 }
 
 interface ProjectListResponse {
@@ -44,6 +45,7 @@ export interface ProjectResponse {
   exists: boolean;
   /** Project type: "repo" or "studio" */
   project_type: string;
+  archived: boolean;
 }
 
 interface AddProjectRequest {
@@ -84,8 +86,9 @@ interface BranchesResponse {
 /**
  * List all registered projects
  */
-export async function listProjects(): Promise<ProjectListResponse> {
-  return apiClient.get<ProjectListResponse>('/api/v1/projects');
+export async function listProjects(archived = false): Promise<ProjectListResponse> {
+  const query = archived ? '?archived=true' : '';
+  return apiClient.get<ProjectListResponse>(`/api/v1/projects${query}`);
 }
 
 /**
@@ -147,6 +150,16 @@ export async function deleteProject(id: string): Promise<void> {
 
 export async function renameProject(id: string, name: string): Promise<ProjectResponse> {
   return apiClient.patch<{ name: string }, ProjectResponse>(`/api/v1/projects/${id}`, { name });
+}
+
+/** Hide a project from normal project discovery without changing its tasks. */
+export async function archiveProject(id: string): Promise<void> {
+  return apiClient.post<undefined, void>(`/api/v1/projects/${id}/archive`);
+}
+
+/** Return an archived project to normal project discovery. */
+export async function restoreProject(id: string): Promise<void> {
+  return apiClient.post<undefined, void>(`/api/v1/projects/${id}/restore`);
 }
 
 /**
@@ -249,9 +262,13 @@ export function resourceDownloadUrl(id: string, path: string) {
   return resourceApi(id).downloadUrl(path);
 }
 
-/** Open a shared-asset file with the OS default application (runs on the server host). */
-export function openResourceFile(id: string, path: string) {
-  return resourceApi(id).open(path);
+/** Open a shared-asset file with the OS default application or reveal in file manager. */
+export function openResourceFile(id: string, path: string, action: "app" | "reveal" = "app") {
+  return resourceApi(id).open(path, action !== "app" ? { action } : undefined);
+}
+
+export function revealResourceFile(id: string, path: string) {
+  return openResourceFile(id, path, "reveal");
 }
 
 export function createResourceFolder(id: string, path: string) {
@@ -295,8 +312,11 @@ export async function getMemory(id: string): Promise<{ content: string }> {
   return apiClient.get<{ content: string }>(`/api/v1/projects/${id}/memory`);
 }
 
-export async function updateMemory(id: string, content: string): Promise<{ content: string }> {
-  return apiClient.put<{ content: string }, { content: string }>(`/api/v1/projects/${id}/memory`, { content });
+export async function migrateMemory(id: string): Promise<{ log_id: string }> {
+  return apiClient.post<Record<string, never>, { log_id: string }>(
+    `/api/v1/projects/${id}/memory/migrate`,
+    {},
+  );
 }
 
 // ============================================================================

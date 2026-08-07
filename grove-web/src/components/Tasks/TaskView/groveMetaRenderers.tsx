@@ -12,6 +12,8 @@ import type { GroveMetaEnvelope } from "../../../utils/groveMeta";
  *
  * Unknown / unsupported `type` falls back to `envelope.systemPrompt`, so the
  * UI never crashes on schema drift between backend and frontend versions.
+ * Session bootstrap metadata is explicitly hidden here while remaining part
+ * of the persisted ACP transcript.
  */
 
 type Renderer = (
@@ -367,6 +369,7 @@ function renderReviewCommentCard(env: GroveMetaEnvelope): ReactNode {
 }
 
 export const GROVE_META_RENDERERS: Record<string, Renderer> = {
+  grove_session_init: () => null,
   mention_spawn: (env) => renderMentionSpawn(env),
   mention_send: (env) => renderMentionSend(env),
   mention_reply: (env) => renderMentionReply(env),

@@ -29,12 +29,19 @@ import { Button } from "../ui/Button";
 import { Input } from "../ui/Input";
 import { Combobox, type ComboboxOption } from "../ui/Combobox";
 import { AgentPicker, agentOptions } from "../ui/AgentPicker";
+import { MemoryAgentConfig } from "../Memory/MemoryAgentConfig";
 import { useACPAvailability } from "../Tasks/TaskView/useACPAvailability";
 import { useProject } from "../../context";
 import { getBranches } from "../../api";
 import { listChats, listTasks } from "../../api";
+import {
+  listInstalledAgentConfigs,
+  type InstalledAgentConfig,
+} from "../../api/marketplace";
+import { configForAgent, reconcileAgentConfig } from "../../utils/agentConfig";
 import { useCommand, useKeyboardScope } from "../../keyboard";
 import type {
+  AgentConfigSelection,
   Automation,
   AutomationUpsert,
   TargetMode,
@@ -194,6 +201,9 @@ export function AutomationDialog({
   const [sessionMode, setSessionMode] = useState<TargetMode>("new");
   const [chatId, setChatId] = useState<string>("");
   const [newSessionAgent, setNewSessionAgent] = useState("");
+  const [agentConfig, setAgentConfig] = useState<AgentConfigSelection>({
+    source: "default",
+  });
 
   const [scheduleKind, setScheduleKind] = useState<ScheduleKind>("daily");
   const [hourlyN, setHourlyN] = useState(1);
@@ -208,6 +218,9 @@ export function AutomationDialog({
   // ── async loaded data ─────────────────────────────────────────────────
   const [tasks, setTasks] = useState<TaskResponse[]>([]);
   const [chats, setChats] = useState<ChatSessionResponse[]>([]);
+  const [installedAgents, setInstalledAgents] = useState<InstalledAgentConfig[]>([]);
+  const [agentConfigsLoading, setAgentConfigsLoading] = useState(false);
+  const [agentConfigsError, setAgentConfigsError] = useState<string | null>(null);
   const [branches, setBranches] = useState<string[]>([]);
   const [isLoadingBranches, setIsLoadingBranches] = useState(false);
   const [branchDropdownOpen, setBranchDropdownOpen] = useState(false);
@@ -239,6 +252,7 @@ export function AutomationDialog({
       setSessionMode(initial.session_mode);
       setChatId(initial.chat_id ?? "");
       setNewSessionAgent(initial.session_template?.agent ?? "");
+      setAgentConfig(initial.agent_config);
       const kind = detectScheduleKind(initial.schedule_cron);
       setScheduleKind(kind);
       const parts = initial.schedule_cron.trim().split(/\s+/);
@@ -275,6 +289,7 @@ export function AutomationDialog({
       setSessionMode("new");
       setChatId("");
       setNewSessionAgent("");
+      setAgentConfig({ source: "default" });
       setScheduleKind("daily");
       setHourlyN(1);
       setHourlyMinute(0);
@@ -288,6 +303,35 @@ export function AutomationDialog({
     setError(null);
     /* eslint-enable react-hooks/set-state-in-effect */
   }, [isOpen, initial, selectedProject?.currentBranch]);
+
+  // Capability snapshots are persisted by the Agent marketplace, so loading
+  // them is fast and does not need to start an Agent just to build this form.
+  useEffect(() => {
+    if (!isOpen) return;
+    let alive = true;
+    void Promise.resolve().then(() => {
+      if (!alive) return;
+      setAgentConfigsLoading(true);
+      setAgentConfigsError(null);
+      listInstalledAgentConfigs()
+        .then((agents) => {
+          if (alive) setInstalledAgents(agents);
+        })
+        .catch((reason) => {
+          if (!alive) return;
+          setInstalledAgents([]);
+          setAgentConfigsError(
+            reason instanceof Error ? reason.message : String(reason),
+          );
+        })
+        .finally(() => {
+          if (alive) setAgentConfigsLoading(false);
+        });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [isOpen]);
 
   // Load tasks for the "existing" picker.
   useEffect(() => {
@@ -456,6 +500,41 @@ export function AutomationDialog({
     [chats],
   );
 
+  const activeSessionAgent = sessionMode === "new"
+    ? newSessionAgent
+    : chats.find((chat) => chat.id === chatId)?.agent ?? "";
+  const configAgentId = agentConfig.agent_id || activeSessionAgent;
+  const selectedInstalledAgent = installedAgents.find(
+    (agent) => agent.id === configAgentId,
+  );
+  const selectedCapability = selectedInstalledAgent?.capability_snapshot;
+  const configOptions = selectedCapability?.uses_config_options
+    ? selectedCapability.config_options ?? []
+    : [];
+  const legacyModes = selectedCapability?.modes?.available ?? [];
+  const effectiveAgentConfig = selectedInstalledAgent
+    ? reconcileAgentConfig(agentConfig, selectedInstalledAgent)
+    : agentConfig;
+
+  function configSelectionForAgentId(agentId: string): AgentConfigSelection {
+    const installed = installedAgents.find((agent) => agent.id === agentId);
+    return installed
+      ? configForAgent(installed)
+      : { source: "default", agent_id: agentId || undefined };
+  }
+
+  function selectAgentConfig(agentId: string) {
+    setAgentConfig(configSelectionForAgentId(agentId));
+  }
+
+  function handleSessionModeChange(mode: TargetMode) {
+    setSessionMode(mode);
+    const agentId = mode === "new"
+      ? newSessionAgent
+      : chats.find((chat) => chat.id === chatId)?.agent ?? "";
+    setAgentConfig(configSelectionForAgentId(agentId));
+  }
+
   async function handleSubmit() {
     setError(null);
     if (!name.trim()) return setError("Name is required");
@@ -469,6 +548,7 @@ export function AutomationDialog({
     const payload: AutomationUpsert = {
       name: name.trim(),
       enabled,
+      agent_config: effectiveAgentConfig,
       task_mode: taskMode,
       task_id: taskMode === "existing" ? taskId : undefined,
       task_template:
@@ -483,6 +563,7 @@ export function AutomationDialog({
           : undefined,
       prompt,
       schedule_cron: cronExpr,
+      event_triggers: initial?.event_triggers ?? [],
     };
 
     setSubmitting(true);
@@ -697,7 +778,7 @@ export function AutomationDialog({
             <div className="flex items-end gap-3 flex-wrap">
               <div className="flex-shrink-0">
                 <LabelRow>Mode</LabelRow>
-                <ModePill value={sessionMode} onChange={setSessionMode} />
+                <ModePill value={sessionMode} onChange={handleSessionModeChange} />
               </div>
               <div className="flex-1 min-w-[220px]">
                 <LabelRow>
@@ -707,7 +788,11 @@ export function AutomationDialog({
                   <Combobox
                     options={chatOptions}
                     value={chatId}
-                    onChange={(v) => setChatId(v)}
+                    onChange={(value) => {
+                      setChatId(value);
+                      const agentId = chats.find((chat) => chat.id === value)?.agent ?? "";
+                      selectAgentConfig(agentId);
+                    }}
                     placeholder={
                       taskMode === "existing" && !taskId
                         ? "Pick a task first"
@@ -721,7 +806,10 @@ export function AutomationDialog({
                 ) : (
                   <AgentPicker
                     value={newSessionAgent}
-                    onChange={setNewSessionAgent}
+                    onChange={(agentId) => {
+                      setNewSessionAgent(agentId);
+                      selectAgentConfig(agentId);
+                    }}
                     allowCustom={false}
                     options={availableAgentOptions}
                     customAgents={customAgents}
@@ -730,6 +818,46 @@ export function AutomationDialog({
                 )}
               </div>
             </div>
+            {configAgentId && (agentConfigsLoading || agentConfigsError || configOptions.length > 0 || legacyModes.length > 0) && (
+              <div className="mt-1.5">
+                <div className="flex min-h-7 items-center gap-3">
+                  <span className="w-32 flex-shrink-0 text-xs text-[var(--color-text-muted)]">
+                    Agent configuration
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    {agentConfigsLoading ? (
+                      <span className="inline-flex items-center gap-1.5 text-xs text-[var(--color-text-muted)]">
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        Loading supported settings…
+                      </span>
+                    ) : agentConfigsError ? (
+                      <span className="text-xs text-[var(--color-error)]">
+                        Agent settings are unavailable. The Automation can still use the Agent default.
+                      </span>
+                    ) : effectiveAgentConfig.source === "config_options" && configOptions.length > 0 ? (
+                      <MemoryAgentConfig
+                        options={configOptions}
+                        config={effectiveAgentConfig}
+                        onChange={setAgentConfig}
+                      />
+                    ) : effectiveAgentConfig.source === "modes" && legacyModes.length > 0 ? (
+                      <div className="max-w-xs">
+                        <Combobox
+                          options={legacyModes.map(([id, label]) => ({ id, value: id, label }))}
+                          value={effectiveAgentConfig.mode_id}
+                          onChange={(modeId) => setAgentConfig({
+                            ...effectiveAgentConfig,
+                            source: "modes",
+                            mode_id: modeId,
+                          })}
+                          allowCustom={false}
+                        />
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
+            )}
           </Section>
 
           {/* Prompt */}

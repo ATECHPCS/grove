@@ -18,13 +18,16 @@ interface ComboboxProps {
   customPlaceholder?: string;
   label?: string;
   disabled?: boolean;
+  size?: "default" | "compact";
 }
 
 interface DropdownPosition {
-  top: number;
+  top: number | null;
+  bottom: number | null;
   left: number;
   width: number;
   maxHeight: number;
+  opensUp: boolean;
 }
 
 export function Combobox({
@@ -36,6 +39,7 @@ export function Combobox({
   customPlaceholder = "Enter custom value...",
   label,
   disabled = false,
+  size = "default",
 }: ComboboxProps) {
   const [isOpen, setIsOpen] = useState(false);
   // Initialize custom mode from initial props (lazy state initializer)
@@ -67,10 +71,12 @@ export function Combobox({
       );
 
       setDropdownPosition({
-        top: opensUp ? rect.top - gap - maxHeight : rect.bottom + gap,
+        top: opensUp ? null : rect.bottom + gap,
+        bottom: opensUp ? window.innerHeight - rect.top + gap : null,
         left: rect.left,
         width: rect.width,
         maxHeight,
+        opensUp,
       });
     }
   }, []);
@@ -158,13 +164,14 @@ export function Combobox({
       <AnimatePresence>
         <motion.div
           ref={dropdownRef}
-          initial={{ opacity: 0, y: -10 }}
+          initial={{ opacity: 0, y: dropdownPosition.opensUp ? 8 : -8 }}
           animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: -10 }}
+          exit={{ opacity: 0, y: dropdownPosition.opensUp ? 8 : -8 }}
           transition={{ duration: 0.15 }}
           style={{
             position: "fixed",
-            top: dropdownPosition.top,
+            top: dropdownPosition.top ?? undefined,
+            bottom: dropdownPosition.bottom ?? undefined,
             left: dropdownPosition.left,
             width: dropdownPosition.width,
             maxHeight: dropdownPosition.maxHeight,
@@ -176,7 +183,7 @@ export function Combobox({
             <button
               key={option.id}
               onClick={() => handleSelect(option)}
-              className={`w-full flex items-center justify-between px-3 py-2 text-sm transition-colors
+              className={`w-full flex items-center justify-between transition-colors ${size === "compact" ? "px-2.5 py-1.5 text-xs" : "px-3 py-2 text-sm"}
                 ${option.value === value
                   ? "bg-[var(--color-highlight)]/10 text-[var(--color-highlight)]"
                   : "text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)]"
@@ -215,10 +222,10 @@ export function Combobox({
               onBlur={handleCustomSubmit}
               placeholder={customPlaceholder}
               disabled={disabled}
-              className="flex-1 px-3 py-2 bg-[var(--color-bg-secondary)] border border-[var(--color-highlight)] rounded-lg
-                text-[var(--color-text)] placeholder-[var(--color-text-muted)] text-sm
+              className={`flex-1 bg-[var(--color-bg-secondary)] border border-[var(--color-highlight)] rounded-lg
+                text-[var(--color-text)] placeholder-[var(--color-text-muted)]
                 focus:outline-none focus:ring-1 focus:ring-[var(--color-highlight)]
-                transition-all duration-200"
+                transition-all duration-200 ${size === "compact" ? "min-w-0 px-2.5 py-1.5 text-xs" : "px-3 py-2 text-sm"}`}
             />
             <button
               disabled={disabled}
@@ -226,11 +233,11 @@ export function Combobox({
                 setIsCustomMode(false);
                 setIsOpen(true);
               }}
-              className="px-3 py-2 bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-lg
+              className={`${size === "compact" ? "px-2 py-1.5" : "px-3 py-2"} bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-lg
                 text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:border-[var(--color-text-muted)]
-                transition-all duration-200"
+                transition-all duration-200`}
             >
-              <ChevronDown className="w-4 h-4" />
+              <ChevronDown className={size === "compact" ? "h-3.5 w-3.5" : "h-4 w-4"} />
             </button>
           </div>
         ) : (
@@ -238,22 +245,22 @@ export function Combobox({
             ref={triggerRef}
             onClick={() => !disabled && setIsOpen(!isOpen)}
             disabled={disabled}
-            className={`w-full flex items-center justify-between px-3 py-2 bg-[var(--color-bg-secondary)] border rounded-lg
-              text-sm transition-all duration-200
+            className={`w-full flex items-center justify-between bg-[var(--color-bg-secondary)] border rounded-lg
+              transition-all duration-200 ${size === "compact" ? "px-2.5 py-1.5 text-xs" : "px-3 py-2 text-sm"}
               ${disabled ? "cursor-not-allowed border-[var(--color-border)] bg-[var(--color-bg-secondary)]/60 opacity-60" : ""}
               ${isOpen
                 ? "border-[var(--color-highlight)] ring-1 ring-[var(--color-highlight)]"
                 : "border-[var(--color-border)] hover:border-[var(--color-text-muted)]"
               }`}
           >
-            <span className={selectedOption || isCustomValue ? "text-[var(--color-text)]" : "text-[var(--color-text-muted)]"}>
+            <span className={`min-w-0 truncate ${selectedOption || isCustomValue ? "text-[var(--color-text)]" : "text-[var(--color-text-muted)]"}`}>
               {displayValue}
             </span>
             <motion.div
               animate={{ rotate: isOpen ? 180 : 0 }}
               transition={{ duration: 0.2 }}
             >
-              <ChevronDown className="w-4 h-4 text-[var(--color-text-muted)]" />
+              <ChevronDown className={`${size === "compact" ? "h-3.5 w-3.5" : "h-4 w-4"} flex-shrink-0 text-[var(--color-text-muted)]`} />
             </motion.div>
           </button>
         )}

@@ -126,9 +126,10 @@ export function AgentQuotaPopover({
       spaceAbove >= popoverHeight || spaceAbove >= spaceBelow ? "top" : "bottom";
     const availableHeight = placement === "top" ? spaceAbove : spaceBelow;
     const maxHeight = Math.max(120, Math.min(popoverHeight, availableHeight));
+    const cardHeight = measuredHeight > 0 ? Math.min(measuredHeight, maxHeight) : maxHeight;
     const rawTop =
       placement === "top"
-        ? r.top - POPOVER_GAP - maxHeight
+        ? r.top - POPOVER_GAP - cardHeight
         : r.bottom + POPOVER_GAP;
     const maxTop = Math.max(VIEWPORT_PADDING, viewportH - maxHeight - VIEWPORT_PADDING);
     const top = Math.max(VIEWPORT_PADDING, Math.min(rawTop, maxTop));

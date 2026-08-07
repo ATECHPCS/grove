@@ -16,6 +16,7 @@ pub struct CustomAgentDto {
     pub id: String,
     pub name: String,
     pub base_agent: String,
+    pub agent_config: crate::agent_config::AgentConfigSelection,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,6 +36,7 @@ impl From<CustomAgent> for CustomAgentDto {
             id: a.id,
             name: a.name,
             base_agent: a.base_agent,
+            agent_config: a.agent_config,
             model: a.model,
             mode: a.mode,
             effort: a.effort,
@@ -251,6 +253,7 @@ mod tests {
         custom_agent::create(custom_agent::CustomAgentInput {
             name: name.to_string(),
             base_agent: base.to_string(),
+            agent_config: crate::agent_config::AgentConfigSelection::default(),
             model: None,
             mode: None,
             effort: None,

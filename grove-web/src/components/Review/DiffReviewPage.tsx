@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { getDiffStats, getSingleFileDiff, createInlineComment, createFileComment, createProjectComment, deleteComment as apiDeleteComment, replyReviewComment as apiReplyComment, updateCommentStatus as apiUpdateCommentStatus, getFileContent, editComment as apiEditComment, editReply as apiEditReply, deleteReply as apiDeleteReply, bulkDeleteComments as apiBulkDeleteComments } from '../../api/review';
 import type { DiffFile, DiffStatsResult } from '../../api/review';
-import { getReviewComments, getCommits, getTaskFiles, getTaskDirEntries, getTask, openTaskFile } from '../../api/tasks';
+import { getReviewComments, getCommits, getTaskFiles, getTaskDirEntries, getTask, openTaskFile, revealTaskFile } from '../../api/tasks';
 import type { ReviewCommentEntry, ReviewCommentsResponse, DirEntry, CommitsResponse } from '../../api/tasks';
 import { buildMentionItems } from '../../utils/fileMention';
+import { taskRelativeFilePath } from './fileNavigation';
 
 export interface VersionOption {
   id: string;
@@ -103,6 +105,11 @@ import { getPreviewRenderer } from './previewRenderers';
 
 
 export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, isGitRepo, isChatBusy }: DiffReviewPageProps) {
+  // Host-side file actions would open the remote Grove server's desktop, not
+  // the reviewing user's machine. Local web and Desktop remain eligible.
+  const canUseHostFileActions =
+    typeof window !== 'undefined' &&
+    (window as unknown as Record<string, unknown>).__GROVE_REMOTE__ !== true;
   const { isMobile } = useIsMobile();
   const [diffData, setDiffData] = useState<DiffStatsResult | null>(null);
   const [taskPath, setTaskPath] = useState<string | null>(null);
@@ -167,6 +174,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   const [commentFormAnchor, setCommentFormAnchor] = useState<CommentAnchor | null>(null);
   const [fileCommentFormPath, setFileCommentFormPath] = useState<string | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  const fileListRef = useRef<VirtuosoHandle>(null);
 
   // Full file content cache
   const [fullFileContents, setFullFileContents] = useState<Map<string, string>>(new Map());
@@ -356,6 +364,14 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     fileDiffCacheRef.current = fileDiffCache;
   }, [fileDiffCache]);
   const loadingDiffsRef = useRef<Set<string>>(new Set());
+  // Bumped every time fileDiffCache is wiped (refresh / mode switch / initial load).
+  // The auto-load effect below keys off this so it re-fires even when
+  // activeFilePath resolves to the same string as before the cache was cleared.
+  const [diffCacheGen, setDiffCacheGen] = useState(0);
+  const clearFileDiffCache = useCallback(() => {
+    setFileDiffCache(new Map());
+    setDiffCacheGen((g) => g + 1);
+  }, []);
   const failedFullFilesRef = useRef<Set<string>>(new Set());
   const [displayMode, setDisplayMode] = useState<'code' | 'split' | 'preview'>(() => {
     if (initialCachedOptions && (initialCachedOptions.displayMode === 'code' || initialCachedOptions.displayMode === 'split' || initialCachedOptions.displayMode === 'preview')) {
@@ -631,6 +647,16 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     displayFilesRef.current = displayFiles;
   }, [displayFiles]);
 
+  const scrollToFile = useCallback((path: string, align: 'start' | 'center' = 'start') => {
+    const index = displayFilesRef.current.findIndex((file) => file.new_path === path);
+    if (!focusMode && index >= 0) {
+      fileListRef.current?.scrollToIndex({ index, align, behavior: 'smooth' });
+      return;
+    }
+    const el = document.getElementById(`diff-file-${encodeURIComponent(path)}`);
+    el?.scrollIntoView({ behavior: 'smooth', block: align });
+  }, [focusMode]);
+
   // Auto-detect iframe mode
   const isEmbedded = embedded ?? (typeof window !== 'undefined' && window !== window.parent);
 
@@ -642,7 +668,13 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
     // Find matching file — try exact match first, then suffix match in both directions
     const target = pending.file;
+    const relativeTarget = taskRelativeFilePath(target, taskPath);
     let match = displayFiles.find((f) => f.new_path === target && !f.new_path.endsWith('/'));
+    if (!match && relativeTarget !== null) {
+      match = displayFiles.find(
+        (f) => f.new_path === relativeTarget && !f.new_path.endsWith('/'),
+      );
+    }
     if (!match) {
       // Target is absolute, file is relative: check if target ends with /file
       match = displayFiles.find((f) => !f.new_path.endsWith('/') && target.endsWith('/' + f.new_path));
@@ -658,8 +690,10 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
     if (!match && viewMode === 'full' && focusMode) {
       // File not yet in tree — expand parent directories to trigger lazy load.
-      // Build all ancestor paths of the target file (relative path assumed).
-      const parts = target.replace(/^\//, '').split('/');
+      // Absolute Agent paths cannot be sent to the task-relative tree API.
+      // Wait for taskPath, then expand only ancestors beneath that root.
+      if (relativeTarget === null) return;
+      const parts = relativeTarget.split('/');
       const parentPaths: string[] = [];
       for (let i = 1; i < parts.length; i++) {
         parentPaths.push(parts.slice(0, i).join('/'));
@@ -698,13 +732,10 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
         setScrollToLine({ file: resolvedPath, line: pending.line, seq: ++scrollSeqRef.current });
       } else {
         // No line number — just scroll the file header into view
-        requestAnimationFrame(() => {
-          const el = document.getElementById(`diff-file-${encodeURIComponent(resolvedPath)}`);
-          el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        });
+        requestAnimationFrame(() => scrollToFile(resolvedPath));
       }
     }
-  }, [displayFiles, navigateToFile, viewMode, focusMode, projectId, taskId, appendLazyFiles]);
+  }, [displayFiles, navigateToFile, viewMode, focusMode, projectId, taskId, taskPath, appendLazyFiles, scrollToFile]);
 
   // Load full file content with concurrency control
   const loadFullFileContent = useCallback(async (filePath: string, forceReload = false) => {
@@ -943,11 +974,15 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   // nor the navigation effect (which doesn't load) ever triggers the fetch.
   // loadFileDiff sets fetch state internally; this is a legitimate fetch-on-prop-change
   // sync, not the cascading-render pattern the rule targets.
+  // Also depends on diffCacheGen: a refresh/mode-switch clears fileDiffCache but often
+  // resolves activeFilePath to the same string as before, so without this the effect's
+  // deps would look unchanged and the now-uncached file would never be refetched —
+  // leaving the diff view stuck on "Loading diff..." until the user manually clicks a file.
   useEffect(() => {
     if (!activeFilePath || viewMode !== 'diff') return;
     // eslint-disable-next-line react-hooks/set-state-in-effect
     loadFileDiff(activeFilePath, currentDiffRefs.fromRef, currentDiffRefs.toRef);
-  }, [activeFilePath, viewMode, currentDiffRefs.fromRef, currentDiffRefs.toRef, loadFileDiff]);
+  }, [activeFilePath, viewMode, currentDiffRefs.fromRef, currentDiffRefs.toRef, loadFileDiff, diffCacheGen]);
 
   // Version options for FROM / TO selectors
   const versionList = versions;
@@ -972,7 +1007,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
     if (!silent) {
       setLoading(true);
-      setFileDiffCache(new Map());
+      clearFileDiffCache();
       loadingDiffsRef.current = new Set();
     }
 
@@ -1004,7 +1039,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       }
     }
     if (fetchGenRef.current === gen && !silent) setLoading(false);
-  }, [projectId, taskId, loadFileDiff]);
+  }, [projectId, taskId, loadFileDiff, clearFileDiffCache]);
 
   useEffect(() => {
     if (!modeSwitchReadyRef.current) return;
@@ -1107,7 +1142,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       activeRequests.current.clear();
       setLoadingFiles(new Set());
       setFullFileContents(new Map());
-      setFileDiffCache(new Map());
+      clearFileDiffCache();
       loadingDiffsRef.current = new Set();
       lazyRootDirEntriesRef.current = [];
     }
@@ -1188,7 +1223,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     if (caught !== null) {
       throw caught;
     }
-  }, [refetchDiff, projectId, taskId, viewMode, focusMode, appendLazyFiles, loadFullFileContent]);
+  }, [refetchDiff, projectId, taskId, viewMode, focusMode, appendLazyFiles, loadFullFileContent, clearFileDiffCache]);
 
   // Two callers: the manual refresh button / hotkey-r path (loud, shows
   // spinner) and the agent-turn-finished auto-refresh path (silent). Splitting
@@ -1229,7 +1264,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     const load = async () => {
       setLoading(true);
       setError(null);
-      setFileDiffCache(new Map());
+      clearFileDiffCache();
       loadingDiffsRef.current = new Set();
       // Build per-mode promises BEFORE the try so the conditional
       // expressions don't sit inside a try/catch (React Compiler bails on
@@ -1554,18 +1589,17 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       // Focus mode renders only the selected file — reset scroll to top
       if (contentRef.current) contentRef.current.scrollTop = 0;
     } else {
-      const el = document.getElementById(`diff-file-${encodeURIComponent(path)}`);
-      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      scrollToFile(path);
     }
     if (isMobile) {
       setSidebarVisible(false);
     }
-  }, [isMobile, loadFileDiff, versions, fromVersion, toVersion, focusMode, viewMode, setSidebarVisible]);
+  }, [isMobile, loadFileDiff, versions, fromVersion, toVersion, focusMode, viewMode, setSidebarVisible, scrollToFile]);
 
   const handleTogglePreview = useCallback((path: string) => {
     setPreviewOverrides((prev) => {
       const next = new Map(prev);
-      const renderer = getPreviewRenderer(path);
+      const renderer = getPreviewRenderer(path, viewMode);
       const defaultOpen = displayMode !== 'code' && !!renderer;
       const currentlyOpen = prev.has(path) ? prev.get(path)! : defaultOpen;
       if (!currentlyOpen === defaultOpen) {
@@ -1576,53 +1610,14 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
       }
       return next;
     });
-  }, [displayMode]);
+  }, [displayMode, viewMode]);
 
   const handleToggleActivePreview = useCallback(() => {
-    if (!activeFilePath || !getPreviewRenderer(activeFilePath)) return;
+    if (!activeFilePath || !getPreviewRenderer(activeFilePath, viewMode)) return;
     handleTogglePreview(activeFilePath);
-  }, [activeFilePath, handleTogglePreview]);
+  }, [activeFilePath, handleTogglePreview, viewMode]);
 
   // (hotkeys registered below, after goToNextFile/goToPrevFile/handleToggleViewed are defined)
-
-  // Track topmost visible file on scroll (non-focus mode)
-  useEffect(() => {
-    const container = contentRef.current;
-    if (!container || focusMode) return;
-
-    let rafId: number | null = null;
-
-    const handleScroll = () => {
-      if (rafId) return;
-      rafId = requestAnimationFrame(() => {
-        rafId = null;
-        const files = displayFilesRef.current;
-        if (files.length === 0) return;
-
-        const containerTop = container.getBoundingClientRect().top;
-        let bestFile = files[0].new_path;
-
-        for (const file of files) {
-          const el = document.getElementById(`diff-file-${encodeURIComponent(file.new_path)}`);
-          if (!el) continue;
-          if (el.getBoundingClientRect().top <= containerTop + 10) {
-            bestFile = file.new_path;
-          }
-        }
-
-        setSelectedFile(bestFile);
-      });
-    };
-
-    container.addEventListener('scroll', handleScroll, { passive: true });
-    // Set initial selection
-    handleScroll();
-
-    return () => {
-      container.removeEventListener('scroll', handleScroll);
-      if (rafId) cancelAnimationFrame(rafId);
-    };
-  }, [focusMode, displayFiles]); // re-attach when files change
 
   // File navigation using refs to avoid dependency issues
   const currentFileIndexRef = useRef(currentFileIndex);
@@ -1636,9 +1631,8 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     const prevIndex = currentFileIndexRef.current;
     const next = Math.min(prevIndex + 1, files.length - 1);
     setSelectedFile(files[next].new_path);
-    const el = document.getElementById(`diff-file-${encodeURIComponent(files[next].new_path)}`);
-    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }, []);
+    scrollToFile(files[next].new_path);
+  }, [scrollToFile]);
 
   const goToPrevFile = useCallback(() => {
     const files = displayFilesRef.current;
@@ -1646,9 +1640,8 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     const prevIndex = currentFileIndexRef.current;
     const prev = Math.max(prevIndex - 1, 0);
     setSelectedFile(files[prev].new_path);
-    const el = document.getElementById(`diff-file-${encodeURIComponent(files[prev].new_path)}`);
-    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }, []);
+    scrollToFile(files[prev].new_path);
+  }, [scrollToFile]);
 
   // Toggle viewed — stores current file hash and auto-collapses when marked as viewed
   const handleToggleViewed = useCallback((path: string) => {
@@ -1736,7 +1729,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   useCommand('diffReview.toggleViewed', handleToggleActiveViewed, { enabled: () => !!activeFilePath }, [handleToggleActiveViewed, activeFilePath]);
   useCommand('diffReview.refresh', handleRefresh, [handleRefresh]);
   useCommand('diffReview.toggleViewMode', handleToggleViewMode, [handleToggleViewMode]);
-  useCommand('diffReview.togglePreview', handleToggleActivePreview, { enabled: () => !!activeFilePath && !!getPreviewRenderer(activeFilePath ?? '') }, [handleToggleActivePreview, activeFilePath]);
+  useCommand('diffReview.togglePreview', handleToggleActivePreview, { enabled: () => !!activeFilePath && !!getPreviewRenderer(activeFilePath ?? '', viewMode) }, [handleToggleActivePreview, activeFilePath, viewMode]);
   useCommand('diffReview.markViewed', handleMarkActiveViewed, { enabled: () => !!activeFilePath }, [handleMarkActiveViewed, activeFilePath]);
   useCommand('diffReview.toggleSidebar', () => setSidebarVisible((v) => !v), [setSidebarVisible]);
 
@@ -1943,6 +1936,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
   // Navigate to a comment (from conversation sidebar)
   const handleNavigateToComment = useCallback((filePath: string, line: number, commentId?: number) => {
     setSelectedFile(filePath);
+    scrollToFile(filePath);
     // Auto-expand file if it's collapsed
     setCollapsedFiles((prev) => {
       if (prev.has(filePath)) {
@@ -1998,7 +1992,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
 
     // Start with initial delay to allow React to render
     setTimeout(() => tryScroll(1), 150);
-  }, []);
+  }, [scrollToFile]);
 
   // Comments for a specific file
   const getFileComments = (filePath: string) => {
@@ -2259,7 +2253,13 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
               onLoadFileDiff={viewMode === 'full' && focusMode ? loadFileDiff : undefined}
               taskPath={taskPath}
               projectId={projectId}
-              onOpenInApp={(path) => { void openTaskFile(projectId, taskId, path); }}
+              taskId={taskId}
+              onOpenInApp={canUseHostFileActions
+                ? (path) => { void openTaskFile(projectId, taskId, path); }
+                : undefined}
+              onRevealInFileManager={canUseHostFileActions
+                ? (path) => { void revealTaskFile(projectId, taskId, path); }
+                : undefined}
               autoViewedRules={autoViewedRules}
               onUpdateAutoViewedRules={setAutoViewedRules}
             />
@@ -2278,19 +2278,31 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
             )}
 
             {/* Diff content */}
-            <div className="diff-content" ref={contentRef} tabIndex={-1} style={{ outline: 'none' }}>
+            <div
+              className={`diff-content ${focusMode ? 'diff-content-focus' : 'diff-content-all-files'}`}
+              ref={contentRef}
+              tabIndex={-1}
+              style={{ outline: 'none' }}
+            >
               {(() => {
                 // Reset global match index before rendering
                 resetGlobalMatchIndex();
-                return (focusMode
+                const files = focusMode
                   ? displayFiles.filter((f) => f.new_path === validSelectedFile)
-                  : displayFiles
-                ).map((file) => {
-                  const renderer = getPreviewRenderer(file.new_path);
+                  : displayFiles;
+                const renderFile = (file: DiffFile) => {
+                  const renderer = getPreviewRenderer(file.new_path, viewMode);
                   const defaultOpen = displayMode !== 'code' && !!renderer;
-                  const isPreviewOpen = previewOverrides.has(file.new_path)
-                    ? previewOverrides.get(file.new_path)!
-                    : defaultOpen;
+                  // Image files render the picture directly inside the code
+                  // view (see DiffFileView), so the preview pane is redundant —
+                  // force it closed and hide the toggle. Other renderers keep
+                  // the override behavior.
+                  const isImage = renderer?.id === 'image';
+                  const isPreviewOpen = isImage
+                    ? false
+                    : previewOverrides.has(file.new_path)
+                      ? previewOverrides.get(file.new_path)!
+                      : defaultOpen;
                   return (
                     <DiffFileView
                       key={file.new_path}
@@ -2298,7 +2310,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
                       viewType={viewType}
                       isActive={validSelectedFile === file.new_path}
                       isPreviewOpen={isPreviewOpen}
-                      onTogglePreview={renderer ? handleTogglePreview : undefined}
+                      onTogglePreview={renderer && !isImage ? handleTogglePreview : undefined}
                       previewRenderer={renderer}
                       defaultExpanded={displayMode === 'preview'}
                       projectId={projectId}
@@ -2340,7 +2352,22 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
                       mentionItems={mentionItems}
                     />
                   );
-                });
+                };
+                if (focusMode) return files.map(renderFile);
+                return (
+                  <Virtuoso
+                    ref={fileListRef}
+                    data={files}
+                    className="diff-file-virtuoso"
+                    increaseViewportBy={{ top: 600, bottom: 900 }}
+                    computeItemKey={(_, file) => file.new_path}
+                    rangeChanged={({ startIndex }) => {
+                      const file = displayFilesRef.current[startIndex];
+                      if (file) setSelectedFile(file.new_path);
+                    }}
+                    itemContent={(_, file) => renderFile(file)}
+                  />
+                );
               })()}
             </div>
 

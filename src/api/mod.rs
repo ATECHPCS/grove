@@ -289,6 +289,10 @@ pub fn create_api_router() -> Router {
             "/projects/{id}/tasks/{taskId}/chats/{chatId}/attachments",
             post(handlers::acp::upload_chat_attachment),
         )
+        .route(
+            "/projects/{id}/tasks/{taskId}/chats/{chatId}/import-sessions",
+            get(handlers::acp::list_import_sessions).post(handlers::acp::import_session),
+        )
         // Chat WebSocket (per-chat)
         .route(
             "/projects/{id}/tasks/{taskId}/chats/{chatId}/ws",
@@ -304,6 +308,10 @@ pub fn create_api_router() -> Router {
         .route(
             "/agents/marketplace",
             get(handlers::marketplace::list_marketplace),
+        )
+        .route(
+            "/agents/installed",
+            get(handlers::marketplace::list_installed_agents),
         )
         .route(
             "/agents/marketplace/refresh",
@@ -328,6 +336,12 @@ pub fn create_api_router() -> Router {
             "/projects/{id}/tasks/{taskId}/chats/{chatId}/take-control",
             post(handlers::acp::take_control),
         )
+        // Restart the ACP process / remote WebSocket while preserving the
+        // Grove chat and its persisted ACP session id.
+        .route(
+            "/projects/{id}/tasks/{taskId}/chats/{chatId}/reconnect",
+            post(handlers::acp::reconnect_chat),
+        )
         // Fork chat (ACP session/fork)
         .route(
             "/projects/{id}/tasks/{taskId}/chats/{chatId}/fork",
@@ -344,7 +358,29 @@ pub fn create_api_router() -> Router {
         .route("/projects/{id}", get(handlers::projects::get_project))
         .route("/projects/{id}", patch(handlers::projects::rename_project))
         .route("/projects/{id}", delete(handlers::projects::delete_project))
+        .route(
+            "/projects/{id}/archive",
+            post(handlers::projects::archive_project),
+        )
+        .route(
+            "/projects/{id}/restore",
+            post(handlers::projects::restore_project),
+        )
         .route("/projects/{id}/stats", get(handlers::projects::get_stats))
+        // Unified read-only file API. Project, Resource and Task routes share
+        // the same resolver, access policy and streaming response builder.
+        .route(
+            "/projects/{id}/files/raw",
+            get(handlers::files::project_file),
+        )
+        .route(
+            "/projects/{id}/resource/files/raw",
+            get(handlers::files::resource_file),
+        )
+        .route(
+            "/projects/{id}/tasks/{taskId}/files/raw",
+            get(handlers::files::task_file),
+        )
         // Studio Resource API
         .route(
             "/projects/{id}/resource",
@@ -395,9 +431,10 @@ pub fn create_api_router() -> Router {
             "/projects/{id}/instructions",
             get(handlers::projects::get_instructions).put(handlers::projects::update_instructions),
         )
+        .route("/projects/{id}/memory", get(handlers::projects::get_memory))
         .route(
-            "/projects/{id}/memory",
-            get(handlers::projects::get_memory).put(handlers::projects::update_memory),
+            "/projects/{id}/memory/migrate",
+            post(handlers::projects::migrate_memory),
         )
         .route("/dashboard", get(handlers::dashboard::get_dashboard))
         .route(
@@ -441,6 +478,10 @@ pub fn create_api_router() -> Router {
         .route(
             "/projects/{id}/tasks/{taskId}/activate",
             post(handlers::tasks::activate_task),
+        )
+        .route(
+            "/projects/{id}/tasks/{taskId}/linked-projects",
+            get(handlers::tasks::get_linked_projects).put(handlers::tasks::update_linked_projects),
         )
         .route(
             "/projects/{id}/tasks/{taskId}/symbols/lookup",
@@ -694,7 +735,10 @@ pub fn create_api_router() -> Router {
             post(handlers::tasks::bulk_delete_review_comments),
         )
         // Hooks API
-        .route("/hooks", get(handlers::hooks::list_all_hooks))
+        .route(
+            "/hooks",
+            get(handlers::hooks::list_all_hooks).delete(handlers::hooks::clear_all_hooks),
+        )
         .route("/hooks/preview", post(handlers::hooks::preview_sound))
         .route(
             "/projects/{id}/hooks/{taskId}",
@@ -861,6 +905,46 @@ pub fn create_api_router() -> Router {
         .route(
             "/projects/{id}/automations/{aid}/runs/{run_id}/cancel",
             post(handlers::automations::cancel_run),
+        )
+        .route(
+            "/projects/{id}/automation-runs/ws",
+            get(handlers::automations::run_updates_ws),
+        )
+        .route(
+            "/projects/{id}/memory/config",
+            get(handlers::memory::get_config).put(handlers::memory::update_config),
+        )
+        .route(
+            "/projects/{id}/memory/overview",
+            get(handlers::memory::overview),
+        )
+        .route(
+            "/projects/{id}/memory/entities",
+            get(handlers::memory::list_entities),
+        )
+        .route(
+            "/projects/{id}/memory/entities/{entity_id}",
+            get(handlers::memory::get_entity).delete(handlers::memory::delete_entity),
+        )
+        .route(
+            "/projects/{id}/memory/logs",
+            get(handlers::memory::list_logs),
+        )
+        .route(
+            "/projects/{id}/memory/logs/delete",
+            post(handlers::memory::delete_logs),
+        )
+        .route(
+            "/projects/{id}/memory/relations",
+            get(handlers::memory::list_relations),
+        )
+        .route(
+            "/projects/{id}/memory/runs/{run_id}/history",
+            get(handlers::memory::run_history),
+        )
+        .route(
+            "/projects/{id}/memory/runs/{run_id}",
+            delete(handlers::memory::delete_run),
         )
         // Walkie-Talkie / Radio
         .route(
@@ -1097,6 +1181,10 @@ pub fn create_proxy_router(remote: String) -> Router {
         )
         .route(
             "/api/v1/projects/{id}/tasks/{taskId}/sketches/ws",
+            any(ws_proxy_handler),
+        )
+        .route(
+            "/api/v1/projects/{id}/automation-runs/ws",
             any(ws_proxy_handler),
         )
         // Map all other HTTP requests
@@ -1491,6 +1579,25 @@ fn display_host_for(bind_host: &str, lan_ip: Option<&str>) -> String {
         .unwrap_or_else(|| "localhost".to_string())
 }
 
+/// Start the Automation runtime shared by Web and the local desktop server.
+/// Callers own the surrounding server lifecycle, so this is invoked once per
+/// local Grove process before Automation endpoints can receive traffic.
+pub fn start_automation_runtime() {
+    crate::memory::register_automation_handlers();
+
+    let sweep_now = chrono::Utc::now().timestamp();
+    match crate::storage::automations::sweep_interrupted_runs(sweep_now) {
+        Ok(n) if n > 0 => {
+            crate::automation::awarn!("swept {n} stale queued run(s) → interrupted");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            crate::automation::awarn!("startup sweep failed: {e}");
+        }
+    }
+    crate::automation::scheduler::spawn();
+}
+
 /// Start the web server (API + static files)
 pub async fn start_server(
     host: &str,
@@ -1510,11 +1617,6 @@ pub async fn start_server(
     // subscribes; safe to start unconditionally.
     crate::plugins::radio_bridge::spawn();
 
-    // Auto-correct agent defaults based on what's actually installed on PATH.
-    // Runs every server start because the user's environment can change between
-    // sessions (e.g. they install a new CLI).
-    crate::acp::init_agent_defaults();
-
     // Recover any installed_agents row stuck in `installing` — happens when
     // grove was killed mid-download. Marking them failed lets the user
     // retry from Marketplace instead of staring at a perpetual spinner.
@@ -1525,53 +1627,41 @@ pub async fn start_server(
         );
     }
 
-    // Long-running ACP registry refresher. First tick happens immediately
-    // so the cache gets populated on startup (Marketplace then opens fast
-    // with full data). Subsequent ticks run every hour and call
-    // refresh_if_stale, which respects the 24h freshness window — so we
-    // hit the CDN at most once per stale-window in steady state, but stay
-    // responsive when grove runs for days/weeks.
+    // Agent onboarding is a startup prerequisite, not a fire-and-forget task:
+    //   1. resolve a complete registry snapshot (cache first, network fallback)
+    //   2. reconcile the four product-owned Npx channels
+    //   3. scan every registry agent for local PATH installations
+    //   4. only then choose valid defaults and expose the server
+    let startup_registry = crate::storage::agent_registry::get_for_auto_install()
+        .await
+        .map_err(|e| {
+            std::io::Error::other(format!("agent registry initialization failed: {}", e))
+        })?;
+    let seeded = tokio::task::spawn_blocking(move || -> crate::error::Result<usize> {
+        crate::storage::installed_agents::reconcile_registry_state(&startup_registry)
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("agent onboarding task failed: {}", e)))?
+    .map_err(|e| std::io::Error::other(format!("agent onboarding reconciliation failed: {}", e)))?;
+    eprintln!(
+        "[startup] onboarding agents reconciled ({} Npx channel(s) added)",
+        seeded
+    );
+
+    // Defaults are derived only after both managed and PATH channels have
+    // converged, so first-run config cannot observe an empty database.
+    crate::acp::init_agent_defaults();
+
+    // Keep the registry fresh for long-running servers. Startup already has a
+    // usable cache-backed snapshot, so these refreshes are non-blocking.
     tokio::spawn(async {
+        crate::storage::agent_registry::refresh_if_stale().await;
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
         loop {
             ticker.tick().await;
             crate::storage::agent_registry::refresh_if_stale().await;
-        }
-    });
-
-    // Boot-time PATH scan: register/deregister External installations for
-    // any registry agent whose binary is (or isn't) on the user's PATH.
-    // Without this, the first chat the user opens would resolve against a
-    // stale installed_agents row (e.g. claude-acp's External installation
-    // missing because no Marketplace render has triggered the scan yet),
-    // which manifests as "Waiting for connection…" stuck states.
-    //
-    // Runs once at startup on the blocking pool — the scan is just PATH
-    // stats + sqlite writes, fast but synchronous. We don't await it from
-    // the boot path; the chat WS / launch handlers tolerate missing rows
-    // (resolve_agent falls back to defaults), this just makes the steady
-    // state arrive sooner.
-    tokio::task::spawn_blocking(|| {
-        let registry = crate::storage::agent_registry::get();
-        if let Err(e) = crate::storage::installed_agents::auto_scan_path_binaries(&registry) {
-            eprintln!("[startup] PATH binary scan failed: {}", e);
-        }
-    });
-
-    // Curated agent seed: guarantees every chat / config referencing a
-    // curated id (`claude-acp`, `codex-acp`, `gemini`, `opencode`,
-    // `github-copilot-cli`, `qwen-code`) has a resolvable row before the
-    // user opens any UI. Idempotent — only inserts rows that don't
-    // already exist; never touches user customizations. This covers BOTH:
-    //   - fresh installs (no prior rows) — same effect as the old
-    //     `seed_curated_if_fresh` Marketplace-handler call
-    //   - v2.5→v2.6 upgrades whose chats referenced builtin agents that
-    //     previously needed no `installed_agents` row
-    tokio::task::spawn_blocking(|| {
-        let registry = crate::storage::agent_registry::get();
-        if let Err(e) = crate::storage::installed_agents::ensure_curated_agents_seeded(&registry) {
-            eprintln!("[startup] curated agent seed failed: {}", e);
         }
     });
 
@@ -1582,17 +1672,7 @@ pub async fn start_server(
     // Sweep any `queued` runs left over from a previous Grove process (whose
     // ACP subscriber died with the process) into `interrupted` first, so
     // the run-history UI doesn't display them as "still running forever".
-    let sweep_now = chrono::Utc::now().timestamp();
-    match crate::storage::automations::sweep_interrupted_runs(sweep_now) {
-        Ok(n) if n > 0 => {
-            crate::automation::awarn!("swept {n} stale queued run(s) → interrupted");
-        }
-        Ok(_) => {}
-        Err(e) => {
-            crate::automation::awarn!("startup sweep failed: {e}");
-        }
-    }
-    crate::automation::scheduler::spawn();
+    start_automation_runtime();
 
     // Start the in-process agent_graph MCP listener (loopback-only). Failure to
     // bind is non-fatal — the rest of the server still boots; ACP sessions will

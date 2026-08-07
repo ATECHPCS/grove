@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import { X, Plus, Pencil, Trash2, UserCog, Bot, Globe, Terminal, Check, Loader2 } from "lucide-react";
-import { Button, AgentPicker } from "../ui";
+import { Button, AgentPicker, Combobox } from "../ui";
+import { MemoryAgentConfig } from "../Memory/MemoryAgentConfig";
 import {
   createCustomAgent,
   updateCustomAgent,
@@ -13,7 +14,13 @@ import {
   type CustomAgentPatch,
   type CustomAgentServer,
 } from "../../api";
+import type { AgentConfigSelection } from "../../api/agentConfig";
+import {
+  listInstalledAgentConfigs,
+  type InstalledAgentConfig,
+} from "../../api/marketplace";
 import { loadCustomAgentPersonas as loadCustomAgentPersonasIcon } from "../../utils/agentIcon";
+import { configForAgent } from "../../utils/agentConfig";
 import { useIsMobile } from "../../hooks";
 import { useDefineCommand, useKeyboardScope } from "../../keyboard";
 
@@ -45,9 +52,7 @@ interface DraftAgent {
   id: string;
   name: string;
   base_agent: string;
-  model?: string;
-  mode?: string;
-  effort?: string;
+  agent_config: AgentConfigSelection;
   duty?: string;
   system_prompt: string;
 }
@@ -55,9 +60,7 @@ interface DraftAgent {
 type FormState = {
   name: string;
   base_agent: string;
-  model: string;
-  mode: string;
-  effort: string;
+  agent_config: AgentConfigSelection;
   duty: string;
   system_prompt: string;
 };
@@ -79,11 +82,26 @@ function defaultBase(options: AgentOption[]): string {
   return options.find((o) => !o.disabled)?.id ?? options[0]?.id ?? "";
 }
 
-function makeDraft(options: AgentOption[]): DraftAgent {
+function configForBase(
+  baseAgent: string,
+  installedConfigs: InstalledAgentConfig[],
+): AgentConfigSelection {
+  const installed = installedConfigs.find((agent) => agent.id === baseAgent);
+  return installed
+    ? configForAgent(installed)
+    : { source: "default", agent_id: baseAgent || undefined };
+}
+
+function makeDraft(
+  options: AgentOption[],
+  installedConfigs: InstalledAgentConfig[],
+): DraftAgent {
+  const baseAgent = defaultBase(options);
   return {
     id: makeDraftId(),
     name: "New Agent",
-    base_agent: defaultBase(options),
+    base_agent: baseAgent,
+    agent_config: configForBase(baseAgent, installedConfigs),
     system_prompt: "",
   };
 }
@@ -92,9 +110,10 @@ function toFormState(p: CustomAgentPersona | DraftAgent): FormState {
   return {
     name: p.name,
     base_agent: p.base_agent,
-    model: p.model ?? "",
-    mode: p.mode ?? "",
-    effort: p.effort ?? "",
+    agent_config: p.agent_config ?? {
+      source: "default",
+      agent_id: p.base_agent || undefined,
+    },
     duty: p.duty ?? "",
     system_prompt: p.system_prompt ?? "",
   };
@@ -117,7 +136,31 @@ export function CustomAgentsModal({
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [installedConfigs, setInstalledConfigs] = useState<InstalledAgentConfig[]>([]);
+  const [agentConfigsLoading, setAgentConfigsLoading] = useState(false);
+  const [agentConfigsError, setAgentConfigsError] = useState<string | null>(null);
   const { isMobile } = useIsMobile();
+
+  useEffect(() => {
+    if (!isOpen) return;
+    let active = true;
+    void Promise.resolve().then(async () => {
+      if (!active) return;
+      setAgentConfigsLoading(true);
+      setAgentConfigsError(null);
+      try {
+        const configs = await listInstalledAgentConfigs();
+        if (active) setInstalledConfigs(configs);
+      } catch {
+        if (active) setAgentConfigsError("Supported settings are unavailable.");
+      } finally {
+        if (active) setAgentConfigsLoading(false);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [isOpen]);
 
   // Refs for keyboard handler so it always calls the latest closures without
   // re-adding the document listener on every render.
@@ -277,7 +320,7 @@ export function CustomAgentsModal({
     // the first draft's work-in-progress slot. The user must Save or
     // Cancel the current draft before creating another.
     if (editingId && isDraft(editingId)) return;
-    const draft = makeDraft(baseAgentOptions);
+    const draft = makeDraft(baseAgentOptions, installedConfigs);
     const next = [...list, draft];
     setList(next);
     setSelectedId(draft.id);
@@ -321,13 +364,7 @@ export function CustomAgentsModal({
     setBusy(true);
     setError(null);
     const trimmedName = form.name.trim();
-    const trimmedModel = form.model.trim();
-    const trimmedMode = form.mode.trim();
-    const trimmedEffort = form.effort.trim();
     const trimmedDuty = form.duty.trim();
-    const modelVal = trimmedModel ? trimmedModel : null;
-    const modeVal = trimmedMode ? trimmedMode : null;
-    const effortVal = trimmedEffort ? trimmedEffort : null;
     const dutyVal = trimmedDuty ? trimmedDuty : null;
     const draftFlag = isDraft(editingId);
     let created: CustomAgentPersona | null = null;
@@ -338,9 +375,7 @@ export function CustomAgentsModal({
         const input: CustomAgentInput = {
           name: trimmedName,
           base_agent: form.base_agent,
-          model: modelVal,
-          mode: modeVal,
-          effort: effortVal,
+          agent_config: form.agent_config,
           duty: dutyVal,
           system_prompt: form.system_prompt,
         };
@@ -349,9 +384,7 @@ export function CustomAgentsModal({
         const patch: CustomAgentPatch = {
           name: trimmedName,
           base_agent: form.base_agent,
-          model: modelVal,
-          mode: modeVal,
-          effort: effortVal,
+          agent_config: form.agent_config,
           duty: dutyVal,
           system_prompt: form.system_prompt,
         };
@@ -485,7 +518,7 @@ export function CustomAgentsModal({
                   Custom Agents
                 </h2>
                 <p className="text-xs text-[var(--color-text-muted)]">
-                  Personas built on top of a base agent with a preset model & system prompt
+                  Personas built on a base Agent with preset runtime configuration and instructions
                 </p>
               </div>
             </div>
@@ -594,7 +627,7 @@ export function CustomAgentsModal({
                       </div>
                       <div className="text-[10px] text-[var(--color-text-muted)] mt-1 truncate pl-7">
                         Based on {baseLabel(p.base_agent)}
-                        {p.model ? ` · ${p.model}` : ""}
+                        {p.agent_config && p.agent_config.source !== "default" ? " · Configured" : ""}
                       </div>
                     </div>
                   );
@@ -636,12 +669,16 @@ export function CustomAgentsModal({
                     onUpdate={updateForm}
                     baseAgentOptions={baseAgentOptions}
                     customServers={customServers}
+                    installedConfigs={installedConfigs}
+                    agentConfigsLoading={agentConfigsLoading}
+                    agentConfigsError={agentConfigsError}
                   />
                 ) : !isDraft(current.id) ? (
                   <ViewView
                     agent={current as CustomAgentPersona}
                     baseLabel={baseLabel(current.base_agent)}
                     baseIcon={renderBaseIcon(current.base_agent)}
+                    installedConfigs={installedConfigs}
                   />
                 ) : null}
               </div>
@@ -701,14 +738,107 @@ function ReadOnlyValue({ value, mono = false, multiline = false }: { value?: str
   );
 }
 
+function AgentConfigEditor({
+  baseAgent,
+  config,
+  installedConfigs,
+  loading,
+  error,
+  onChange,
+}: {
+  baseAgent: string;
+  config: AgentConfigSelection;
+  installedConfigs: InstalledAgentConfig[];
+  loading: boolean;
+  error: string | null;
+  onChange: (config: AgentConfigSelection) => void;
+}) {
+  const installed = installedConfigs.find((agent) => agent.id === baseAgent);
+  const capability = installed?.capability_snapshot;
+  const options = capability?.uses_config_options ? capability.config_options ?? [] : [];
+  const modes = capability?.modes?.available ?? [];
+  const effective = installed && (
+    (options.length > 0 && config.source !== "config_options")
+    || (options.length === 0 && modes.length > 0 && config.source !== "modes")
+  )
+    ? configForAgent(installed)
+    : config;
+
+  if (loading) {
+    return (
+      <span className="inline-flex min-h-7 items-center gap-1.5 text-xs text-[var(--color-text-muted)]">
+        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        Loading supported settings…
+      </span>
+    );
+  }
+  if (error) {
+    return <span className="text-xs text-[var(--color-error)]">{error} Using the Agent default is still available.</span>;
+  }
+  if (effective.source === "config_options" && options.length > 0) {
+    return <MemoryAgentConfig options={options} config={effective} onChange={onChange} />;
+  }
+  if (effective.source === "modes" && modes.length > 0) {
+    return (
+      <div className="max-w-xs">
+        <Combobox
+          options={modes.map(([id, label]) => ({ id, value: id, label }))}
+          value={effective.mode_id}
+          onChange={(modeId) => onChange({ ...effective, mode_id: modeId })}
+          allowCustom={false}
+          size="compact"
+        />
+      </div>
+    );
+  }
+  return <span className="text-xs text-[var(--color-text-muted)]">Uses the Base Agent defaults.</span>;
+}
+
+function AgentConfigSummary({
+  agent,
+  installedConfigs,
+}: {
+  agent: CustomAgentPersona;
+  installedConfigs: InstalledAgentConfig[];
+}) {
+  const config = agent.agent_config;
+  if (!config || config.source === "default") {
+    const legacyValues = [agent.model, agent.mode, agent.effort].filter(
+      (value): value is string => Boolean(value),
+    );
+    if (legacyValues.length > 0) {
+      return <span>{legacyValues.join(" · ")}</span>;
+    }
+    return <span>Base Agent defaults</span>;
+  }
+  if (config.source === "modes") {
+    const modes = installedConfigs.find((item) => item.id === agent.base_agent)
+      ?.capability_snapshot?.modes?.available ?? [];
+    return <span>{modes.find(([id]) => id === config.mode_id)?.[1] ?? config.mode_id}</span>;
+  }
+  const options = installedConfigs.find((item) => item.id === agent.base_agent)
+    ?.capability_snapshot?.config_options ?? [];
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {Object.entries(config.values).map(([id, value]) => (
+        <span key={id} className="rounded-full bg-[var(--color-bg-secondary)] px-2 py-1 text-[11px] text-[var(--color-text-muted)]">
+          {options.find((option) => option.id === id)?.name ?? id} <span className="text-[var(--color-text)]">{String(value)}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function ViewView({
   agent,
   baseLabel,
   baseIcon,
+  installedConfigs,
 }: {
   agent: CustomAgentPersona;
   baseLabel: string;
   baseIcon: React.ReactNode;
+  installedConfigs: InstalledAgentConfig[];
 }) {
   return (
     <div className="space-y-5">
@@ -716,8 +846,6 @@ function ViewView({
         <FieldLabel>Name</FieldLabel>
         <ReadOnlyValue value={agent.name} />
       </div>
-
-      <div className="border-t border-[var(--color-border)]" />
 
       <div>
         <FieldLabel>Base Agent</FieldLabel>
@@ -727,22 +855,10 @@ function ViewView({
         </div>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-        <div>
-          <FieldLabel>Model</FieldLabel>
-          <ReadOnlyValue value={agent.model} mono />
-        </div>
-        <div>
-          <FieldLabel>Mode</FieldLabel>
-          <ReadOnlyValue value={agent.mode} mono />
-        </div>
-        <div>
-          <FieldLabel>Effort</FieldLabel>
-          <ReadOnlyValue value={agent.effort} mono />
-        </div>
+      <div>
+        <FieldLabel>Agent configuration</FieldLabel>
+        <AgentConfigSummary agent={agent} installedConfigs={installedConfigs} />
       </div>
-
-      <div className="border-t border-[var(--color-border)]" />
 
       <div>
         <FieldLabel>Duty</FieldLabel>
@@ -762,11 +878,17 @@ function EditView({
   onUpdate,
   baseAgentOptions,
   customServers,
+  installedConfigs,
+  agentConfigsLoading,
+  agentConfigsError,
 }: {
   form: FormState;
   onUpdate: (patch: Partial<FormState>) => void;
   baseAgentOptions: AgentOption[];
   customServers: CustomAgentServer[];
+  installedConfigs: InstalledAgentConfig[];
+  agentConfigsLoading: boolean;
+  agentConfigsError: string | null;
 }) {
   const inputCls =
     "w-full h-9 rounded-md border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-3 text-sm text-[var(--color-text)] outline-none focus:border-[var(--color-highlight)]";
@@ -783,57 +905,38 @@ function EditView({
         />
       </div>
 
-      <div className="border-t border-[var(--color-border)]" />
-
-      <div>
-        <FieldLabel>Base Agent</FieldLabel>
-        <AgentPicker
-          value={form.base_agent}
-          onChange={(v) => onUpdate({ base_agent: v })}
-          options={baseAgentOptions}
-          allowCustom={false}
-          placeholder="Select base agent..."
-          customAgents={customServers}
-        />
-      </div>
-
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      <div className="space-y-2.5">
         <div>
-          <FieldLabel>Model</FieldLabel>
-          <input
-            type="text"
-            value={form.model}
-            onChange={(e) => onUpdate({ model: e.target.value })}
-            placeholder="e.g. sonnet"
-            className={inputCls}
+          <FieldLabel>Base Agent</FieldLabel>
+          <AgentPicker
+            value={form.base_agent}
+            onChange={(baseAgent) => onUpdate({
+              base_agent: baseAgent,
+              agent_config: configForBase(baseAgent, installedConfigs),
+            })}
+            options={baseAgentOptions}
+            allowCustom={false}
+            placeholder="Select base agent..."
+            customAgents={customServers}
           />
         </div>
-        <div>
-          <FieldLabel>Mode</FieldLabel>
-          <input
-            type="text"
-            value={form.mode}
-            onChange={(e) => onUpdate({ mode: e.target.value })}
-            placeholder="e.g. default"
-            className={inputCls}
-          />
-        </div>
-        <div>
-          <FieldLabel>Effort</FieldLabel>
-          <input
-            type="text"
-            value={form.effort}
-            onChange={(e) => onUpdate({ effort: e.target.value })}
-            placeholder="e.g. high"
-            className={inputCls}
-          />
+
+        <div className="flex min-h-7 items-center gap-3">
+          <span className="w-32 flex-shrink-0 text-xs text-[var(--color-text-muted)]">
+            Agent configuration
+          </span>
+          <div className="min-w-0 flex-1">
+            <AgentConfigEditor
+              baseAgent={form.base_agent}
+              config={form.agent_config}
+              installedConfigs={installedConfigs}
+              loading={agentConfigsLoading}
+              error={agentConfigsError}
+              onChange={(agent_config) => onUpdate({ agent_config })}
+            />
+          </div>
         </div>
       </div>
-      <p className="text-[11px] text-[var(--color-text-muted)] -mt-2">
-        Free-text. Matched by name on the chosen base agent, falling back to its default if not available.
-      </p>
-
-      <div className="border-t border-[var(--color-border)]" />
 
       <div>
         <FieldLabel>Duty</FieldLabel>

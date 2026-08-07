@@ -2,6 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Project list query. By default only active projects are discoverable.
+#[derive(Debug, Deserialize, Default)]
+pub struct ProjectListQuery {
+    #[serde(default)]
+    pub archived: bool,
+}
+
 /// Project list item (for GET /projects)
 #[derive(Debug, Serialize)]
 pub struct ProjectListItem {
@@ -18,6 +25,7 @@ pub struct ProjectListItem {
     pub exists: bool,
     /// Project type: "repo" or "studio"
     pub project_type: String,
+    pub archived: bool,
 }
 
 /// Project list response
@@ -74,6 +82,7 @@ pub struct ProjectResponse {
     pub exists: bool,
     /// Project type: "repo" or "studio"
     pub project_type: String,
+    pub archived: bool,
 }
 
 /// Rename project request
@@ -162,7 +171,14 @@ pub struct InstructionsResponse {
     pub content: String,
 }
 
-/// Instructions/memory update request
+/// Result of moving one legacy Studio `memory.md` into the new Memory Log
+/// lifecycle. The full migrated content remains in the created Log.
+#[derive(Debug, Serialize)]
+pub struct LegacyMemoryMigrationResponse {
+    pub log_id: String,
+}
+
+/// Workspace Instructions update request
 #[derive(Debug, Deserialize)]
 pub struct InstructionsUpdateRequest {
     pub content: String,
@@ -178,6 +194,7 @@ pub struct ResourceDeleteQuery {
 #[derive(Debug, Deserialize)]
 pub struct ResourceFileQuery {
     pub path: String,
+    pub action: Option<String>,
 }
 
 /// Query params for list resources (optional path for subdirectory listing)

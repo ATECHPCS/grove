@@ -5,6 +5,82 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] - 2026-08-06
+
+### Added
+
+- **Agent configuration and memory workflows** — Agent selections reconcile with installed capabilities, recalled project memories are visible in task chat, and legacy Studio memory migration refreshes existing task instructions.
+
+## [0.12.0] - 2026-08-05
+
+### Added
+
+- **Project memory** — Projects can capture durable logs and entities, organize them into a navigable memory graph, and expose memory workflows to agents and automations.
+- **ACP v1 sessions** — ACP agents now support authentication, reconnect and import flows, session deletion, cancellation, terminals, plans, modes, configuration options, and form or URL elicitation.
+- **Project archive and restore** — Projects can be archived from the project list and restored later without deleting their data.
+
+### Improved
+
+- **Memory organization and agent context** — Memory agents receive clearer project context, safer organization behavior, and dedicated navigation shortcuts.
+- **Full-file previews** — Review and task surfaces now share one full-file renderer for consistent Markdown, HTML, image, and comment behavior.
+
+### Fixed
+
+- **ACP session commands and notifications** — Session-scoped slash commands remain available, and elicitation requests can trigger desktop notifications.
+- **Homebrew hook discovery** — Active base URL lookup is gated correctly on macOS Homebrew installations.
+
+## [0.11.10] - 2026-07-28
+
+### Added
+
+- **Contextual comments across chat and previews** — Selected content in chat, Markdown, HTML, and diff previews can be carried into contextual comments, with clearer diagnostics when chat rendering fails.
+- **Native file actions** — Files can be dragged to native applications and revealed in the system file manager directly from task and review views.
+
+### Improved
+
+- **Document and HTML previews** — Markdown preserves document semantics while HTML previews fit their content more reliably, with consistent comment interactions across preview surfaces.
+- **Large chat and review performance** — Task chat and multi-file diffs virtualize long content while preserving search, scrolling, selection, and interaction stability.
+
+### Fixed
+
+- **Streaming chat and tool-call rendering** — Streamed messages, thought state, edit paths, tool details, and ACP updates render consistently as conversations evolve.
+- **Project selection on headless Linux** — When a native folder picker is unavailable, project selection falls back to the web picker.
+
+## [0.11.9] - 2026-07-23
+
+### Added
+
+- **Richer completed-turn presentation** — Completed chat turns now have a clearer, more polished presentation, and notifications can be cleared all at once.
+- **Markdown worktree resources and HTML previews** — Markdown now resolves local file resources consistently, including raw HTML rendered with worktree-relative iframe sources.
+
+### Improved
+
+- **Reliable diagnostics and quota badges** — Web sourcemaps are emitted for crash diagnostics, while providers can customize their aggregate quota badge.
+
+### Fixed
+
+- **Chat and agent reliability** — Billion-token counts and voice-command IDs are formatted correctly, agent icons resolve from display names, onboarding installs automatically, and the app recovers from white-screen crashes.
+- **Code Review file and diff interactions** — Binary and image files render directly; preview availability is capability-aware; and split-diff selection, copying, hovering, and expand/collapse controls work correctly.
+
+## [0.11.8] - 2026-07-13
+
+### Added
+
+- **Conversation minimap** — A navigable minimap for long chats, with height capped and previously-invisible ticks now rendered.
+- **Compact queue send mode** — The message queue now pauses while editing a queued message, plus a new compact send mode for queuing.
+- **Drag file cards into chat from Artifacts** — File cards in the Artifacts tab can now be dragged into the chat composer as file chips, matching the existing behavior from the file tree.
+
+### Improved
+
+- **Folder mentions in chat search** — `@` mentions now match folders, search scoring is tuned, and the result limit is raised to 20.
+- **Island project switcher** — "Add Project" and "Manage Projects" are now reachable from the island sidebar's project switcher.
+
+### Fixed
+
+- **Code Review diff refresh** — The diff view now retriggers correctly after the cache is cleared.
+- **ACP WebSocket cleanup** — The chat WebSocket is now properly closed when an ACP session ends.
+- **Agent seeding race on fresh installs** — Boot-time registry refresh, curated-agent seeding, and the PATH-binary scan are now serialized, fixing a race where seeding could finish before the registry cache loaded and leave 0 agents seeded.
+
 ## [0.11.7] - 2026-07-07
 
 ### Added

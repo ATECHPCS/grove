@@ -76,6 +76,7 @@ pub struct NotificationsConfigDto {
     pub tray_show_running: bool,
     pub notification_enabled: bool,
     pub notification_show_permission: bool,
+    pub notification_show_elicitation: bool,
     pub notification_show_done: bool,
     pub notification_show_running: bool,
     pub menubar_shortcut: Option<String>,
@@ -205,6 +206,7 @@ impl From<&Config> for ConfigResponse {
                 tray_show_running: config.notifications.tray_show_running,
                 notification_enabled: config.notifications.notification_enabled,
                 notification_show_permission: config.notifications.notification_show_permission,
+                notification_show_elicitation: config.notifications.notification_show_elicitation,
                 notification_show_done: config.notifications.notification_show_done,
                 notification_show_running: config.notifications.notification_show_running,
                 menubar_shortcut: config.notifications.menubar_shortcut.clone(),
@@ -293,6 +295,7 @@ pub struct NotificationsConfigPatch {
     pub tray_show_running: Option<bool>,
     pub notification_enabled: Option<bool>,
     pub notification_show_permission: Option<bool>,
+    pub notification_show_elicitation: Option<bool>,
     pub notification_show_done: Option<bool>,
     pub notification_show_running: Option<bool>,
     /// `Some("")` clears the shortcut, `Some("Cmd+Shift+M")` sets it.
@@ -560,6 +563,9 @@ pub async fn patch_config(
         }
         if let Some(v) = n.notification_show_permission {
             config.notifications.notification_show_permission = v;
+        }
+        if let Some(v) = n.notification_show_elicitation {
+            config.notifications.notification_show_elicitation = v;
         }
         if let Some(v) = n.notification_show_done {
             config.notifications.notification_show_done = v;

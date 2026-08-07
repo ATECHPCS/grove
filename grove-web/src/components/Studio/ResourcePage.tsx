@@ -3,18 +3,18 @@ import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Trash2, Upload, Loader2, MoreHorizontal, Download, Eye,
-  FolderOpen, Save, FileText, RefreshCw, Sparkles,
+  FolderOpen, FolderSearch, Save, FileText, RefreshCw, Sparkles,
   Search, ArrowRight, Files, ShieldCheck, Clock3, X, Brain,
   FolderPlus, ChevronRight, Pencil, Check, CornerLeftUp, Edit3,
   Link as LinkIcon, SquareArrowOutUpRight,
 } from "lucide-react";
-import { useProject } from "../../context";
+import { useBanner, useProject } from "../../context";
 import {
   listResources, uploadResource, deleteResource,
-  previewResource, resourceDownloadUrl, openResourceFile,
+  previewResource, resourceDownloadUrl, openResourceFile, revealResourceFile,
   createResourceFolder, moveResource, createResourceLink, updateResourceLink,
   getInstructions, updateInstructions,
-  getMemory, updateMemory,
+  getMemory, migrateMemory,
   listResourceWorkdirs, addResourceWorkdir, deleteResourceWorkdir, openResourceWorkdir,
   type ResourceFile, type WorkDirectoryEntry,
 } from "../../api";
@@ -37,6 +37,7 @@ import {
   parseLinkFile,
   type FileConflictState,
 } from "../ui";
+import { ConfirmDialog } from "../Dialogs/ConfirmDialog";
 import { openExternalUrl } from "../../utils/openExternal";
 import { useCommand, useContextKey, useKeyboardScope } from "../../keyboard";
 
@@ -71,7 +72,7 @@ const INSTRUCTION_TEMPLATES = [
     content: `# Project context
 
 - This Studio shares files through resource/
-- Instructions here are injected into every task's AGENTS.md
+- Instructions are available to every task as instructions.md
 - Prefer using shared files before recreating context in each task`,
   },
 ];
@@ -93,6 +94,7 @@ function dropContainsDirectory(dataTransfer: DataTransfer): boolean {
 
 export function ResourcePage() {
   const { selectedProject } = useProject();
+  const { showBanner } = useBanner();
   const projectId = selectedProject?.id;
 
   const [files, setFiles] = useState<ResourceFile[]>([]);
@@ -138,15 +140,9 @@ export function ResourcePage() {
   const instructionLineCount = countInstructionLines(instructions);
 
   const [memory, setMemory] = useState("");
-  const [savedMemory, setSavedMemory] = useState("");
   const [isLoadingMemory, setIsLoadingMemory] = useState(true);
-  const [isSavingMemory, setIsSavingMemory] = useState(false);
-  const [memorySaveMessage, setMemorySaveMessage] = useState<string | null>(null);
-
-  const [isEditingMemory, setIsEditingMemory] = useState(false);
-
-  const hasUnsavedMemory = memory !== savedMemory;
-  const memoryLineCount = countInstructionLines(memory);
+  const [isMigratingMemory, setIsMigratingMemory] = useState(false);
+  const [memoryMigrationOpen, setMemoryMigrationOpen] = useState(false);
 
   const fileOnlyList = files.filter(f => !f.is_dir);
   const filteredFiles = files
@@ -235,29 +231,27 @@ export function ResourcePage() {
     try {
       const data = await getMemory(projectId);
       setMemory(data.content);
-      setSavedMemory(data.content);
     } catch (err) {
       console.error('Failed to load memory:', err);
       setMemory("");
-      setSavedMemory("");
     }
     setIsLoadingMemory(false);
   }, [projectId]);
 
-  const handleSaveMemory = useCallback(async () => {
+  const handleMigrateMemory = useCallback(async () => {
     if (!projectId) return;
-    setIsSavingMemory(true);
-    setMemorySaveMessage(null);
+    setIsMigratingMemory(true);
     try {
-      await updateMemory(projectId, memory);
-      setSavedMemory(memory);
-      setMemorySaveMessage("Saved");
-      setIsEditingMemory(false);
-    } catch {
-      setMemorySaveMessage("Failed to save");
+      await migrateMemory(projectId);
+      setMemory("");
+      setMainPanel("assets");
+      setMemoryMigrationOpen(false);
+      showBanner("Legacy Project Memory migrated to a Memory Log.", "success");
+    } catch (err) {
+      showBanner(errorMessage(err, "Failed to migrate legacy Project Memory"), "error", 5000);
     }
-    setIsSavingMemory(false);
-  }, [projectId, memory]);
+    setIsMigratingMemory(false);
+  }, [projectId, showBanner]);
 
   useEffect(() => { void Promise.resolve().then(loadFiles); }, [loadFiles]);
   useEffect(() => {
@@ -268,18 +262,18 @@ export function ResourcePage() {
     });
   }, [loadWorkdirs, loadInstructions, loadMemory]);
 
+  useEffect(() => {
+    if (!isLoadingMemory && !memory.trim() && mainPanel === "memory") {
+      void Promise.resolve().then(() => setMainPanel("assets"));
+    }
+  }, [isLoadingMemory, mainPanel, memory]);
+
   // Auto-dismiss save messages with proper cleanup
   useEffect(() => {
     if (!saveMessage) return;
     const t = setTimeout(() => setSaveMessage(null), 2000);
     return () => clearTimeout(t);
   }, [saveMessage]);
-
-  useEffect(() => {
-    if (!memorySaveMessage) return;
-    const t = setTimeout(() => setMemorySaveMessage(null), 2000);
-    return () => clearTimeout(t);
-  }, [memorySaveMessage]);
 
   // Focus new folder input when it appears
   useEffect(() => {
@@ -477,13 +471,10 @@ export function ResourcePage() {
     setIsSaving(false);
   }, [projectId, instructions]);
 
-  // Cmd/Ctrl+S → save instructions or memory, routed through the Scoped
-  // Command Registry. Catalog declarations live in keyboard/catalog/studio.ts
-  // (studio.instructions.save / studio.memory.save). Context keys gate the
-  // "when" expression so the binding is inert when the buffer is unchanged
-  // or focus is outside the relevant Monaco editor.
+  // Cmd/Ctrl+S → save instructions, routed through the Scoped Command
+  // Registry. Context keys keep the binding inert when the buffer is clean.
   // - studioMode: ResourcePage only mounts inside Studio surfaces.
-  // - instructionsEdited / memoryEdited: surface the "has unsaved" boolean.
+  // - instructionsEdited: surfaces the "has unsaved" boolean.
   // - The catalog entries have passThroughTextInput: true so the binding
   //   fires while the Monaco editor (which suppresses commands by default)
   //   owns focus.
@@ -493,11 +484,9 @@ export function ResourcePage() {
   useKeyboardScope("workspace");
   useContextKey("studioMode", true);
   useContextKey("instructionsEdited", hasUnsaved);
-  useContextKey("memoryEdited", hasUnsavedMemory);
 
-  // `enabled` keeps the original focus-bound behavior — Cmd+S only saves the
-  // editor that currently owns focus. Without this, having both editors
-  // present would race for the same chord.
+  // `enabled` keeps the focus-bound behavior — Cmd+S only saves while the
+  // Workspace Instructions editor owns focus.
   useCommand(
     "studio.instructions.save",
     () => {
@@ -509,32 +498,13 @@ export function ResourcePage() {
     },
     [hasUnsaved, handleSaveInstructions],
   );
-  useCommand(
-    "studio.memory.save",
-    () => {
-      if (hasUnsavedMemory) handleSaveMemory();
-    },
-    {
-      enabled: () =>
-        document.activeElement?.id === "resource-memory-editor",
-    },
-    [hasUnsavedMemory, handleSaveMemory],
-  );
-
-  // Edit-mode toggles for the Workspace Instructions / Project Memory
-  // editors. Mirror the "Edit" button: switch the panel into the edit
-  // state. Disabled while the relevant content is still loading.
+  // Edit-mode toggle for Workspace Instructions. Legacy Project Memory is
+  // intentionally migration-only so the old and new systems cannot diverge.
   useCommand(
     "studio.instructions.edit",
     () => setIsEditingInstructions(true),
     { enabled: () => !isLoadingInstructions && !isEditingInstructions },
     [isLoadingInstructions, isEditingInstructions],
-  );
-  useCommand(
-    "studio.memory.edit",
-    () => setIsEditingMemory(true),
-    { enabled: () => !isLoadingMemory && !isEditingMemory },
-    [isLoadingMemory, isEditingMemory],
   );
 
   // Import = primary file upload button (Upload). Disabled while a previous
@@ -624,6 +594,11 @@ export function ResourcePage() {
     void openResourceFile(projectId, file.path);
   };
 
+  const handleRevealInFileManager = (file: ResourceFile) => {
+    if (!projectId || file.is_dir) return;
+    void revealResourceFile(projectId, file.path);
+  };
+
   const handleOpenLink = useCallback(async (file: ResourceFile) => {
     if (!projectId) return;
     let raw: string | null = null;
@@ -687,7 +662,11 @@ export function ResourcePage() {
 
   const breadcrumbSegments = currentPath.split("/").filter(Boolean);
 
-  const rightPanels = (["assets", "instructions", "memory"] as const).filter(
+  const showLegacyMemory = isLoadingMemory || memory.trim().length > 0;
+  const availablePanels: readonly ("assets" | "instructions" | "memory")[] = showLegacyMemory
+    ? ["assets", "instructions", "memory"]
+    : ["assets", "instructions"];
+  const rightPanels = availablePanels.filter(
     (p) => p !== mainPanel,
   );
 
@@ -944,6 +923,7 @@ export function ResourcePage() {
                     onDownload={handleDownload}
                     onDelete={handleDelete}
                     onOpenInApp={handleOpenInApp}
+                    onRevealInFileManager={handleRevealInFileManager}
                     onOpenLink={handleOpenLink}
                     onEditLink={handleEditLink}
                     onStartRename={() => { setRenamingPath(item.data.path); setRenameValue(item.data.name); }}
@@ -989,7 +969,7 @@ export function ResourcePage() {
                 )}
               </div>
               <p className="mt-0.5 text-xs" style={{ color: "var(--color-text-muted)" }}>
-                Injected into every task. Define reusable guidance once.
+                Available to every task as <span className="font-mono">instructions.md</span>.
               </p>
             </div>
           </div>
@@ -1013,7 +993,7 @@ export function ResourcePage() {
                   style={{ color: hasUnsaved ? "white" : "var(--color-text-muted)", background: hasUnsaved ? "var(--color-highlight)" : "var(--color-bg)" }}
                 >
                   {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                  {hasUnsaved ? "Save Changes" : "Saved"}
+                  {hasUnsaved ? "Save" : "Saved"}
                 </button>
               </>
             ) : (
@@ -1088,7 +1068,7 @@ export function ResourcePage() {
                 <p className="text-xs font-medium" style={{ color: "var(--color-text)" }}>
                   {instructionLineCount > 0 ? `${instructionLineCount} ${instructionLineCount === 1 ? "line" : "lines"}` : "No content"}
                 </p>
-                <p className="text-[11px]" style={{ color: "var(--color-text-muted)" }}>Synced to task bootstrap</p>
+                <p className="text-[11px]" style={{ color: "var(--color-text-muted)" }}>Shared as instructions.md</p>
               </div>
             </div>
             <textarea
@@ -1128,8 +1108,7 @@ export function ResourcePage() {
   const renderMemoryPanel = ({ isMain }: { isMain: boolean }) => (
     <section className={`min-h-[240px] rounded-2xl border overflow-hidden flex flex-col xl:min-h-0${!isMain ? " xl:flex-1 xl:min-w-[420px] 2xl:min-w-[480px]" : " h-full"}`}
       style={{ borderColor: "var(--color-border)", background: "var(--color-bg-secondary)" }}>
-      <div className="px-4 py-3 border-b"
-        style={{ borderColor: "var(--color-border)" }}>
+      <div className="px-4 py-3 border-b" style={{ borderColor: "var(--color-border)" }}>
         <div className="flex flex-wrap items-start gap-3">
           <div
             className={`flex items-center gap-3 min-w-0 flex-1 rounded-lg transition-colors ${!isMain ? "cursor-pointer px-1 -mx-1" : ""}`}
@@ -1143,62 +1122,30 @@ export function ResourcePage() {
             </div>
             <div className="min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-sm font-semibold">Project Memory</span>
-                {isEditingMemory && hasUnsavedMemory && (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded font-medium"
-                    style={{ background: "color-mix(in srgb, var(--color-warning) 15%, transparent)", color: "var(--color-warning)" }}>
-                    Unsaved
-                  </span>
-                )}
+                <span className="text-sm font-semibold">Legacy Project Memory</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded font-medium uppercase tracking-wide"
+                  style={{ background: "color-mix(in srgb, var(--color-warning) 15%, transparent)", color: "var(--color-warning)" }}>
+                  Legacy
+                </span>
               </div>
               <p className="mt-0.5 text-xs" style={{ color: "var(--color-text-muted)" }}>
-                Accumulated by AI agents across tasks. Read on start, updated on finish.
+                Move this older shared document into the current Memory lifecycle.
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            {isEditingMemory ? (
-              <>
-                <button
-                  onClick={() => { setMemory(savedMemory); setIsEditingMemory(false); }}
-                  disabled={isSavingMemory}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all disabled:opacity-30 border"
-                  style={{ borderColor: "var(--color-border)", color: "var(--color-text-muted)", background: "var(--color-bg)" }}
-                >
-                  <X className="w-4 h-4" />
-                  Cancel
-                </button>
-                <button
-                  onClick={handleSaveMemory}
-                  disabled={isSavingMemory || !hasUnsavedMemory}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all disabled:opacity-30"
-                  style={{ color: hasUnsavedMemory ? "white" : "var(--color-text-muted)", background: hasUnsavedMemory ? "var(--color-highlight)" : "var(--color-bg)" }}
-                >
-                  {isSavingMemory ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                  {hasUnsavedMemory ? "Save Changes" : "Saved"}
-                </button>
-              </>
-            ) : (
-              <button
-                onClick={() => setIsEditingMemory(true)}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all border"
-                style={{ borderColor: "var(--color-border)", color: "var(--color-text-muted)", background: "var(--color-bg)" }}
-                onMouseEnter={e => { e.currentTarget.style.color = "var(--color-text)"; e.currentTarget.style.background = "var(--color-bg-tertiary)"; }}
-                onMouseLeave={e => { e.currentTarget.style.color = "var(--color-text-muted)"; e.currentTarget.style.background = "var(--color-bg)"; }}
-              >
-                <Edit3 className="w-4 h-4" />
-                Edit
-              </button>
-            )}
-          </div>
+          <button
+            onClick={() => setMemoryMigrationOpen(true)}
+            disabled={isLoadingMemory || isMigratingMemory || !memory.trim()}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all disabled:opacity-40"
+            style={{ color: "white", background: "var(--color-highlight)" }}
+          >
+            {isMigratingMemory
+              ? <Loader2 className="w-4 h-4 animate-spin" />
+              : <ArrowRight className="w-4 h-4" />}
+            Migrate
+          </button>
         </div>
-
-        {memorySaveMessage && (
-          <p className="mt-3 text-xs font-medium" style={{ color: memorySaveMessage === "Saved" ? "var(--color-success)" : "var(--color-error)" }}>
-            {memorySaveMessage}
-          </p>
-        )}
       </div>
 
       <div className="flex-1 min-h-0 p-3 overflow-y-auto">
@@ -1206,57 +1153,12 @@ export function ResourcePage() {
           <div className="flex items-center justify-center h-full">
             <Loader2 className="w-5 h-5 animate-spin" style={{ color: "var(--color-text-muted)" }} />
           </div>
-        ) : isEditingMemory ? (
-          <div className="flex h-full min-h-[120px] flex-col rounded-2xl border"
-            style={{
-              borderColor: "var(--color-border)",
-              background: "linear-gradient(180deg, color-mix(in srgb, var(--color-bg) 56%, transparent), transparent)",
-            }}>
-            <div className="flex items-center justify-between gap-3 px-4 py-2.5 border-b"
-              style={{ borderColor: "var(--color-border)" }}>
-              <div>
-                <p className="text-sm font-medium">Memory editor</p>
-                <p className="text-xs" style={{ color: "var(--color-text-muted)" }}>
-                  AI-maintained knowledge base. Save with <span className="font-mono">Cmd/Ctrl + S</span>.
-                </p>
-              </div>
-              <div className="text-right">
-                <p className="text-xs font-medium" style={{ color: "var(--color-text)" }}>
-                  {memoryLineCount > 0 ? `${memoryLineCount} ${memoryLineCount === 1 ? "line" : "lines"}` : "No content"}
-                </p>
-                <p className="text-[11px]" style={{ color: "var(--color-text-muted)" }}>Shared across tasks</p>
-              </div>
-            </div>
-            <textarea
-              id="resource-memory-editor"
-              value={memory}
-              onChange={(e) => setMemory(e.target.value)}
-              placeholder={"# Project Memory\n\nThis file is maintained by AI agents.\n\n## Conventions\n\n## Known Issues\n\n## Decisions"}
-              className="w-full flex-1 resize-none outline-none px-4 py-3 text-[13px] font-mono leading-6"
-              style={{ background: "transparent", color: "var(--color-text)", caretColor: "var(--color-highlight)" }}
-              spellCheck={false}
-            />
-          </div>
         ) : memory.trim() ? (
           <div className="rounded-2xl border p-4 min-h-full"
             style={{ borderColor: "var(--color-border)", background: "var(--color-bg)" }}>
             <MarkdownRenderer content={memory} />
           </div>
-        ) : (
-          <div className="flex flex-col items-center justify-center gap-3 h-full min-h-[120px] rounded-2xl border border-dashed"
-            style={{ borderColor: "var(--color-border)" }}>
-            <Brain className="w-8 h-8" style={{ color: "var(--color-text-muted)" }} />
-            <p className="text-sm" style={{ color: "var(--color-text-muted)" }}>No memory yet</p>
-            <button
-              onClick={() => setIsEditingMemory(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium border"
-              style={{ borderColor: "var(--color-border)", color: "var(--color-highlight)", background: "color-mix(in srgb, var(--color-highlight) 10%, transparent)" }}
-            >
-              <Edit3 className="w-4 h-4" />
-              Add Memory
-            </button>
-          </div>
-        )}
+        ) : null}
       </div>
     </section>
   );
@@ -1333,6 +1235,11 @@ export function ResourcePage() {
             loading={previewLoading}
             onClose={() => setPreviewFile(null)}
             onDownload={() => handleDownload(previewFile.file)}
+            location={projectId ? {
+              projectId,
+              root: { kind: "resource" },
+              path: previewFile.file.path,
+            } : undefined}
           />
         )}
       </AnimatePresence>
@@ -1360,6 +1267,31 @@ export function ResourcePage() {
           if (!projectId || !editLink) return;
           await updateResourceLink(projectId, editLink.file.path, payload);
           await loadFiles();
+        }}
+      />
+
+      <ConfirmDialog
+        isOpen={memoryMigrationOpen}
+        title="Migrate Legacy Project Memory?"
+        message={(
+          <div className="space-y-2">
+            <p>
+              Grove will preserve the current <span className="font-mono">memory.md</span> content as one Memory Log,
+              then remove the legacy shared file from this Studio.
+            </p>
+            <p>
+              Existing Studio tasks will remove their legacy <span className="font-mono">memory.md</span> entry and refresh
+              <span className="font-mono"> AGENTS.md</span>, <span className="font-mono">CLAUDE.md</span>, and
+              <span className="font-mono"> GEMINI.md</span> to the current task contract.
+            </p>
+          </div>
+        )}
+        confirmLabel={isMigratingMemory ? "Migrating..." : "Migrate"}
+        variant="warning"
+        actionsDisabled={isMigratingMemory}
+        onConfirm={() => void handleMigrateMemory()}
+        onCancel={() => {
+          if (!isMigratingMemory) setMemoryMigrationOpen(false);
         }}
       />
 
@@ -1727,7 +1659,7 @@ function ResourceFolderRow({
 
 function ResourceFileRow({
   file, isRenaming, renameValue, renameInputRef,
-  onPreview, onDownload, onDelete, onOpenInApp, onOpenLink, onEditLink,
+  onPreview, onDownload, onDelete, onOpenInApp, onRevealInFileManager, onOpenLink, onEditLink,
   onStartRename, onRenameChange, onRenameConfirm, onRenameCancel,
   onDragStart, onMoveToParent,
 }: {
@@ -1739,6 +1671,7 @@ function ResourceFileRow({
   onDownload: (f: ResourceFile) => void;
   onDelete: (f: ResourceFile) => void;
   onOpenInApp?: (f: ResourceFile) => void;
+  onRevealInFileManager?: (f: ResourceFile) => void;
   onOpenLink?: (f: ResourceFile) => void;
   onEditLink?: (f: ResourceFile) => void;
   onStartRename: () => void;
@@ -1748,6 +1681,13 @@ function ResourceFileRow({
   onDragStart: (e: React.DragEvent) => void;
   onMoveToParent?: () => void;
 }) {
+  const canUseHostFileActions =
+    typeof window !== "undefined" &&
+    (window as unknown as Record<string, unknown>).__GROVE_REMOTE__ !== true;
+  const revealLabel =
+    typeof navigator !== "undefined" && /mac/i.test(navigator.userAgent)
+      ? "Show in Finder"
+      : "Show in File Manager";
   const isLink = isLinkFile(file.name);
   const canPreview = !isLink && canPreviewFile(file.name);
   const ext = getExtBadge(file.name);
@@ -1917,13 +1857,22 @@ function ResourceFileRow({
               <Download className="w-3.5 h-3.5" /> Download
             </button>
           )}
-          {!isLink && onOpenInApp && (
+          {!isLink && canUseHostFileActions && onOpenInApp && (
             <button
               onClick={(e) => { e.stopPropagation(); setShowMenu(false); onOpenInApp(file); }}
               className="w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors"
               onMouseEnter={e => e.currentTarget.style.background = "var(--color-bg-secondary)"}
               onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
               <SquareArrowOutUpRight className="w-3.5 h-3.5" /> Open
+            </button>
+          )}
+          {!isLink && canUseHostFileActions && onRevealInFileManager && (
+            <button
+              onClick={(e) => { e.stopPropagation(); setShowMenu(false); onRevealInFileManager(file); }}
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors"
+              onMouseEnter={e => e.currentTarget.style.background = "var(--color-bg-secondary)"}
+              onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+              <FolderSearch className="w-3.5 h-3.5" /> {revealLabel}
             </button>
           )}
           {!isLink && (

@@ -1,4 +1,5 @@
 mod acp;
+mod agent_config;
 mod agent_graph;
 mod agent_usage;
 mod api;
@@ -21,6 +22,7 @@ mod fs_link;
 mod git;
 mod groove_dashboard;
 mod hooks;
+mod memory;
 mod model;
 #[cfg(not(windows))]
 mod notification_state;
@@ -73,6 +75,9 @@ fn ensure_storage_version() {
         // Up to date — just ensure DB is initialized
         let _ = storage::database::connection();
         storage::database::run_agent_graph_startup_maintenance();
+        if let Err(e) = storage::curated_agents::ensure_curated_file() {
+            eprintln!("[startup] failed to update curated agents file: {}", e);
+        }
         return;
     }
 
@@ -197,8 +202,7 @@ fn ensure_storage_version() {
     // Curated agent list — idempotent first-launch copy. On every boot we
     // make sure `~/.grove/builtin-agents/curated.json` exists; if it
     // doesn't, we drop the embedded default there. The marketplace modal
-    // reads this file to render the default landing view + the onboarding
-    // "install recommended" prompt.
+    // reads this file to render its default landing view.
     if let Err(e) = storage::curated_agents::ensure_curated_file() {
         eprintln!("[startup] failed to bootstrap curated agents file: {}", e);
     }
@@ -394,8 +398,8 @@ fn main() -> io::Result<()> {
                     }
                 });
         }
-        Commands::McpBridge => {
-            std::process::exit(cli::mcp_bridge::run());
+        Commands::McpBridge { route } => {
+            std::process::exit(cli::mcp_bridge::run(route));
         }
         Commands::Fp => {
             #[cfg(windows)]
@@ -496,7 +500,16 @@ fn main() -> io::Result<()> {
                     .to_string_lossy()
                     .to_string()
             });
-            let name = std::path::Path::new(&path)
+            // Resolve "." / ".." / relative paths against current_dir so that
+            // `file_name()` returns the real directory name instead of "." / "..".
+            let name_path = std::path::Path::new(&path);
+            let name_path = match name_path.file_name() {
+                Some(name) if name != "." && name != ".." => name_path,
+                _ => &std::env::current_dir()
+                    .expect("Failed to get current directory")
+                    .join(&path),
+            };
+            let name = name_path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.clone());

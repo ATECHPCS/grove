@@ -1,6 +1,10 @@
 //! Project CRUD handlers and helpers
 
-use axum::{extract::Path, http::StatusCode, Json};
+use axum::{
+    extract::{Path, Query},
+    http::StatusCode,
+    Json,
+};
 use chrono::Utc;
 use std::fs;
 
@@ -141,12 +145,19 @@ pub(crate) fn list_resource_files(
 /// Validate that a symlink entry points inside the given directory
 /// GET /api/v1/projects
 #[cfg_attr(feature = "perf-monitor", tracing::instrument(skip_all))]
-pub async fn list_projects() -> Result<Json<ProjectListResponse>, StatusCode> {
+pub async fn list_projects(
+    Query(query): Query<ProjectListQuery>,
+) -> Result<Json<ProjectListResponse>, StatusCode> {
     let cwd = std::env::current_dir().ok();
 
     #[cfg(feature = "perf-monitor")]
     let _s = tracing::info_span!("load_projects").entered();
-    let projects = workspace::load_projects().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let projects = if query.archived {
+        workspace::load_archived_projects()
+    } else {
+        workspace::load_active_projects()
+    }
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     #[cfg(feature = "perf-monitor")]
     drop(_s);
 
@@ -231,6 +242,7 @@ pub async fn list_projects() -> Result<Json<ProjectListResponse>, StatusCode> {
                 is_git_repo,
                 exists,
                 project_type: p.project_type.as_str().to_string(),
+                archived: p.archived,
             }
         })
         .collect();
@@ -267,6 +279,7 @@ pub async fn get_project(Path(id): Path<String>) -> Result<Json<ProjectResponse>
     let project_path = project.path.clone();
     let added_at = project.added_at.to_rfc3339();
     let project_type = project.project_type.as_str().to_string();
+    let archived = project.archived;
     let is_studio = project.project_type == workspace::ProjectType::Studio;
     let exists = if is_studio {
         workspace::studio_project_dir(&project_path).exists()
@@ -285,6 +298,7 @@ pub async fn get_project(Path(id): Path<String>) -> Result<Json<ProjectResponse>
             is_git_repo: false,
             exists: false,
             project_type,
+            archived,
         }));
     }
 
@@ -315,6 +329,7 @@ pub async fn get_project(Path(id): Path<String>) -> Result<Json<ProjectResponse>
             is_git_repo: false,
             exists: true,
             project_type,
+            archived,
         }));
     }
 
@@ -371,6 +386,7 @@ pub async fn get_project(Path(id): Path<String>) -> Result<Json<ProjectResponse>
         is_git_repo,
         exists: true,
         project_type,
+        archived,
     }))
 }
 
@@ -509,6 +525,7 @@ pub async fn add_project(
         is_git_repo: is_git,
         exists: true,
         project_type: "repo".to_string(),
+        archived: false,
     }))
 }
 
@@ -546,6 +563,7 @@ pub async fn create_new_project(
             is_git_repo: false,
             exists: true,
             project_type: "studio".to_string(),
+            archived: false,
         }))
     } else {
         let init_git = req.init_git;
@@ -608,6 +626,7 @@ pub async fn create_new_project(
             is_git_repo: init_git,
             exists: true,
             project_type: "repo".to_string(),
+            archived: false,
         }))
     }
 }
@@ -661,5 +680,29 @@ pub async fn delete_project(Path(id): Path<String>) -> Result<StatusCode, Status
     use crate::api::handlers::walkie_talkie::{broadcast_radio_event, RadioEvent};
     broadcast_radio_event(RadioEvent::GroupChanged);
 
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/v1/projects/{id}/archive
+pub async fn archive_project(Path(id): Path<String>) -> Result<StatusCode, StatusCode> {
+    let project = workspace::load_project_by_hash(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if !project.archived {
+        workspace::set_project_archived(&id, true)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/v1/projects/{id}/restore
+pub async fn restore_project(Path(id): Path<String>) -> Result<StatusCode, StatusCode> {
+    let project = workspace::load_project_by_hash(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if project.archived {
+        workspace::set_project_archived(&id, false)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-use crate::acp::{self, AcpStartConfig, AcpUpdate};
+use crate::acp::{self, AcpStartConfig, AcpUpdate, ContentBlockData};
 
 /// 执行 ACP 交互式聊天
 pub async fn execute(agent: String, cwd: String) {
@@ -35,10 +35,14 @@ pub async fn execute(agent: String, cwd: String) {
         project_key: String::new(),
         task_id: String::new(),
         chat_id: None,
+        artifact_dir: None,
+        additional_mcp_servers: Vec::new(),
+        mcp_server_policy: crate::acp::McpServerPolicy::WorkingSession,
         agent_type: resolved.agent_type,
         remote_url: resolved.url,
         remote_auth: resolved.auth_header,
         suppress_initial_connecting: false,
+        import_session: false,
         persona_injection: None,
     };
 
@@ -126,6 +130,37 @@ pub async fn execute(agent: String, cwd: String) {
                     print!("{}", text);
                     io::stdout().flush().ok();
                 }
+                Ok(AcpUpdate::MessageContentChunk { content }) => {
+                    match content {
+                        ContentBlockData::Image { mime_type, uri, .. } => {
+                            println!("\n[Image: {}]", uri.as_deref().unwrap_or(&mime_type))
+                        }
+                        ContentBlockData::Audio { mime_type, .. } => {
+                            println!("\n[Audio: {}]", mime_type)
+                        }
+                        ContentBlockData::ResourceLink {
+                            uri, name, title, ..
+                        } => println!("\n[Resource: {} — {}]", title.unwrap_or(name), uri),
+                        ContentBlockData::Resource {
+                            uri,
+                            mime_type,
+                            text,
+                            ..
+                        } => {
+                            if let Some(text) = text {
+                                println!("\n{}", text);
+                            } else {
+                                println!(
+                                    "\n[Embedded resource: {} — {}]",
+                                    mime_type.as_deref().unwrap_or("binary"),
+                                    uri
+                                );
+                            }
+                        }
+                        ContentBlockData::Text { text } => print!("{}", text),
+                    }
+                    io::stdout().flush().ok();
+                }
                 Ok(AcpUpdate::ThoughtChunk { text }) => {
                     // 灰色打印思考过程
                     eprint!("\x1b[90m{}\x1b[0m", text);
@@ -133,6 +168,9 @@ pub async fn execute(agent: String, cwd: String) {
                 }
                 Ok(AcpUpdate::ToolCall { id: _, title, .. }) => {
                     eprintln!("\x1b[36m[Tool: {}]\x1b[0m", title);
+                }
+                Ok(AcpUpdate::ToolCallV1 { title, status, .. }) => {
+                    eprintln!("\x1b[36m[Tool: {} — {}]\x1b[0m", title, status);
                 }
                 Ok(AcpUpdate::ToolCallUpdate {
                     id: _,
@@ -142,6 +180,18 @@ pub async fn execute(agent: String, cwd: String) {
                 }) => {
                     if let Some(c) = content {
                         eprintln!("\x1b[36m  {} — {}\x1b[0m", status, c);
+                    } else {
+                        eprintln!("\x1b[36m  {}\x1b[0m", status);
+                    }
+                }
+                Ok(AcpUpdate::ToolCallUpdateV1 {
+                    status,
+                    display_content,
+                    ..
+                }) => {
+                    let status = status.as_deref().unwrap_or("updated");
+                    if let Some(content) = display_content {
+                        eprintln!("\x1b[36m  {} — {}\x1b[0m", status, content);
                     } else {
                         eprintln!("\x1b[36m  {}\x1b[0m", status);
                     }
@@ -169,12 +219,19 @@ pub async fn execute(agent: String, cwd: String) {
                     break;
                 }
                 Ok(AcpUpdate::AuthSucceeded) => continue,
+                Ok(AcpUpdate::AuthFailed { message }) => {
+                    eprintln!("\x1b[31mError: {}\x1b[0m", message);
+                    break;
+                }
+                Ok(AcpUpdate::AuthLoggedOut) => continue,
                 Ok(
                     AcpUpdate::Busy { .. }
                     | AcpUpdate::UserMessage { .. }
                     | AcpUpdate::ModeChanged { .. }
                     | AcpUpdate::ModelChanged { .. }
                     | AcpUpdate::ThoughtLevelsUpdate { .. }
+                    | AcpUpdate::ConfigOptionsUpdate { .. }
+                    | AcpUpdate::ConfigOptionError { .. }
                     | AcpUpdate::PlanUpdate { .. }
                     | AcpUpdate::AvailableCommands { .. }
                     | AcpUpdate::PermissionResponse { .. }
@@ -184,9 +241,14 @@ pub async fn execute(agent: String, cwd: String) {
                     | AcpUpdate::TerminalExecute { .. }
                     | AcpUpdate::TerminalChunk { .. }
                     | AcpUpdate::TerminalComplete { .. }
+                    | AcpUpdate::TerminalOutputUpdate { .. }
                     | AcpUpdate::ConnectPhase { .. }
                     | AcpUpdate::UsageUpdate { .. }
-                    | AcpUpdate::AskForm { .. },
+                    | AcpUpdate::AskForm { .. }
+                    | AcpUpdate::ElicitationRequest { .. }
+                    | AcpUpdate::ElicitationResolved { .. }
+                    | AcpUpdate::ElicitationValidationError { .. }
+                    | AcpUpdate::ElicitationComplete { .. },
                 ) => continue,
                 Ok(AcpUpdate::SessionEnded) => {
                     eprintln!("Session ended.");

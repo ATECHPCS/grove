@@ -49,6 +49,8 @@ export interface Project {
   exists: boolean;
   /** Project type: 'repo' for code repositories, 'studio' for AI agent workspaces */
   projectType: ProjectType;
+  /** Hidden from normal project discovery when true. */
+  archived: boolean;
 }
 
 export type ActivityType = 'create' | 'merge' | 'sync' | 'archive' | 'recover';

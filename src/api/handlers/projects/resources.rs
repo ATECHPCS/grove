@@ -265,12 +265,18 @@ pub async fn preview_resource(
 pub async fn download_resource(
     Path(id): Path<String>,
     Query(query): Query<ResourceFileQuery>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ApiError>)> {
-    let (_project, studio_dir) = resolve_studio_dir(&id)?;
-    let resource_dir = studio_dir.join("resource");
-    let canonical_file = resolve_resource_file(&resource_dir, &query.path)?;
-    let (headers, content) = studio_common::download_file(&canonical_file)?;
-    Ok((headers, content))
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, Json<ApiError>)> {
+    crate::api::handlers::files::serve(
+        id,
+        crate::api::handlers::files::FileRoot::Resource,
+        crate::api::handlers::files::RawFileQuery {
+            path: query.path,
+            disposition: crate::api::handlers::files::Disposition::Attachment,
+        },
+        headers,
+    )
+    .await
 }
 
 /// POST /api/v1/projects/{id}/resource/open?path=<rel>
@@ -284,7 +290,18 @@ pub async fn open_resource(
     let (_project, studio_dir) = resolve_studio_dir(&id)?;
     let resource_dir = studio_dir.join("resource");
     let canonical_file = resolve_resource_file(&resource_dir, &query.path)?;
-    studio_common::open_with_default_app(&canonical_file);
+    if query.action.as_deref() == Some("reveal") {
+        studio_common::reveal_in_file_manager(&canonical_file).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: format!("Failed to reveal resource: {error}"),
+                }),
+            )
+        })?;
+    } else {
+        studio_common::open_with_default_app(&canonical_file);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

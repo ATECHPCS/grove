@@ -19,6 +19,9 @@ import {
   PictureInPicture2,
   ChevronDown,
   X,
+  Plus,
+  Settings2,
+  Brain,
 } from "lucide-react";
 import type { Plugin } from "../../api/plugins";
 import { PluginIcon } from "../Plugins/PluginIcon";
@@ -86,6 +89,7 @@ const ALL_NAV_ITEMS: Record<string, NavItem> = {
   work: { id: "work", label: "Work", icon: Laptop },
   tasks: { id: "tasks", label: "Tasks", icon: ListTodo },
   resource: { id: "resource", label: "Studio", icon: Layers },
+  memory: { id: "memory", label: "Memory", icon: Brain, beta: true },
   automation: { id: "automation", label: "Automation", icon: Repeat },
   skills: { id: "skills", label: "Skills", icon: Blocks },
   ai: { id: "ai", label: "AI", icon: Sparkles },
@@ -349,10 +353,10 @@ export function Sidebar({
 
   const onIslandLeave = useCallback(() => {
     if (!hoverEnabledRef.current) return;
-    // Longer leave delay once expanded — gives the user time to settle the
-    // cursor inside the wide horizontal pill before it collapses. 300ms is
-    // the resting default; the expanded state bumps to 500ms.
-    const delay = islandHovered ? 500 : 300;
+    // Keep a short grace period so grazing the edge does not cause flicker,
+    // while still letting the island collapse promptly after the pointer
+    // leaves the visible surface.
+    const delay = islandHovered ? 180 : 100;
     hideTimerRef.current = setTimeout(() => setIslandHovered(false), delay);
   }, [islandHovered]);
 
@@ -697,6 +701,8 @@ export function Sidebar({
             <IslandProjectSwitcher
               onBack={() => setIslandView("nav")}
               onProjectSwitch={onProjectSwitch}
+              onManageProjects={onManageProjects}
+              onAddProject={onAddProject}
               accentPalette={theme.accentPalette}
             />
           ) : (
@@ -727,27 +733,7 @@ export function Sidebar({
             onMouseEnter={() => setAlertHovered(true)}
             onMouseLeave={() => setAlertHovered(false)}
           />
-        ) : (
-          // Invisible hover pad — extends the resting pill's hit area.
-          // The visual pill is 120×16 (very small target). Adding a 240×32
-          // transparent pad centered below it doubles the width and gives
-          // a 16px vertical buffer, so the user's cursor doesn't have to
-          // land pixel-perfect on the thin black bar to trigger expand.
-          // Removed the instant the pill expands — the expanded 720×64
-          // surface is large enough to catch movement on its own.
-          <div
-            aria-hidden
-            style={{
-              position: "absolute",
-              top: "100%",
-              left: "50%",
-              transform: "translateX(-50%)",
-              width: 240,
-              height: 32,
-              pointerEvents: "auto",
-            }}
-          />
-        )
+        ) : null
       ) : (
         content
       )}
@@ -1016,7 +1002,7 @@ interface IslandNotificationsProps {
 }
 
 function IslandNotifications({ onBack, onNavigate }: IslandNotificationsProps) {
-  const { notifications, dismissNotification } = useNotifications();
+  const { notifications, dismissNotification, clearAllNotifications } = useNotifications();
 
   return (
     <div className="relative w-full h-full flex flex-col">
@@ -1030,9 +1016,21 @@ function IslandNotifications({ onBack, onNavigate }: IslandNotificationsProps) {
           <ChevronLeft className="w-4 h-4" />
         </button>
         <span className="text-[13px] font-medium flex-1">Notifications</span>
-        <span className="text-[11px] text-[color-mix(in_oklab,currentColor_50%,transparent)] flex-shrink-0 pr-1">
-          {notifications.length > 0 ? `${notifications.length} active` : ""}
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-[color-mix(in_oklab,currentColor_50%,transparent)] flex-shrink-0">
+            {notifications.length > 0 ? `${notifications.length} active` : ""}
+          </span>
+          {notifications.length > 0 && (
+            <button
+              type="button"
+              onClick={() => void clearAllNotifications()}
+              className="text-[10px] font-medium text-[color-mix(in_oklab,currentColor_50%,transparent)] hover:text-current transition-colors"
+              aria-label="Clear all notifications"
+            >
+              Clear all
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto island-notifications-scroll">
@@ -1104,10 +1102,18 @@ function IslandNotifications({ onBack, onNavigate }: IslandNotificationsProps) {
 interface IslandProjectSwitcherProps {
   onBack: () => void;
   onProjectSwitch?: (projectId?: string) => void;
+  onManageProjects?: (tab?: "coding" | "studio") => void;
+  onAddProject?: (studioMode?: "studio") => void;
   accentPalette: string[];
 }
 
-function IslandProjectSwitcher({ onBack, onProjectSwitch, accentPalette }: IslandProjectSwitcherProps) {
+function IslandProjectSwitcher({
+  onBack,
+  onProjectSwitch,
+  onManageProjects,
+  onAddProject,
+  accentPalette,
+}: IslandProjectSwitcherProps) {
   const { selectedProject, projects, selectProject } = useProject();
   const [searchQuery, setSearchQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<"coding" | "studio">("coding");
@@ -1209,6 +1215,29 @@ function IslandProjectSwitcher({ onBack, onProjectSwitch, accentPalette }: Islan
             );
           })
         )}
+      </div>
+
+      <div className="flex-shrink-0 border-t border-[color-mix(in_oklab,currentColor_10%,transparent)] p-1">
+        <button
+          onClick={() => {
+            onAddProject?.(typeFilter === "studio" ? "studio" : undefined);
+            onBack();
+          }}
+          className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-[12px] text-[color-mix(in_oklab,currentColor_70%,transparent)] hover:text-current hover:bg-[color-mix(in_oklab,currentColor_10%,transparent)] transition-colors"
+        >
+          <Plus className="w-3.5 h-3.5" />
+          <span>Add Project</span>
+        </button>
+        <button
+          onClick={() => {
+            onManageProjects?.(typeFilter);
+            onBack();
+          }}
+          className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-[12px] text-[color-mix(in_oklab,currentColor_70%,transparent)] hover:text-current hover:bg-[color-mix(in_oklab,currentColor_10%,transparent)] transition-colors"
+        >
+          <Settings2 className="w-3.5 h-3.5" />
+          <span>Manage Projects</span>
+        </button>
       </div>
     </div>
   );

@@ -106,12 +106,14 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
     // development (started_at/finished_at → triggered_at/queued_at/completed_at
     // + several new columns) and the new CREATE INDEX references columns the
     // old schema doesn't have. CREATE TABLE IF NOT EXISTS won't update an
-    // existing table, so we detect the legacy column and drop the table here
+    // existing table, so we detect the legacy-only `finished_at` column and
+    // drop the table here. The current schema also has `started_at`, so that
+    // column cannot safely distinguish the two versions.
     // — automation_runs is dev-time history, no migration owed. Remove this
     // block once the new schema has shipped to users.
     let has_legacy_automation_runs: bool = conn
         .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('automation_runs') WHERE name = 'started_at'",
+            "SELECT COUNT(*) FROM pragma_table_info('automation_runs') WHERE name = 'finished_at'",
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -131,7 +133,8 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             path         TEXT NOT NULL UNIQUE,
             is_git_repo  INTEGER NOT NULL DEFAULT 1,
             added_at     TEXT NOT NULL,
-            project_type TEXT NOT NULL DEFAULT 'repo'
+            project_type TEXT NOT NULL DEFAULT 'repo',
+            archived     INTEGER NOT NULL DEFAULT 0
         );
 
         -- Tasks (active + archived, unified)
@@ -165,6 +168,19 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
         -- and the sort no-op.
         CREATE INDEX IF NOT EXISTS ix_tasks_project_status
             ON tasks (project, status, updated_at DESC);
+
+        -- Task-level workspace links. We persist Grove project IDs rather than
+        -- absolute paths; ACP lifecycle requests resolve the current path at
+        -- connection time and expose it as `additionalDirectories`.
+        CREATE TABLE IF NOT EXISTS task_linked_projects (
+            project           TEXT    NOT NULL,
+            task_id           TEXT    NOT NULL,
+            linked_project_id TEXT    NOT NULL,
+            position          INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (project, task_id, linked_project_id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_task_linked_projects_task
+            ON task_linked_projects (project, task_id, position);
 
         -- Task Groups
         CREATE TABLE IF NOT EXISTS task_groups (
@@ -397,6 +413,7 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             id            TEXT PRIMARY KEY,
             name          TEXT NOT NULL,
             base_agent    TEXT NOT NULL,
+            agent_config_json TEXT NOT NULL DEFAULT '{\"source\":\"default\"}',
             model         TEXT,
             mode          TEXT,
             effort        TEXT,
@@ -439,6 +456,8 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             selected_install_method   TEXT NOT NULL,                       -- 'npx' | 'binary' | 'uvx' | 'external'
             args_override             TEXT NOT NULL DEFAULT '[]',          -- JSON array of strings
             env_override              TEXT NOT NULL DEFAULT '{}',          -- JSON map
+            capability_snapshot_json  TEXT,
+            capability_updated_at     TEXT,
             hidden                    INTEGER NOT NULL DEFAULT 0,
             created_at                TEXT NOT NULL,
             updated_at                TEXT NOT NULL
@@ -502,8 +521,9 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS chat_token_usage (
             id                 INTEGER PRIMARY KEY,
             project_key        TEXT    NOT NULL,
-            task_id            TEXT    NOT NULL,
-            chat_id            TEXT    NOT NULL,
+            task_id            TEXT,
+            chat_id            TEXT,
+            automation_run_id  TEXT,
             agent              TEXT    NOT NULL,
             model              TEXT,
             input_tokens       INTEGER NOT NULL,
@@ -513,7 +533,12 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             start_ts           INTEGER NOT NULL,
             end_ts             INTEGER NOT NULL,
             cost_amount        REAL,
-            cost_currency      TEXT
+            cost_currency      TEXT,
+            CHECK(
+                (automation_run_id IS NULL AND task_id IS NOT NULL AND chat_id IS NOT NULL)
+                OR
+                (automation_run_id IS NOT NULL AND task_id IS NULL AND chat_id IS NULL)
+            )
         );
 
         -- Stats hot path: GROUP BY date(end_ts, 'unixepoch') WHERE project_key = ?
@@ -521,6 +546,72 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             ON chat_token_usage(project_key, end_ts);
         CREATE INDEX IF NOT EXISTS ix_chat_token_usage_end
             ON chat_token_usage(end_ts);
+        -- Append-only short-term memory emitted by agents while working in a
+        -- task. Logs retain their origin but carry no long-term scope. There
+        -- is no task FK so deleting a task cannot silently discard logs that
+        -- have not been organized yet.
+        CREATE TABLE IF NOT EXISTS memory_logs (
+            id          TEXT PRIMARY KEY,
+            project_id  TEXT NOT NULL,
+            task_id     TEXT NOT NULL,
+            chat_id     TEXT,
+            agent       TEXT,
+            title       TEXT NOT NULL,
+            tags_json   TEXT NOT NULL,
+            description TEXT NOT NULL,
+            created_at  TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS ix_memory_logs_project_created
+            ON memory_logs(project_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS ix_memory_logs_task_created
+            ON memory_logs(project_id, task_id, created_at DESC);
+
+        -- Long-term Project Memory. Markdown is the source of truth for the
+        -- document fields; these columns are the projection used by list,
+        -- search and the UI. Runtime ranking state lives only in SQLite.
+        CREATE TABLE IF NOT EXISTS memory_entities (
+            project_id   TEXT NOT NULL,
+            entity_id    TEXT NOT NULL,
+            file_path    TEXT NOT NULL,
+            title        TEXT NOT NULL,
+            description  TEXT NOT NULL,
+            tags_json    TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            base_score   INTEGER NOT NULL DEFAULT 0 CHECK(base_score BETWEEN 0 AND 80),
+            access_count INTEGER NOT NULL DEFAULT 0 CHECK(access_count >= 0),
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL,
+            PRIMARY KEY (project_id, entity_id),
+            UNIQUE (project_id, file_path)
+        );
+        CREATE INDEX IF NOT EXISTS ix_memory_entities_project_rank
+            ON memory_entities(project_id, base_score DESC, access_count DESC, updated_at DESC);
+
+        -- Directed relationships between long-term Memories. Relations have
+        -- the same deliberately small ranking model as Entities.
+        CREATE TABLE IF NOT EXISTS memory_relations (
+            id               TEXT PRIMARY KEY,
+            project_id       TEXT NOT NULL,
+            source_entity_id TEXT NOT NULL,
+            target_entity_id TEXT NOT NULL,
+            relation_type    TEXT NOT NULL,
+            description      TEXT NOT NULL DEFAULT '',
+            base_score       INTEGER NOT NULL DEFAULT 0 CHECK(base_score BETWEEN 0 AND 80),
+            access_count     INTEGER NOT NULL DEFAULT 0 CHECK(access_count >= 0),
+            created_at       TEXT NOT NULL,
+            updated_at       TEXT NOT NULL,
+            UNIQUE(project_id, source_entity_id, target_entity_id, relation_type),
+            FOREIGN KEY(project_id, source_entity_id)
+                REFERENCES memory_entities(project_id, entity_id) ON DELETE CASCADE,
+            FOREIGN KEY(project_id, target_entity_id)
+                REFERENCES memory_entities(project_id, entity_id) ON DELETE CASCADE,
+            CHECK(source_entity_id <> target_entity_id)
+        );
+        CREATE INDEX IF NOT EXISTS ix_memory_relations_source_rank
+            ON memory_relations(project_id, source_entity_id, base_score DESC, access_count DESC);
+        CREATE INDEX IF NOT EXISTS ix_memory_relations_target_rank
+            ON memory_relations(project_id, target_entity_id, base_score DESC, access_count DESC);
 
         -- Automations: scheduled prompts that fire into a (task, chat session)
         -- pair on a cron schedule. task_template / session_template are JSON
@@ -530,6 +621,8 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             project          TEXT NOT NULL,
             name             TEXT NOT NULL,
             enabled          INTEGER NOT NULL DEFAULT 1,
+            handler_key      TEXT NOT NULL DEFAULT 'builtin.task_prompt',
+            agent_config_json TEXT NOT NULL DEFAULT '{\"source\":\"default\"}',
             task_mode        TEXT NOT NULL,        -- 'new' | 'existing'
             task_id          TEXT,
             task_template    TEXT,                 -- JSON {name,target,notes}
@@ -538,6 +631,7 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             session_template TEXT,                 -- JSON {agent,launch_mode,title,custom_agent_id}
             prompt           TEXT NOT NULL,
             schedule_cron    TEXT NOT NULL,
+            event_triggers_json TEXT NOT NULL DEFAULT '[]',
             last_run_at      INTEGER,
             last_run_status  TEXT,
             last_run_error   TEXT,
@@ -550,16 +644,33 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS ix_automations_next_run
             ON automations(enabled, next_run_at);
 
+        -- One Memory-owned configuration row per Project. Execution settings
+        -- remain on the linked Automation; Memory only owns its product
+        -- switch, organization policy and the association.
+        CREATE TABLE IF NOT EXISTS memory_project_configs (
+            project_id                 TEXT PRIMARY KEY,
+            enabled                    INTEGER NOT NULL DEFAULT 0,
+            deep_organization          INTEGER NOT NULL DEFAULT 0,
+            pending_log_threshold      INTEGER,
+            organization_automation_id TEXT NOT NULL UNIQUE,
+            last_input_through_at      TEXT,
+            created_at                 TEXT NOT NULL,
+            updated_at                 TEXT NOT NULL,
+            FOREIGN KEY(organization_automation_id)
+                REFERENCES automations(id) ON DELETE RESTRICT
+        );
+
         -- Automation run history. One row per trigger. Three-stage timeline:
         --   triggered_at  cron tick or manual click
         --   queued_at     prompt successfully entered the ACP pending queue
         --   completed_at  agent reported Complete (or Error / timeout / cancel)
         -- Status state machine:
         --   queued → running → success | failed | timeout | cancelled | interrupted
+        --                  └→ cancelling → cancelled
         -- 'running' is skipped on pre-pickup terminal transitions (resolve_*
         -- error, spawn_acp error, or a user cancel before the agent saw our
         -- prompt). 'interrupted' is set on startup-sweep when Grove restarted
-        -- while runs were still in 'queued' OR 'running' (round-3 fix).
+        -- while runs were still active ('queued', 'running', or 'cancelling').
         -- agent_response captures up to 16KB of the agent's last_assistant_text
         -- at Complete time — NULL when the agent only ran tools (no text), or
         -- when the run never completed.
@@ -570,17 +681,23 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             id                 TEXT PRIMARY KEY,
             automation_id      TEXT NOT NULL,
             trigger_kind       TEXT NOT NULL,           -- 'cron' | 'manual'
+            trigger_payload_json TEXT,
             prompt_snapshot    TEXT NOT NULL,
             agent_snapshot     TEXT,
+            agent_config_snapshot_json TEXT NOT NULL DEFAULT '{\"source\":\"default\"}',
+            input_json         TEXT NOT NULL DEFAULT '{}',
+            execution_scope    TEXT NOT NULL DEFAULT 'task_chat',
             resolved_task_id   TEXT,
             resolved_chat_id   TEXT,
             triggered_at       INTEGER NOT NULL,
             queued_at          INTEGER,
+            started_at         INTEGER,
             completed_at       INTEGER,
-            status             TEXT NOT NULL,           -- queued|running|success|failed|timeout|cancelled|interrupted
+            status             TEXT NOT NULL,           -- queued|running|cancelling|success|failed|timeout|cancelled|interrupted
             phase              TEXT,                    -- resolve_task|resolve_session|spawn_acp|queue|agent_run
             error              TEXT,
-            agent_response     TEXT                     -- last_assistant_text, max 16KB
+            agent_response     TEXT,                    -- last_assistant_text, max 16KB
+            result_json        TEXT
         );
         CREATE INDEX IF NOT EXISTS ix_automation_runs_by_automation
             ON automation_runs(automation_id, triggered_at DESC);
@@ -594,11 +711,119 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch(
         "ALTER TABLE projects ADD COLUMN project_type TEXT NOT NULL DEFAULT 'repo';",
     );
+    let _ =
+        conn.execute_batch("ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;");
     // chat_id is nullable: pre-migration rows have no chat context, and the
     // notification UI falls back to navigating to the task only when NULL.
     let _ = conn.execute_batch("ALTER TABLE hook_notifications ADD COLUMN chat_id TEXT;");
     let _ = conn.execute_batch("ALTER TABLE chat_token_usage ADD COLUMN cost_amount REAL;");
     let _ = conn.execute_batch("ALTER TABLE chat_token_usage ADD COLUMN cost_currency TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE chat_token_usage ADD COLUMN automation_run_id TEXT;");
+    let usage_task_not_null = {
+        let mut stmt = conn.prepare("PRAGMA table_info(chat_token_usage)")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+        })?;
+        let mut found = false;
+        for (name, not_null) in rows.flatten() {
+            if name == "task_id" && not_null != 0 {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if usage_task_not_null {
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE chat_token_usage RENAME TO chat_token_usage__legacy;
+             CREATE TABLE chat_token_usage (
+                 id INTEGER PRIMARY KEY,
+                 project_key TEXT NOT NULL,
+                 task_id TEXT,
+                 chat_id TEXT,
+                 automation_run_id TEXT,
+                 agent TEXT NOT NULL,
+                 model TEXT,
+                 input_tokens INTEGER NOT NULL,
+                 cached_read_tokens INTEGER,
+                 output_tokens INTEGER NOT NULL,
+                 total_tokens INTEGER NOT NULL,
+                 start_ts INTEGER NOT NULL,
+                 end_ts INTEGER NOT NULL,
+                 cost_amount REAL,
+                 cost_currency TEXT,
+                 CHECK(
+                    (automation_run_id IS NULL AND task_id IS NOT NULL AND chat_id IS NOT NULL)
+                    OR
+                    (automation_run_id IS NOT NULL AND task_id IS NULL AND chat_id IS NULL)
+                 )
+             );
+             INSERT INTO chat_token_usage (
+                 id, project_key, task_id, chat_id, automation_run_id, agent, model,
+                 input_tokens, cached_read_tokens, output_tokens, total_tokens,
+                 start_ts, end_ts, cost_amount, cost_currency
+             )
+             SELECT id, project_key, task_id, chat_id, NULL, agent, model,
+                    input_tokens, cached_read_tokens, output_tokens, total_tokens,
+                    start_ts, end_ts, cost_amount, cost_currency
+             FROM chat_token_usage__legacy;
+             DROP TABLE chat_token_usage__legacy;
+             CREATE INDEX ix_chat_token_usage_proj_end ON chat_token_usage(project_key, end_ts);
+             CREATE INDEX ix_chat_token_usage_end ON chat_token_usage(end_ts);
+             CREATE INDEX ix_chat_token_usage_automation_run
+                 ON chat_token_usage(automation_run_id, end_ts)
+                 WHERE automation_run_id IS NOT NULL;
+             COMMIT;",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS ix_chat_token_usage_automation_run
+         ON chat_token_usage(automation_run_id, end_ts)
+         WHERE automation_run_id IS NOT NULL;",
+    )?;
+    let _ = conn
+        .execute_batch("ALTER TABLE installed_agents ADD COLUMN capability_snapshot_json TEXT;");
+    let _ =
+        conn.execute_batch("ALTER TABLE installed_agents ADD COLUMN capability_updated_at TEXT;");
+    let _ = conn.execute_batch(
+        "ALTER TABLE automations ADD COLUMN handler_key TEXT NOT NULL DEFAULT 'builtin.task_prompt';",
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE automations ADD COLUMN agent_config_json TEXT NOT NULL DEFAULT '{\"source\":\"default\"}';",
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE automations ADD COLUMN event_triggers_json TEXT NOT NULL DEFAULT '[]';",
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE custom_agent ADD COLUMN agent_config_json TEXT NOT NULL DEFAULT '{\"source\":\"default\"}';",
+    );
+    migrate_automation_agent_config(conn)?;
+    let _ = conn.execute_batch("ALTER TABLE automation_runs ADD COLUMN trigger_payload_json TEXT;");
+    let _ = conn.execute_batch(
+        "ALTER TABLE automation_runs ADD COLUMN agent_config_snapshot_json TEXT NOT NULL DEFAULT '{\"source\":\"default\"}';",
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE automation_runs ADD COLUMN input_json TEXT NOT NULL DEFAULT '{}';",
+    );
+    let _ = conn.execute_batch(
+        "ALTER TABLE automation_runs ADD COLUMN execution_scope TEXT NOT NULL DEFAULT 'task_chat';",
+    );
+    let _ = conn.execute_batch("ALTER TABLE automation_runs ADD COLUMN started_at INTEGER;");
+    let _ = conn.execute_batch("ALTER TABLE automation_runs ADD COLUMN result_json TEXT;");
+    let _ = conn.execute_batch(
+        "ALTER TABLE memory_project_configs ADD COLUMN organization_automation_id TEXT;",
+    );
+    let _ = conn
+        .execute_batch("ALTER TABLE memory_project_configs ADD COLUMN last_input_through_at TEXT;");
+    let _ = conn.execute_batch(
+        "ALTER TABLE memory_project_configs ADD COLUMN pending_log_threshold INTEGER;",
+    );
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_memory_project_configs_automation
+         ON memory_project_configs(organization_automation_id)
+         WHERE organization_automation_id IS NOT NULL;",
+    )?;
     // Streaming transcription mode + OS-wide global voice mode (added later).
     let _ = conn.execute_batch(
         "ALTER TABLE audio_config ADD COLUMN transcribe_mode TEXT NOT NULL DEFAULT 'batch';",
@@ -776,6 +1001,62 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'acp'",
     )?;
 
+    Ok(())
+}
+
+/// Backfill the generic Agent selection from the legacy new-session template.
+/// Existing explicit Config Options/Modes selections are never overwritten.
+fn migrate_automation_agent_config(conn: &Connection) -> Result<()> {
+    let rows = {
+        let mut stmt = conn.prepare(
+            "SELECT id, session_template, agent_config_json
+             FROM automations WHERE handler_key = 'builtin.task_prompt'",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (id, template, config) in rows {
+        let Some(agent_id) = template
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .and_then(|value| {
+                value
+                    .get("agent")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+        else {
+            continue;
+        };
+        let mut config = serde_json::from_str::<serde_json::Value>(&config)
+            .unwrap_or_else(|_| serde_json::json!({ "source": "default" }));
+        let Some(object) = config.as_object_mut() else {
+            continue;
+        };
+        if object.get("source").and_then(serde_json::Value::as_str) != Some("default")
+            || object.get("agent_id").is_some()
+        {
+            continue;
+        }
+        object.insert(
+            "agent_id".to_string(),
+            serde_json::json!(super::installed_agents::canonicalize_agent_id(&agent_id)),
+        );
+        conn.execute(
+            "UPDATE automations SET agent_config_json = ?1 WHERE id = ?2",
+            params![serde_json::to_string(&config)?, id],
+        )?;
+    }
     Ok(())
 }
 

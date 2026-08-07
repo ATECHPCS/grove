@@ -358,6 +358,8 @@ pub struct NotificationsConfig {
     #[serde(default = "default_true")]
     pub notification_show_permission: bool,
     #[serde(default = "default_true")]
+    pub notification_show_elicitation: bool,
+    #[serde(default = "default_true")]
     pub notification_show_done: bool,
     /// System notifications for running sessions are disabled by default —
     /// they fire continuously and would be too noisy.
@@ -411,6 +413,7 @@ impl Default for NotificationsConfig {
             tray_show_running: true,
             notification_enabled: false,
             notification_show_permission: true,
+            notification_show_elicitation: true,
             notification_show_done: true,
             notification_show_running: false,
             menubar_shortcut: None,

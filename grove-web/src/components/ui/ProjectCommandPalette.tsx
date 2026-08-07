@@ -5,6 +5,7 @@ import { useProject, useTheme } from "../../context";
 import type { Project } from "../../data/types";
 import { getProjectStyle } from "../../utils/projectStyle";
 import { useCommand } from "../../keyboard";
+import { ProjectTypeBadge } from "./ProjectTypeBadge";
 
 interface ProjectCommandPaletteProps {
   isOpen: boolean;
@@ -171,8 +172,11 @@ export function ProjectCommandPalette({ isOpen, onClose, onProjectSelect }: Proj
                           <Icon className="w-4 h-4" style={{ color: color.fg }} />
                         </div>
                         <div className="flex-1 min-w-0 text-left">
-                          <div className="text-sm font-medium text-[var(--color-text)] truncate">
-                            {project.name}
+                          <div className="flex min-w-0 items-center gap-2">
+                            <span className="truncate text-sm font-medium text-[var(--color-text)]">
+                              {project.name}
+                            </span>
+                            <ProjectTypeBadge type={project.projectType} />
                           </div>
                           <div className="text-xs text-[var(--color-text-muted)]">
                             {totalCount} task{totalCount !== 1 ? "s" : ""}

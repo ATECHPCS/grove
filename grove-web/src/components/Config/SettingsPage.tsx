@@ -308,6 +308,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
   const [isRecordingMenubarShortcut, setIsRecordingMenubarShortcut] = useState(false);
   const [systemNotifEnabled, setSystemNotifEnabled] = useState(false);
   const [systemNotifShowPermission, setSystemNotifShowPermission] = useState(true);
+  const [systemNotifShowElicitation, setSystemNotifShowElicitation] = useState(true);
   const [systemNotifShowDone, setSystemNotifShowDone] = useState(true);
   const [systemNotifShowRunning, setSystemNotifShowRunning] = useState(false);
 
@@ -501,6 +502,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
       setMenubarShortcut(cfg.notifications.menubar_shortcut || "");
       setSystemNotifEnabled(cfg.notifications.notification_enabled);
       setSystemNotifShowPermission(cfg.notifications.notification_show_permission);
+      setSystemNotifShowElicitation(cfg.notifications.notification_show_elicitation ?? true);
       setSystemNotifShowDone(cfg.notifications.notification_show_done);
       setSystemNotifShowRunning(cfg.notifications.notification_show_running);
       const ret = cfg.notifications.tray_done_retention;
@@ -718,6 +720,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
         tray_show_running: trayShowRunning,
         notification_enabled: systemNotifEnabled,
         notification_show_permission: systemNotifShowPermission,
+        notification_show_elicitation: systemNotifShowElicitation,
         notification_show_done: systemNotifShowDone,
         notification_show_running: systemNotifShowRunning,
         menubar_shortcut: menubarShortcut,
@@ -742,7 +745,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
     } catch {
       console.error("Failed to save config");
     }
-  }, [isLoaded, selectedLayout, agentCommand, acpAgent, chatDefaultsByAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, trayDoneRetentionMode, trayDoneRetentionUnit, trayDoneRetentionValue, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, refreshGlobalConfig]);
+  }, [isLoaded, selectedLayout, agentCommand, acpAgent, chatDefaultsByAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowElicitation, systemNotifShowDone, systemNotifShowRunning, trayDoneRetentionMode, trayDoneRetentionUnit, trayDoneRetentionValue, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, refreshGlobalConfig]);
 
   // Handle theme change with immediate save
   const handleModeChange = useCallback((newMode: "auto" | "light" | "dark") => {
@@ -878,7 +881,7 @@ export function SettingsPage({ config }: SettingsPageProps) {
     }, 500); // 500ms debounce
 
     return () => clearTimeout(timer);
-  }, [selectedLayout, agentCommand, acpAgent, chatDefaultsByAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, isLoaded, saveConfig]);
+  }, [selectedLayout, agentCommand, acpAgent, chatDefaultsByAgent, chatRenderWindowLimit, chatRenderWindowTrigger, customLayouts, selectedCustomLayoutId, customLayoutsLoaded, ideCommand, terminalCommand, terminalMultiplexer, webTerminalMode, workspaceLayout, showHideWindowShortcut, autoLinkPatterns, hooksResponseSoundEnabled, hooksResponseSound, hooksPermissionSoundEnabled, hooksPermissionSound, trayEnabled, trayShowPermission, trayShowDone, trayShowRunning, menubarShortcut, systemNotifEnabled, systemNotifShowPermission, systemNotifShowElicitation, systemNotifShowDone, systemNotifShowRunning, indexingEnabled, indexingDisabledLangs, browserControlEnabled, browserControlAutoGroups, isLoaded, saveConfig]);
 
   useEffect(() => {
     if (!isRecordingWindowShortcut) return;
@@ -1023,15 +1026,14 @@ export function SettingsPage({ config }: SettingsPageProps) {
   // enabled iff the marketplace reports it installed (grove-installed or
   // auto-detected) AND `supports_terminal_launch === true` (i.e. its
   // registry entry declares a `terminal_launch` config).
-  const terminalAgentOptions = useMemo(() => agentOptions.map(a => {
-    if (!hasAvailability) return a;
-    const available =
-      terminalLaunchableIds.has(a.id) || terminalLaunchableIds.has(a.value);
-    if (!available) {
-      return { ...a, disabled: true, disabledReason: `Not installed — install via Marketplace to enable` };
-    }
-    return a;
-  }), [terminalLaunchableIds, hasAvailability]);
+  const terminalAgentOptions = useMemo(() => {
+    if (!hasAvailability) return [];
+    return agentOptions.filter(
+      (agent) =>
+        terminalLaunchableIds.has(agent.id) ||
+        terminalLaunchableIds.has(agent.value),
+    );
+  }, [terminalLaunchableIds, hasAvailability]);
 
   // Chat Agent 选项：ACP base agent availability comes from backend.
   const chatAgentOptions = useMemo(() => {
@@ -1800,7 +1802,7 @@ env_vars = [
             </div>
 
             {/* Terminal Coding Agent (only for multiplexer mode) */}
-            {webTerminalMode === "multiplexer" && (
+            {webTerminalMode === "multiplexer" && terminalAgentOptions.length > 0 && (
               <div>
                 <div className="text-xs font-medium text-[var(--color-text-muted)] mb-2 uppercase tracking-wider select-none">Terminal Coding Agent</div>
                 <AgentPicker
@@ -2604,6 +2606,15 @@ env_vars = [
                           )}
                         </AnimatePresence>
                         <ToggleSwitch checked={systemNotifShowPermission} onChange={setSystemNotifShowPermission} />
+                      </div>
+                      {/* Input requested */}
+                      <div className="flex items-center gap-3">
+                        <span className="flex-shrink-0 inline-block w-2 h-2 rounded-full bg-[var(--color-info)]" />
+                        <div className="flex-1 min-w-0">
+                          <div className="text-[13px] text-[var(--color-text)]">Input requested</div>
+                          <div className="text-[11px] text-[var(--color-text-muted)]">When the agent presents an Elicitation form or URL</div>
+                        </div>
+                        <ToggleSwitch checked={systemNotifShowElicitation} onChange={setSystemNotifShowElicitation} />
                       </div>
                       {/* Turn completed */}
                       <div className="flex items-center gap-3">

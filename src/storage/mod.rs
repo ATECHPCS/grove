@@ -14,6 +14,7 @@ pub mod database;
 pub mod installed_agents;
 pub mod keymap;
 pub mod libraries;
+pub mod memory;
 pub mod migrate_chats;
 pub mod notes;
 pub mod plugin_data;

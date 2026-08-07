@@ -181,6 +181,26 @@ fn open_external_url(url: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Resolve a task-owned file for a native OS drag operation.
+///
+/// This command is only registered by the Desktop app. The returned path has
+/// passed the same project/task containment checks as `/files/raw`; the web
+/// frontend never gets a way to supply an arbitrary local path.
+#[tauri::command]
+fn resolve_external_drag_path(
+    project_id: String,
+    task_id: String,
+    path: String,
+) -> Result<String, String> {
+    crate::api::handlers::files::resolve_local_file(
+        &project_id,
+        crate::api::handlers::files::FileRoot::Task(task_id),
+        &path,
+    )
+    .map(|path| path.to_string_lossy().into_owned())
+    .map_err(|(_, body)| body.0.error)
+}
+
 /// Show a native "Save As" dialog, download the given http(s) URL, and
 /// write its bytes to the chosen path.
 ///
@@ -440,6 +460,10 @@ pub async fn execute(port: u16, remote_url: Option<String>) {
             // Initialize FileWatchers for all live tasks
             api::init_file_watchers();
 
+            // The desktop server owns the same Automation runtime as `grove web`.
+            // Register built-in consumers before Run Now or event triggers can fire.
+            api::start_automation_runtime();
+
             // Start the agent_graph MCP listener (loopback-only). Non-fatal on failure.
             match api::handlers::agent_graph_mcp::start_listener(
                 api::handlers::agent_graph_mcp::DEFAULT_BASE_PORT,
@@ -492,10 +516,12 @@ pub async fn execute(port: u16, remote_url: Option<String>) {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_drag::init())
         .invoke_handler(tauri::generate_handler![
             open_external_url,
             download_file_dialog,
             save_bytes_dialog,
+            resolve_external_drag_path,
             toggle_devtools,
             toggle_main_window_visibility,
             crate::tray::tray_resolve_permission,

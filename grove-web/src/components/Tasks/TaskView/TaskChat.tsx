@@ -6,7 +6,9 @@ import {
   useMemo,
   useDeferredValue,
   memo,
+  Fragment,
   type CSSProperties,
+  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
@@ -33,6 +35,10 @@ import {
   ListPlus,
   Trash2,
   GitFork,
+  MoreHorizontal,
+  LogIn,
+  LogOut,
+  RefreshCw,
   Pencil,
   Square,
   Paperclip,
@@ -52,6 +58,11 @@ import {
   Search,
   User,
   ListChecks,
+  Download,
+  ArrowRightLeft,
+  SlidersHorizontal,
+  Box,
+  Database,
 } from "lucide-react";
 import { iconUrlForFile } from "../../ui/iconUrl";
 import {
@@ -61,6 +72,7 @@ import {
   VSCodeIcon,
   FileMentionDropdown,
   AgentPickerMenuItems,
+  DropdownMenu,
 } from "../../ui";
 import { agentOptions } from "../../../data/agents";
 import {
@@ -75,7 +87,12 @@ import {
 } from "../../../utils/groveMeta";
 import { renderGroveMetaEnvelope } from "./groveMetaRenderers";
 import { FormPill } from "./FormPill";
-import type { AskFormDefinition } from "./formPillTypes";
+import { ElicitationUrlPill } from "./ElicitationUrlPill";
+import {
+  elicitationToSurvey,
+  type AcpElicitationSnapshot,
+  type AskFormDefinition,
+} from "./formPillTypes";
 import {
   agentIconComponent,
   agentIconUrl,
@@ -84,18 +101,75 @@ import {
 } from "../../../utils/agentIcon";
 import type { MentionItem, FilteredMentionItem } from "../../../utils/fileMention";
 import { getMentionCandidates } from "../../../api";
+import type {
+  SessionConfigOption,
+  SessionConfigSelectGroup,
+  SessionConfigSelectValue,
+} from "../../../api/tasks";
+import {
+  configCategoryMatches,
+  configDropdownValues,
+  isConfigGroup,
+  quickConfigOptions,
+} from "./sessionConfigOptions";
 import { listExtensionTabs, getExtensionStatus } from "../../../api/extension";
 import { useProject } from "../../../context/ProjectContext";
 import { useConfig } from "../../../context/ConfigContext";
-import { usePreviewComments, type PreviewCommentDraft } from "../../../context";
+import { previewCommentTaskLabel, usePreviewComments, type PreviewCommentDraft, type PreviewCommentLocator } from "../../../context";
 import { PreviewSearchBar } from "../../Review/PreviewSearchBar";
-import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
+import {
+  Virtuoso,
+  type ContextProp,
+  type VirtuosoHandle,
+} from "react-virtuoso";
 import { useChatSearch } from "./useChatSearch";
 import { useChatPositioning } from "./useChatPositioning";
+import { ChatListErrorBoundary } from "./ChatListErrorBoundary";
+import { useDeferredVirtuosoRangeValue } from "./useDeferredVirtuosoRangeValue";
+import {
+  extractDiffForEditPath,
+  extractEditToolPaths,
+} from "./editToolPaths";
+import { nextExpandedToolDetail } from "./toolDetailExpansion";
+import { extractThoughtStatus } from "./thoughtStatus";
+import {
+  firstVisibleTaskChatRow,
+  scrollVirtuosoToBottom,
+  shouldVirtualizeTaskChat,
+  taskChatHeightEstimates,
+  taskChatLayoutTransitionTarget,
+  taskChatVirtualizationLayoutKey,
+  type TaskChatScrollAnchor,
+} from "./taskChatVirtualScroll";
 import { useACPAvailability } from "./useACPAvailability";
 import { useInitialChatLoad } from "./useInitialChatLoad";
 import { useActiveChatId } from "./useActiveChatId";
 import { useTypewriter } from "./useTypewriter";
+import {
+  appendStructuredContentBlock,
+  appendTextContentBlock,
+  type AgentContentBlock,
+} from "./agentContentBlocks";
+import {
+  applyToolCallCreated,
+  applyToolCallUpdated,
+  applyTerminalOutputUpdate,
+  canApplyToolCallUpdate,
+  formatToolInputValue,
+  hasReadableToolInput,
+  hasReadableToolOutput,
+  toolCallChipTone,
+  toolCallHoverText,
+  type ToolCallContentData,
+  type ToolCallInputData,
+  type ToolCallMessage,
+} from "./toolCallReducer";
+import {
+  normalizePlanEntries,
+  shouldOpenPlan,
+  sortPlanEntries,
+  type PlanEntry,
+} from "./planEntries";
 import { listSketches, type SketchMeta } from "../../../api/sketches";
 import { writeLastActiveTab } from "../../../utils/lastActiveTab";
 import { XTerminal } from "../TaskDetail/XTerminal";
@@ -108,6 +182,7 @@ import { useAgentQuota, useRadioEvents } from "../../../hooks";
 import { AgentQuotaPopover } from "./AgentQuotaPopover";
 import { ContextUsagePill } from "./ContextUsagePill";
 import { TurnUsageMeta } from "./TurnUsageMeta";
+import { collectCurrentTurnRecalledMemories } from "./memoryRecall";
 import {
   quotaBadgePercent,
   quotaBatteryIcon,
@@ -120,20 +195,49 @@ import {
   updateChatTitle,
   deleteChat,
   forkChat,
+  listImportSessions,
+  importSession,
   uploadChatAttachment,
   getTaskFiles,
   getChatHistory,
   takeControl,
+  reconnectChat,
   readFile,
   updateNotes,
 } from "../../../api";
-import type { ChatSessionResponse, CustomAgentServer } from "../../../api";
+import { ConfirmDialog } from "../../Dialogs/ConfirmDialog";
+import type { ChatSessionResponse, CustomAgentServer, ImportableSession } from "../../../api";
 import { listProjects, getProject, listResources, type ProjectListItem } from "../../../api/projects";
 import { openExternalUrl } from "../../../utils/openExternal";
 import { ansiToHtml, stripAnsi } from "../../../utils/ansi";
 import { fuzzyFindByName } from "../../../utils/fuzzySearch";
 import { useCommand, useContextKey, useVoiceControlContext } from "../../../keyboard";
 import "./task-chat.css";
+
+// ─── Queue send mode persistence (localStorage) ───────────────────────────
+// Flat, global key (not per-project/per-chat) — the user picks one mode and
+// expects it to stick everywhere, matching the product decision.
+
+type QueueSendMode = "separate" | "compact";
+const QUEUE_MODE_STORAGE_KEY = "grove:queue-mode";
+
+function loadQueueMode(): QueueSendMode {
+  try {
+    return window.localStorage.getItem(QUEUE_MODE_STORAGE_KEY) === "compact"
+      ? "compact"
+      : "separate";
+  } catch {
+    return "separate";
+  }
+}
+
+function saveQueueMode(mode: QueueSendMode): void {
+  try {
+    window.localStorage.setItem(QUEUE_MODE_STORAGE_KEY, mode);
+  } catch {
+    // quota/denied — silently skip
+  }
+}
 
 // ─── Chat draft persistence (localStorage) ────────────────────────────────
 
@@ -272,18 +376,7 @@ interface TaskChatProps {
   onBusyStateChange?: (busy: boolean) => void;
 }
 
-type ToolMessage = {
-  type: "tool";
-  id: string;
-  title: string;
-  status: string;
-  content?: string;
-  collapsed: boolean;
-  locations?: { path: string; line?: number }[];
-  /// ACP `tool_call.raw_input` — agent 实际调用工具时的入参 JSON。
-  /// Bash 的 `command`、Grep 的 `pattern`、MCP 的入参等。
-  rawInput?: unknown;
-};
+type ToolMessage = ToolCallMessage;
 
 interface PermOption {
   option_id: string;
@@ -320,6 +413,9 @@ interface TurnUsageData {
   cachedReadTokens?: number;
 }
 
+const REFUSAL_CONTEXT_NOTICE =
+  "Agent declined this request. This turn won't be included in future conversation context.";
+
 type AskFormMessage = {
   /** Special-case rendering of the `ask_form` MCP tool call: instead of a
    *  collapsed tool card we show an interactive form (FormPill). The agent
@@ -329,11 +425,19 @@ type AskFormMessage = {
   type: "ask_form";
   /** ACP tool_call id. Stable across tool_call_update events. */
   id: string;
-  /** Direct passthrough of `tool_call.raw_input`. */
+  /** Validated form definition used by the dedicated form experience. */
   definition: AskFormDefinition;
   /** Set to true locally once the user submits / skips / cancels — the next
    *  render returns null so the pill disappears. */
   resolved?: boolean;
+};
+
+type ElicitationMessage = {
+  type: "elicitation";
+  id: string;
+  snapshot: AcpElicitationSnapshot;
+  resolved?: "accept" | "decline" | "cancel" | "complete";
+  error?: string;
 };
 
 type ChatMessage =
@@ -348,6 +452,8 @@ type ChatMessage =
       type: "assistant";
       content: string;
       complete: boolean;
+      /** Ordered ACP content blocks. Absent for legacy text-only cached state. */
+      blocks?: AgentContentBlock[];
       /** Per-turn token accounting from the agent's PromptResponse, attached
        * by the `complete` reducer to the most recent assistant message in
        * the turn. Absent on streaming messages and on agents that don't
@@ -361,6 +467,7 @@ type ChatMessage =
   | { type: "thinking"; content: string; collapsed: boolean; complete: boolean }
   | ToolMessage
   | AskFormMessage
+  | ElicitationMessage
   | { type: "system"; content: string }
   | PermissionMessage
   | { type: "terminal_output"; chunks: string[]; exitCode?: number | null }
@@ -383,11 +490,6 @@ type ServerEvent = {
   [key: string]: any;
 };
 
-interface PlanEntry {
-  content: string;
-  status: string;
-}
-
 interface SlashCommand {
   name: string;
   description: string;
@@ -400,11 +502,176 @@ interface PromptCaps {
   embeddedContext: boolean;
 }
 
+interface AuthMethodOption {
+  id: string;
+  name: string;
+  description?: string;
+}
+
+function apiErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object" && "message" in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message;
+    if (message && typeof message === "object" && "message" in message) {
+      const nested = (message as { message?: unknown }).message;
+      if (typeof nested === "string" && nested.trim()) return nested;
+    }
+  }
+  return "The request failed. Please try again.";
+}
+
+interface SessionActionsMenuProps {
+  surface: "header" | "sidebar";
+  chatId: string;
+  forkCapable: boolean;
+  importCapable: boolean;
+  importSessions: ImportableSession[];
+  importLoading: boolean;
+  importNextCursor?: string;
+  authMethods: AuthMethodOption[];
+  logoutCapable: boolean;
+  reconnectDisabled: boolean;
+  actionsDisabled: boolean;
+  deleteDisabled: boolean;
+  onFork: (chatId: string) => void;
+  onOpenImport: () => void;
+  onLoadMoreImport: () => void;
+  onImport: (session: ImportableSession) => void;
+  onLogin: (method: AuthMethodOption) => void;
+  onLogout: () => void;
+  onReconnect: () => void;
+  onDelete: (chatId: string) => void;
+}
+
+function SessionActionsMenu({
+  surface,
+  chatId,
+  forkCapable,
+  importCapable,
+  importSessions,
+  importLoading,
+  importNextCursor,
+  authMethods,
+  logoutCapable,
+  reconnectDisabled,
+  actionsDisabled,
+  deleteDisabled,
+  onFork,
+  onOpenImport,
+  onLoadMoreImport,
+  onImport,
+  onLogin,
+  onLogout,
+  onReconnect,
+  onDelete,
+}: SessionActionsMenuProps) {
+  const items: Parameters<typeof DropdownMenu>[0]["items"] = [];
+
+  if (forkCapable) {
+    items.push({
+      id: "fork",
+      label: "Fork",
+      icon: GitFork,
+      onClick: () => onFork(chatId),
+      disabled: actionsDisabled,
+    });
+  }
+  if (importCapable) {
+    const children: NonNullable<
+      Parameters<typeof DropdownMenu>[0]["items"][number]["children"]
+    > = importSessions.map((session) => ({
+      id: `import-${session.session_id}`,
+      label: session.title?.trim() || `Session ${session.session_id.slice(0, 8)}`,
+      description: `${session.updated_at ? `Updated ${new Date(session.updated_at).toLocaleString()} · ` : ""}ID ${session.session_id.slice(0, 12)}`,
+      onClick: () => onImport(session),
+      disabled: importLoading,
+    }));
+    if (importLoading && children.length === 0) children.push({ id: "loading", label: "Loading…", description: "", onClick: () => {}, disabled: true });
+    if (!importLoading && children.length === 0) children.push({ id: "empty", label: "No sessions to import", description: "", onClick: () => {}, disabled: true });
+    if (importNextCursor) children.push({
+      id: "more",
+      label: importLoading ? "Loading…" : "Load more",
+      description: "",
+      onClick: onLoadMoreImport,
+      disabled: importLoading,
+      keepOpenOnClick: true,
+      listAction: true,
+    });
+    items.push({ id: "import", label: "Import", icon: Download, children, onOpen: onOpenImport, wideChildren: true, disabled: actionsDisabled });
+  }
+  items.push({
+    id: "reconnect",
+    label: "Reconnect",
+    icon: RefreshCw,
+    onClick: onReconnect,
+    disabled: reconnectDisabled,
+  });
+  if (authMethods.length > 0) {
+    items.push({
+      id: "login",
+      label: "Login",
+      icon: LogIn,
+      disabled: actionsDisabled,
+      children: authMethods.map((method) => ({
+        id: `login-${method.id}`,
+        label: method.name.trim() || "Login",
+        onClick: () => onLogin(method),
+      })),
+    });
+  }
+  if (logoutCapable) {
+    items.push({
+      id: "logout",
+      label: "Logout",
+      icon: LogOut,
+      onClick: onLogout,
+      disabled: actionsDisabled,
+    });
+  }
+  items.push({
+    id: "delete",
+    label: "Delete",
+    icon: Trash2,
+    onClick: () => onDelete(chatId),
+    variant: "danger",
+    disabled: deleteDisabled,
+  });
+
+  const triggerClassName =
+    surface === "header"
+      ? "flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-highlight)]"
+      : "flex h-full shrink-0 items-center gap-1.5 rounded-md border border-dashed border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-transparent px-2 text-[12px] text-[var(--color-text-muted)] transition-colors hover:border-[color-mix(in_srgb,var(--color-highlight)_34%,transparent)] hover:text-[var(--color-highlight)]";
+
+  return (
+    <DropdownMenu
+      items={items}
+      trigger={
+        <>
+          <MoreHorizontal className={surface === "header" ? "h-3.5 w-3.5" : "h-3 w-3"} />
+          <span>More</span>
+        </>
+      }
+      triggerClassName={triggerClassName}
+      ariaLabel="Session actions"
+      portal
+      compact
+    />
+  );
+}
+
 type TitleEditSurface = "header" | "sidebar-header" | "sidebar-list";
 
 const AGENT_PICKER_MENU_WIDTH = 192;
 const AGENT_PICKER_MENU_MAX_HEIGHT = 256;
 const AGENT_PICKER_VIEWPORT_MARGIN = 8;
+
+type ChatDropdownOption = {
+  label: string;
+  value: string;
+  description?: string | null;
+  group?: string;
+};
 
 /** Per-chat cached state (preserved across chat switches) */
 interface PerChatState {
@@ -414,13 +681,15 @@ interface PerChatState {
   isBusy: boolean;
   selectedModel: string;
   permissionLevel: string;
-  modelOptions: { label: string; value: string }[];
-  modeOptions: { label: string; value: string }[];
-  /** Thought-level / reasoning-effort selector (0.11 SessionConfigOption) */
-  thoughtLevelOptions: { label: string; value: string }[];
+  modelOptions: ChatDropdownOption[];
+  modeOptions: ChatDropdownOption[];
+  /** Thought-level / reasoning-effort selector (ACP SessionConfigOption) */
+  thoughtLevelOptions: ChatDropdownOption[];
   thoughtLevel: string;
   thoughtLevelConfigId: string;
+  sessionConfigOptions: SessionConfigOption[];
   planEntries: PlanEntry[];
+  showPlan: boolean;
   slashCommands: SlashCommand[];
   isConnected: boolean;
   agentLabel: string;
@@ -429,6 +698,10 @@ interface PerChatState {
   /** Agent 是否声明 ACP `session/fork` 能力(`unstable_session_fork`)。
    * true → 在 chat 菜单的当前 chat 行显示 Fork 按钮。 */
   forkCapable: boolean;
+  importCapable: boolean;
+  deleteCapable: boolean;
+  authMethods: AuthMethodOption[];
+  logoutCapable: boolean;
   planFilePath: string;
   planFileContent: string;
   isRemoteSession: boolean;
@@ -449,6 +722,38 @@ interface PerChatState {
   pendingMessages: { id: string; text: string }[];
 }
 
+const applyConfigOptionsToCachedState = (
+  state: PerChatState,
+  options: SessionConfigOption[],
+) => {
+  state.sessionConfigOptions = options;
+  const quick = quickConfigOptions(options);
+  const applySelect = (
+    option: SessionConfigOption | undefined,
+  ): { options: ChatDropdownOption[]; current: string } =>
+    option?.type === "select"
+      ? {
+          options: configDropdownValues(option).map((value) => ({
+            label: value.name,
+            value: value.value,
+            description: value.description,
+            group: value.group,
+          })),
+          current: option.currentValue,
+        }
+      : { options: [], current: "" };
+  const model = applySelect(quick.model);
+  const mode = applySelect(quick.mode);
+  const thinking = applySelect(quick.thinking);
+  state.modelOptions = model.options;
+  state.selectedModel = model.current;
+  state.modeOptions = mode.options;
+  state.permissionLevel = mode.current;
+  state.thoughtLevelOptions = thinking.options;
+  state.thoughtLevel = thinking.current;
+  state.thoughtLevelConfigId = quick.thinking?.id ?? "";
+};
+
 function defaultPerChatState(): PerChatState {
   return {
     messages: [],
@@ -462,7 +767,9 @@ function defaultPerChatState(): PerChatState {
     thoughtLevelOptions: [],
     thoughtLevel: "",
     thoughtLevelConfigId: "",
+    sessionConfigOptions: [],
     planEntries: [],
+    showPlan: false,
     slashCommands: [],
     isConnected: false,
     agentLabel: "Chat",
@@ -471,6 +778,10 @@ function defaultPerChatState(): PerChatState {
     remoteOwnerName: "",
     promptCaps: { image: false, audio: false, embeddedContext: false },
     forkCapable: false,
+    importCapable: false,
+    deleteCapable: false,
+    authMethods: [],
+    logoutCapable: false,
     planFilePath: "",
     planFileContent: "",
     draftHtml: "",
@@ -510,12 +821,205 @@ function fileUrlToPath(uri: string | undefined): string | null {
 // ─── Render grouping types ───────────────────────────────────────────────────
 
 type ToolSectionItem = { message: ToolMessage; index: number };
+type WorkSummaryItem = {
+  message: Extract<ChatMessage, { type: "assistant" | "thinking" | "tool" }>;
+  index: number;
+};
 type RenderItem =
   | { kind: "single"; message: ChatMessage; index: number }
-  | { kind: "tool-section"; sectionId: string; tools: ToolSectionItem[] };
+  | { kind: "tool-section"; sectionId: string; tools: ToolSectionItem[] }
+  | {
+      kind: "work-summary";
+      sectionId: string;
+      items: WorkSummaryItem[];
+      durationSeconds?: number;
+    }
+  | { kind: "file-change-summary"; sectionId: string; tools: ToolSectionItem[] };
+
+function renderItemKey(item: RenderItem): string {
+  return item.kind === "single"
+    ? `m-${item.index}`
+    : item.kind === "tool-section"
+      ? `ts-${item.sectionId}`
+      : item.kind === "work-summary"
+        ? `ws-${item.sectionId}`
+        : `fs-${item.sectionId}`;
+}
+
+type TaskChatVirtuosoContext = {
+  hiddenMessageCount: number;
+  hotRows: ReactNode;
+  inputAreaHeight: number;
+  showThinking: boolean;
+};
+
+function TaskChatVirtuosoHeader({
+  context,
+}: ContextProp<TaskChatVirtuosoContext>) {
+  return context.hiddenMessageCount > 0 ? (
+    <div className="px-4 pt-4">
+      <div className="mx-auto max-w-[720px] rounded-md border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-3 py-2 text-center text-xs text-[var(--color-text-muted)]">
+        {context.hiddenMessageCount.toLocaleString()} earlier messages are
+        hidden from this view. Full history is still saved.
+      </div>
+    </div>
+  ) : (
+    <div className="h-4" />
+  );
+}
+
+function TaskChatVirtuosoFooter({
+  context,
+}: ContextProp<TaskChatVirtuosoContext>) {
+  return (
+    <div>
+      {context.hotRows}
+      {context.showThinking && (
+        <div className="mx-auto w-full max-w-[920px] px-4 py-2 sm:px-6">
+          <ThinkingStatus label="Thinking" active />
+        </div>
+      )}
+      <div style={{ height: context.inputAreaHeight + 16 }} />
+    </div>
+  );
+}
+
+const TASK_CHAT_VIRTUOSO_COMPONENTS = {
+  Header: TaskChatVirtuosoHeader,
+  Footer: TaskChatVirtuosoFooter,
+};
+
+const TASK_CHAT_RECENT_TURN_HOT_ZONE = 50;
+const TASK_CHAT_DEFAULT_ITEM_HEIGHT = 120;
+const TASK_CHAT_WINDOWED_VIEWPORT = { top: 1_600, bottom: 1_600 } as const;
+const TASK_CHAT_MIN_OVERSCAN_ITEMS = { top: 12, bottom: 12 } as const;
+
+const MeasuredTaskChatRow = memo(function MeasuredTaskChatRow({
+  className,
+  dataItemIndex,
+  dataRenderKey,
+  measureKey,
+  onObserve,
+  children,
+}: {
+  className: string;
+  dataItemIndex?: number;
+  dataRenderKey: string;
+  measureKey: string;
+  onObserve: (
+    element: HTMLDivElement,
+    key: string,
+    observing: boolean,
+  ) => void;
+  children: ReactNode;
+}) {
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const attachRow = useCallback((element: HTMLDivElement | null) => {
+    if (rowRef.current) onObserve(rowRef.current, measureKey, false);
+    rowRef.current = element;
+    if (element) onObserve(element, measureKey, true);
+  }, [measureKey, onObserve]);
+
+  return (
+    <div
+      ref={attachRow}
+      className={className}
+      data-item-index={dataItemIndex}
+      data-render-key={dataRenderKey}
+    >
+      {children}
+    </div>
+  );
+});
+
+/** A user prompt and the assistant material that follows it.  This is a
+ * presentation-only projection of `messages`: the full message history
+ * remains the source of truth and no extra history is persisted. */
+type ConversationTurn = {
+  messageIndex: number;
+  renderIndex: number;
+  user: string;
+  assistant: string;
+  isStreaming: boolean;
+  tools: { label: string; count: number }[];
+};
+
+function conversationToolLabel(tool: ToolMessage): string {
+  switch (normalizeToolVerb(tool.title)) {
+    case "read":
+    case "search":
+    case "list":
+    case "run":
+      return "Exploration";
+    case "edit":
+      return "Edit";
+    case "plan":
+    case "permission":
+    default:
+      return "Action";
+  }
+}
+
+function compactConversationText(value: string, limit = 220): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (!compact) return "";
+  return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
+}
+
+/**
+ * Builds the data for the chat's left-hand conversation minimap. Tool and
+ * thinking events remain part of their surrounding user → assistant turn;
+ * they do not create noisy standalone markers in the navigator.
+ */
+function buildConversationTurns(
+  messages: ChatMessage[],
+  renderItems: RenderItem[],
+): ConversationTurn[] {
+  const renderIndexByMessageIndex = new Map<number, number>();
+  renderItems.forEach((item, renderIndex) => {
+    if (item.kind === "single") renderIndexByMessageIndex.set(item.index, renderIndex);
+  });
+
+  const turns: ConversationTurn[] = [];
+  let current: ConversationTurn | null = null;
+  messages.forEach((message, messageIndex) => {
+    if (message.type === "user") {
+      const renderIndex = renderIndexByMessageIndex.get(messageIndex);
+      if (renderIndex === undefined) return;
+      current = {
+        messageIndex,
+        renderIndex,
+        user: compactConversationText(message.content) || "Attachment",
+        assistant: "",
+        isStreaming: false,
+        tools: [],
+      };
+      turns.push(current);
+      return;
+    }
+    if (!current) return;
+    if (message.type === "tool") {
+      const label = conversationToolLabel(message);
+      const existing = current.tools.find((tool) => tool.label === label);
+      if (existing) existing.count += 1;
+      else current.tools.push({ label, count: 1 });
+      return;
+    }
+    if (message.type !== "assistant") return;
+    const text = compactConversationText(message.content);
+    if (text) current.assistant = compactConversationText(
+      `${current.assistant}${current.assistant ? " " : ""}${text}`,
+    );
+    if (!message.complete) current.isStreaming = true;
+  });
+  return turns;
+}
 
 /** Group consecutive tool messages into sections; everything else is a single item */
-function buildRenderItems(messages: ChatMessage[]): RenderItem[] {
+function buildSequentialRenderItems(
+  messages: ChatMessage[],
+  startIndex = 0,
+): RenderItem[] {
   const items: RenderItem[] = [];
   let toolBuf: ToolSectionItem[] = [];
 
@@ -530,8 +1034,12 @@ function buildRenderItems(messages: ChatMessage[]): RenderItem[] {
     }
   };
 
-  messages.forEach((msg, i) => {
-    if (msg.type === "tool") {
+  messages.forEach((msg, offset) => {
+    const i = startIndex + offset;
+    if (msg.type === "thinking" && msg.complete) {
+      // Keep completed reasoning in history but out of the transcript.
+      flush();
+    } else if (msg.type === "tool") {
       toolBuf.push({ message: msg, index: i });
     } else if (msg.type === "auth_required") {
       // 不进消息流 — 由 composer panel 统一渲染(同 PermissionRequest)。
@@ -543,6 +1051,150 @@ function buildRenderItems(messages: ChatMessage[]): RenderItem[] {
     }
   });
   flush();
+  return items;
+}
+
+/**
+ * Keep the live turn chronological, then compact completed turns in the same
+ * way command-oriented agents do: everything through the final tool call is
+ * one expandable work record, while the answer emitted after that boundary
+ * remains fully visible.
+ */
+function buildRenderItems(messages: ChatMessage[], isBusy = false): RenderItem[] {
+  const items: RenderItem[] = [];
+  let cursor = 0;
+
+  while (cursor < messages.length) {
+    let userIndex = cursor;
+    while (userIndex < messages.length && messages[userIndex].type !== "user") {
+      userIndex += 1;
+    }
+    if (userIndex >= messages.length) {
+      items.push(...buildSequentialRenderItems(messages.slice(cursor), cursor));
+      break;
+    }
+
+    items.push(...buildSequentialRenderItems(messages.slice(cursor, userIndex), cursor));
+    items.push({ kind: "single", message: messages[userIndex], index: userIndex });
+
+    let nextUserIndex = userIndex + 1;
+    while (
+      nextUserIndex < messages.length &&
+      messages[nextUserIndex].type !== "user"
+    ) {
+      nextUserIndex += 1;
+    }
+    const isLatestTurn = nextUserIndex === messages.length;
+    const turnEntries = messages.slice(userIndex + 1, nextUserIndex);
+    const hasStreamingEntry = turnEntries.some(
+      (message) =>
+        (message.type === "assistant" || message.type === "thinking") &&
+        !message.complete,
+    );
+
+    if ((isLatestTurn && isBusy) || hasStreamingEntry) {
+      items.push(
+        ...buildSequentialRenderItems(turnEntries, userIndex + 1),
+      );
+      cursor = nextUserIndex;
+      continue;
+    }
+
+    // Rich ACP content must retain its exact position relative to text and
+    // tools. The compact WorkSummary intentionally rearranges process items,
+    // so keep these uncommon turns in the sequential renderer.
+    const hasStructuredAssistantContent = turnEntries.some(
+      (message) =>
+        message.type === "assistant" &&
+        message.blocks?.some((block) => block.type !== "text"),
+    );
+    if (hasStructuredAssistantContent) {
+      items.push(...buildSequentialRenderItems(turnEntries, userIndex + 1));
+      cursor = nextUserIndex;
+      continue;
+    }
+
+    let processEndOffset = -1;
+    for (let i = turnEntries.length - 1; i >= 0; i -= 1) {
+      if (turnEntries[i].type === "tool") {
+        processEndOffset = i;
+        break;
+      }
+    }
+    if (processEndOffset >= 0) {
+      const processItems: WorkSummaryItem[] = [];
+      for (let i = 0; i < turnEntries.length; i += 1) {
+        const message = turnEntries[i];
+        if (
+          (message.type === "assistant" && i <= processEndOffset) ||
+          message.type === "thinking" ||
+          message.type === "tool"
+        ) {
+          processItems.push({ message, index: userIndex + 1 + i });
+        }
+      }
+      if (processItems.length > 0) {
+        const timedAssistants = turnEntries.filter(
+          (message): message is Extract<ChatMessage, { type: "assistant" }> =>
+            message.type === "assistant",
+        );
+        const starts = timedAssistants
+          .map((message) => message.startTs)
+          .filter((value): value is number => typeof value === "number");
+        const ends = timedAssistants
+          .map((message) => message.endTs)
+          .filter((value): value is number => typeof value === "number");
+        items.push({
+          kind: "work-summary",
+          sectionId: `work-${userIndex}-${processItems.at(-1)!.index}`,
+          items: processItems,
+          durationSeconds:
+            starts.length > 0 && ends.length > 0
+              ? Math.max(0, Math.max(...ends) - Math.min(...starts))
+              : undefined,
+        });
+      }
+      // Preserve uncommon inline messages (permission/system/etc.) that are
+      // not part of the compactable agent process.
+      const passthrough = turnEntries
+        .slice(0, processEndOffset + 1)
+        .map((message, offset) => ({ message, index: userIndex + 1 + offset }))
+        .filter(
+          ({ message }) =>
+            message.type !== "assistant" &&
+            message.type !== "thinking" &&
+            message.type !== "tool",
+        );
+      passthrough.forEach(({ message, index }) =>
+        items.push({ kind: "single", message, index }),
+      );
+      const trailingStart = userIndex + processEndOffset + 2;
+      items.push(
+        ...buildSequentialRenderItems(
+          turnEntries.slice(processEndOffset + 1),
+          trailingStart,
+        ).filter(
+          (item) =>
+            item.kind !== "single" || item.message.type !== "thinking",
+        ),
+      );
+      const editedTools = processItems.flatMap(({ message, index }) =>
+        message.type === "tool" && isEditTool(message)
+          ? [{ message, index }]
+          : [],
+      );
+      if (editedTools.length > 0) {
+        items.push({
+          kind: "file-change-summary",
+          sectionId: `files-${userIndex}`,
+          tools: editedTools,
+        });
+      }
+    } else {
+      items.push(...buildSequentialRenderItems(turnEntries, userIndex + 1));
+    }
+    cursor = nextUserIndex;
+  }
   return items;
 }
 
@@ -567,6 +1219,12 @@ function extractRenderItemText(item: RenderItem): string {
         ]
           .filter(Boolean)
           .join("\n");
+      case "elicitation":
+        return [
+          m.snapshot.agent_name,
+          m.snapshot.request.message,
+          m.snapshot.request.url ?? "",
+        ].filter(Boolean).join("\n");
       case "permission":
         return m.description;
       case "terminal_output":
@@ -580,11 +1238,22 @@ function extractRenderItemText(item: RenderItem): string {
           .filter(Boolean)
           .join("\n");
     }
-  } else {
+  } else if (
+    item.kind === "tool-section" ||
+    item.kind === "file-change-summary"
+  ) {
     return item.tools
       .map((t) => [t.message.title, t.message.content ?? ""].filter(Boolean).join("\n"))
       .join("\n");
   }
+  return item.items
+    .filter(({ message }) => message.type !== "thinking")
+    .map(({ message }) =>
+      message.type === "tool"
+        ? [message.title, message.content ?? ""].filter(Boolean).join("\n")
+        : message.content,
+    )
+    .join("\n");
 }
 
 function getAutoScrollTailSignature(messages: ChatMessage[]): string {
@@ -593,13 +1262,20 @@ function getAutoScrollTailSignature(messages: ChatMessage[]): string {
     .map((message) => {
       switch (message.type) {
         case "assistant":
-          return `assistant:${message.complete ? 1 : 0}:${message.content.length}`;
+          return `assistant:${message.complete ? 1 : 0}:${message.content.length}:${message.blocks?.length ?? 0}`;
         case "thinking":
           return `thinking:${message.complete ? 1 : 0}:${message.content.length}`;
         case "tool":
-          return `tool:${message.id}:${message.status}:${(message.content ?? "").length}`;
+          return `tool:${message.id}:${message.status}:${(message.content ?? "").length}:${
+            message.output?.reduce(
+              (size, item) => size + (item.type === "terminal" ? (item.output?.length ?? 0) : 0),
+              0,
+            ) ?? 0
+          }`;
         case "ask_form":
           return `ask_form:${message.id}:${message.resolved ? 1 : 0}`;
+        case "elicitation":
+          return `elicitation:${message.id}:${message.snapshot.opened ? 1 : 0}:${message.resolved ?? ""}`;
         case "system":
           return `system:${message.content.length}`;
         case "permission":
@@ -646,7 +1322,7 @@ function previewCommentElementLabel(draft: PreviewCommentDraft): string {
 
 function previewCommentSystemPrompt(draft: PreviewCommentDraft, index: number, total: number): string {
   const lines = [
-    `Preview comment ${index} of ${total}: address this rendered preview feedback.`,
+    `Comment ${index} of ${total}: address this feedback on ${draft.source === "chat" ? "the conversation text" : "the rendered preview"}.`,
     `File: ${draft.filePath}`,
     `Source: ${draft.source}`,
     `Renderer: ${draft.rendererId}`,
@@ -692,21 +1368,6 @@ function formatPreviewCommentPrompt(comments: PreviewCommentDraft[]): string {
  * de-duped by (path, line). Preserves insertion order so early-discovered
  * locations stay on top.
  */
-function mergeLocations(
-  existing: { path: string; line?: number }[] | undefined,
-  incoming: { path: string; line?: number }[] | undefined,
-): { path: string; line?: number }[] | undefined {
-  if (!incoming || incoming.length === 0) return existing;
-  const base = existing ?? [];
-  const out = [...base];
-  for (const loc of incoming) {
-    if (!out.some((e) => e.path === loc.path && e.line === loc.line)) {
-      out.push(loc);
-    }
-  }
-  return out;
-}
-
 function completeThinking(messages: ChatMessage[]): ChatMessage[] {
   let changed = false;
   const result = messages.map((m) => {
@@ -1388,7 +2049,11 @@ function reduceHistoryMessages(
         const m = prev[i];
         if (m.type === "assistant") {
           const updated = [...prev];
-          updated[i] = { ...m, content: m.content + msg.text };
+          updated[i] = {
+            ...m,
+            content: m.content + msg.text,
+            blocks: appendTextContentBlock(m.blocks, m.content, msg.text),
+          };
           return updated;
         }
         if (m.type === "user" || m.type === "tool") break;
@@ -1396,7 +2061,42 @@ function reduceHistoryMessages(
       if (!msg.text?.trim()) return prev;
       return [
         ...prev,
-        { type: "assistant", content: msg.text, complete: false },
+        {
+          type: "assistant",
+          content: msg.text,
+          complete: false,
+          blocks: [{ type: "text", text: msg.text }],
+        },
+      ];
+    }
+    case "message_content_chunk": {
+      const content = msg.content as AgentContentBlock | undefined;
+      if (!content || content.type === "text") return messages;
+      const prev = completeThinking(messages);
+      for (let i = prev.length - 1; i >= 0; i -= 1) {
+        const m = prev[i];
+        if (m.type === "assistant") {
+          const updated = [...prev];
+          updated[i] = {
+            ...m,
+            blocks: appendStructuredContentBlock(
+              m.blocks,
+              m.content,
+              content,
+            ),
+          };
+          return updated;
+        }
+        if (m.type === "user" || m.type === "tool") break;
+      }
+      return [
+        ...prev,
+        {
+          type: "assistant",
+          content: "",
+          complete: false,
+          blocks: [content],
+        },
       ];
     }
     case "thought_chunk": {
@@ -1424,14 +2124,7 @@ function reduceHistoryMessages(
       if (prev.some((m) => m.type === "tool" && m.id === msg.id)) {
         return prev.map((m) =>
           m.type === "tool" && m.id === msg.id
-            ? {
-                ...m,
-                title: msg.title,
-                // locations 按增量合并，按 (path,line) 去重保序
-                locations: mergeLocations(m.locations, msg.locations),
-                // raw_input 后到优先（agent 在 update 阶段才补全 input 时不抹掉）
-                rawInput: msg.raw_input !== undefined ? msg.raw_input : m.rawInput,
-              }
+            ? applyToolCallCreated(m, msg)
             : m,
         );
       }
@@ -1440,64 +2133,32 @@ function reduceHistoryMessages(
       );
       return [
         ...completed,
-        {
-          type: "tool",
-          id: msg.id,
-          title: msg.title,
-          status: "running",
-          collapsed: false,
-          locations: msg.locations,
-          rawInput: msg.raw_input,
-        },
+        applyToolCallCreated(undefined, msg),
       ];
     }
     case "tool_call_update": {
-      // 按 ACP 规范，每条 tool_call_update 的 content 是增量内容，应在已有
-      // content 上追加（去重），而不是覆盖。覆盖会让早期的命令/进度被最终
-      // 的结果/错误挤掉。
-      const mergeContent = (
-        prev: string | undefined,
-        next: string | undefined,
-      ): string | undefined => {
-        if (!next) return prev;
-        if (!prev) return next;
-        // 见后端 compact_events 同名逻辑：三种 agent 行为
-        //   1. 纯增量（next 是 delta）→ 拼接
-        //   2. 累积快照（next 以 prev 为前缀）→ 用 next 替换，避免 O(n²)
-        //   3. 重复广播（next 已包含在 prev 中）→ 跳过
-        if (prev.includes(next)) return prev;
-        if (next.startsWith(prev)) return next;
-        return prev.endsWith("\n") ? prev + next : prev + "\n" + next;
-      };
       const exists = messages.some((m) => m.type === "tool" && m.id === msg.id);
       if (exists) {
         return messages.map((m) =>
           m.type === "tool" && m.id === msg.id
-            ? {
-                ...m,
-                status: msg.status,
-                content: mergeContent(m.content, msg.content),
-                locations: mergeLocations(m.locations, msg.locations),
-                rawInput:
-                  msg.raw_input !== undefined ? msg.raw_input : m.rawInput,
-              }
+            ? applyToolCallUpdated(m, msg)
             : m,
         );
       }
-      return [
-        ...messages,
-        {
-          type: "tool",
-          id: msg.id,
-          title: msg.id,
-          status: msg.status,
-          content: msg.content,
-          collapsed: true,
-          locations: msg.locations ?? [],
-          rawInput: msg.raw_input,
-        },
-      ];
+      // ACP can only construct a missing ToolCall from an update when the
+      // required title is present. Keep malformed v1 updates out of the UI;
+      // a later complete ToolCall event can still create the item normally.
+      if (!canApplyToolCallUpdate(undefined, msg)) {
+        return messages;
+      }
+      return [...messages, applyToolCallUpdated(undefined, msg)];
     }
+    case "terminal_output_update":
+      return messages.map((message) =>
+        message.type === "tool"
+          ? applyTerminalOutputUpdate(message, msg)
+          : message,
+      );
     case "permission_request":
       return [
         ...messages,
@@ -1529,6 +2190,42 @@ function reduceHistoryMessages(
         },
       ];
     }
+    case "elicitation_request": {
+      const snapshot = msg as AcpElicitationSnapshot & { type: string };
+      if (!snapshot.request_id || !snapshot.request || !snapshot.agent_name) return messages;
+      const existing = messages.findIndex(
+        (message) => message.type === "elicitation" && message.id === snapshot.request_id,
+      );
+      if (existing >= 0) {
+        return messages.map((message, index) =>
+          index === existing && message.type === "elicitation"
+            ? { ...message, snapshot: { ...snapshot, opened: snapshot.opened || message.snapshot.opened } }
+            : message,
+        );
+      }
+      return [...messages, { type: "elicitation", id: snapshot.request_id, snapshot }];
+    }
+    case "elicitation_resolved":
+      return messages.map((message) => {
+        if (message.type !== "elicitation" || message.id !== msg.request_id) return message;
+        if (msg.action === "accept" && message.snapshot.request.mode === "url") {
+          return { ...message, snapshot: { ...message.snapshot, opened: true } };
+        }
+        return { ...message, resolved: msg.action };
+      });
+    case "elicitation_validation_error":
+      return messages.map((message) =>
+        message.type === "elicitation" && message.id === msg.request_id
+          ? { ...message, error: msg.message }
+          : message,
+      );
+    case "elicitation_complete":
+      return messages.map((message) =>
+        message.type === "elicitation"
+          && message.snapshot.request.elicitationId === msg.elicitation_id
+          ? { ...message, resolved: "complete" }
+          : message,
+      );
     case "permission_response":
       return resolveLatestPendingPermission(
         messages,
@@ -1552,38 +2249,58 @@ function reduceHistoryMessages(
       const startTs =
         typeof msg.start_ts === "number" ? msg.start_ts : undefined;
       const endTs = typeof msg.end_ts === "number" ? msg.end_ts : undefined;
-      return completed.map((m) =>
+      const completedTurn = completed.map((m) =>
         m.type === "assistant" && !m.complete
           ? { ...m, complete: true, usage, startTs, endTs }
           : m,
       );
+      return String(msg.stop_reason).toLowerCase() === "refusal"
+        ? appendSystemMessage(completedTurn, REFUSAL_CONTEXT_NOTICE)
+        : completedTurn;
     }
     case "user_message":
-      return [
-        ...messages,
-        {
+      {
+        const incomingAttachments: Attachment[] = msg.attachments?.map((a: ServerEvent) => ({
+          type:
+            a.type === "resource_link"
+              ? "resource"
+              : (a.type as "image" | "audio" | "resource"),
+          data: a.data ?? a.blob ?? a.text ?? "",
+          mimeType: a.mime_type ?? "",
+          name: a.name ?? a.uri?.split("/").filter(Boolean).pop() ?? "",
+          label: a.label ?? a.title ?? a.name ?? "",
+          uri: a.uri ?? undefined,
+          size: a.size ?? undefined,
+          previewUrl:
+            a.type === "image"
+              ? `data:${a.mime_type};base64,${a.data}`
+              : undefined,
+        })) ?? [];
+        const previous = messages[messages.length - 1];
+        if (previous?.type === "user" && !previous.terminal && !msg.terminal) {
+          return [
+            ...messages.slice(0, -1),
+            {
+              ...previous,
+              content: `${previous.content}${msg.text ?? ""}`,
+              attachments: [
+                ...(previous.attachments ?? []),
+                ...incomingAttachments,
+              ],
+            },
+          ];
+        }
+        return [
+          ...messages,
+          {
           type: "user",
           content: msg.text,
           terminal: !!msg.terminal,
           sender: msg.sender || undefined,
-          attachments: msg.attachments?.map((a: ServerEvent) => ({
-            type:
-              a.type === "resource_link"
-                ? "resource"
-                : (a.type as "image" | "audio" | "resource"),
-            data: a.data ?? "",
-            mimeType: a.mime_type ?? "",
-            name: a.name ?? "",
-            label: a.label ?? a.name ?? "",
-            uri: a.uri ?? undefined,
-            size: a.size ?? undefined,
-            previewUrl:
-              a.type === "image"
-                ? `data:${a.mime_type};base64,${a.data}`
-                : undefined,
-          })),
-        },
-      ];
+            attachments: incomingAttachments,
+          },
+        ];
+      }
     case "terminal_execute":
       return [
         ...messages,
@@ -1862,16 +2579,23 @@ export function TaskChat({
   const [selectedModel, setSelectedModel] = useState("");
   const [permissionLevel, setPermissionLevel] = useState("");
   const [modelOptions, setModelOptions] = useState<
-    { label: string; value: string }[]
+    ChatDropdownOption[]
   >([]);
   const [modeOptions, setModeOptions] = useState<
-    { label: string; value: string }[]
+    ChatDropdownOption[]
   >([]);
   const [thoughtLevel, setThoughtLevel] = useState("");
   const [thoughtLevelConfigId, setThoughtLevelConfigId] = useState("");
   const [thoughtLevelOptions, setThoughtLevelOptions] = useState<
-    { label: string; value: string }[]
+    ChatDropdownOption[]
   >([]);
+  const [sessionConfigOptions, setSessionConfigOptions] = useState<
+    SessionConfigOption[]
+  >([]);
+  const [pendingConfigIds, setPendingConfigIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [showSessionSettings, setShowSessionSettings] = useState(false);
   const [showThoughtLevelMenu, setShowThoughtLevelMenu] = useState(false);
   const [showModelMenu, setShowModelMenu] = useState(false);
   const [showPermMenu, setShowPermMenu] = useState(false);
@@ -1890,9 +2614,97 @@ export function TaskChat({
   const [planFilePath, setPlanFilePath] = useState("");
   const [planFileContent, setPlanFileContent] = useState("");
   const [showPlanFile, setShowPlanFile] = useState(false);
+
+  const applyConfigOptionsSnapshot = useCallback(
+    (options: SessionConfigOption[]) => {
+      setSessionConfigOptions(options);
+      const quick = quickConfigOptions(options);
+
+      const applySelect = (
+        option: SessionConfigOption | undefined,
+        setOptions: (value: ChatDropdownOption[]) => void,
+        setCurrent: (value: string) => void,
+      ) => {
+        if (!option || option.type !== "select") {
+          setOptions([]);
+          setCurrent("");
+          return;
+        }
+        setOptions(
+          configDropdownValues(option).map((value) => ({
+            label: value.name,
+            value: value.value,
+            description: value.description,
+            group: value.group,
+          })),
+        );
+        setCurrent(option.currentValue);
+      };
+
+      applySelect(quick.model, setModelOptions, setSelectedModel);
+      applySelect(quick.mode, setModeOptions, setPermissionLevel);
+      applySelect(quick.thinking, setThoughtLevelOptions, setThoughtLevel);
+      setThoughtLevelConfigId(quick.thinking?.id ?? "");
+      setPendingConfigIds(new Set());
+    },
+    [],
+  );
+
+  const requestConfigOptionChange = useCallback(
+    (option: SessionConfigOption, value: string | boolean) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        setMessages((previous) => [
+          ...previous,
+          { type: "system", content: "Session setting is unavailable while offline." },
+        ]);
+        return;
+      }
+      setPendingConfigIds((previous) => {
+        const next = new Set(previous);
+        next.add(option.id);
+        return next;
+      });
+      ws.send(
+        JSON.stringify({
+          type: "set_config_option",
+          config_id: option.id,
+          value,
+        }),
+      );
+    },
+    [],
+  );
+
+  const requestLegacyModeChange = useCallback((modeId: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    setPendingConfigIds((previous) => {
+      const next = new Set(previous);
+      next.add("__legacy_mode");
+      return next;
+    });
+    ws.send(JSON.stringify({ type: "set_mode", mode_id: modeId }));
+  }, []);
+
+  const matchedSessionConfig = useMemo(
+    () => quickConfigOptions(sessionConfigOptions),
+    [sessionConfigOptions],
+  );
+  const additionalSessionConfigOptions = useMemo(() => {
+    const matchedIds = new Set(
+      [
+        matchedSessionConfig.model?.id,
+        matchedSessionConfig.mode?.id,
+        matchedSessionConfig.thinking?.id,
+      ].filter((id): id is string => !!id),
+    );
+    return sessionConfigOptions.filter((option) => !matchedIds.has(option.id));
+  }, [matchedSessionConfig, sessionConfigOptions]);
   const [showPermissionPanel, setShowPermissionPanel] = useState(false);
   const [showFormPanel, setShowFormPanel] = useState(false);
   const [showAuthPanel, setShowAuthPanel] = useState(false);
+  const [showMemoryPanel, setShowMemoryPanel] = useState(false);
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [showSlashMenu, setShowSlashMenu] = useState(false);
   const [slashFilter, setSlashFilter] = useState("");
@@ -1944,6 +2756,9 @@ export function TaskChat({
     editingPendingIdRef.current = editingPendingId;
   }, [editingPendingId]);
   const [editingPendingValue, setEditingPendingValue] = useState("");
+  // Compact/Separate queue send mode — global flat localStorage key, not
+  // scoped per-project/per-chat (product decision: one choice sticks everywhere).
+  const [queueMode, setQueueMode] = useState<QueueSendMode>(() => loadQueueMode());
   // Subscribe to persona registry — re-renders this tree (and the picker /
   // chip / icon descendants that read `agentIconComponent` / `resolveAgentIcon`)
   // whenever a persona is created / edited / deleted from any page.
@@ -1955,7 +2770,16 @@ export function TaskChat({
   }> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const messagesViewportRef = useRef<HTMLDivElement>(null);
+  const messagePaneRef = useRef<HTMLDivElement>(null);
+  const directListContentRef = useRef<HTMLDivElement>(null);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const [measuredRowHeights] = useState<Map<string, number>>(
+    () => new Map(),
+  );
+  // Row heights depend on the available message width because Markdown and
+  // code blocks reflow. A settled width change starts a fresh measurement
+  // generation instead of reusing sizes captured for another pane width.
+  const [measurementWidth, setMeasurementWidth] = useState(0);
   // Bumped whenever Virtuoso renders a different range of items. Drives
   // useChatSearch's "re-apply highlights to freshly mounted DOM" effect.
   const [renderToken, setRenderToken] = useState(0);
@@ -1970,6 +2794,7 @@ export function TaskChat({
   const modelMenuRef = useRef<HTMLDivElement>(null);
   const permMenuRef = useRef<HTMLDivElement>(null);
   const thoughtLevelMenuRef = useRef<HTMLDivElement>(null);
+  const sessionSettingsRef = useRef<HTMLDivElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
   const slashItemRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const [taskFiles, setTaskFiles] = useState<string[]>([]);
@@ -1979,7 +2804,13 @@ export function TaskChat({
   const taskFilesLoadingRef = useRef(false);
   const { selectedProject, projects } = useProject();
   const { config: appConfig } = useConfig();
-  const { drafts: previewCommentDrafts, removeDraft: removePreviewCommentDraft, clearDrafts: clearPreviewCommentDrafts } = usePreviewComments();
+  const {
+    drafts: previewCommentDrafts,
+    addDraft: addPreviewCommentDraft,
+    updateDraft: updatePreviewCommentDraft,
+    removeDraft: removePreviewCommentDraft,
+    clearDrafts: clearPreviewCommentDrafts,
+  } = usePreviewComments();
   // Resolve project from the task's own projectId, not the globally-selected
   // one — Blitz can open a task from a different project than the sidebar
   // selection (same pattern as TaskInfoPanel / FlexLayoutContainer).
@@ -2096,6 +2927,21 @@ export function TaskChat({
     embeddedContext: false,
   });
   const [forkCapable, setForkCapable] = useState(false);
+  const [importCapable, setImportCapable] = useState(false);
+  const [deleteCapable, setDeleteCapable] = useState(false);
+  const [importSessions, setImportSessions] = useState<ImportableSession[]>([]);
+  const [importNextCursor, setImportNextCursor] = useState<string>();
+  const [importLoading, setImportLoading] = useState(false);
+  const importRequestRef = useRef(0);
+  const initialImportChatIdRef = useRef<string | null>(null);
+  const [authMethods, setAuthMethods] = useState<AuthMethodOption[]>([]);
+  const [logoutCapable, setLogoutCapable] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
+  const [reconnectConfirmOpen, setReconnectConfirmOpen] = useState(false);
+  const [deleteConfirmChatId, setDeleteConfirmChatId] = useState<string | null>(null);
+  const [deleteConfirmTargetCapable, setDeleteConfirmTargetCapable] = useState(false);
+  const [isDeletingChat, setIsDeletingChat] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const attachCountersRef = useRef<AttachmentCounters>({ image: 0, audio: 0, resource: 0 });
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -2104,6 +2950,8 @@ export function TaskChat({
   const [isInputFocused, setIsInputFocused] = useState(false);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [showPreviewComments, setShowPreviewComments] = useState(false);
+  const [editingPreviewCommentId, setEditingPreviewCommentId] = useState<string | null>(null);
+  const [editingPreviewCommentText, setEditingPreviewCommentText] = useState("");
   const [chatSearchOpen, setChatSearchOpen] = useState(false);
   const [chatSearchQuery, setChatSearchQuery] = useState("");
   const planFilePathRef = useRef("");
@@ -2162,9 +3010,18 @@ export function TaskChat({
     ? quotaBadgePercent(agentQuota)
     : null;
   const orderedChats = useMemo(() => [...chats].reverse(), [chats]);
+  const displayedPlanEntries = useMemo(
+    () => sortPlanEntries(planEntries),
+    [planEntries],
+  );
   const hasTodoPanel = planEntries.length > 0;
   const hasPlanPanel = !!planFileContent;
   const hasPendingPanel = pendingMessages.length > 0;
+  const recalledMemories = useMemo(
+    () => collectCurrentTurnRecalledMemories(messages),
+    [messages],
+  );
+  const hasMemoryPanel = recalledMemories.length > 0;
   const activePermissionMessage = useMemo(
     () =>
       [...messages]
@@ -2174,14 +3031,15 @@ export function TaskChat({
         ) ?? null,
     [messages],
   );
-  /** Latest unresolved ask_form message. Drives the composer panel + pill. */
-  type AskFormMsg = Extract<ChatMessage, { type: "ask_form" }>;
-  const activeFormMessage = useMemo(
-    () =>
-      [...messages]
-        .reverse()
-        .find((m): m is AskFormMsg => m.type === "ask_form" && !m.resolved) ??
-      null,
+  /** Latest unresolved survey, regardless of whether it came from Grove's
+   * `ask_form` tool or native ACP elicitation. Both use the same panel. */
+  type SurveyMsg = Extract<ChatMessage, { type: "ask_form" | "elicitation" }>;
+  const activeSurveyMessage = useMemo(
+    () => [...messages]
+      .reverse()
+      .find((message): message is SurveyMsg =>
+        (message.type === "ask_form" || message.type === "elicitation") && !message.resolved,
+      ) ?? null,
     [messages],
   );
   /** 最近一条仍在生效的 auth_required(succeeded 视为已结束,自动让位)。
@@ -2216,17 +3074,19 @@ export function TaskChat({
       ? "auth"
       : showPermissionPanel && activePermissionMessage
         ? "permission"
-        : showFormPanel && activeFormMessage
+        : showFormPanel && activeSurveyMessage
           ? "ask_form"
-          : showPlan && hasTodoPanel
-            ? "todo"
-            : showPlanFile && hasPlanPanel
-              ? "plan"
-              : showPendingQueue && hasPendingPanel
-                ? "pending"
-                : showPreviewComments && hasPreviewCommentsPanel
-                  ? "previewComments"
-                  : null;
+          : showMemoryPanel && hasMemoryPanel
+            ? "memory"
+            : showPlan && hasTodoPanel
+              ? "todo"
+              : showPlanFile && hasPlanPanel
+                ? "plan"
+                : showPendingQueue && hasPendingPanel
+                  ? "pending"
+                  : showPreviewComments && hasPreviewCommentsPanel
+                    ? "previewComments"
+                    : null;
   const composerPanelOpen = activeComposerPanel !== null;
 
   // When a permission message appears, force the permission panel open and
@@ -2244,6 +3104,7 @@ export function TaskChat({
       setShowPlanFile(false);
       setShowPendingQueue(false);
       setShowPreviewComments(false);
+      setShowMemoryPanel(false);
     } else {
       setShowPermissionPanel(false);
     }
@@ -2251,15 +3112,16 @@ export function TaskChat({
 
   // Same prev-prop pattern for ask_form: auto-open the form panel when a new
   // ask_form message arrives, auto-close when it resolves.
-  const [prevActiveFormMessage, setPrevActiveFormMessage] = useState(activeFormMessage);
-  if (activeFormMessage !== prevActiveFormMessage) {
-    setPrevActiveFormMessage(activeFormMessage);
-    if (activeFormMessage) {
+  const [prevActiveFormMessage, setPrevActiveFormMessage] = useState(activeSurveyMessage);
+  if (activeSurveyMessage !== prevActiveFormMessage) {
+    setPrevActiveFormMessage(activeSurveyMessage);
+    if (activeSurveyMessage) {
       setShowFormPanel(true);
       setShowPlan(false);
       setShowPlanFile(false);
       setShowPendingQueue(false);
       setShowPreviewComments(false);
+      setShowMemoryPanel(false);
     } else {
       setShowFormPanel(false);
     }
@@ -2277,6 +3139,7 @@ export function TaskChat({
       setShowPlanFile(false);
       setShowPendingQueue(false);
       setShowPreviewComments(false);
+      setShowMemoryPanel(false);
     } else {
       setShowAuthPanel(false);
     }
@@ -2494,7 +3357,7 @@ export function TaskChat({
         sessionId: p.id,
       }));
       
-      return filterMentionItems(projectItems, deferredFileFilter, 15);
+      return filterMentionItems(projectItems, deferredFileFilter, 20);
     }
 
     // 3. Aggregated Search (activeCategory is null)
@@ -2515,9 +3378,9 @@ export function TaskChat({
 
     // Non-empty query: search across all categories (with limited files to avoid noise)
     const matchedSelectors = filterMentionItems(CATEGORY_SELECTORS, deferredFileFilter, 4);
-    const matchedConvs = filterMentionItems(conversationItems, deferredFileFilter, 10);
-    const matchedAgents = filterMentionItems(agentItems, deferredFileFilter, 10);
-    const matchedFiles = filterMentionItems(fileItems, deferredFileFilter, 5); // Limit files to 5 in aggregated search to avoid clutter!
+    const matchedConvs = filterMentionItems(conversationItems, deferredFileFilter, 20);
+    const matchedAgents = filterMentionItems(agentItems, deferredFileFilter, 20);
+    const matchedFiles = filterMentionItems(fileItems, deferredFileFilter, 20); // Limit files to 20 in aggregated search!
 
     // Combine them, sort by score descending
     const combined = [...matchedConvs, ...matchedAgents, ...matchedFiles];
@@ -2855,16 +3718,25 @@ export function TaskChat({
   const scrollMessagesToBottom = useCallback(
     (behavior: ScrollBehavior = "smooth") => {
       const handle = virtuosoRef.current;
-      if (!handle) return; // Virtuoso not mounted yet — no useful fallback.
       // Virtuoso accepts only "auto" | "smooth"; coerce "instant" → "auto".
       const vBehavior: "auto" | "smooth" =
         behavior === "smooth" ? "smooth" : "auto";
       markProgrammaticScroll();
-      handle.scrollToIndex({
-        index: "LAST",
-        align: "end",
-        behavior: vBehavior,
-      });
+      if (!handle) {
+        const viewport = messagesViewportRef.current;
+        if (!viewport) return;
+        viewport.scrollTo({
+          top: viewport.scrollHeight,
+          behavior: vBehavior,
+        });
+        return;
+      }
+      // Scroll the scroller itself, rather than aligning the last data item.
+      // The latter stops *before* Virtuoso's Footer, which contains both the
+      // live Thinking indicator and the spacer that keeps content above the
+      // floating composer. Browsers clamp this deliberately oversized offset
+      // to the real scroll extent, including that Footer.
+      scrollVirtuosoToBottom(handle, vBehavior);
     },
     [markProgrammaticScroll],
   );
@@ -2885,9 +3757,39 @@ export function TaskChat({
   // i.e. there's a live user-driven scroll in progress. Re-enabling
   // happens unconditionally when atBottom becomes true.
   const isUserScrollingRef = useRef(false);
+  // `isScrolling` alone cannot identify the source: Virtuoso sets it for
+  // both a wheel/drag from the user and our own scrollToIndex calls. Record
+  // a short-lived user gesture before the scroll begins so an upward scroll
+  // reliably opts out of follow-output before any height re-measure arrives.
+  const userScrollGestureUntilRef = useRef(0);
+  const disengageAutoStick = useCallback(() => {
+    autoStickToBottomRef.current = false;
+  }, []);
+  const handleChatWheelCapture = useCallback((event: React.WheelEvent) => {
+    // Negative delta means the user is heading into history. Detach
+    // immediately instead of waiting for Virtuoso's atBottom callback,
+    // whose ordering can be behind a height-change notification.
+    if (event.deltaY < 0) disengageAutoStick();
+  }, [disengageAutoStick]);
+  const handleChatPointerDownCapture = useCallback((event: React.PointerEvent) => {
+    if (event.button !== 0) return;
+    const viewport = messagesViewportRef.current;
+    if (!viewport) return;
+    const rect = viewport.getBoundingClientRect();
+    const isTouchGesture = event.pointerType === "touch";
+    const isScrollbarGesture =
+      event.target === viewport && event.clientX >= rect.right - 16;
+    if (!isTouchGesture && !isScrollbarGesture) return;
+    // Covers touch scrolling and scrollbar-thumb drags, neither of which is
+    // represented by a negative wheel delta.
+    userScrollGestureUntilRef.current = Date.now() + 1_000;
+  }, []);
   const handleIsScrolling = useCallback((scrolling: boolean) => {
     isUserScrollingRef.current = scrolling;
-  }, []);
+    if (scrolling && Date.now() < userScrollGestureUntilRef.current) {
+      disengageAutoStick();
+    }
+  }, [disengageAutoStick]);
 
   // The tail-signature autoscroll path used to fire scrollMessagesToBottom
   // on every streaming token. With Virtuoso, `followOutput` already
@@ -2919,7 +3821,7 @@ export function TaskChat({
   // bottom, or (b) a hard fallback timeout fires.
   const { chatPositioning, notifyPositionedAtBottom } = useChatPositioning({
     activeChatId,
-    messagesLength: messages.length,
+    hasMessages: messages.length > 0,
     scrollMessagesToBottom,
     initialPinChatIdRef,
     suppressNextSmoothScrollRef,
@@ -2995,6 +3897,15 @@ export function TaskChat({
         !thoughtLevelMenuRef.current.contains(e.target as Node)
       )
         setShowThoughtLevelMenu(false);
+      if (
+        sessionSettingsRef.current &&
+        !sessionSettingsRef.current.contains(e.target as Node) &&
+        !(
+          e.target instanceof Element &&
+          e.target.closest("[data-session-settings-menu]")
+        )
+      )
+        setShowSessionSettings(false);
       if (
         chatMenuRef.current &&
         !chatMenuRef.current.contains(e.target as Node)
@@ -3090,13 +4001,19 @@ export function TaskChat({
       thoughtLevelOptions,
       thoughtLevel,
       thoughtLevelConfigId,
+      sessionConfigOptions,
       planEntries,
+      showPlan,
       slashCommands,
       isConnected,
       agentLabel,
       agentIcon: AgentIcon,
       promptCaps,
       forkCapable,
+      importCapable,
+      deleteCapable,
+      authMethods,
+      logoutCapable,
       planFilePath,
       planFileContent,
       isRemoteSession,
@@ -3118,13 +4035,19 @@ export function TaskChat({
     thoughtLevelOptions,
     thoughtLevel,
     thoughtLevelConfigId,
+    sessionConfigOptions,
     planEntries,
+    showPlan,
     slashCommands,
     isConnected,
     agentLabel,
     AgentIcon,
     promptCaps,
     forkCapable,
+    importCapable,
+    deleteCapable,
+    authMethods,
+    logoutCapable,
     planFilePath,
     planFileContent,
     isRemoteSession,
@@ -3135,6 +4058,7 @@ export function TaskChat({
 
   /** Restore chat state from cache */
   const restoreChatState = useCallback((chatId: string) => {
+    setShowMemoryPanel(false);
     const cached = perChatStateRef.current.get(chatId);
     if (cached) {
       setMessages(cached.messages);
@@ -3147,16 +4071,23 @@ export function TaskChat({
       setThoughtLevelOptions(cached.thoughtLevelOptions);
       setThoughtLevel(cached.thoughtLevel);
       setThoughtLevelConfigId(cached.thoughtLevelConfigId);
+      setSessionConfigOptions(cached.sessionConfigOptions ?? []);
+      setPendingConfigIds(new Set());
       setPlanEntries(cached.planEntries);
+      setShowPlan(cached.showPlan ?? false);
       setSlashCommands(cached.slashCommands);
       setIsConnected(cached.isConnected);
       setAgentLabel(cached.agentLabel);
       if (cached.agentIcon) setAgentIcon(() => cached.agentIcon);
       setPromptCaps(cached.promptCaps);
-      // 不从 cache 恢复 forkCapable:cache 是 chat 切换前的快照,可能 stale
-      // (agent 升级 / 能力被关掉)。等 SessionReady / snapshot 到达由 live
-      // 信号刷新;在那之前先按"未知 → 隐藏"处理,避免误显示按钮。
-      setForkCapable(false);
+      // Each live WebSocket keeps its own initialized Agent capabilities.
+      // Switching chats does not trigger another session_ready, so restore
+      // the matching chat's snapshot; a later session_ready overwrites it.
+      setForkCapable(cached.forkCapable);
+      setImportCapable(cached.importCapable);
+      setDeleteCapable(cached.deleteCapable);
+      setAuthMethods(cached.authMethods);
+      setLogoutCapable(cached.logoutCapable);
       setPlanFilePath(cached.planFilePath);
       setPlanFileContent(cached.planFileContent);
       planFilePathRef.current = cached.planFilePath;
@@ -3176,6 +4107,7 @@ export function TaskChat({
       setThoughtLevel("");
       setThoughtLevelConfigId("");
       setPlanEntries([]);
+      setShowPlan(false);
       setContextUsage(null);
       setSlashCommands([]);
       setIsConnected(false);
@@ -3184,6 +4116,9 @@ export function TaskChat({
       setIsTerminalMode(false);
       setPromptCaps({ image: false, audio: false, embeddedContext: false });
       setForkCapable(false);
+      setDeleteCapable(false);
+      setAuthMethods([]);
+      setLogoutCapable(false);
       setPlanFilePath("");
       setPlanFileContent("");
       planFilePathRef.current = "";
@@ -3191,6 +4126,11 @@ export function TaskChat({
       setIsRemoteSession(false);
       setRemoteOwnerName("");
     }
+    if (!cached) setImportCapable(false);
+    importRequestRef.current += 1;
+    setImportSessions([]);
+    setImportNextCursor(undefined);
+    setImportLoading(false);
     // 从缓存恢复 pending queue;tab 切换时 WS 不会断,server 也不会主动
     // 重发 queue_update,只能靠本地缓存 — 若 cache miss(首次进入此 chat)
     // 才置空,等首条 queue_update 灌入。
@@ -3267,7 +4207,7 @@ export function TaskChat({
   // Forward-declared ref for connectChatWs so handlers defined before its
   // useCallback (e.g. the ChatListChanged refetch handler) can call it
   // without creating a TDZ reference that React Compiler refuses to compile.
-  const connectChatWsRef = useRef<(chatId: string) => Promise<void>>(
+  const connectChatWsRef = useRef<(chatId: string, importing?: boolean) => Promise<void>>(
     async () => {},
   );
 
@@ -3390,7 +4330,7 @@ export function TaskChat({
 
   /** Connect a WebSocket for a given chat ID (idempotent) */
   const connectChatWs = useCallback(
-    async (chatId: string) => {
+    async (chatId: string, importing = false) => {
       if (wsMapRef.current.has(chatId)) return; // Already connected
       if (connectingRef.current.has(chatId)) return; // Connection already in-flight
       // Terminal-mode chats have no ACP WebSocket — they speak PTY only.
@@ -3413,7 +4353,7 @@ export function TaskChat({
       const host = getApiHost();
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const url = await appendHmacToUrl(
-        `${protocol}//${host}/api/v1/projects/${projectId}/tasks/${task.id}/chats/${chatId}/ws`,
+        `${protocol}//${host}/api/v1/projects/${projectId}/tasks/${task.id}/chats/${chatId}/ws${importing ? "?import=true" : ""}`,
       );
 
       connectingRef.current.delete(chatId);
@@ -3430,6 +4370,10 @@ export function TaskChat({
       };
 
       ws.onmessage = (event) => {
+        // Ignore messages already queued by a socket that Reconnect replaced.
+        // Otherwise a late `session_ended` from the old owner can downgrade
+        // the state established by the successor connection.
+        if (wsMapRef.current.get(chatId) !== ws) return;
         try {
           const data = JSON.parse(event.data);
           // Permanent-failure check: if backend says "Resume session failed"
@@ -3445,7 +4389,9 @@ export function TaskChat({
           if (
             data?.type === "error" &&
             typeof data.message === "string" &&
-            data.message.includes("Resume session failed")
+            ["Resume session failed", "Load session failed", "Import session failed"].some(
+              (failure) => data.message.includes(failure),
+            )
           ) {
             intentionalCloseRef.current.add(chatId);
             cancelPendingReconnectRef.current(chatId);
@@ -3466,6 +4412,10 @@ export function TaskChat({
       };
 
       ws.onclose = (ev) => {
+        // A manually replaced socket may close after its successor has already
+        // been installed. Never let that stale callback delete or downgrade
+        // the new connection. (upstream 0.12)
+        if (wsMapRef.current.get(chatId) !== ws) return;
         wsMapRef.current.delete(chatId);
         console.warn(
           `[grove-ws] closed chat ${chatId}: code=${ev.code} reason=${ev.reason || "(none)"} clean=${ev.wasClean} attempt=${reconnectAttemptRef.current.get(chatId) ?? 0}`,
@@ -3600,12 +4550,20 @@ export function TaskChat({
   useEffect(() => {
     if (!activeChatId) return;
     const chatId = activeChatId;
-    historyLoadingRef.current = true;
-    wsEventBufferRef.current = [];
+    const isInitialImport = initialImportChatIdRef.current === chatId;
+    historyLoadingRef.current = !isInitialImport;
+    if (!isInitialImport) wsEventBufferRef.current = [];
     (async () => {
       // Step 1: Connect WS for real-time events
       await connectChatWs(chatId);
       wsRef.current = wsMapRef.current.get(chatId) ?? null;
+      // A newly imported chat has no Grove history yet. Its first render is
+      // the live session/load replay; later opens use the normal HTTP history
+      // path because this marker is deliberately one-shot and in-memory.
+      if (isInitialImport) {
+        initialImportChatIdRef.current = null;
+        return;
+      }
       // Step 2: Load history from HTTP (one-shot, avoids "过电影" effect)
       if (chatId !== getActiveChatId()) return;
       let res: Awaited<ReturnType<typeof getChatHistory>>;
@@ -3619,8 +4577,12 @@ export function TaskChat({
       if (chatId !== getActiveChatId()) return;
       {
         let msgs: ChatMessage[] = [];
+        let historicalPlanEntries: PlanEntry[] | null = null;
         for (const evt of res.events) {
           msgs = reduceHistoryMessages(msgs, evt);
+          if (evt.type === "plan_update") {
+            historicalPlanEntries = normalizePlanEntries(evt.entries);
+          }
         }
         // Drain buffered WS events that arrived during HTTP load
         const buffered = wsEventBufferRef.current;
@@ -3639,6 +4601,12 @@ export function TaskChat({
         msgs = prunedHistory.messages;
         setMessages(msgs);
         updateHiddenMessageCount(prunedHistory.hiddenMessageCount);
+        if (historicalPlanEntries) {
+          setPlanEntries(historicalPlanEntries);
+          // Restored history exposes the Todo pill without unexpectedly
+          // opening the composer panel on every app launch.
+          setShowPlan(false);
+        }
         // Keep attachment numbering based on full history, even when old
         // rendered messages are hidden from the view.
         attachCountersRef.current = attachmentCounters;
@@ -3648,34 +4616,33 @@ export function TaskChat({
             case "session_ready":
               setIsConnected(true);
               onConnectedPropRef.current?.();
-              if (evt.available_modes?.length) {
+              if (evt.uses_config_options || (Array.isArray(evt.config_options) && evt.config_options.length > 0)) {
+                applyConfigOptionsSnapshot(evt.config_options ?? []);
+              } else {
+                setSessionConfigOptions([]);
                 setModeOptions(
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  evt.available_modes.map((m: any) => ({
+                  (evt.available_modes ?? []).map((m: { id: string; name: string; description?: string }) => ({
                     label: m.name,
                     value: m.id,
+                    description: m.description,
                   })),
                 );
-              }
-              if (evt.current_mode_id) setPermissionLevel(evt.current_mode_id);
-              if (evt.available_models?.length) {
+                setPermissionLevel(evt.current_mode_id ?? "");
                 setModelOptions(
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  evt.available_models.map((m: any) => ({
+                  (evt.available_models ?? []).map((m: { id: string; name: string }) => ({
                     label: m.name,
                     value: m.id,
                   })),
                 );
-              }
-              if (evt.current_model_id) setSelectedModel(evt.current_model_id);
-              if (evt.available_thought_levels?.length) {
+                setSelectedModel(evt.current_model_id ?? "");
                 setThoughtLevelOptions(
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  evt.available_thought_levels.map((t: any) => ({
+                  (evt.available_thought_levels ?? []).map((t: { id: string; name: string }) => ({
                     label: t.name,
                     value: t.id,
                   })),
                 );
+                setThoughtLevel(evt.current_thought_level_id ?? "");
+                setThoughtLevelConfigId(evt.thought_level_config_id ?? "");
               }
               if (evt.current_thought_level_id)
                 setThoughtLevel(evt.current_thought_level_id);
@@ -3699,6 +4666,26 @@ export function TaskChat({
                 });
               }
               setForkCapable(!!evt.fork_capable);
+              setImportCapable(!!evt.import_capable);
+              setDeleteCapable(!!evt.delete_capable);
+              setAuthMethods(evt.auth_methods ?? []);
+              setLogoutCapable(!!evt.logout_capable);
+              {
+                const state =
+                  perChatStateRef.current.get(chatId) ?? defaultPerChatState();
+                state.isConnected = true;
+                state.forkCapable = !!evt.fork_capable;
+                state.importCapable = !!evt.import_capable;
+                state.deleteCapable = !!evt.delete_capable;
+                state.authMethods = evt.auth_methods ?? [];
+                state.logoutCapable = !!evt.logout_capable;
+                perChatStateRef.current.set(chatId, state);
+              }
+              if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                wsRef.current.send(
+                  JSON.stringify({ type: "set_queue_mode", mode: loadQueueMode() }),
+                );
+              }
               break;
             case "thought_levels_update":
               setThoughtLevelOptions(
@@ -3711,15 +4698,26 @@ export function TaskChat({
               setThoughtLevel(evt.current ?? "");
               setThoughtLevelConfigId(evt.config_id ?? "");
               break;
+            case "config_options_update":
+              applyConfigOptionsSnapshot(evt.config_options ?? []);
+              break;
             case "busy":
               updateBusy(true);
               break;
             case "complete":
               updateBusy(false);
               break;
-            case "plan_update":
-              setPlanEntries(evt.entries || []);
+            case "plan_update": {
+              const entries = normalizePlanEntries(evt.entries);
+              const shouldOpen = shouldOpenPlan(entries);
+              setPlanEntries(entries);
+              setShowPlan(shouldOpen);
+              if (shouldOpen) {
+                setShowPlanFile(false);
+                setShowPendingQueue(false);
+              }
               break;
+            }
             case "queue_update":
               setPendingMessages(
                 (evt.messages ?? []).map(
@@ -3766,36 +4764,34 @@ export function TaskChat({
         const hadSessionReady = buffered.some((e) => e.type === "session_ready");
         if (!hadSessionReady && res.session) {
           const s = res.session;
-          if (s.available_modes?.length) {
+          if (s.uses_config_options || (Array.isArray(s.config_options) && s.config_options.length > 0)) {
+            applyConfigOptionsSnapshot(s.config_options ?? []);
+          } else {
+            setSessionConfigOptions([]);
             setModeOptions(
-              s.available_modes.map(([id, name]) => ({
+              (s.available_modes ?? []).map(([id, name]) => ({
                 label: name,
                 value: id,
+                description: s.mode_descriptions?.[id],
               })),
             );
-          }
-          if (s.current_mode_id) setPermissionLevel(s.current_mode_id);
-          if (s.available_models?.length) {
+            setPermissionLevel(s.current_mode_id ?? "");
             setModelOptions(
-              s.available_models.map(([id, name]) => ({
+              (s.available_models ?? []).map(([id, name]) => ({
                 label: name,
                 value: id,
               })),
             );
-          }
-          if (s.current_model_id) setSelectedModel(s.current_model_id);
-          if (s.available_thought_levels?.length) {
+            setSelectedModel(s.current_model_id ?? "");
             setThoughtLevelOptions(
-              s.available_thought_levels.map(([id, name]) => ({
+              (s.available_thought_levels ?? []).map(([id, name]) => ({
                 label: name,
                 value: id,
               })),
             );
+            setThoughtLevel(s.current_thought_level_id ?? "");
+            setThoughtLevelConfigId(s.thought_level_config_id ?? "");
           }
-          if (s.current_thought_level_id)
-            setThoughtLevel(s.current_thought_level_id);
-          if (s.thought_level_config_id)
-            setThoughtLevelConfigId(s.thought_level_config_id);
           if (s.prompt_capabilities) {
             setPromptCaps({
               image: s.prompt_capabilities.image ?? false,
@@ -3804,7 +4800,9 @@ export function TaskChat({
                 s.prompt_capabilities.embedded_context ?? false,
             });
           }
-          if (s.available_commands?.length) {
+          // An empty list is an authoritative ACP snapshot: it means the
+          // Agent removed every command and must clear any cached menu.
+          if (s.available_commands) {
             setSlashCommands(
               s.available_commands.map((c) => ({
                 name: c.name,
@@ -3841,7 +4839,7 @@ export function TaskChat({
     // loading after this effect's first run (when launch_mode was still
     // undefined → connectChatWs bailed), the effect re-fires with the
     // resolved mode and routes the chat correctly (ACP WS vs PTY-only).
-  }, [activeChatId, activeChat?.launch_mode, connectChatWs, projectId, task.id, updateBusy, chatRenderWindowSettings, updateHiddenMessageCount, getActiveChatId, seedChatDefaults]);
+  }, [activeChatId, activeChat?.launch_mode, connectChatWs, projectId, task.id, updateBusy, chatRenderWindowSettings, updateHiddenMessageCount, getActiveChatId, seedChatDefaults, applyConfigOptionsSnapshot]);
 
   // Cleanup all WebSockets on unmount, plus any pending reconnect timers —
   // otherwise an in-flight backoff timer fires after unmount and creates a
@@ -3990,34 +4988,35 @@ export function TaskChat({
           setConnectPhase(null);
           setConnectPhaseStartedAt(null);
           onConnectedProp?.();
-          // Dynamic modes/models from agent
-          if (msg.available_modes?.length) {
+          if (msg.uses_config_options || (Array.isArray(msg.config_options) && msg.config_options.length > 0)) {
+            applyConfigOptionsSnapshot(msg.config_options ?? []);
+          } else {
+            setSessionConfigOptions([]);
             setModeOptions(
-              msg.available_modes.map((m: { id: string; name: string }) => ({
+              (msg.available_modes ?? []).map((m: { id: string; name: string; description?: string }) => ({
                 label: m.name,
                 value: m.id,
+                description: m.description,
               })),
             );
-          }
-          if (msg.current_mode_id) setPermissionLevel(msg.current_mode_id);
-          if (msg.available_models?.length) {
+            setPermissionLevel(msg.current_mode_id ?? "");
             setModelOptions(
-              msg.available_models.map((m: { id: string; name: string }) => ({
+              (msg.available_models ?? []).map((m: { id: string; name: string }) => ({
                 label: m.name,
                 value: m.id,
               })),
             );
-          }
-          if (msg.current_model_id) setSelectedModel(msg.current_model_id);
-          if (msg.available_thought_levels?.length) {
+            setSelectedModel(msg.current_model_id ?? "");
             setThoughtLevelOptions(
-              msg.available_thought_levels.map(
+              (msg.available_thought_levels ?? []).map(
                 (t: { id: string; name: string }) => ({
                   label: t.name,
                   value: t.id,
                 }),
               ),
             );
+            setThoughtLevel(msg.current_thought_level_id ?? "");
+            setThoughtLevelConfigId(msg.thought_level_config_id ?? "");
           }
           if (msg.current_thought_level_id)
             setThoughtLevel(msg.current_thought_level_id);
@@ -4040,6 +5039,61 @@ export function TaskChat({
             });
           }
           setForkCapable(!!msg.fork_capable);
+          setImportCapable(!!msg.import_capable);
+          setDeleteCapable(!!msg.delete_capable);
+          setAuthMethods(msg.auth_methods ?? []);
+          setLogoutCapable(!!msg.logout_capable);
+          // A live session_ready is the authoritative snapshot for this chat.
+          // Keep the per-chat cache in sync as well as the visible controls;
+          // otherwise a later chat switch/delete restores the default false
+          // capabilities even though this WebSocket is still connected.
+          {
+            const chatId = getActiveChatId();
+            if (chatId) {
+              const state =
+                perChatStateRef.current.get(chatId) ?? defaultPerChatState();
+              state.isConnected = true;
+              if (msg.uses_config_options || (Array.isArray(msg.config_options) && msg.config_options.length > 0)) {
+                applyConfigOptionsToCachedState(state, msg.config_options ?? []);
+              } else {
+                state.sessionConfigOptions = [];
+                state.modeOptions = (msg.available_modes ?? []).map(
+                  (mode: { id: string; name: string; description?: string }) => ({
+                    label: mode.name,
+                    value: mode.id,
+                    description: mode.description,
+                  }),
+                );
+                state.permissionLevel = msg.current_mode_id ?? "";
+                state.modelOptions = (msg.available_models ?? []).map(
+                  (model: { id: string; name: string }) => ({
+                    label: model.name,
+                    value: model.id,
+                  }),
+                );
+                state.selectedModel = msg.current_model_id ?? "";
+                state.thoughtLevelOptions = (msg.available_thought_levels ?? []).map(
+                  (level: { id: string; name: string }) => ({
+                    label: level.name,
+                    value: level.id,
+                  }),
+                );
+                state.thoughtLevel = msg.current_thought_level_id ?? "";
+                state.thoughtLevelConfigId = msg.thought_level_config_id ?? "";
+              }
+              state.forkCapable = !!msg.fork_capable;
+              state.importCapable = !!msg.import_capable;
+              state.deleteCapable = !!msg.delete_capable;
+              state.authMethods = msg.auth_methods ?? [];
+              state.logoutCapable = !!msg.logout_capable;
+              perChatStateRef.current.set(chatId, state);
+            }
+          }
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            wsRef.current.send(
+              JSON.stringify({ type: "set_queue_mode", mode: loadQueueMode() }),
+            );
+          }
           break;
         case "session_recovered":
           // Server auto-started a fresh agent after the saved session was gone
@@ -4053,6 +5107,7 @@ export function TaskChat({
           );
           break;
         case "message_chunk":
+        case "message_content_chunk":
           // Auto-close the current tool section (one-time)
           setAutoExpandSectionId((prev) => {
             if (prev) {
@@ -4120,6 +5175,9 @@ export function TaskChat({
               .catch(() => {});
           }
           break;
+        case "terminal_output_update":
+          setMessages((prev) => reduceHistoryMessages(prev, msg));
+          break;
         case "permission_request":
           setShowPermissionPanel(true);
           setShowPlan(false);
@@ -4132,6 +5190,12 @@ export function TaskChat({
           setMessages((prev) => reduceHistoryMessages(prev, msg));
           break;
         case "ask_form":
+          setMessages((prev) => reduceHistoryMessages(prev, msg));
+          break;
+        case "elicitation_request":
+        case "elicitation_resolved":
+        case "elicitation_validation_error":
+        case "elicitation_complete":
           setMessages((prev) => reduceHistoryMessages(prev, msg));
           break;
         case "complete":
@@ -4188,7 +5252,9 @@ export function TaskChat({
           } else {
             setMessages((prev) => [
               ...prev,
-              { type: "system", content: `Error: ${msg.message}` },
+              // The server message already carries the Agent/ACP error label.
+              // Do not stack another presentation prefix on top of it.
+              { type: "system", content: msg.message },
             ]);
             updateBusy(false);
             onChatBecameIdle?.();
@@ -4233,11 +5299,68 @@ export function TaskChat({
           );
           break;
         }
+        case "auth_failed": {
+          const errorMessage =
+            typeof msg.message === "string"
+              ? msg.message
+              : "Authentication failed. Please try again.";
+          setMessages((prev) => {
+            const next = [...prev];
+            for (let i = next.length - 1; i >= 0; i -= 1) {
+              const message = next[i];
+              if (
+                message.type === "auth_required" &&
+                message.status === "in_progress"
+              ) {
+                next[i] = { ...message, status: "failed", errorMessage };
+                break;
+              }
+            }
+            return next;
+          });
+          updateBusy(false);
+          onChatBecameIdle?.();
+          break;
+        }
+        case "auth_logged_out":
+          setMessages((prev) => [
+            ...prev,
+            { type: "system", content: `Signed out of ${agentLabel}.` },
+          ]);
+          break;
         case "mode_changed":
           setPermissionLevel(msg.mode_id);
+          setPendingConfigIds((previous) => {
+            const next = new Set(previous);
+            next.delete("__legacy_mode");
+            return next;
+          });
           break;
         case "model_changed":
           setSelectedModel(msg.model_id);
+          break;
+        case "config_options_update":
+          applyConfigOptionsSnapshot(msg.config_options ?? []);
+          {
+            const chatId = getActiveChatId();
+            if (chatId) {
+              const state =
+                perChatStateRef.current.get(chatId) ?? defaultPerChatState();
+              applyConfigOptionsToCachedState(state, msg.config_options ?? []);
+              perChatStateRef.current.set(chatId, state);
+            }
+          }
+          break;
+        case "config_option_error":
+          setPendingConfigIds((previous) => {
+            const next = new Set(previous);
+            next.delete(msg.config_id);
+            return next;
+          });
+          setMessages((previous) => [
+            ...previous,
+            { type: "system", content: msg.message },
+          ]);
           break;
         case "thought_levels_update":
           setThoughtLevelOptions(
@@ -4252,13 +5375,10 @@ export function TaskChat({
           setThoughtLevelConfigId(msg.config_id ?? "");
           break;
         case "plan_update": {
-          const entries: PlanEntry[] = msg.entries ?? [];
+          const entries = normalizePlanEntries(msg.entries);
           setPlanEntries(entries);
           // Auto-expand while in progress, auto-collapse when all done
-          const allDone =
-            entries.length > 0 &&
-            entries.every((e: PlanEntry) => e.status === "completed");
-          const shouldOpen = !allDone;
+          const shouldOpen = shouldOpenPlan(entries);
           setShowPlan(shouldOpen);
           if (shouldOpen) {
             setShowPlanFile(false);
@@ -4289,7 +5409,7 @@ export function TaskChat({
           setSlashCommands(msg.commands ?? []);
           break;
         case "usage_update":
-          // ACP `unstable_session_usage` — context window pill data.
+          // ACP v1 `usage_update` — context window pill data.
           // Agent decides cadence (typically once per turn). No debouncing.
           setContextUsage({
             used: Number(msg.used) || 0,
@@ -4356,7 +5476,7 @@ export function TaskChat({
           break;
       }
     },
-    [onConnectedProp, enableAutoStickToBottom, onChatBecameIdle, updateBusy, pruneActiveChatMessages, setAutoExpandSectionId, getActiveChatId, seedChatDefaults],
+    [agentLabel, onConnectedProp, enableAutoStickToBottom, getActiveChatId, onChatBecameIdle, updateBusy, pruneActiveChatMessages, setAutoExpandSectionId, applyConfigOptionsSnapshot, seedChatDefaults],
   );
 
   /** Buffer a server message into the per-chat cache (for non-active chats) */
@@ -4368,33 +5488,34 @@ export function TaskChat({
       switch (msg.type) {
         case "session_ready":
           state.isConnected = true;
-          if (msg.available_modes?.length)
-            state.modeOptions = msg.available_modes.map(
+          if (msg.uses_config_options || (Array.isArray(msg.config_options) && msg.config_options.length > 0)) {
+            applyConfigOptionsToCachedState(state, msg.config_options ?? []);
+          } else {
+            state.sessionConfigOptions = [];
+            state.modeOptions = (msg.available_modes ?? []).map(
+              (m: { id: string; name: string; description?: string }) => ({
+                label: m.name,
+                value: m.id,
+                description: m.description,
+              }),
+            );
+            state.permissionLevel = msg.current_mode_id ?? "";
+            state.modelOptions = (msg.available_models ?? []).map(
               (m: { id: string; name: string }) => ({
                 label: m.name,
                 value: m.id,
               }),
             );
-          if (msg.current_mode_id) state.permissionLevel = msg.current_mode_id;
-          if (msg.available_models?.length)
-            state.modelOptions = msg.available_models.map(
-              (m: { id: string; name: string }) => ({
-                label: m.name,
-                value: m.id,
-              }),
-            );
-          if (msg.current_model_id) state.selectedModel = msg.current_model_id;
-          if (msg.available_thought_levels?.length)
-            state.thoughtLevelOptions = msg.available_thought_levels.map(
+            state.selectedModel = msg.current_model_id ?? "";
+            state.thoughtLevelOptions = (msg.available_thought_levels ?? []).map(
               (t: { id: string; name: string }) => ({
                 label: t.name,
                 value: t.id,
               }),
             );
-          if (msg.current_thought_level_id)
-            state.thoughtLevel = msg.current_thought_level_id;
-          if (msg.thought_level_config_id)
-            state.thoughtLevelConfigId = msg.thought_level_config_id;
+            state.thoughtLevel = msg.current_thought_level_id ?? "";
+            state.thoughtLevelConfigId = msg.thought_level_config_id ?? "";
+          }
           if (msg.prompt_capabilities) {
             state.promptCaps = {
               image: msg.prompt_capabilities.image ?? false,
@@ -4404,6 +5525,18 @@ export function TaskChat({
             };
           }
           state.forkCapable = !!msg.fork_capable;
+          state.importCapable = !!msg.import_capable;
+          state.deleteCapable = !!msg.delete_capable;
+          state.authMethods = msg.auth_methods ?? [];
+          state.logoutCapable = !!msg.logout_capable;
+          {
+            const bgWs = wsMapRef.current.get(chatId);
+            if (bgWs && bgWs.readyState === WebSocket.OPEN) {
+              bgWs.send(
+                JSON.stringify({ type: "set_queue_mode", mode: loadQueueMode() }),
+              );
+            }
+          }
           break;
         case "thought_levels_update":
           state.thoughtLevelOptions = (msg.available ?? []).map(
@@ -4414,6 +5547,21 @@ export function TaskChat({
           );
           state.thoughtLevel = msg.current ?? "";
           state.thoughtLevelConfigId = msg.config_id ?? "";
+          break;
+        case "config_options_update":
+          applyConfigOptionsToCachedState(state, msg.config_options ?? []);
+          break;
+        case "config_option_error":
+          state.messages = [
+            ...state.messages,
+            { type: "system", content: msg.message },
+          ];
+          break;
+        case "mode_changed":
+          state.permissionLevel = msg.mode_id;
+          break;
+        case "model_changed":
+          state.selectedModel = msg.model_id;
           break;
         case "usage_update":
           state.contextUsage = {
@@ -4428,9 +5576,11 @@ export function TaskChat({
           };
           break;
         case "message_chunk":
+        case "message_content_chunk":
         case "tool_call":
         case "thought_chunk":
         case "tool_call_update":
+        case "terminal_output_update":
         case "permission_request":
         case "permission_response":
         case "complete":
@@ -4477,9 +5627,12 @@ export function TaskChat({
             state.hiddenMessageCount = pruned.hiddenMessageCount;
           }
           break;
-        case "plan_update":
-          state.planEntries = msg.entries ?? [];
+        case "plan_update": {
+          const entries = normalizePlanEntries(msg.entries);
+          state.planEntries = entries;
+          state.showPlan = shouldOpenPlan(entries);
           break;
+        }
         case "plan_file_update":
           state.planFilePath = msg.path;
           if (msg.content) {
@@ -4488,6 +5641,12 @@ export function TaskChat({
           break;
         case "available_commands":
           state.slashCommands = msg.commands ?? [];
+          break;
+        case "auth_logged_out":
+          state.messages = [
+            ...state.messages,
+            { type: "system", content: "Signed out of the agent." },
+          ];
           break;
         case "session_ended":
           state.isConnected = false;
@@ -4687,11 +5846,24 @@ export function TaskChat({
 
   // ─── Chat deletion ─────────────────────────────────────────────────────
 
+  const requestDeleteChat = useCallback(
+    (chatId: string) => {
+      setShowChatMenu(false);
+      setDeleteError(null);
+      setDeleteConfirmTargetCapable(
+        chatId === activeChatId && isConnected && !isRemoteSession && deleteCapable,
+      );
+      setDeleteConfirmChatId(chatId);
+    },
+    [activeChatId, deleteCapable, isConnected, isRemoteSession],
+  );
+
   const handleDeleteChat = useCallback(
-    async (chatId: string) => {
+    async (chatId: string, scope: "grove" | "agent") => {
       if (chats.length <= 1) return; // Don't delete the last chat
+      setIsDeletingChat(true);
       try {
-        await deleteChat(projectId, task.id, chatId);
+        await deleteChat(projectId, task.id, chatId, scope);
         // Close WebSocket if connected; cancel any pending reconnect timer so
         // it doesn't fire later trying to reconnect a deleted chat.
         const ws = wsMapRef.current.get(chatId);
@@ -4714,8 +5886,14 @@ export function TaskChat({
           }
           return updated;
         });
+        setDeleteConfirmChatId(null);
+        setDeleteConfirmTargetCapable(false);
+        setDeleteError(null);
       } catch (err) {
         console.error("Failed to delete chat:", err);
+        setDeleteError(apiErrorMessage(err));
+      } finally {
+        setIsDeletingChat(false);
       }
       setShowChatMenu(false);
     },
@@ -4751,6 +5929,57 @@ export function TaskChat({
     },
     [projectId, task.id, pinnedChatId, restoreChatState, setActiveChatId],
   );
+
+  const loadImportSessions = useCallback(async (cursor?: string) => {
+    if (!activeChatId || importLoading) return;
+    const requestedChatId = activeChatId;
+    const requestId = ++importRequestRef.current;
+    setImportLoading(true);
+    try {
+      const page = await listImportSessions(projectId, task.id, requestedChatId, cursor);
+      if (importRequestRef.current !== requestId || getActiveChatId() !== requestedChatId) return;
+      setImportSessions((previous) => cursor ? [...previous, ...page.sessions] : page.sessions);
+      setImportNextCursor(page.next_cursor);
+    } catch (error) {
+      if (importRequestRef.current !== requestId || getActiveChatId() !== requestedChatId) return;
+      setMessages((previous) => appendSystemMessage(previous, `Import list failed: ${error instanceof Error ? error.message : String(error)}`));
+    } finally {
+      if (importRequestRef.current === requestId && getActiveChatId() === requestedChatId) {
+        setImportLoading(false);
+      }
+    }
+  }, [activeChatId, getActiveChatId, importLoading, projectId, task.id]);
+
+  const handleImportSession = useCallback(async (session: ImportableSession) => {
+    if (!activeChatId || importLoading) return;
+    setImportLoading(true);
+    try {
+      const created = await importSession(projectId, task.id, activeChatId, session);
+      if (!chatsRef.current.some((chat) => chat.id === created.id)) {
+        chatsRef.current = [...chatsRef.current, created];
+      }
+      setChats((previous) =>
+        previous.some((chat) => chat.id === created.id)
+          ? previous
+          : [...previous, created],
+      );
+      saveCurrentChatState();
+      // Claim the connection synchronously with the one-shot import flag. The
+      // normal active-chat effect sees connectingRef and cannot replace it.
+      initialImportChatIdRef.current = created.id;
+      const connecting = connectChatWs(created.id, true);
+      setActiveChatId(created.id);
+      writeLastActiveTab("chat", projectId, task.id, created.id);
+      restoreChatState(created.id);
+      await connecting;
+      wsRef.current = wsMapRef.current.get(created.id) ?? null;
+      setImportSessions((previous) => previous.filter((item) => item.session_id !== session.session_id));
+    } catch (error) {
+      setMessages((previous) => appendSystemMessage(previous, `Import failed: ${error instanceof Error ? error.message : String(error)}`));
+    } finally {
+      setImportLoading(false);
+    }
+  }, [activeChatId, connectChatWs, importLoading, projectId, restoreChatState, saveCurrentChatState, setActiveChatId, task.id]);
 
   // ─── User actions ────────────────────────────────────────────────────────
 
@@ -5017,6 +6246,8 @@ export function TaskChat({
           ? { ...m, resolved: "Cancelled" }
           : m.type === "ask_form" && !m.resolved
             ? { ...m, resolved: true }
+            : m.type === "elicitation" && !m.resolved
+              ? { ...m, resolved: "cancel" as const }
             : m,
       ),
     );
@@ -5050,13 +6281,15 @@ export function TaskChat({
     setIsSavingToNote(false);
   }, [planFileContent, isSavingToNote, projectId, task.id]);
 
-  // Bundle current model/mode/thought_level into a `config` object for every
-  // prompt/queue_message send. The backend cmd_loop applies these as ACP
-  // SetSessionMode/Model/ThoughtLevel requests right before the prompt itself —
-  // so per-prompt config swaps land in the correct order even when the user
-  // toggles selectors between rapid sends. Replaces the old set_mode/set_model/
-  // set_thought_level standalone WS messages.
+  // Legacy compatibility for queued messages created before full ACP
+  // configOptions support. New sessions change settings immediately and do
+  // not capture per-prompt snapshots.
   const buildPromptConfig = useCallback(() => {
+    // New configOptions-aware sessions apply settings immediately and use
+    // the Agent's authoritative session state when a queued prompt is later
+    // dispatched. Keep the legacy bundle only for old sessions/messages that
+    // predate full config snapshots.
+    if (sessionConfigOptions.length > 0) return undefined;
     const cfg: {
       model?: string;
       mode?: string;
@@ -5070,7 +6303,7 @@ export function TaskChat({
       cfg.thought_level_config_id = thoughtLevelConfigId;
     }
     return Object.keys(cfg).length === 0 ? undefined : cfg;
-  }, [selectedModel, permissionLevel, thoughtLevel, thoughtLevelConfigId]);
+  }, [sessionConfigOptions.length, selectedModel, permissionLevel, thoughtLevel, thoughtLevelConfigId]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -5321,6 +6554,7 @@ export function TaskChat({
             data: att.data,
             label: att.label,
             mime_type: att.mimeType,
+            ...(att.type === "image" && att.uri ? { uri: att.uri } : {}),
           }),
     }));
 
@@ -5353,6 +6587,7 @@ export function TaskChat({
       setShowPendingQueue(true);
       setShowPlan(false);
       setShowPlanFile(false);
+      setShowMemoryPanel(false);
       onUserMessageSent?.();
       el.focus();
     } else {
@@ -5409,12 +6644,15 @@ export function TaskChat({
       }),
     );
     clearPreviewCommentDrafts(comments.map((comment) => comment.id));
+    setEditingPreviewCommentId(null);
+    setEditingPreviewCommentText("");
     setShowPreviewComments(false);
     setShowSlashMenu(false);
     setShowFileMenu(false);
     setShowPendingQueue(isBusy);
     setShowPlan(false);
     setShowPlanFile(false);
+    setShowMemoryPanel(false);
     // Part B: 删乐观 updateBusy — 等后端事件
     onUserMessageSent?.();
   }, [
@@ -5485,12 +6723,15 @@ export function TaskChat({
     wsRef.current.send(JSON.stringify({ type: "cancel" }));
   }, [isCancelling]);
 
-  // 不再发 pause_queue:后端不暂停队列,而是在 save/delete 时按 id 定位 —
-  // 找不到(已被 drain 走)就回一个 queue_message_gone 让前端关编辑态。
+  // 编辑排队消息期间暂停队列 auto-send,避免 agent 变 idle 时把队列里的旧文本
+  // 弹出发送,覆盖用户正在进行的编辑。save/cancel 都要 resume。
   const handleEditPending = useCallback(
     (msg: { id: string; text: string }) => {
       setEditingPendingId(msg.id);
       setEditingPendingValue(msg.text);
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "pause_queue" }));
+      }
     },
     [],
   );
@@ -5516,11 +6757,15 @@ export function TaskChat({
         }),
       );
     }
+    wsRef.current.send(JSON.stringify({ type: "resume_queue" }));
     setEditingPendingId(null);
     setEditingPendingValue("");
   }, [editingPendingId, editingPendingValue]);
 
   const handleCancelPendingEdit = useCallback(() => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "resume_queue" }));
+    }
     setEditingPendingId(null);
     setEditingPendingValue("");
   }, []);
@@ -5542,6 +6787,14 @@ export function TaskChat({
     wsRef.current.send(JSON.stringify({ type: "clear_queue" }));
     setEditingPendingId(null);
     setEditingPendingValue("");
+  }, []);
+
+  const handleSetQueueMode = useCallback((mode: QueueSendMode) => {
+    setQueueMode(mode);
+    saveQueueMode(mode);
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "set_queue_mode", mode }));
+    }
   }, []);
 
   // ── Chat command registrations (catalog: workspace scope) ─────────────
@@ -5579,10 +6832,15 @@ export function TaskChat({
       if (modeOptions.length === 0) return;
       const currentIdx = modeOptions.findIndex((m) => m.value === permissionLevel);
       const nextIdx = (currentIdx + 1) % modeOptions.length;
-      setPermissionLevel(modeOptions[nextIdx].value);
+      const nextMode = modeOptions[nextIdx].value;
+      if (matchedSessionConfig.mode) {
+        requestConfigOptionChange(matchedSessionConfig.mode, nextMode);
+      } else {
+        requestLegacyModeChange(nextMode);
+      }
     },
-    { enabled: () => modeOptions.length > 0 },
-    [modeOptions, permissionLevel],
+    { enabled: () => isConnected && modeOptions.length > 0 },
+    [isConnected, modeOptions, permissionLevel, matchedSessionConfig.mode, requestConfigOptionChange, requestLegacyModeChange],
   );
   useCommand(
     "chat.pending.clear",
@@ -5715,6 +6973,31 @@ export function TaskChat({
     );
   }, []);
 
+  const respondElicitation = useCallback(
+    (
+      id: string,
+      action: "accept" | "decline" | "cancel",
+      content?: Record<string, string | number | boolean | string[]>,
+    ) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+      wsRef.current.send(JSON.stringify({
+        type: "elicitation_response",
+        id,
+        action,
+        ...(content ? { content } : {}),
+      }));
+    },
+    [],
+  );
+
+  const clearElicitationError = useCallback((id: string) => {
+    setMessages((prev) => prev.map((message) =>
+      message.type === "elicitation" && message.id === id
+        ? { ...message, error: undefined }
+        : message,
+    ));
+  }, []);
+
   /** Respond to a permission request. `requestId` correlates with the server's
    * live pending permission so a stale dialog (rendered from history but
    * already cancelled by reconcile) can't be silently accepted. */
@@ -5751,6 +7034,115 @@ export function TaskChat({
     },
     [],
   );
+
+  /** Retry an auth-gated request after the user signs in through the Agent's
+   * external CLI. This is only shown when the Agent advertised no ACP method. */
+  const handleAuthRetry = useCallback((index: number) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    setMessages((prev) =>
+      prev.map((m, i) =>
+        i === index && m.type === "auth_required"
+          ? {
+              ...m,
+              status: "in_progress",
+              activeMethodId: undefined,
+              errorMessage: undefined,
+            }
+          : m,
+      ),
+    );
+    wsRef.current.send(JSON.stringify({ type: "retry_authentication" }));
+  }, []);
+
+  /** Start an advertised authentication method proactively from More. */
+  const handleMenuLogin = useCallback(
+    (method: AuthMethodOption) => {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+      setMessages((prev) => [
+        ...prev,
+        {
+          type: "auth_required",
+          methods: authMethods,
+          agentName: agentLabel,
+          status: "in_progress",
+          activeMethodId: method.id,
+        },
+      ]);
+      setShowAuthPanel(true);
+      wsRef.current.send(
+        JSON.stringify({ type: "authenticate", method_id: method.id }),
+      );
+    },
+    [agentLabel, authMethods],
+  );
+
+  const handleLogout = useCallback(() => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    wsRef.current.send(JSON.stringify({ type: "logout" }));
+  }, []);
+
+  const performReconnect = useCallback(async () => {
+    if (!activeChatId || isReconnecting) return;
+    const chatId = activeChatId;
+    const existingWs = wsMapRef.current.get(chatId);
+    setIsReconnecting(true);
+    setReconnectConfirmOpen(false);
+    cancelPendingReconnectRef.current(chatId);
+    intentionalCloseRef.current.add(chatId);
+
+    try {
+      await reconnectChat(projectId, task.id, chatId);
+
+      // The backend normally closes this socket through SessionEnded. Keep a
+      // local fallback for broken links where that close frame never arrives.
+      if (existingWs && existingWs.readyState !== WebSocket.CLOSED) {
+        existingWs.close();
+      }
+      if (wsMapRef.current.get(chatId) === existingWs) {
+        wsMapRef.current.delete(chatId);
+      }
+      intentionalCloseRef.current.delete(chatId);
+      connectingRef.current.delete(chatId);
+      if (getActiveChatId() === chatId) {
+        wsRef.current = null;
+        setIsConnected(false);
+        updateBusy(false);
+        setPendingMessages([]);
+      } else {
+        const cached = perChatStateRef.current.get(chatId);
+        if (cached) {
+          cached.isConnected = false;
+          cached.isBusy = false;
+          cached.pendingMessages = [];
+        }
+      }
+
+      await connectChatWs(chatId);
+      if (getActiveChatId() === chatId) {
+        wsRef.current = wsMapRef.current.get(chatId) ?? null;
+      }
+    } catch (error) {
+      intentionalCloseRef.current.delete(chatId);
+      const message = `Reconnect failed: ${error instanceof Error ? error.message : String(error)}`;
+      if (getActiveChatId() === chatId) {
+        setMessages((prev) => appendSystemMessage(prev, message));
+      } else {
+        const cached = perChatStateRef.current.get(chatId);
+        if (cached) cached.messages = appendSystemMessage(cached.messages, message);
+      }
+    } finally {
+      setIsReconnecting(false);
+    }
+  }, [activeChatId, connectChatWs, getActiveChatId, isReconnecting, projectId, task.id, updateBusy]);
+
+  const handleReconnect = useCallback(() => {
+    if (isReconnecting) return;
+    if (isBusy || pendingMessages.length > 0) {
+      setReconnectConfirmOpen(true);
+      return;
+    }
+    void performReconnect();
+  }, [isBusy, isReconnecting, pendingMessages.length, performReconnect]);
 
   const triggerProjectFilesLoad = useCallback((projectName: string) => {
     const project = allProjects.find(p => p.name.toLowerCase() === projectName.toLowerCase());
@@ -6336,11 +7728,29 @@ export function TaskChat({
     [checkContent],
   );
 
-  /** Strip HTML on paste — insert plain text or handle image paste */
+  /** Strip HTML on paste — upload copied files/images or insert plain text. */
   const handlePaste = useCallback(
     (e: React.ClipboardEvent) => {
-      // Check for image paste
       const items = Array.from(e.clipboardData.items);
+      // Finder/Explorer file copy commonly includes both a real File and a
+      // text/plain filename. Handle the file payload first so the browser's
+      // default paste does not leave only that filename in the composer.
+      const clipboardFiles = Array.from(e.clipboardData.files);
+      if (clipboardFiles.length === 0) {
+        for (const item of items) {
+          if (item.kind !== "file") continue;
+          const file = item.getAsFile();
+          if (file) clipboardFiles.push(file);
+        }
+      }
+      if (clipboardFiles.length > 0) {
+        e.preventDefault();
+        clipboardFiles.forEach((file) => void addFileAsAttachment(file));
+        return;
+      }
+
+      // Some screenshot clipboard payloads expose only a DataTransferItem,
+      // not clipboardData.files.
       const imageItem = items.find((i) => i.type.startsWith("image/"));
       if (imageItem && promptCaps.image) {
         e.preventDefault();
@@ -6774,17 +8184,257 @@ export function TaskChat({
     ],
   );
 
-  const toggleThinkingCollapse = useCallback((index: number) => {
-    setMessages((prev) =>
-      prev.map((m, i) =>
-        i === index && m.type === "thinking"
-          ? { ...m, collapsed: !m.collapsed }
-          : m,
-      ),
+  const renderItems = useMemo(
+    () => buildRenderItems(messages, isBusy),
+    [messages, isBusy],
+  );
+  // The minimap is deliberately derived from the same `messages` state that
+  // renders the chat. It is therefore immediately available for loaded
+  // history and updates as an assistant streams, with no second history API.
+  const conversationTurns = useMemo(
+    () => buildConversationTurns(messages, renderItems),
+    [messages, renderItems],
+  );
+  const shouldVirtualizeChat = shouldVirtualizeTaskChat(
+    conversationTurns.length,
+    TASK_CHAT_RECENT_TURN_HOT_ZONE,
+  );
+  const recentTurnStartRenderIndex =
+    conversationTurns[
+      Math.max(0, conversationTurns.length - TASK_CHAT_RECENT_TURN_HOT_ZONE)
+    ]?.renderIndex ?? 0;
+  const virtualizedRenderItems = shouldVirtualizeChat
+    ? renderItems.slice(0, recentTurnStartRenderIndex)
+    : renderItems;
+  const rowHeightCachePrefix = `${activeChatId ?? "none"}:${hiddenMessageCount}`;
+  const rowHeightCacheScope = `${rowHeightCachePrefix}:${measurementWidth}`;
+  const measuredHeightKey = useCallback(
+    (item: RenderItem) => `${rowHeightCacheScope}:${renderItemKey(item)}`,
+    [rowHeightCacheScope],
+  );
+  const recordMeasuredRowHeight = useCallback(
+    (key: string, height: number, width: number) => {
+      const scopedKey = `${rowHeightCachePrefix}:${width}:${key}`;
+      if (measuredRowHeights.get(scopedKey) === height) return;
+      measuredRowHeights.set(scopedKey, height);
+      // Keep the cache bounded across chat switches and width generations.
+      // Map iteration is insertion ordered, so discard the oldest samples.
+      while (measuredRowHeights.size > 5_000) {
+        const oldestKey = measuredRowHeights.keys().next().value;
+        if (oldestKey === undefined) break;
+        measuredRowHeights.delete(oldestKey);
+      }
+    },
+    [measuredRowHeights, rowHeightCachePrefix],
+  );
+  const recordMeasuredRowHeightRef = useRef(recordMeasuredRowHeight);
+  useEffect(() => {
+    recordMeasuredRowHeightRef.current = recordMeasuredRowHeight;
+  }, [recordMeasuredRowHeight]);
+  const measuredElementKeysRef = useRef(new WeakMap<Element, string>());
+  const rowResizeObserverRef = useRef<ResizeObserver | null>(null);
+  const observeMeasuredRow = useCallback(
+    (element: HTMLDivElement, key: string, observing: boolean) => {
+      if (!observing) {
+        rowResizeObserverRef.current?.unobserve(element);
+        measuredElementKeysRef.current.delete(element);
+        return;
+      }
+      measuredElementKeysRef.current.set(element, key);
+      const measure = (target: Element) => {
+        const measuredKey = measuredElementKeysRef.current.get(target);
+        if (!measuredKey) return;
+        const rect = target.getBoundingClientRect();
+        const height = Math.ceil(rect.height);
+        const width = Math.round(rect.width);
+        if (height > 0 && width > 0) {
+          recordMeasuredRowHeightRef.current(measuredKey, height, width);
+        }
+      };
+      measure(element);
+      if (typeof ResizeObserver === "undefined") return;
+      if (!rowResizeObserverRef.current) {
+        rowResizeObserverRef.current = new ResizeObserver((entries) => {
+          for (const entry of entries) measure(entry.target);
+        });
+      }
+      rowResizeObserverRef.current.observe(element);
+    },
+    [],
+  );
+  useEffect(
+    () => () => {
+      rowResizeObserverRef.current?.disconnect();
+      rowResizeObserverRef.current = null;
+    },
+    [],
+  );
+  const virtualizedHeightEstimates = taskChatHeightEstimates(
+    virtualizedRenderItems,
+    measuredHeightKey,
+    measuredRowHeights,
+    TASK_CHAT_DEFAULT_ITEM_HEIGHT,
+  );
+  // Virtuoso only consumes heightEstimates while constructing an empty size
+  // tree. Remount whenever the cold/hot boundary advances, or after the pane
+  // settles at a new width, so a turn leaving the hot zone enters the cold
+  // zone with the real height already measured for this generation.
+  const virtualizationLayoutKey = taskChatVirtualizationLayoutKey({
+    chatId: activeChatId ?? "none",
+    hiddenMessageCount,
+    measurementWidth,
+    virtualized: shouldVirtualizeChat,
+    coldBoundaryIndex: recentTurnStartRenderIndex,
+  });
+  const resolveActiveConversationTurnMessageIndex = useCallback((range: { startIndex: number }) => {
+    let active = conversationTurns[0];
+    for (const turn of conversationTurns) {
+      if (turn.renderIndex > range.startIndex) break;
+      active = turn;
+    }
+    return active?.messageIndex ?? null;
+  }, [conversationTurns]);
+  // Virtuoso can synchronously replay range events while measuring streaming
+  // rows. Defer those notifications and only re-render when the active turn
+  // actually changes; row-level range jitter within one turn is UI noise.
+  const [activeConversationTurnMessageIndex, handleConversationRangeChanged] =
+    useDeferredVirtuosoRangeValue(
+      resolveActiveConversationTurnMessageIndex,
+      conversationTurns[0]?.messageIndex ?? null,
     );
+  const viewportAnchorRef = useRef<TaskChatScrollAnchor | null>(null);
+  const navigateToConversationTurn = useCallback((turn: ConversationTurn) => {
+    // User navigation should detach follow-output, otherwise a running agent
+    // would immediately pull the viewport back to the newest response.
+    autoStickToBottomRef.current = false;
+    const mountedRow = messagesViewportRef.current?.querySelector<HTMLElement>(
+      `[data-item-index="${turn.renderIndex}"]`,
+    );
+    if (mountedRow) {
+      mountedRow.scrollIntoView({ block: "start", behavior: "smooth" });
+      return;
+    }
+    const handle = virtuosoRef.current;
+    if (handle) {
+      handle.scrollToIndex({
+        index: turn.renderIndex,
+        align: "start",
+        behavior: "smooth",
+      });
+      return;
+    }
+    messagesViewportRef.current
+      ?.querySelector<HTMLElement>(`[data-item-index="${turn.renderIndex}"]`)
+      ?.scrollIntoView({ block: "start", behavior: "smooth" });
+  }, []);
+  const visibleConversationRangeRafRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (visibleConversationRangeRafRef.current !== null) {
+        cancelAnimationFrame(visibleConversationRangeRafRef.current);
+        visibleConversationRangeRafRef.current = null;
+      }
+    };
+  }, [activeChatId]);
+  const captureViewportAnchor = useCallback(() => {
+    const viewport = messagesViewportRef.current;
+    if (!viewport) return null;
+    const viewportTop = viewport.getBoundingClientRect().top;
+    const elements = viewport.querySelectorAll<HTMLElement>(
+      "[data-item-index][data-render-key]",
+    );
+    // Rows are in document order, so binary-search their bounds. The previous
+    // implementation measured every mounted row on every animation frame.
+    const visibleRow = firstVisibleTaskChatRow(
+      elements.length,
+      (index) => {
+        const row = elements[index];
+        const rect = row.getBoundingClientRect();
+        return {
+          key: row.dataset.renderKey ?? "",
+          index: Number(row.dataset.itemIndex ?? 0),
+          top: rect.top,
+          bottom: rect.bottom,
+        };
+      },
+      viewportTop,
+    );
+    if (!visibleRow || !visibleRow.key) return null;
+    const anchor = {
+      key: visibleRow.key,
+      index: visibleRow.index,
+      offset: visibleRow.top - viewportTop,
+    };
+    viewportAnchorRef.current = anchor;
+    handleConversationRangeChanged({ startIndex: visibleRow.index });
+    return anchor;
+  }, [handleConversationRangeChanged]);
+  const captureViewportAnchorRef = useRef(captureViewportAnchor);
+  useEffect(() => {
+    captureViewportAnchorRef.current = captureViewportAnchor;
+  }, [captureViewportAnchor]);
+  const scheduleVisibleConversationRangeUpdate = useCallback(() => {
+    if (visibleConversationRangeRafRef.current !== null) return;
+    visibleConversationRangeRafRef.current = requestAnimationFrame(() => {
+      visibleConversationRangeRafRef.current = null;
+      captureViewportAnchorRef.current();
+    });
   }, []);
 
-  const renderItems = useMemo(() => buildRenderItems(messages), [messages]);
+  useEffect(() => {
+    const pane = messagePaneRef.current;
+    if (!pane || typeof ResizeObserver === "undefined") return;
+    let initialized = false;
+    let timer: number | null = null;
+    const commitWidth = () => {
+      captureViewportAnchorRef.current();
+      const width = Math.round(pane.getBoundingClientRect().width);
+      if (width > 0) {
+        setMeasurementWidth((current) =>
+          current === width ? current : width,
+        );
+      }
+    };
+    const observer = new ResizeObserver(() => {
+      if (!initialized) {
+        initialized = true;
+        commitWidth();
+        return;
+      }
+      if (timer !== null) window.clearTimeout(timer);
+      // Panel resizing can emit dozens of widths. Let the mounted rows reflow
+      // during the gesture, then rebuild the size tree once at the settled
+      // width instead of remounting Virtuoso on every pixel.
+      timer = window.setTimeout(commitWidth, 120);
+    });
+    observer.observe(pane);
+    return () => {
+      observer.disconnect();
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [activeChatId]);
+  const handleDirectListScroll = useCallback(() => {
+    const viewport = messagesViewportRef.current;
+    if (!viewport) return;
+    if (
+      !programmaticScrollRef.current &&
+      Date.now() < userScrollGestureUntilRef.current
+    ) {
+      disengageAutoStick();
+    }
+    const distanceFromBottom =
+      viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+    handleAtBottomStateChange(distanceFromBottom <= 48);
+
+    scheduleVisibleConversationRangeUpdate();
+  }, [
+    disengageAutoStick,
+    handleAtBottomStateChange,
+    scheduleVisibleConversationRangeUpdate,
+  ]);
+  const handleVirtualizedListScroll = useCallback(() => {
+    scheduleVisibleConversationRangeUpdate();
+  }, [scheduleVisibleConversationRangeUpdate]);
   const lastMessageType = messages[messages.length - 1]?.type;
 
   // Data-layer chat search — works across the full conversation, not just
@@ -6800,55 +8450,6 @@ export function TaskChat({
     scrollerRef: messagesViewportRef,
     renderToken,
   });
-
-  // ─── Memoized Virtuoso plumbing ──────────────────────────────────────
-  // Virtuoso treats the `components` prop as render config — when its
-  // identity changes, Header/Footer subtrees are unmounted and remounted.
-  // During streaming the parent re-renders many times per second, so we
-  // memoize Header/Footer/components on the only inputs that actually
-  // affect their rendered output.
-
-  const VirtuosoHeader = useMemo(() => {
-    const Header = () =>
-      hiddenMessageCount > 0 ? (
-        <div className="px-4 pt-4">
-          <div className="mx-auto max-w-[720px] rounded-md border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-3 py-2 text-center text-xs text-[var(--color-text-muted)]">
-            {hiddenMessageCount.toLocaleString()} earlier messages are hidden
-            from this view. Full history is still saved.
-          </div>
-        </div>
-      ) : (
-        <div className="h-4" />
-      );
-    return Header;
-  }, [hiddenMessageCount]);
-
-  const VirtuosoFooter = useMemo(() => {
-    const showThinking =
-      isBusy &&
-      lastMessageType !== "assistant" &&
-      lastMessageType !== "terminal_output";
-    const spacerHeight = inputAreaHeight + 16;
-    const Footer = () => (
-      <div>
-        {showThinking && (
-          <div className="flex items-center gap-2 px-4 py-2 text-sm text-[var(--color-text-muted)]">
-            <Loader2 className="w-4 h-4 animate-spin" />
-            <span>Thinking...</span>
-          </div>
-        )}
-        {/* Spacer: keeps the last row above the floating composer. Sized
-            from the live ResizeObserver on inputAreaRef. */}
-        <div style={{ height: spacerHeight }} />
-      </div>
-    );
-    return Footer;
-  }, [isBusy, lastMessageType, inputAreaHeight]);
-
-  const virtuosoComponents = useMemo(
-    () => ({ Header: VirtuosoHeader, Footer: VirtuosoFooter }),
-    [VirtuosoHeader, VirtuosoFooter],
-  );
 
   // Only bump renderToken (which forces useChatSearch to re-apply
   // highlights to freshly mounted DOM) when search is open. Otherwise
@@ -6889,60 +8490,165 @@ export function TaskChat({
     return isAtBottom ? ("auto" as const) : (false as const);
   }, []);
 
-  // Typewriter reveals text via setState INSIDE MessageItem — the
-  // `messages` array reference doesn't change, so Virtuoso's
-  // followOutput never fires. We watch totalListHeightChanged
-  // (which DOES fire when the streaming row grows) and re-anchor to
-  // bottom. Use behavior: "auto" to prevent blank viewport rendering
-  // glitches during rapid streaming.
-  //
-  // Auto-stick behavior: once the user scrolls up to read history we
-  // leave them alone, BUT if a brand-new row is appended (a new tool
-  // section, a new thought chunk) and the user is still within a
-  // reasonable "tail" window of the list, we re-arm auto-stick. This
-  // matches the user's mental model — "I was watching the agent, a new
-  // tool ran, take me back to the bottom so I see what it did" — without
-  // yanking them away while they're actively reading earlier content.
-  const handleTotalListHeightChanged = useCallback(() => {
-    if (isUserScrollingRef.current) return;
-    if (autoStickToBottomRef.current) {
-      virtuosoRef.current?.scrollToIndex({
-        index: "LAST",
-        align: "end",
-        behavior: "auto",
-      });
-      return;
-    }
-    // Re-arm only makes sense when a running agent APPENDS a brand-new row.
-    // While idle no rows are appended, so a height change here is purely
-    // Virtuoso re-measuring existing rows — and re-arming + scrollToIndex
-    // would self-excite (scroll -> new rows enter viewport -> heights
-    // re-measured -> height changes -> scroll again ...), which the user
-    // sees as constant flicker when stopped near, but not at, the bottom.
-    if (!isBusy) return;
-    const viewport = messagesViewportRef.current;
-    if (!viewport) return;
-    // Within ~30px of the bottom counts as "still in the tail".
-    const distanceFromBottom =
-      viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
-    if (distanceFromBottom > 30) return;
-    autoStickToBottomRef.current = true;
-    virtuosoRef.current?.scrollToIndex({
-      index: "LAST",
-      align: "end",
-      behavior: "auto",
-    });
-  }, [isBusy]);
+  // Typewriter reveals text inside MessageItem, so the data array does not
+  // change and followOutput alone cannot observe the growth. Re-anchor the
+  // scroller's real end (including the Footer), rather than the last data row.
+  const heightChangeReanchorRafRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (heightChangeReanchorRafRef.current !== null) {
+        cancelAnimationFrame(heightChangeReanchorRafRef.current);
+        heightChangeReanchorRafRef.current = null;
+      }
+    };
+  }, [activeChatId]);
 
-  // Track the message index where the current busy turn started
-  const turnStartIndexRef = useRef(0);
+  const handleTotalListHeightChanged = useCallback(() => {
+    if (!isBusy || !autoStickToBottomRef.current) return;
+    if (heightChangeReanchorRafRef.current !== null) return;
+
+    heightChangeReanchorRafRef.current = requestAnimationFrame(() => {
+      heightChangeReanchorRafRef.current = null;
+      if (!autoStickToBottomRef.current) return;
+      markProgrammaticScroll();
+      const handle = virtuosoRef.current;
+      if (handle) scrollVirtuosoToBottom(handle, "auto");
+    });
+  }, [isBusy, markProgrammaticScroll]);
+
+  // Up to 50 turns use a normal scroll container, so keep its tail anchored
+  // while the active turn is growing. Idle/manual layout changes are excluded;
+  // the busy -> idle compaction has its own intent-preserving effect below.
+  useEffect(() => {
+    if (shouldVirtualizeChat || typeof ResizeObserver === "undefined") return;
+    const content = directListContentRef.current;
+    if (!content) return;
+    let rafId: number | null = null;
+    const observer = new ResizeObserver(() => {
+      if (!isBusy) return;
+      if (!autoStickToBottomRef.current || rafId !== null) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        if (autoStickToBottomRef.current) scrollMessagesToBottom("auto");
+      });
+    });
+    observer.observe(content);
+    return () => {
+      observer.disconnect();
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
+  }, [activeChatId, isBusy, scrollMessagesToBottom, shouldVirtualizeChat]);
+
   const wasBusyRef = useRef(false);
   useEffect(() => {
-    if (isBusy && !wasBusyRef.current) {
-      turnStartIndexRef.current = messages.length;
-    }
+    let firstFrame: number | null = null;
+    let secondFrame: number | null = null;
+    const turnJustCompleted = !isBusy && wasBusyRef.current;
     wasBusyRef.current = isBusy;
-  }, [isBusy, messages.length]);
+    // Completing a turn automatically replaces its live sequential rows with
+    // a compact WorkSummary. That can remove a large amount of height in one
+    // commit. Preserve the tail only for readers who were already following
+    // it; someone who intentionally scrolled into history remains detached.
+    if (turnJustCompleted && autoStickToBottomRef.current) {
+      firstFrame = requestAnimationFrame(() => {
+        secondFrame = requestAnimationFrame(() => {
+          if (autoStickToBottomRef.current) {
+            scrollMessagesToBottom("auto");
+          }
+        });
+      });
+    }
+    return () => {
+      if (firstFrame !== null) cancelAnimationFrame(firstFrame);
+      if (secondFrame !== null) cancelAnimationFrame(secondFrame);
+    };
+  }, [isBusy, scrollMessagesToBottom]);
+
+  // A layout generation changes when the direct/virtual renderer swaps, when
+  // the 50-turn boundary advances, or when the pane settles at a new width.
+  // All three rebuild Virtuoso's size tree. Preserve either the complete tail
+  // or an exact row + pixel-offset anchor across that rebuild.
+  const previousVirtualizationLayoutRef = useRef({
+    chatId: activeChatId,
+    key: virtualizationLayoutKey,
+  });
+  useEffect(() => {
+    const previous = previousVirtualizationLayoutRef.current;
+    previousVirtualizationLayoutRef.current = {
+      chatId: activeChatId,
+      key: virtualizationLayoutKey,
+    };
+    // Chat switches have their own scroll-to-bottom orchestration in
+    // useChatPositioning. This effect only owns renderer changes within the
+    // same chat, notably the 50 -> 51 turn boundary.
+    if (previous.chatId !== activeChatId) {
+      viewportAnchorRef.current = null;
+      return;
+    }
+    const target = taskChatLayoutTransitionTarget(
+      previous.key,
+      virtualizationLayoutKey,
+      autoStickToBottomRef.current,
+      viewportAnchorRef.current,
+    );
+    if (target.kind === "none") return;
+
+    const frameIds: number[] = [];
+    const scheduleFrame = (callback: () => void) => {
+      frameIds.push(requestAnimationFrame(callback));
+    };
+    const findAnchorRow = (key: string) =>
+      Array.from(
+        messagesViewportRef.current?.querySelectorAll<HTMLElement>(
+          "[data-render-key]",
+        ) ?? [],
+      ).find((row) => row.dataset.renderKey === key) ?? null;
+    const restoreAnchorOffset = (attempt: number): void => {
+      if (target.kind !== "anchor" || autoStickToBottomRef.current) return;
+      const viewport = messagesViewportRef.current;
+      if (!viewport) return;
+      const row = findAnchorRow(target.anchor.key);
+      if (!row) {
+        if (attempt === 0) {
+          markProgrammaticScroll();
+          virtuosoRef.current?.scrollToIndex({
+            index: target.anchor.index,
+            align: "start",
+            behavior: "auto",
+          });
+        }
+        if (attempt < 4) {
+          scheduleFrame(() => restoreAnchorOffset(attempt + 1));
+        }
+        return;
+      }
+      const viewportTop = viewport.getBoundingClientRect().top;
+      const currentOffset = row.getBoundingClientRect().top - viewportTop;
+      const correction = currentOffset - target.anchor.offset;
+      if (Math.abs(correction) > 0.5) {
+        markProgrammaticScroll();
+        viewport.scrollTop += correction;
+      }
+      viewportAnchorRef.current = target.anchor;
+    };
+    scheduleFrame(() => {
+      scheduleFrame(() => {
+        if (target.kind === "bottom") {
+          if (autoStickToBottomRef.current) scrollMessagesToBottom("auto");
+          return;
+        }
+        restoreAnchorOffset(0);
+      });
+    });
+    return () => {
+      for (const frameId of frameIds) cancelAnimationFrame(frameId);
+    };
+  }, [
+    activeChatId,
+    markProgrammaticScroll,
+    scrollMessagesToBottom,
+    virtualizationLayoutKey,
+  ]);
 
   const toggleSection = useCallback((sectionId: string) => {
     setExpandedSections((prev) => {
@@ -6955,6 +8661,129 @@ export function TaskChat({
       return next;
     });
   }, []);
+
+  const renderChatItem = (idx: number, item: RenderItem) => {
+    const rowClassName = `mx-auto flow-root w-full max-w-[920px] px-4 pt-3 sm:px-6 ${
+      idx >= recentTurnStartRenderIndex ? "task-chat-hot-row" : ""
+    }`;
+    const dataItemIndex = idx;
+    const measureKey = renderItemKey(item);
+    if (item.kind === "single") {
+      return (
+        <MeasuredTaskChatRow
+          className={rowClassName}
+          dataItemIndex={dataItemIndex}
+          dataRenderKey={measureKey}
+          measureKey={measureKey}
+          onObserve={observeMeasuredRow}
+        >
+          <MessageItem
+            message={item.message}
+            index={item.index}
+            isBusy={isBusy}
+            agentLabel={agentLabel}
+            projectId={projectId}
+            taskId={task.id}
+            activeChatId={activeChatId ?? undefined}
+            previewCommentDrafts={taskPreviewCommentDrafts}
+            onAddPreviewComment={addPreviewCommentDraft}
+            onUpdatePreviewComment={updatePreviewCommentDraft}
+            onRemovePreviewComment={removePreviewCommentDraft}
+            isStudio={isStudioProject}
+            resolveSender={resolveSender}
+            onPermissionResponse={handlePermissionResponse}
+            onFileClick={onNavigateToFile}
+            onImageClick={setLightboxUrl}
+            onMermaidClick={setLightboxSvg}
+            onD2Click={setLightboxSvg}
+            onInsertReference={insertAttachmentReference}
+          />
+        </MeasuredTaskChatRow>
+      );
+    }
+    if (item.kind === "tool-section") {
+      return (
+        <MeasuredTaskChatRow
+          className={rowClassName}
+          dataItemIndex={dataItemIndex}
+          dataRenderKey={measureKey}
+          measureKey={measureKey}
+          onObserve={observeMeasuredRow}
+        >
+          <ToolSectionView
+            sectionId={item.sectionId}
+            tools={item.tools}
+            expanded={expandedSections.has(item.sectionId)}
+            forceExpanded={false}
+            sectionFinished={idx < renderItems.length - 1 || !isBusy}
+            onToggleSection={toggleSection}
+            onFileClick={onNavigateToFile}
+          />
+        </MeasuredTaskChatRow>
+      );
+    }
+    if (item.kind === "work-summary") {
+      return (
+        <MeasuredTaskChatRow
+          className={rowClassName}
+          dataItemIndex={dataItemIndex}
+          dataRenderKey={measureKey}
+          measureKey={measureKey}
+          onObserve={observeMeasuredRow}
+        >
+          <WorkSummaryView
+            sectionId={item.sectionId}
+            items={item.items}
+            durationSeconds={item.durationSeconds}
+            expanded={expandedSections.has(item.sectionId)}
+            onToggleSection={toggleSection}
+            onFileClick={onNavigateToFile}
+          />
+        </MeasuredTaskChatRow>
+      );
+    }
+    return (
+      <MeasuredTaskChatRow
+        className={rowClassName}
+        dataItemIndex={dataItemIndex}
+        dataRenderKey={measureKey}
+        measureKey={measureKey}
+        onObserve={observeMeasuredRow}
+      >
+        <FileChangeSummaryView
+          tools={item.tools}
+          onFileClick={onNavigateToFile}
+        />
+      </MeasuredTaskChatRow>
+    );
+  };
+
+  // In long chats, only turns older than the recent hot zone are Virtuoso
+  // data items. The latest 50 turns live in the stable Footer and therefore
+  // stay mounted with real browser-measured heights while old history remains
+  // windowed. In short chats the normal scroll container renders everything.
+  const hotRows = shouldVirtualizeChat
+    ? renderItems.slice(recentTurnStartRenderIndex).map((item, offset) => {
+        const idx = recentTurnStartRenderIndex + offset;
+        return (
+          <Fragment key={renderItemKey(item)}>
+            {renderChatItem(idx, item)}
+          </Fragment>
+        );
+      })
+    : null;
+  // Keep the Header/Footer component types stable. Updating context changes
+  // their content without unmounting Virtuoso's measured boundary elements.
+  const virtuosoContext: TaskChatVirtuosoContext = {
+    hiddenMessageCount,
+    hotRows,
+    inputAreaHeight,
+    showThinking:
+      isBusy &&
+      lastMessageType !== "assistant" &&
+      lastMessageType !== "thinking" &&
+      lastMessageType !== "terminal_output",
+  };
 
   // ─── Collapsed mode ──────────────────────────────────────────────────────
 
@@ -7125,7 +8954,7 @@ export function TaskChat({
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    handleDeleteChat(chat.id);
+                                    requestDeleteChat(chat.id);
                                   }}
                                   className="shrink-0 p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-error)] group-hover:opacity-100"
                                   title="Delete chat"
@@ -7156,26 +8985,29 @@ export function TaskChat({
                   <span>New</span>
                 </button>
               </div>
-              {/* Fork 只在 source agent live 且当前空闲、不在登录中时允许。
-                  disabled 而不是隐藏:让用户知道按钮存在,只是当下不能用。 */}
-              {forkCapable && activeChat && (
-                <button
-                  onClick={() => handleForkChat(activeChat.id)}
-                  disabled={!isConnected || isBusy || !!activeAuthMessage}
-                  className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-highlight)] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-[var(--color-text-muted)]"
-                  title={
-                    !isConnected
-                      ? "Fork unavailable: source session not connected"
-                      : isBusy
-                        ? "Fork unavailable while agent is responding"
-                        : activeAuthMessage
-                          ? "Fork unavailable: finish login first"
-                          : "Fork Session — derive a new session from the current chat, copy the conversation history"
-                  }
-                >
-                  <GitFork className="w-3.5 h-3.5" />
-                  <span>Fork</span>
-                </button>
+              {activeChat && (
+                <SessionActionsMenu
+                  surface="header"
+                  chatId={activeChat.id}
+                  forkCapable={forkCapable}
+                  importCapable={importCapable}
+                  importSessions={importSessions}
+                  importLoading={importLoading}
+                  importNextCursor={importNextCursor}
+                  authMethods={authMethods}
+                  logoutCapable={logoutCapable}
+                  reconnectDisabled={isReconnecting || activeChat.launch_mode === "terminal"}
+                  actionsDisabled={!isConnected || isBusy || !!activeAuthMessage}
+                  deleteDisabled={chats.length <= 1}
+                  onFork={handleForkChat}
+                  onOpenImport={() => { if (importSessions.length === 0) void loadImportSessions(); }}
+                  onLoadMoreImport={() => { if (importNextCursor) void loadImportSessions(importNextCursor); }}
+                  onImport={(session) => void handleImportSession(session)}
+                  onLogin={handleMenuLogin}
+                  onLogout={handleLogout}
+                  onReconnect={handleReconnect}
+                  onDelete={requestDeleteChat}
+                />
               )}
             </div>
 
@@ -7304,24 +9136,29 @@ export function TaskChat({
                       <span className="font-medium">New Session</span>
                     </button>
                   </div>
-                  {forkCapable && activeChat && (
-                    <button
-                      onClick={() => handleForkChat(activeChat.id)}
-                      disabled={!isConnected || isBusy || !!activeAuthMessage}
-                      className="flex shrink-0 items-center gap-1.5 rounded-md border border-dashed border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-transparent px-2 text-[12px] text-[var(--color-text-muted)] transition-colors hover:border-[color-mix(in_srgb,var(--color-highlight)_34%,transparent)] hover:text-[var(--color-highlight)] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] disabled:hover:text-[var(--color-text-muted)]"
-                      title={
-                        !isConnected
-                          ? "Fork unavailable: source session not connected"
-                          : isBusy
-                            ? "Fork unavailable while agent is responding"
-                            : activeAuthMessage
-                              ? "Fork unavailable: finish login first"
-                              : "Fork Session — derive a new session from the current chat, copy the conversation history"
-                      }
-                    >
-                      <GitFork className="h-3 w-3" />
-                      <span>Fork</span>
-                    </button>
+                  {activeChat && (
+                    <SessionActionsMenu
+                      surface="sidebar"
+                      chatId={activeChat.id}
+                      forkCapable={forkCapable}
+                      importCapable={importCapable}
+                      importSessions={importSessions}
+                      importLoading={importLoading}
+                      importNextCursor={importNextCursor}
+                      authMethods={authMethods}
+                      logoutCapable={logoutCapable}
+                      reconnectDisabled={isReconnecting || activeChat.launch_mode === "terminal"}
+                      actionsDisabled={!isConnected || isBusy || !!activeAuthMessage}
+                      deleteDisabled={chats.length <= 1}
+                      onFork={handleForkChat}
+                      onOpenImport={() => { if (importSessions.length === 0) void loadImportSessions(); }}
+                      onLoadMoreImport={() => { if (importNextCursor) void loadImportSessions(importNextCursor); }}
+                      onImport={(session) => void handleImportSession(session)}
+                      onLogin={handleMenuLogin}
+                      onLogout={handleLogout}
+                      onReconnect={handleReconnect}
+                      onDelete={requestDeleteChat}
+                    />
                   )}
                 </div>
                 {!pinnedChatId && orderedChats.map((chat) => {
@@ -7382,7 +9219,7 @@ export function TaskChat({
                           editingTitle.surface === "sidebar-list"
                         ) && (
                           <button
-                            onClick={() => handleDeleteChat(chat.id)}
+                            onClick={() => requestDeleteChat(chat.id)}
                             className="shrink-0 rounded p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-error)] group-hover:opacity-100"
                             title="Delete chat"
                           >
@@ -7409,7 +9246,17 @@ export function TaskChat({
           />
         )}
 
-        <div className="relative min-h-0 min-w-0 flex-1">
+        <div
+          ref={messagePaneRef}
+          className="task-chat-message-pane relative min-h-0 min-w-0 flex-1"
+          onWheelCapture={handleChatWheelCapture}
+          onPointerDownCapture={handleChatPointerDownCapture}
+        >
+          <ConversationMinimap
+            turns={conversationTurns}
+            activeMessageIndex={activeConversationTurnMessageIndex}
+            onNavigate={navigateToConversationTurn}
+          />
           {/* Terminal launch mode: agent CLI runs in xterm.js (PTY).
               Chatbox input still writes lines to PTY stdin via handleSend. */}
           {isTerminalLaunchMode && agentPtyWsUrl ? (
@@ -7436,6 +9283,12 @@ export function TaskChat({
               message conversations stay snappy. Virtuoso owns the scroll
               container; we hand it the renderItems array and let it
               mount/unmount rows as the viewport moves. */
+          <ChatListErrorBoundary
+            resetKey={activeChatId}
+            projectId={projectId}
+            taskId={task.id}
+          >
+          {shouldVirtualizeChat ? (
           <Virtuoso
             // Force-remount per chat so each chat starts with a clean
             // scroll position (no carry-over from the previous chat).
@@ -7443,9 +9296,11 @@ export function TaskChat({
             // the activeChatId/renderItems.length effect — Virtuoso's
             // initialTopMostItemIndex is unreliable when data loads
             // async after mount.
-            key={activeChatId}
+            key={virtualizationLayoutKey}
             ref={virtuosoRef}
-            data={renderItems}
+            data={virtualizedRenderItems}
+            heightEstimates={virtualizedHeightEstimates}
+            context={virtuosoContext}
             scrollerRef={(ref) => {
               messagesViewportRef.current = ref as HTMLDivElement | null;
             }}
@@ -7457,55 +9312,58 @@ export function TaskChat({
               opacity: chatPositioning ? 0 : 1,
               transition: chatPositioning ? "none" : "opacity 120ms ease-out",
             }}
-            increaseViewportBy={{ top: 600, bottom: 1200 }}
+            // Do not let an unusually tall first chat row (for example, a
+            // pasted source file) become the estimate for every unmeasured
+            // row. A stable baseline prevents multi-pass fill/jump cycles.
+            defaultItemHeight={TASK_CHAT_DEFAULT_ITEM_HEIGHT}
+            increaseViewportBy={TASK_CHAT_WINDOWED_VIEWPORT}
+            // The latest 50 turns are rendered directly in the Footer. This
+            // overscan applies only to the older, genuinely virtualized rows.
+            minOverscanItemCount={TASK_CHAT_MIN_OVERSCAN_ITEMS}
+            // Commit dynamic row measurements in the ResizeObserver callback
+            // instead of one frame later. A very tall row can otherwise leave
+            // the render window before its real height reaches the size tree,
+            // causing the same scroll correction to repeat on every visit.
+            skipAnimationFrameInResizeObserver
             followOutput={handleFollowOutput}
             atBottomStateChange={handleAtBottomStateChange}
             atBottomThreshold={48}
             isScrolling={handleIsScrolling}
             totalListHeightChanged={handleTotalListHeightChanged}
-            itemContent={(idx, item) =>
-              item.kind === "single" ? (
-                <div className="px-4 pt-3">
-                  <MessageItem
-                    message={item.message}
-                    index={item.index}
-                    isBusy={isBusy}
-                    agentLabel={agentLabel}
-                    projectId={projectId}
-                    taskId={task.id}
-                    isStudio={isStudioProject}
-                    resolveSender={resolveSender}
-                    onToggleThinkingCollapse={toggleThinkingCollapse}
-                    onPermissionResponse={handlePermissionResponse}
-                    onFileClick={onNavigateToFile}
-                    onImageClick={setLightboxUrl}
-                    onMermaidClick={setLightboxSvg}
-                    onD2Click={setLightboxSvg}
-                    onInsertReference={insertAttachmentReference}
-                  />
-                </div>
-              ) : (
-                <div className="px-4 pt-3">
-                  <ToolSectionView
-                    sectionId={item.sectionId}
-                    tools={item.tools}
-                    expanded={expandedSections.has(item.sectionId)}
-                    forceExpanded={false}
-                    sectionFinished={idx < renderItems.length - 1 || !isBusy}
-                    onToggleSection={toggleSection}
-                    onFileClick={onNavigateToFile}
-                  />
-                </div>
-              )
-            }
-            computeItemKey={(_idx, item) =>
-              item.kind === "single"
-                ? `m-${item.index}`
-                : `ts-${item.sectionId}`
-            }
+            itemContent={renderChatItem}
+            computeItemKey={(_idx, item) => renderItemKey(item)}
             itemsRendered={handleItemsRendered}
-            components={virtuosoComponents}
+            rangeChanged={handleConversationRangeChanged}
+            onScroll={handleVirtualizedListScroll}
+            components={TASK_CHAT_VIRTUOSO_COMPONENTS}
           />
+          ) : (
+            <div
+              key={virtualizationLayoutKey}
+              ref={(element) => {
+                messagesViewportRef.current = element;
+              }}
+              className="relative z-0 h-full min-h-0 overflow-y-auto overflow-x-hidden overscroll-none"
+              style={{
+                opacity: chatPositioning ? 0 : 1,
+                transition: chatPositioning
+                  ? "none"
+                  : "opacity 120ms ease-out",
+              }}
+              onScroll={handleDirectListScroll}
+            >
+              <div ref={directListContentRef} className="min-h-full">
+                <TaskChatVirtuosoHeader context={virtuosoContext} />
+                {renderItems.map((item, idx) => (
+                  <Fragment key={renderItemKey(item)}>
+                    {renderChatItem(idx, item)}
+                  </Fragment>
+                ))}
+                <TaskChatVirtuosoFooter context={virtuosoContext} />
+              </div>
+            </div>
+          )}
+          </ChatListErrorBoundary>
           )}
 
           {/* Input */}
@@ -7544,15 +9402,19 @@ export function TaskChat({
                     animate={{ opacity: 1, y: 0, height: "auto" }}
                     exit={{ opacity: 0, y: 8, height: 0 }}
                     transition={{ duration: 0.2, ease: "easeOut" }}
-                    className="mb-3 overflow-hidden rounded-[26px] border border-[color-mix(in_srgb,var(--color-border)_62%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_82%,transparent)] shadow-[0_16px_40px_rgba(0,0,0,0.14)] backdrop-blur-md"
+                    className="mb-3 overflow-hidden rounded-2xl border border-[color-mix(in_srgb,var(--color-border)_62%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_92%,transparent)] shadow-[0_12px_32px_rgba(0,0,0,0.14)] backdrop-blur-md"
                   >
-                    <div className="max-h-72 overflow-y-auto px-3 py-3">
+                    <div className={`max-h-[min(360px,48vh)] overflow-y-auto overscroll-contain ${activeComposerPanel === "previewComments" ? "" : activeComposerPanel === "pending" ? "px-2.5 py-1.5" : "px-3 py-3"}`}>
                       {activeComposerPanel === "todo" && (
                         <div className="space-y-1">
-                          {planEntries.map((entry, i) => (
+                          {displayedPlanEntries.map((entry, i) => (
                             <div
-                              key={i}
-                              className="flex items-center gap-2 py-0.5 text-sm"
+                              key={`${entry.priority ?? "legacy"}:${entry.content}:${i}`}
+                              className={`flex items-center gap-2 rounded-md px-1.5 py-1 text-sm ${
+                                entry.status === "in_progress"
+                                  ? "bg-[color-mix(in_srgb,var(--color-highlight)_10%,transparent)]"
+                                  : ""
+                              }`}
                             >
                               {entry.status === "completed" ? (
                                 <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-[var(--color-success)]" />
@@ -7562,16 +9424,68 @@ export function TaskChat({
                                 <Circle className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-muted)]" />
                               )}
                               <span
-                                className={
+                                className={`min-w-0 flex-1 ${
                                   entry.status === "completed"
                                     ? "text-[var(--color-text-muted)] line-through"
-                                    : "text-[var(--color-text)]"
-                                }
+                                    : entry.status === "in_progress"
+                                      ? "font-medium text-[var(--color-highlight)]"
+                                      : "text-[var(--color-text)]"
+                                }`}
                               >
                                 {entry.content}
                               </span>
                             </div>
                           ))}
+                        </div>
+                      )}
+
+                      {activeComposerPanel === "memory" && (
+                        <div className="space-y-2">
+                          <div className="flex items-center gap-2 px-0.5">
+                            <Database className="h-3.5 w-3.5 text-[var(--color-highlight)]" />
+                            <div className="text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
+                              Recalled Memory · {recalledMemories.length}
+                            </div>
+                          </div>
+                          <div className="space-y-1.5">
+                            {recalledMemories.map((memory) => (
+                              <div
+                                key={memory.entityId || memory.title}
+                                className="rounded-xl border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] bg-[color-mix(in_srgb,var(--color-bg)_72%,transparent)] px-3 py-2.5"
+                              >
+                                <div className="flex min-w-0 items-start justify-between gap-3">
+                                  <div className="min-w-0 text-sm font-medium leading-5 text-[var(--color-text)]">
+                                    {memory.title}
+                                  </div>
+                                  {memory.entityId && (
+                                    <span
+                                      className="max-w-28 shrink-0 truncate font-mono text-[9px] text-[var(--color-text-muted)] opacity-60"
+                                      title={memory.entityId}
+                                    >
+                                      {memory.entityId}
+                                    </span>
+                                  )}
+                                </div>
+                                {memory.description && (
+                                  <div className="mt-1 line-clamp-2 text-[11px] leading-4 text-[var(--color-text-muted)]">
+                                    {memory.description}
+                                  </div>
+                                )}
+                                {memory.tags.length > 0 && (
+                                  <div className="mt-2 flex flex-wrap gap-1">
+                                    {memory.tags.slice(0, 6).map((tag) => (
+                                      <span
+                                        key={tag}
+                                        className="rounded-full bg-[color-mix(in_srgb,var(--color-highlight)_10%,transparent)] px-1.5 py-0.5 text-[9px] text-[var(--color-highlight)]"
+                                      >
+                                        {tag}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
                         </div>
                       )}
 
@@ -7609,11 +9523,45 @@ export function TaskChat({
                       )}
 
                       {activeComposerPanel === "pending" && (
-                        <div className="space-y-1">
+                        <div>
+                          <div className="flex h-5 items-center gap-2 px-0.5">
+                            <div className="text-[9px] font-medium uppercase tracking-[0.08em] text-[var(--color-text-muted)] opacity-55">
+                              Queued · {pendingMessages.length}
+                            </div>
+                            <div className="ml-auto inline-flex items-center gap-2 text-[9px]">
+                              {(
+                                [
+                                  {
+                                    id: "separate" as const,
+                                    label: "Separate",
+                                    title: "Send queued messages one at a time",
+                                  },
+                                  {
+                                    id: "compact" as const,
+                                    label: "Compact",
+                                    title: "Merge all queued messages into one when auto-sent",
+                                  },
+                                ]
+                              ).map((opt) => (
+                                <button
+                                  key={opt.id}
+                                  onClick={() => handleSetQueueMode(opt.id)}
+                                  title={opt.title}
+                                  className={`rounded px-1 py-0.5 transition-colors ${
+                                    queueMode === opt.id
+                                      ? "text-[var(--color-highlight)]"
+                                      : "text-[var(--color-text-muted)] opacity-60 hover:opacity-100"
+                                  }`}
+                                >
+                                  {opt.label}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
                           {pendingMessages.map((msg, i) => (
                             <div
                               key={pendingMessageKeys[i] ?? `idx-${i}`}
-                              className="flex items-center gap-2 py-1 text-sm"
+                              className="flex min-h-7 items-center gap-2 rounded-lg px-0.5 text-sm transition-colors hover:bg-[color-mix(in_srgb,var(--color-text)_3%,transparent)]"
                             >
                               <span className="w-4 shrink-0 text-right text-xs text-[var(--color-text-muted)]">
                                 {i + 1}
@@ -7685,12 +9633,12 @@ export function TaskChat({
                       )}
 
                       {activeComposerPanel === "previewComments" && (
-                        <div className="space-y-2.5">
-                          <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <div className="sticky top-0 z-20 flex items-center justify-between gap-2 border-b border-[color-mix(in_srgb,var(--color-border)_55%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_94%,transparent)] px-3 py-2.5 backdrop-blur-md">
                             <div className="flex items-center gap-1.5">
                               <MessageSquarePlus className="h-3.5 w-3.5 text-[var(--color-highlight)]" />
                               <span className="text-[11px] font-medium uppercase tracking-[0.1em] text-[var(--color-text-muted)]">
-                                Preview comments
+                                Comments
                               </span>
                               <span className="rounded-full bg-[color-mix(in_srgb,var(--color-highlight)_14%,transparent)] px-1.5 py-px text-[10px] font-medium leading-none text-[var(--color-highlight)]">
                                 {taskPreviewCommentDrafts.length}
@@ -7705,11 +9653,19 @@ export function TaskChat({
                               Send all
                             </button>
                           </div>
-                          <div className="space-y-1.5">
+                          <div className="space-y-1.5 px-2.5 py-2.5">
                             {taskPreviewCommentDrafts.map((draft, idx) => {
-                              const fileLabel = draft.fileName || draft.filePath.split("/").pop() || draft.filePath;
-                              const dir = draft.filePath.slice(0, Math.max(0, draft.filePath.length - fileLabel.length - 1));
-                              const crumb = draft.locator.selector || draft.locator.tagName;
+                              const fileLabel = draft.source === "chat"
+                                ? `Conversation · message ${draft.filePath.split("-").pop()}`
+                                : draft.fileName || draft.filePath.split("/").pop() || draft.filePath;
+                              const dir = draft.source === "chat"
+                                ? ""
+                                : draft.filePath.slice(0, Math.max(0, draft.filePath.length - fileLabel.length - 1));
+                              const selectedText = draft.locator.text?.trim();
+                              const contextLabel = selectedText
+                                ? `“${selectedText}”`
+                                : draft.locator.selector || draft.locator.tagName;
+                              const isEditing = editingPreviewCommentId === draft.id;
                               return (
                                 <div
                                   key={draft.id}
@@ -7723,9 +9679,32 @@ export function TaskChat({
                                     {idx + 1}
                                   </div>
                                   <div className="min-w-0 flex-1">
-                                    <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12px] leading-snug text-[var(--color-text)]">
-                                      {draft.comment}
-                                    </div>
+                                    {isEditing ? (
+                                      <textarea
+                                        autoFocus
+                                        rows={3}
+                                        value={editingPreviewCommentText}
+                                        onChange={(event) => setEditingPreviewCommentText(event.target.value)}
+                                        onKeyDown={(event) => {
+                                          if (event.key === "Escape") {
+                                            event.preventDefault();
+                                            setEditingPreviewCommentId(null);
+                                            setEditingPreviewCommentText("");
+                                          }
+                                          if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && editingPreviewCommentText.trim()) {
+                                            event.preventDefault();
+                                            updatePreviewCommentDraft(draft.id, { comment: editingPreviewCommentText.trim() });
+                                            setEditingPreviewCommentId(null);
+                                            setEditingPreviewCommentText("");
+                                          }
+                                        }}
+                                        className="w-full resize-none rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-2 py-1.5 text-[12px] leading-snug text-[var(--color-text)] outline-none focus:border-[var(--color-highlight)]"
+                                      />
+                                    ) : (
+                                      <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12px] leading-snug text-[var(--color-text)]">
+                                        {draft.comment}
+                                      </div>
+                                    )}
                                     <div className="mt-1 flex items-center gap-1 text-[10px] text-[var(--color-text-muted)]">
                                       <span className="truncate font-medium text-[var(--color-text)]" title={draft.filePath}>
                                         {fileLabel}
@@ -7736,11 +9715,62 @@ export function TaskChat({
                                         </span>
                                       )}
                                     </div>
-                                    <div className="mt-0.5 truncate font-mono text-[10px] text-[var(--color-text-muted)] opacity-80" title={crumb}>
-                                      {crumb}
+                                    <div
+                                      className={`mt-1 line-clamp-2 text-[10px] leading-4 text-[var(--color-text-muted)] opacity-80 ${selectedText ? "" : "font-mono"}`}
+                                      title={contextLabel}
+                                    >
+                                      {contextLabel}
                                     </div>
+                                    {isEditing && (
+                                      <div className="mt-2 flex items-center justify-end gap-1.5">
+                                        <button
+                                          onClick={() => {
+                                            setEditingPreviewCommentId(null);
+                                            setEditingPreviewCommentText("");
+                                          }}
+                                          className="rounded-md px-2 py-1 text-[10px] font-medium text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+                                        >
+                                          Cancel
+                                        </button>
+                                        <button
+                                          disabled={!editingPreviewCommentText.trim()}
+                                          onClick={() => {
+                                            updatePreviewCommentDraft(draft.id, { comment: editingPreviewCommentText.trim() });
+                                            setEditingPreviewCommentId(null);
+                                            setEditingPreviewCommentText("");
+                                          }}
+                                          className="rounded-md px-2 py-1 text-[10px] font-semibold text-[var(--color-highlight)] hover:bg-[color-mix(in_srgb,var(--color-highlight)_12%,transparent)] disabled:cursor-not-allowed disabled:opacity-40"
+                                        >
+                                          Save
+                                        </button>
+                                        <button
+                                          disabled={!editingPreviewCommentText.trim()}
+                                          onClick={() => {
+                                            const comment = editingPreviewCommentText.trim();
+                                            if (!comment) return;
+                                            setEditingPreviewCommentId(null);
+                                            setEditingPreviewCommentText("");
+                                            sendPreviewComments([{ ...draft, comment }]);
+                                          }}
+                                          className="inline-flex items-center gap-1 rounded-md bg-[var(--color-highlight)] px-2 py-1 text-[10px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40"
+                                        >
+                                          <Send className="h-3 w-3" />
+                                          Send
+                                        </button>
+                                      </div>
+                                    )}
                                   </div>
-                                  <div className="flex shrink-0 items-start gap-1 opacity-70 transition-opacity group-hover:opacity-100">
+                                  {!isEditing && <div className="flex shrink-0 items-start gap-1 opacity-70 transition-opacity group-hover:opacity-100">
+                                    <button
+                                      onClick={() => {
+                                        setEditingPreviewCommentId(draft.id);
+                                        setEditingPreviewCommentText(draft.comment);
+                                      }}
+                                      className="rounded-md p-1 text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+                                      title="Edit comment"
+                                    >
+                                      <Pencil className="h-3 w-3" />
+                                    </button>
                                     <button
                                       onClick={() => sendPreviewComments([draft])}
                                       className="rounded-md p-1 text-[var(--color-text-muted)] transition-colors hover:bg-[color-mix(in_srgb,var(--color-highlight)_12%,transparent)] hover:text-[var(--color-highlight)]"
@@ -7755,7 +9785,7 @@ export function TaskChat({
                                     >
                                       <X className="h-3 w-3" />
                                     </button>
-                                  </div>
+                                  </div>}
                                 </div>
                               );
                             })}
@@ -7769,16 +9799,7 @@ export function TaskChat({
                           index={activeAuthMessageIndex}
                           agentLabel={agentLabel}
                           onAuthLogin={handleAuthLogin}
-                          onDismiss={(idx) => {
-                            setMessages((prev) =>
-                              prev.map((m, i) =>
-                                i === idx && m.type === "auth_required"
-                                  ? { ...m, status: "succeeded" }
-                                  : m
-                              )
-                            );
-                            setShowAuthPanel(false);
-                          }}
+                          onAuthRetry={handleAuthRetry}
                         />
                       )}
 
@@ -7813,18 +9834,65 @@ export function TaskChat({
                           </div>
                         )}
                       {activeComposerPanel === "ask_form" &&
-                        activeFormMessage && (
-                          <FormPill
-                            key={activeFormMessage.id}
-                            definition={activeFormMessage.definition}
-                            onSubmit={(text) => {
-                              sendFormResponse(text);
-                              resolveAskForm(activeFormMessage.id);
-                            }}
-                            onDismiss={() => {
-                              resolveAskForm(activeFormMessage.id);
-                            }}
-                          />
+                        activeSurveyMessage && (
+                          activeSurveyMessage.type === "ask_form" ? (
+                            <FormPill
+                              key={activeSurveyMessage.id}
+                              definition={activeSurveyMessage.definition}
+                              disabled={!isConnected}
+                              onSubmit={({ markdown }) => {
+                                sendFormResponse(markdown);
+                                resolveAskForm(activeSurveyMessage.id);
+                              }}
+                              onDismiss={() => resolveAskForm(activeSurveyMessage.id)}
+                            />
+                          ) : activeSurveyMessage.snapshot.request.mode === "form" ? (
+                            (() => {
+                              const definition = elicitationToSurvey(activeSurveyMessage.snapshot);
+                              return definition ? (
+                                <FormPill
+                                  key={activeSurveyMessage.id}
+                                  definition={definition}
+                                  agentName={activeSurveyMessage.snapshot.agent_name}
+                                  requestMessage={activeSurveyMessage.snapshot.request.message}
+                                  disabled={!isConnected}
+                                  externalError={activeSurveyMessage.error}
+                                  onChange={() => clearElicitationError(activeSurveyMessage.id)}
+                                  onSubmit={({ answers }) => respondElicitation(
+                                    activeSurveyMessage.id,
+                                    "accept",
+                                    answers,
+                                  )}
+                                  onDecline={() => respondElicitation(activeSurveyMessage.id, "decline")}
+                                  onDismiss={() => respondElicitation(activeSurveyMessage.id, "cancel")}
+                                />
+                              ) : (
+                                <div className="space-y-3 text-sm text-[var(--color-text)]">
+                                  <p>This Agent requested a form Grove cannot safely display.</p>
+                                  <Button variant="ghost" size="sm" onClick={() => respondElicitation(activeSurveyMessage.id, "cancel")}>Cancel</Button>
+                                </div>
+                              );
+                            })()
+                          ) : (
+                            <ElicitationUrlPill
+                              key={activeSurveyMessage.id}
+                              agentName={activeSurveyMessage.snapshot.agent_name}
+                              message={activeSurveyMessage.snapshot.request.message}
+                              url={activeSurveyMessage.snapshot.request.url ?? ""}
+                              opened={!!activeSurveyMessage.snapshot.opened}
+                              disabled={!isConnected && !activeSurveyMessage.snapshot.opened}
+                              onOpen={() => {
+                                const url = activeSurveyMessage.snapshot.request.url;
+                                if (!url) return;
+                                openExternalUrl(url);
+                                if (!activeSurveyMessage.snapshot.opened) {
+                                  respondElicitation(activeSurveyMessage.id, "accept");
+                                }
+                              }}
+                              onDecline={() => respondElicitation(activeSurveyMessage.id, "decline")}
+                              onCancel={() => respondElicitation(activeSurveyMessage.id, "cancel")}
+                            />
+                          )
                         )}
                     </div>
                   </motion.div>
@@ -7834,24 +9902,22 @@ export function TaskChat({
               <AnimatePresence>
                 {showScrollToBottom && (
                   <motion.div
-                    initial={{ opacity: 0, y: 10 }}
+                    initial={{ opacity: 0, y: 8, scale: 0.98 }}
                     animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: 8 }}
-                    transition={{ duration: 0.18, ease: "easeOut" }}
-                    className="absolute inset-x-0 top-0 z-20 -translate-y-[118%]"
+                    exit={{ opacity: 0, y: 6, scale: 0.98 }}
+                    transition={{ duration: 0.16, ease: "easeOut" }}
+                    className="pointer-events-none absolute inset-x-0 top-0 z-20 -translate-y-[132%] flex justify-center"
                   >
                     <button
+                      type="button"
                       onClick={() => {
                         enableAutoStickToBottom("smooth");
                         setShowScrollToBottom(false);
                       }}
-                      className="group relative mx-auto flex items-center gap-2 rounded-full px-3 py-2 text-[15px] font-medium tracking-[0.01em] text-[color-mix(in_srgb,var(--color-highlight)_80%,white_4%)] transition-all duration-200 hover:text-[color-mix(in_srgb,var(--color-highlight)_96%,white_8%)] select-none"
+                      className="pointer-events-auto group inline-flex h-8 items-center gap-1.5 rounded-full border border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[color-mix(in_srgb,var(--color-bg)_86%,transparent)] px-3 text-xs font-medium text-[var(--color-text-muted)] shadow-[0_1px_2px_rgba(0,0,0,0.08),0_6px_20px_rgba(0,0,0,0.10)] backdrop-blur-xl transition-[color,background-color,border-color,box-shadow,transform] duration-150 hover:-translate-y-px hover:border-[color-mix(in_srgb,var(--color-highlight)_24%,var(--color-border))] hover:bg-[var(--color-bg)] hover:text-[var(--color-text)] hover:shadow-[0_2px_4px_rgba(0,0,0,0.10),0_8px_24px_rgba(0,0,0,0.14)] active:translate-y-0 select-none"
                     >
-                      <span className="pointer-events-none absolute inset-0 rounded-full bg-[color-mix(in_srgb,var(--color-highlight)_8%,transparent)] opacity-0 blur-md transition-all duration-200 group-hover:opacity-100" />
-                      <span className="relative flex items-center gap-2">
-                        <ArrowDown className="h-4 w-4" />
-                        <span>Scroll to bottom</span>
-                      </span>
+                      <ArrowDown className="h-3.5 w-3.5 text-[var(--color-highlight)] transition-transform duration-150 group-hover:translate-y-0.5" />
+                      <span>Scroll to bottom</span>
                     </button>
                   </motion.div>
                 )}
@@ -8019,6 +10085,33 @@ export function TaskChat({
                     )}
                   </div>
                   <div className="flex items-center gap-1.5 shrink-0 select-none">
+                    {hasMemoryPanel && (
+                      <button
+                        onClick={() => {
+                          const next = !showMemoryPanel;
+                          setShowMemoryPanel(next);
+                          if (next) {
+                            setShowAuthPanel(false);
+                            setShowPermissionPanel(false);
+                            setShowFormPanel(false);
+                            setShowPlan(false);
+                            setShowPlanFile(false);
+                            setShowPendingQueue(false);
+                            setShowPreviewComments(false);
+                          }
+                        }}
+                        className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
+                          activeComposerPanel === "memory"
+                            ? "bg-[color-mix(in_srgb,var(--color-highlight)_14%,transparent)] text-[var(--color-highlight)]"
+                            : "bg-[var(--color-bg)] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+                        }`}
+                        title="Memory recalled by the agent in this turn"
+                      >
+                        <Database className="h-3 w-3" />
+                        <span>Memory</span>
+                        <span className="opacity-70">{recalledMemories.length}</span>
+                      </button>
+                    )}
                     {hasTodoPanel && (
                       <button
                         onClick={() => {
@@ -8030,6 +10123,7 @@ export function TaskChat({
                             setShowPlanFile(false);
                             setShowPendingQueue(false);
                             setShowPreviewComments(false);
+                            setShowMemoryPanel(false);
                           }
                         }}
                         className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
@@ -8060,6 +10154,7 @@ export function TaskChat({
                             setShowPlan(false);
                             setShowPendingQueue(false);
                             setShowPreviewComments(false);
+                            setShowMemoryPanel(false);
                           }
                         }}
                         className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
@@ -8083,6 +10178,7 @@ export function TaskChat({
                             setShowPlan(false);
                             setShowPlanFile(false);
                             setShowPreviewComments(false);
+                            setShowMemoryPanel(false);
                           }
                         }}
                         className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
@@ -8105,6 +10201,7 @@ export function TaskChat({
                             setShowPlanFile(false);
                             setShowPendingQueue(false);
                             setShowPreviewComments(false);
+                            setShowMemoryPanel(false);
                           }
                         }}
                         className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
@@ -8117,7 +10214,7 @@ export function TaskChat({
                         <span>Permission Request</span>
                       </button>
                     )}
-                    {activeFormMessage && (
+                    {activeSurveyMessage && (
                       <button
                         onClick={() => {
                           const next = !showFormPanel;
@@ -8134,6 +10231,7 @@ export function TaskChat({
                             setShowPlanFile(false);
                             setShowPendingQueue(false);
                             setShowPreviewComments(false);
+                            setShowMemoryPanel(false);
                           }
                         }}
                         className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
@@ -8142,8 +10240,16 @@ export function TaskChat({
                             : "border border-[color-mix(in_srgb,var(--color-highlight)_24%,transparent)] bg-[color-mix(in_srgb,var(--color-highlight)_6%,transparent)] text-[color-mix(in_srgb,var(--color-highlight)_96%,white_8%)] hover:bg-[color-mix(in_srgb,var(--color-highlight)_12%,transparent)]"
                         }`}
                       >
-                        <ListChecks className="h-3 w-3" />
-                        <span>Survey</span>
+                        {activeSurveyMessage.type === "elicitation"
+                          && activeSurveyMessage.snapshot.request.mode === "url"
+                          ? <ExternalLink className="h-3 w-3" />
+                          : <ListChecks className="h-3 w-3" />}
+                        <span>
+                          {activeSurveyMessage.type === "elicitation"
+                            && activeSurveyMessage.snapshot.request.mode === "url"
+                            ? "External Request"
+                            : "Survey"}
+                        </span>
                       </button>
                     )}
                     {hasPreviewCommentsPanel && (
@@ -8157,6 +10263,7 @@ export function TaskChat({
                             setShowPlan(false);
                             setShowPlanFile(false);
                             setShowPendingQueue(false);
+                            setShowMemoryPanel(false);
                           }
                         }}
                         className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-[10px] transition-colors ${
@@ -8166,7 +10273,7 @@ export function TaskChat({
                         }`}
                       >
                         <MessageSquarePlus className="h-3 w-3" />
-                        <span>Preview</span>
+                        <span>Comments</span>
                         <span className="opacity-70">{taskPreviewCommentDrafts.length}</span>
                       </button>
                     )}
@@ -8333,18 +10440,27 @@ export function TaskChat({
                     {!isTerminalLaunchMode && !composerNarrow && modelOptions.length > 0 && (
                       <DropdownSelect
                         ref={modelMenuRef}
-                        label="Model"
+                        label={matchedSessionConfig.model?.name ?? "Model"}
+                        icon={<Box className="h-3 w-3" />}
                         options={modelOptions}
                         value={selectedModel}
                         open={showModelMenu}
+                        disabled={!isConnected}
+                        loading={
+                          !!matchedSessionConfig.model &&
+                          pendingConfigIds.has(matchedSessionConfig.model.id)
+                        }
                         onToggle={() => {
                           setShowModelMenu(!showModelMenu);
                           setShowPermMenu(false);
                           setShowThoughtLevelMenu(false);
                         }}
                         onSelect={(v) => {
-                          // Local-only: model now travels with the next prompt's config bundle.
-                          setSelectedModel(v);
+                          if (matchedSessionConfig.model) {
+                            requestConfigOptionChange(matchedSessionConfig.model, v);
+                          } else {
+                            setSelectedModel(v);
+                          }
                           setShowModelMenu(false);
                         }}
                       />
@@ -8352,18 +10468,28 @@ export function TaskChat({
                     {!isTerminalLaunchMode && !composerNarrow && modeOptions.length > 0 && (
                       <DropdownSelect
                         ref={permMenuRef}
-                        label="Mode"
+                        label={matchedSessionConfig.mode?.name ?? "Mode"}
+                        icon={<ShieldCheck className="h-3 w-3" />}
                         options={modeOptions}
                         value={permissionLevel}
                         open={showPermMenu}
+                        disabled={!isConnected}
+                        loading={
+                          matchedSessionConfig.mode
+                            ? pendingConfigIds.has(matchedSessionConfig.mode.id)
+                            : pendingConfigIds.has("__legacy_mode")
+                        }
                         onToggle={() => {
                           setShowPermMenu(!showPermMenu);
                           setShowModelMenu(false);
                           setShowThoughtLevelMenu(false);
                         }}
                         onSelect={(v) => {
-                          // Local-only: mode now travels with the next prompt's config bundle.
-                          setPermissionLevel(v);
+                          if (matchedSessionConfig.mode) {
+                            requestConfigOptionChange(matchedSessionConfig.mode, v);
+                          } else {
+                            requestLegacyModeChange(v);
+                          }
                           setShowPermMenu(false);
                         }}
                       />
@@ -8371,20 +10497,45 @@ export function TaskChat({
                     {!isTerminalLaunchMode && !composerHideThinking && thoughtLevelOptions.length > 0 && thoughtLevelConfigId && (
                       <DropdownSelect
                         ref={thoughtLevelMenuRef}
-                        label="Thinking"
+                        label={matchedSessionConfig.thinking?.name ?? "Thinking"}
+                        icon={<Brain className="h-3 w-3" />}
                         options={thoughtLevelOptions}
                         value={thoughtLevel}
                         open={showThoughtLevelMenu}
+                        disabled={!isConnected}
+                        loading={
+                          !!matchedSessionConfig.thinking &&
+                          pendingConfigIds.has(matchedSessionConfig.thinking.id)
+                        }
                         onToggle={() => {
                           setShowThoughtLevelMenu(!showThoughtLevelMenu);
                           setShowModelMenu(false);
                           setShowPermMenu(false);
                         }}
                         onSelect={(v) => {
-                          // Local-only: thought_level now travels with the next prompt's config bundle.
-                          setThoughtLevel(v);
+                          if (matchedSessionConfig.thinking) {
+                            requestConfigOptionChange(matchedSessionConfig.thinking, v);
+                          } else {
+                            setThoughtLevel(v);
+                          }
                           setShowThoughtLevelMenu(false);
                         }}
+                      />
+                    )}
+                    {!isTerminalLaunchMode && additionalSessionConfigOptions.length > 0 && (
+                      <SessionSettingsMenu
+                        ref={sessionSettingsRef}
+                        options={additionalSessionConfigOptions}
+                        open={showSessionSettings}
+                        disabled={!isConnected}
+                        pendingConfigIds={pendingConfigIds}
+                        onToggle={() => {
+                          setShowSessionSettings(!showSessionSettings);
+                          setShowModelMenu(false);
+                          setShowPermMenu(false);
+                          setShowThoughtLevelMenu(false);
+                        }}
+                        onSelect={requestConfigOptionChange}
                       />
                     )}
                     {activePermissionMessage && isBusy ? (
@@ -8456,6 +10607,67 @@ export function TaskChat({
         </div>
       </div>
       {/* Image / SVG Lightbox */}
+      <ConfirmDialog
+        isOpen={deleteConfirmChatId !== null}
+        title="Delete Session"
+        message={
+          <div className="space-y-2">
+            <p>
+              {deleteConfirmTargetCapable
+                ? "Remove this session from Grove only, or delete it from the Agent as well."
+                : "This removes the session and its local history from Grove. The Agent-owned session is kept."}
+            </p>
+            {deleteError && (
+              <p className="text-[var(--color-error)]">{deleteError}</p>
+            )}
+          </div>
+        }
+        confirmLabel={
+          isDeletingChat
+            ? "Deleting…"
+            : deleteConfirmTargetCapable
+              ? "Delete from Agent"
+              : "Remove from Grove"
+        }
+        secondaryActionLabel={
+          deleteConfirmTargetCapable ? "Remove from Grove" : undefined
+        }
+        onSecondaryAction={
+          deleteConfirmTargetCapable && deleteConfirmChatId
+            ? () => void handleDeleteChat(deleteConfirmChatId, "grove")
+            : undefined
+        }
+        actionsDisabled={isDeletingChat}
+        compactActions
+        variant="danger"
+        onConfirm={() => {
+          if (!deleteConfirmChatId || isDeletingChat) return;
+          void handleDeleteChat(
+            deleteConfirmChatId,
+            deleteConfirmTargetCapable ? "agent" : "grove",
+          );
+        }}
+        onCancel={() => {
+          if (!isDeletingChat) {
+            setDeleteConfirmChatId(null);
+            setDeleteConfirmTargetCapable(false);
+            setDeleteError(null);
+          }
+        }}
+      />
+      <ConfirmDialog
+        isOpen={reconnectConfirmOpen}
+        title="Reconnect Session"
+        message={
+          pendingMessages.length > 0
+            ? `Reconnect will stop the current response and discard ${pendingMessages.length} queued message${pendingMessages.length === 1 ? "" : "s"}. Chat history will be preserved.`
+            : "Reconnect will stop the current response. Chat history will be preserved."
+        }
+        confirmLabel={isReconnecting ? "Reconnecting..." : "Reconnect"}
+        variant="warning"
+        onConfirm={() => void performReconnect()}
+        onCancel={() => setReconnectConfirmOpen(false)}
+      />
       <ImageLightbox
         imageUrl={lightboxUrl}
         svgContent={lightboxSvg}
@@ -8473,7 +10685,7 @@ export function TaskChat({
               left: agentPickerAnchor.left,
               zIndex: 1000,
             }}
-            className="min-w-48 max-h-64 overflow-y-auto rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg py-1"
+            className="min-w-48 max-h-64 overflow-x-hidden overflow-y-auto rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg"
           >
             {!acpAvailabilityLoaded ? (
               <div className="flex items-center gap-2 px-3 py-2 text-sm text-[var(--color-text-muted)]">
@@ -8520,21 +10732,198 @@ export function TaskChat({
 
 // ─── Sub-components ──────────────────────────────────────────────────────────
 
+const SessionSettingsMenu = ({
+  ref,
+  options,
+  open,
+  disabled,
+  pendingConfigIds,
+  onToggle,
+  onSelect,
+}: {
+  ref: React.RefObject<HTMLDivElement | null>;
+  options: SessionConfigOption[];
+  open: boolean;
+  disabled: boolean;
+  pendingConfigIds: Set<string>;
+  onToggle: () => void;
+  onSelect: (option: SessionConfigOption, value: string | boolean) => void;
+}) => {
+  const [menuAnchor, setMenuAnchor] = useState<{
+    left: number;
+    bottom: number;
+    maxHeight: number;
+  } | null>(null);
+
+  const positionMenu = useCallback((trigger: HTMLElement) => {
+    const rect = trigger.getBoundingClientRect();
+    const viewportMargin = 8;
+    const menuGap = 4;
+    const menuWidth = 320;
+    setMenuAnchor({
+      left: Math.min(
+        Math.max(viewportMargin, rect.right - menuWidth),
+        window.innerWidth - menuWidth - viewportMargin,
+      ),
+      bottom: window.innerHeight - rect.top + menuGap,
+      maxHeight: Math.max(
+        120,
+        Math.min(320, rect.top - menuGap - viewportMargin),
+      ),
+    });
+  }, []);
+
+  const iconForOption = (option: SessionConfigOption) => {
+    if (configCategoryMatches(option, "model")) return <Box className="h-3.5 w-3.5" />;
+    if (configCategoryMatches(option, "mode")) return <ShieldCheck className="h-3.5 w-3.5" />;
+    if (configCategoryMatches(option, "thought_level")) return <Brain className="h-3.5 w-3.5" />;
+    return <SlidersHorizontal className="h-3.5 w-3.5" />;
+  };
+
+  const renderValue = (
+    option: SessionConfigOption,
+    value: SessionConfigSelectValue,
+  ) => (
+    <button
+      key={value.value}
+      type="button"
+      disabled={pendingConfigIds.has(option.id)}
+      onMouseDown={(event) => event.preventDefault()}
+      onClick={() => onSelect(option, value.value)}
+      className="grid w-full grid-cols-[14px_minmax(0,1fr)_auto] items-start gap-x-2 rounded-md px-1 py-1.5 text-left hover:bg-[var(--color-bg-tertiary)] disabled:opacity-50"
+    >
+      <span aria-hidden="true" />
+      <span className="min-w-0">
+        <span className="block text-xs text-[var(--color-text)]">{value.name}</span>
+        {value.description && (
+          <span className="mt-0.5 block text-[10px] leading-4 text-[var(--color-text-muted)]">
+            {value.description}
+          </span>
+        )}
+      </span>
+      {option.currentValue === value.value && (
+        <span className="mt-0.5 justify-self-end text-xs text-[var(--color-highlight)]">✓</span>
+      )}
+    </button>
+  );
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        onClick={(event) => {
+          if (!open) positionMenu(event.currentTarget);
+          onToggle();
+        }}
+        disabled={disabled}
+        title="Session settings"
+        aria-label="Session settings"
+        className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-[var(--color-bg)] text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)] disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        <SlidersHorizontal className="h-3.5 w-3.5" />
+      </button>
+      {open && !disabled && menuAnchor && typeof document !== "undefined" &&
+        createPortal(
+        <div
+          data-session-settings-menu
+          className="fixed z-[1000] flex w-80 flex-col overflow-y-auto rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-1.5 shadow-lg"
+          style={{
+            left: menuAnchor.left,
+            bottom: menuAnchor.bottom,
+            maxHeight: menuAnchor.maxHeight,
+            overflowAnchor: "none",
+          }}
+        >
+          {options.map((option) => (
+            <div key={option.id} className="border-b border-[var(--color-border)] px-1 py-2 last:border-b-0">
+              <div className="mb-1 grid grid-cols-[14px_minmax(0,1fr)_auto] items-start gap-x-2 px-1">
+                <span className="mt-0.5 text-[var(--color-text-muted)]">
+                  {iconForOption(option)}
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-xs font-medium text-[var(--color-text)]">
+                    {option.name}
+                  </span>
+                  {option.description && (
+                    <span className="mt-0.5 block text-[10px] leading-4 text-[var(--color-text-muted)]">
+                      {option.description}
+                    </span>
+                  )}
+                </span>
+              </div>
+              {option.type === "boolean" ? (
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={option.currentValue}
+                  disabled={pendingConfigIds.has(option.id)}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => onSelect(option, !option.currentValue)}
+                  className="mt-1 grid w-full grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-x-2 rounded-md px-1 py-1.5 text-left text-xs text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] disabled:opacity-50"
+                >
+                  <span aria-hidden="true" />
+                  <span>{option.currentValue ? "On" : "Off"}</span>
+                  <span
+                    className={`relative inline-block h-4 w-7 justify-self-end rounded-full transition-colors ${
+                      option.currentValue
+                        ? "bg-[var(--color-highlight)]"
+                        : "bg-[var(--color-bg-tertiary)]"
+                    }`}
+                  >
+                    <span
+                      className={`absolute top-0.5 block h-3 w-3 rounded-full bg-white shadow-sm transition-transform ${
+                        option.currentValue ? "translate-x-3.5" : "translate-x-0.5"
+                      }`}
+                    />
+                  </span>
+                </button>
+              ) : option.options.some(isConfigGroup) ? (
+                (option.options as SessionConfigSelectGroup[]).map((group) => (
+                  <div key={group.group} className="mt-1">
+                    <div className="grid grid-cols-[14px_minmax(0,1fr)_auto] gap-x-2 px-1 py-1">
+                      <span aria-hidden="true" />
+                      <span className="text-[10px] font-medium uppercase tracking-wide text-[var(--color-text-muted)]">
+                        {group.name}
+                      </span>
+                    </div>
+                    {group.options.map((value) => renderValue(option, value))}
+                  </div>
+                ))
+              ) : (
+                (option.options as SessionConfigSelectValue[]).map((value) =>
+                  renderValue(option, value),
+                )
+              )}
+            </div>
+          ))}
+        </div>,
+        document.body,
+      )}
+    </div>
+  );
+};
+
 /** Reusable dropdown selector for bottom toolbar */
 const DropdownSelect = ({
   ref,
   label,
+  icon,
   options,
   value,
   open,
+  disabled = false,
+  loading = false,
   onToggle,
   onSelect,
 }: {
   ref: React.RefObject<HTMLDivElement | null>;
   label: string;
-  options: { label: string; value: string }[];
+  icon?: ReactNode;
+  options: ChatDropdownOption[];
   value: string;
   open: boolean;
+  disabled?: boolean;
+  loading?: boolean;
   onToggle: () => void;
   onSelect: (value: string) => void;
 }) => {
@@ -8582,16 +10971,19 @@ const DropdownSelect = ({
   return (
     <div className="relative" ref={ref}>
       <button
+        type="button"
         onClick={onToggle}
-        className="inline-flex h-7 items-center gap-1 rounded-full bg-[var(--color-bg)] px-2.5 text-[11px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
+        disabled={disabled}
+        className="inline-flex h-7 items-center gap-1 rounded-full bg-[var(--color-bg)] px-2.5 text-[11px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:cursor-not-allowed disabled:opacity-40"
       >
+        {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : icon}
         <span className="chatbox-dropdown-label opacity-70">{label}</span>
         <span className="max-w-40 truncate text-[var(--color-text)]">
           {options.find((o) => o.value === value)?.label ?? "Default"}
         </span>
         <ChevronDown className="w-3 h-3 opacity-70" />
       </button>
-      {open && (
+      {open && !disabled && (
         <div className="absolute bottom-full right-0 mb-1 min-w-44 max-h-64 flex flex-col rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg py-1 z-50">
           {enableSearch && (
             <div className="px-2 pt-1.5 pb-1 border-b border-[var(--color-border)] flex-shrink-0">
@@ -8610,21 +11002,34 @@ const DropdownSelect = ({
             </div>
           )}
           <div className="overflow-y-auto flex-1">
-          {filteredOptions.map((opt) => (
-            <button
-              key={opt.value}
-              onClick={() => onSelect(opt.value)}
-              className={`w-full text-left px-3 py-1.5 text-sm flex items-center justify-between hover:bg-[var(--color-bg-tertiary)] transition-colors ${
-                value === opt.value
-                  ? "text-[var(--color-text)]"
-                  : "text-[var(--color-text-muted)]"
-              }`}
-            >
-              <span>{opt.label}</span>
-              {value === opt.value && (
-                <span className="text-[var(--color-highlight)]">✓</span>
+          {filteredOptions.map((opt, index) => (
+            <Fragment key={opt.value}>
+              {opt.group && filteredOptions[index - 1]?.group !== opt.group && (
+                <div className="px-3 pb-1 pt-2 text-[10px] font-medium uppercase tracking-wide text-[var(--color-text-muted)]">
+                  {opt.group}
+                </div>
               )}
-            </button>
+              <button
+                onClick={() => onSelect(opt.value)}
+                className={`w-full text-left px-3 py-1.5 text-sm flex items-center justify-between hover:bg-[var(--color-bg-tertiary)] transition-colors ${
+                  value === opt.value
+                    ? "text-[var(--color-text)]"
+                    : "text-[var(--color-text-muted)]"
+                }`}
+              >
+                <span className="min-w-0">
+                  <span className="block truncate">{opt.label}</span>
+                  {opt.description && (
+                    <span className="mt-0.5 block text-[10px] leading-4 text-[var(--color-text-muted)]">
+                      {opt.description}
+                    </span>
+                  )}
+                </span>
+                {value === opt.value && (
+                  <span className="text-[var(--color-highlight)]">✓</span>
+                )}
+              </button>
+            </Fragment>
           ))}
           {enableSearch && filteredOptions.length === 0 && (
             <div className="px-3 py-2 text-xs text-[var(--color-text-muted)] text-center">
@@ -8698,51 +11103,352 @@ function UserMessageBody({ content }: { content: string }) {
 }
 
 /**
- * Renders the body of a "thinking" message.
- *
- * Layout decision: while the agent is still streaming, we let the chunk
- * grow with the typewriter text instead of capping it at a fixed height.
- * That way the surrounding Virtuoso row grows, `totalListHeightChanged`
- * fires, and the outer chat viewport auto-anchors to the bottom — the
- * user always sees the latest text being generated. (A 160px cap during
- * streaming would push the latest text behind a tiny inner scrollbar
- * the user has to chase by hand.)
- *
- * Once the message is complete, the cap kicks in so a long thought
- * doesn't dominate the chat forever. We pin the inner scroll to the
- * bottom on mount so the final sentence of the reasoning is visible
- * (the most useful bit — the earlier paragraphs are reasoning history).
+ * A compact, session-local table of contents for the conversation. It mirrors
+ * the affordance in document editors: hover a tick to preview the user prompt
+ * and response, click to jump to that turn in the virtualized chat list.
  */
-function ThoughtChunkBody({
-  content,
-  complete,
+function ConversationMinimap({
+  turns,
+  activeMessageIndex,
+  onNavigate,
 }: {
-  content: string;
-  collapsed: boolean;
-  complete: boolean;
+  turns: ConversationTurn[];
+  activeMessageIndex: number | null;
+  onNavigate: (turn: ConversationTurn) => void;
 }) {
-  const innerRef = useRef<HTMLDivElement>(null);
+  const [preview, setPreview] = useState<{
+    turn: ConversationTurn;
+    rect: DOMRect;
+  } | null>(null);
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  const hideTimerRef = useRef<number | null>(null);
+  const navRef = useRef<HTMLElement | null>(null);
+  const [isScrollable, setIsScrollable] = useState(false);
+
+  const clearScheduledHide = useCallback(() => {
+    if (hideTimerRef.current !== null) {
+      window.clearTimeout(hideTimerRef.current);
+      hideTimerRef.current = null;
+    }
+  }, []);
+  const showPreview = useCallback((turn: ConversationTurn, anchor: HTMLElement) => {
+    clearScheduledHide();
+    setPreview({ turn, rect: anchor.getBoundingClientRect() });
+  }, [clearScheduledHide]);
+  const schedulePreviewHide = useCallback(() => {
+    clearScheduledHide();
+    hideTimerRef.current = window.setTimeout(() => {
+      setPreview(null);
+      hideTimerRef.current = null;
+    }, 220);
+  }, [clearScheduledHide]);
+  useEffect(() => () => clearScheduledHide(), [clearScheduledHide]);
+
+  // The top/bottom fade only makes sense once the rail is actually clipped
+  // by max-height — applying it unconditionally blanks out short lists,
+  // since the fade's percentage-based stops invert when the box is shorter
+  // than the fade itself.
   useEffect(() => {
-    if (!complete) return;
-    const el = innerRef.current;
+    const el = navRef.current;
     if (!el) return;
-    el.scrollTop = el.scrollHeight;
-  }, [complete, content]);
-  if (!complete) {
-    return (
-      <div className="ml-5 rounded-lg bg-[var(--color-bg-tertiary)] text-xs text-[var(--color-text-muted)] italic">
-        <div className="px-3 py-2 whitespace-pre-wrap">{content}</div>
-      </div>
-    );
-  }
+    setIsScrollable(el.scrollHeight > el.clientHeight + 1);
+  }, [turns.length]);
+
+  // Keep the rail's scroll position following the turn the reader is
+  // currently on — without this it stays pinned wherever it was first
+  // rendered (usually the top) instead of tracking the active tick as
+  // the user scrolls through a long conversation.
+  useEffect(() => {
+    const el = navRef.current;
+    if (!el || activeMessageIndex === null) return;
+    const active = el.querySelector<HTMLElement>('[data-active="true"]');
+    if (!active) return;
+    const activeTop = active.offsetTop;
+    const activeBottom = activeTop + active.offsetHeight;
+    if (activeTop < el.scrollTop) {
+      el.scrollTop = activeTop;
+    } else if (activeBottom > el.scrollTop + el.clientHeight) {
+      el.scrollTop = activeBottom - el.clientHeight;
+    }
+  }, [activeMessageIndex]);
+
+  // A single prompt does not need a navigation aid, and hiding it also keeps
+  // a newly-created chat visually quiet until there is actual history.
+  if (turns.length < 2) return null;
+
+  const previewTop = preview
+    ? Math.max(12, Math.min(preview.rect.top - 18, window.innerHeight - 188))
+    : 0;
+
   return (
-    <div className="ml-5 rounded-lg bg-[var(--color-bg-tertiary)] text-xs text-[var(--color-text-muted)] italic overflow-hidden">
-      <div
-        ref={innerRef}
-        className="thought-chunk-scroll px-3 py-2 whitespace-pre-wrap max-h-40 overflow-y-auto"
+    <>
+      <nav
+        ref={navRef}
+        aria-label="Conversation history"
+        className={`conversation-minimap conversation-minimap-scroll absolute left-0.5 top-1/2 z-20 flex max-h-[min(60vh,420px)] -translate-y-1/2 flex-col items-start gap-2 overflow-y-auto py-4 opacity-70 transition-opacity hover:opacity-100 focus-within:opacity-100 ${
+          isScrollable ? "conversation-minimap-fade" : ""
+        }`}
+        onMouseLeave={() => setHoveredIndex(null)}
       >
-        {content}
+        {turns.map((turn, index) => {
+          const hasReply = Boolean(turn.assistant);
+          const isActive = turn.messageIndex === activeMessageIndex;
+          // Dock-style magnification: neighbors within 3 turns of the
+          // hovered tick swell too, tapering off with distance, so hovering
+          // reads as a small "hill" rather than a single bar snapping wide.
+          const baseWidth = isActive ? 16 : 10;
+          const distance = hoveredIndex === null ? Infinity : Math.abs(index - hoveredIndex);
+          const falloff = Math.max(0, 1 - distance / 3);
+          const width = baseWidth + 12 * Math.pow(falloff, 1.5);
+          return (
+            <button
+              key={turn.messageIndex}
+              type="button"
+              data-active={isActive || undefined}
+              aria-label={`Conversation turn ${index + 1}: ${turn.user}`}
+              title={`Turn ${index + 1}`}
+              onMouseEnter={(event) => {
+                showPreview(turn, event.currentTarget);
+                setHoveredIndex(index);
+              }}
+              onFocus={(event) => {
+                showPreview(turn, event.currentTarget);
+                setHoveredIndex(index);
+              }}
+              onMouseLeave={schedulePreviewHide}
+              onBlur={() => {
+                schedulePreviewHide();
+                setHoveredIndex(null);
+              }}
+              onClick={() => {
+                clearScheduledHide();
+                setPreview(null);
+                onNavigate(turn);
+              }}
+              style={{ width }}
+              className={`relative h-[2px] shrink-0 rounded-full transition-[width,background-color,opacity] duration-150 ease-out before:absolute before:-inset-x-2 before:-inset-y-2 before:content-[''] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-highlight)] ${
+                turn.isStreaming
+                  ? "animate-pulse bg-[var(--color-warning)]"
+                  : isActive
+                    ? "bg-[var(--color-highlight)] opacity-100"
+                  : hasReply
+                    ? "bg-[color-mix(in_srgb,var(--color-text-muted)_75%,transparent)] hover:bg-[var(--color-highlight)]"
+                    : "bg-[color-mix(in_srgb,var(--color-warning)_75%,transparent)]"
+              }`}
+            />
+          );
+        })}
+      </nav>
+      {preview && typeof document !== "undefined" &&
+        createPortal(
+          <div
+            role="tooltip"
+            className="pointer-events-none fixed z-[120] w-[min(360px,calc(100vw-32px))] rounded-2xl border border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[color-mix(in_srgb,var(--color-bg)_94%,transparent)] p-3 shadow-[0_18px_48px_rgba(0,0,0,0.18)] backdrop-blur-md"
+            style={{
+              left: Math.min(preview.rect.right + 10, window.innerWidth - 372),
+              top: previewTop,
+            }}
+          >
+            <p className="line-clamp-2 text-sm font-medium leading-5 text-[var(--color-text)]">
+              {preview.turn.user}
+            </p>
+            <p className="mt-2 line-clamp-3 text-[13px] leading-5 text-[var(--color-text-muted)]">
+              {preview.turn.assistant || (preview.turn.isStreaming ? "Responding…" : "No response yet")}
+            </p>
+            {preview.turn.tools.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-1.5 border-t border-[color-mix(in_srgb,var(--color-border)_56%,transparent)] pt-2.5">
+                {preview.turn.tools.map((tool) => (
+                  <span
+                    key={tool.label}
+                    className="inline-flex items-center gap-1 rounded-md bg-[var(--color-bg-tertiary)] px-1.5 py-1 text-[10px] font-medium text-[var(--color-text-muted)]"
+                  >
+                    <Wrench className="h-2.5 w-2.5 text-[var(--color-highlight)]" />
+                    {tool.count} {tool.label}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>,
+          document.body,
+        )}
+    </>
+  );
+}
+
+function ThinkingStatus({ label, active }: { label: string; active: boolean }) {
+  return (
+    <div
+      className="flex min-w-0 items-center py-0.5 text-sm font-medium italic"
+      data-grove-search-skip="true"
+      aria-live={active ? "polite" : undefined}
+      title={label}
+    >
+      <span
+        className={`truncate ${active ? "thought-status-shimmer" : "text-[var(--color-text-muted)]"}`}
+      >
+        {label}
+      </span>
+    </div>
+  );
+}
+
+function contentResourceName(uri: string, fallback = "Resource"): string {
+  const tail = uri.split(/[\\/]/).filter(Boolean).at(-1);
+  if (!tail) return fallback;
+  try {
+    return decodeURIComponent(tail);
+  } catch {
+    return tail;
+  }
+}
+
+function ContentResourceCard({
+  block,
+}: {
+  block: Extract<AgentContentBlock, { type: "resource_link" }>;
+}) {
+  const label = block.title || block.label || block.name;
+  return (
+    <button
+      type="button"
+      onClick={() => openExternalUrl(block.uri)}
+      className="flex w-full max-w-[420px] items-center gap-3 rounded-xl border border-[color-mix(in_srgb,var(--color-border)_70%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_72%,transparent)] px-3 py-2.5 text-left transition-colors hover:bg-[var(--color-bg-secondary)]"
+      title={block.uri}
+    >
+      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[var(--color-bg)]">
+        <Paperclip className="h-4 w-4 text-[var(--color-text-muted)]" />
       </div>
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-xs font-medium text-[var(--color-text)]">
+          {label}
+        </div>
+        {(block.description || block.mime_type || typeof block.size === "number") && (
+          <div className="mt-0.5 truncate text-[10px] text-[var(--color-text-muted)]">
+            {[
+              block.description,
+              block.mime_type,
+              typeof block.size === "number"
+                ? `${Math.max(1, Math.round(block.size / 1024))} KB`
+                : "",
+            ]
+              .filter(Boolean)
+              .join(" · ")}
+          </div>
+        )}
+      </div>
+      <ExternalLink className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-muted)]" />
+    </button>
+  );
+}
+
+function EmbeddedResourceCard({
+  block,
+}: {
+  block: Extract<AgentContentBlock, { type: "resource" }>;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const name = contentResourceName(block.uri);
+  const downloadHref = block.blob
+    ? `data:${block.mime_type || "application/octet-stream"};base64,${block.blob}`
+    : undefined;
+  return (
+    <div className="w-full max-w-[520px] overflow-hidden rounded-xl border border-[color-mix(in_srgb,var(--color-border)_70%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_72%,transparent)]">
+      <div className="flex items-center gap-3 px-3 py-2.5">
+        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[var(--color-bg)]">
+          <Paperclip className="h-4 w-4 text-[var(--color-text-muted)]" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-xs font-medium text-[var(--color-text)]">
+            {name}
+          </div>
+          <div className="truncate text-[10px] text-[var(--color-text-muted)]">
+            {block.mime_type || (block.text != null ? "text/plain" : "Embedded resource")}
+          </div>
+        </div>
+        {block.text != null && (
+          <button
+            type="button"
+            onClick={() => setExpanded((value) => !value)}
+            className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[10px] text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+          >
+            {expanded ? "Collapse" : "Preview"}
+            <ChevronDown
+              className={`h-3 w-3 transition-transform ${expanded ? "rotate-180" : ""}`}
+            />
+          </button>
+        )}
+        {downloadHref && (
+          <a
+            href={downloadHref}
+            download={name}
+            className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[10px] text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+          >
+            <Download className="h-3 w-3" />
+            Download
+          </a>
+        )}
+        {block.uri && (
+          <button
+            type="button"
+            onClick={() => openExternalUrl(block.uri)}
+            className="rounded-md p-1.5 text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+            title={block.uri}
+          >
+            <ExternalLink className="h-3.5 w-3.5" />
+          </button>
+        )}
+      </div>
+      {expanded && block.text != null && (
+        <pre className="max-h-72 overflow-auto border-t border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[var(--color-bg)] px-3 py-2.5 text-[11px] leading-5 text-[var(--color-text)] whitespace-pre-wrap break-words">
+          {block.text}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+function AgentContentBlocks({
+  blocks,
+  renderText,
+  onImageClick,
+}: {
+  blocks: AgentContentBlock[];
+  renderText: (text: string, index: number) => ReactNode;
+  onImageClick?: (url: string) => void;
+}) {
+  return (
+    <div className="space-y-2.5">
+      {blocks.map((block, index) => {
+        if (block.type === "text") {
+          return <Fragment key={index}>{renderText(block.text, index)}</Fragment>;
+        }
+        if (block.type === "image") {
+          const src = `data:${block.mime_type};base64,${block.data}`;
+          return (
+            <img
+              key={index}
+              src={src}
+              alt={block.label || contentResourceName(block.uri || "", "Agent image")}
+              className="max-h-[420px] max-w-full rounded-xl border border-[color-mix(in_srgb,var(--color-border)_70%,transparent)] object-contain shadow-sm cursor-pointer hover:opacity-95"
+              onClick={() => onImageClick?.(src)}
+            />
+          );
+        }
+        if (block.type === "audio") {
+          return (
+            <audio
+              key={index}
+              controls
+              src={`data:${block.mime_type};base64,${block.data}`}
+              className="w-full max-w-[520px]"
+            />
+          );
+        }
+        if (block.type === "resource_link") {
+          return <ContentResourceCard key={index} block={block} />;
+        }
+        return <EmbeddedResourceCard key={index} block={block} />;
+      })}
     </div>
   );
 }
@@ -8755,8 +11461,12 @@ const MessageItem = memo(function MessageItem({
   agentLabel,
   projectId,
   taskId,
+  activeChatId,
+  previewCommentDrafts,
+  onAddPreviewComment,
+  onUpdatePreviewComment,
+  onRemovePreviewComment,
   isStudio,
-  onToggleThinkingCollapse,
   onPermissionResponse,
   onFileClick,
   onImageClick,
@@ -8771,8 +11481,12 @@ const MessageItem = memo(function MessageItem({
   agentLabel?: string;
   projectId: string;
   taskId: string;
+  activeChatId?: string;
+  previewCommentDrafts: PreviewCommentDraft[];
+  onAddPreviewComment: ReturnType<typeof usePreviewComments>["addDraft"];
+  onUpdatePreviewComment: ReturnType<typeof usePreviewComments>["updateDraft"];
+  onRemovePreviewComment: ReturnType<typeof usePreviewComments>["removeDraft"];
   isStudio: boolean;
-  onToggleThinkingCollapse: (index: number) => void;
   onPermissionResponse?: (optionId: string, requestId: string) => void;
   onFileClick?: (filePath: string, line?: number) => Promise<boolean>;
   onImageClick?: (url: string) => void;
@@ -8784,13 +11498,15 @@ const MessageItem = memo(function MessageItem({
     Icon: React.ComponentType<{ size?: number; className?: string }>;
   };
 }) {
-  const sketchContext = isStudio ? { projectId, taskId } : undefined;
-  // Typewriter reveal for streaming assistant/thinking text. Hook must
+  const sketchContext = useMemo(
+    () => (isStudio ? { projectId, taskId } : undefined),
+    [isStudio, projectId, taskId],
+  );
+  // Typewriter reveal for streaming assistant text. Hook must
   // be called unconditionally; for other message types (or any
   // non-busy chat — i.e. history loads) we feed instant=true so it's
   // effectively a no-op and the full content shows immediately.
-  const isTextStream =
-    message.type === "assistant" || message.type === "thinking";
+  const isTextStream = message.type === "assistant";
   const streamRaw = isTextStream ? message.content : "";
   const streamInstant =
     !isTextStream || message.complete || !isBusy;
@@ -8811,6 +11527,46 @@ const MessageItem = memo(function MessageItem({
     }
     return `/api/v1/projects/${projectId}/tasks/${taskId}/file/raw?path=${encodeURIComponent(decoded)}`;
   }, [projectId, taskId]);
+
+  const chatCommentFilePath = activeChatId
+    ? `chat/${activeChatId}/message-${index + 1}`
+    : undefined;
+  const messageCommentDrafts = useMemo(
+    () => chatCommentFilePath
+      ? previewCommentDrafts.filter((draft) => draft.source === "chat" && draft.filePath === chatCommentFilePath)
+      : [],
+    [chatCommentFilePath, previewCommentDrafts],
+  );
+  const isCommentableAssistant = message.type === "assistant" && message.complete;
+  const markdownComments = useMemo(() => {
+    if (!chatCommentFilePath || !isCommentableAssistant) return undefined;
+    return {
+      previewId: `chat-markdown-${activeChatId}-${index}`,
+      markers: messageCommentDrafts.map((draft) => ({
+        id: draft.id,
+        label: previewCommentTaskLabel(previewCommentDrafts, draft),
+        selector: draft.locator.selector,
+        xpath: draft.locator.xpath,
+        extraBlocks: draft.locator.extraBlocks,
+        locator: draft.locator,
+        comment: draft.comment,
+      })),
+      onAdd: (locator: PreviewCommentLocator, comment: string) => {
+        onAddPreviewComment({
+          source: "chat",
+          projectId,
+          taskId,
+          filePath: chatCommentFilePath,
+          fileName: `Conversation · message ${index + 1}`,
+          rendererId: "chat-markdown",
+          locator,
+          comment,
+        });
+      },
+      onUpdate: (id: string, comment: string) => onUpdatePreviewComment(id, { comment }),
+      onDelete: onRemovePreviewComment,
+    };
+  }, [activeChatId, chatCommentFilePath, index, isCommentableAssistant, messageCommentDrafts, onAddPreviewComment, onRemovePreviewComment, onUpdatePreviewComment, previewCommentDrafts, projectId, taskId]);
 
   switch (message.type) {
     case "user":
@@ -8946,23 +11702,55 @@ const MessageItem = memo(function MessageItem({
       // Use the typewriter-revealed text while streaming; once complete
       // the hook returns the full content immediately.
       const shown = message.complete ? message.content : streamDisplay;
-      // Skip empty/whitespace-only assistant messages
-      if (!shown.trim()) return null;
+      const hasStructuredContent =
+        message.blocks?.some((block) => block.type !== "text") ?? false;
+      // Skip empty/whitespace-only assistant messages unless they carry a
+      // structured ACP content block.
+      if (!shown.trim() && !hasStructuredContent) return null;
       return (
         <div className="flex justify-start">
-          <div className="w-full min-w-0 text-sm text-[var(--color-text)]">
-            <MarkdownRenderer
-              content={shown}
-              onFileClick={onFileClick}
-              resolveImageUrl={resolveImageUrl}
-              onMermaidClick={onMermaidClick}
-              onD2Click={onD2Click}
-              onImageClick={onImageClick}
-              enableRunCommand
-              sketchContext={sketchContext}
-            />
-            {!message.complete && isBusy && (
-              <span className="inline-block w-1.5 h-4 ml-0.5 bg-[var(--color-text-muted)] animate-pulse rounded-sm" />
+          <div
+            className="w-full min-w-0 text-sm text-[var(--color-text)]"
+            data-grove-commentable-message="true"
+            data-grove-message-index={index}
+          >
+            {hasStructuredContent && message.blocks ? (
+              <AgentContentBlocks
+                blocks={message.blocks}
+                onImageClick={onImageClick}
+                renderText={(text, blockIndex) => (
+                  <MarkdownRenderer
+                    content={text}
+                    onFileClick={onFileClick}
+                    resolveImageUrl={resolveImageUrl}
+                    onMermaidClick={onMermaidClick}
+                    onD2Click={onD2Click}
+                    onImageClick={onImageClick}
+                    enableRunCommand
+                    sketchContext={sketchContext}
+                    comments={
+                      markdownComments
+                        ? {
+                            ...markdownComments,
+                            previewId: `${markdownComments.previewId}-block-${blockIndex}`,
+                          }
+                        : undefined
+                    }
+                  />
+                )}
+              />
+            ) : (
+              <MarkdownRenderer
+                content={shown}
+                onFileClick={onFileClick}
+                resolveImageUrl={resolveImageUrl}
+                onMermaidClick={onMermaidClick}
+                onD2Click={onD2Click}
+                onImageClick={onImageClick}
+                enableRunCommand
+                sketchContext={sketchContext}
+                comments={markdownComments}
+              />
             )}
             {message.complete && message.usage && (
               <TurnUsageMeta
@@ -8978,33 +11766,12 @@ const MessageItem = memo(function MessageItem({
       );
     }
     case "thinking":
+      if (message.complete) return null;
       return (
-        <div className="flex justify-start" data-grove-search-skip="true">
-          <div className="w-full min-w-0">
-            <button
-              onClick={() => onToggleThinkingCollapse(index)}
-              className="flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors mb-1"
-            >
-              <Brain className="w-3 h-3" />
-              {message.collapsed ? (
-                <ChevronRight className="w-3 h-3" />
-              ) : (
-                <ChevronDown className="w-3 h-3" />
-              )}
-              <span className="italic">
-                {message.complete ? "Thought" : "Thinking"}
-              </span>
-            </button>
-            {!message.collapsed && (
-              <ThoughtChunkBody
-                key={`tc-${index}-${message.complete ? "done" : "stream"}`}
-                content={message.complete ? message.content : streamDisplay}
-                collapsed={false}
-                complete={message.complete}
-              />
-            )}
-          </div>
-        </div>
+        <ThinkingStatus
+          label={extractThoughtStatus(message.content)}
+          active={!message.complete && isBusy}
+        />
       );
     case "permission":
       return message.resolved ? (
@@ -9014,6 +11781,7 @@ const MessageItem = memo(function MessageItem({
       // Tools are rendered via ToolSectionView; skip here
       return null;
     case "ask_form":
+    case "elicitation":
       // Rendered in the composer panel (chip + expandable panel above the
       // input), not inline in the message stream.
       return null;
@@ -9087,13 +11855,13 @@ function AuthRequiredPanel({
   index,
   agentLabel,
   onAuthLogin,
-  onDismiss,
+  onAuthRetry,
 }: {
   message: Extract<ChatMessage, { type: "auth_required" }>;
   index: number;
   agentLabel?: string;
   onAuthLogin?: (index: number, methodId: string) => void;
-  onDismiss?: (index: number) => void;
+  onAuthRetry?: (index: number) => void;
 }) {
   const agentDisplay = message.agentName || agentLabel || "Agent";
   const hasMethods = message.methods.length > 0;
@@ -9108,15 +11876,15 @@ function AuthRequiredPanel({
   } else if (message.status === "in_progress") {
     title = "Authenticating";
     description = activeMethod
-      ? `Complete the ${activeMethod.name} flow in the browser. The session will resume automatically once finished.`
-      : "Waiting for the agent to confirm authentication...";
+      ? `Complete the ${activeMethod.name} sign-in flow. The session will resume automatically once finished.`
+      : "Checking whether the external sign-in completed...";
   } else if (message.status === "failed") {
     title = "Login failed";
     description =
       message.errorMessage ?? "Please choose an option below to try again.";
   } else if (!hasMethods) {
     title = "Authentication required";
-    description = `${agentDisplay} did not advertise any login method. Run the agent's CLI login in a terminal, then send your message again.`;
+    description = `${agentDisplay} did not advertise a login method. Sign in with the agent's CLI, then retry the request.`;
   } else {
     title = "Authentication required";
     description = `${agentDisplay} needs you to sign in before continuing. Pick a login method below.`;
@@ -9125,15 +11893,7 @@ function AuthRequiredPanel({
     message.status === "in_progress" || message.status === "succeeded";
 
   return (
-    <div className="space-y-3 relative pr-6">
-      <button
-        type="button"
-        onClick={() => onDismiss?.(index)}
-        className="absolute top-0 right-0 rounded-md p-1 text-[var(--color-text-muted)] transition-colors hover:bg-[color-mix(in_srgb,var(--color-text)_10%,transparent)] hover:text-[var(--color-text)]"
-        title="Dismiss"
-      >
-        <X className="h-3.5 w-3.5" />
-      </button>
+    <div className="space-y-3 relative">
       <div className="flex items-start gap-2">
         <AlertTriangle className="h-4 w-4 shrink-0 text-[var(--color-warning)] mt-0.5" />
         <div className="min-w-0 flex-1">
@@ -9180,6 +11940,16 @@ function AuthRequiredPanel({
             );
           })}
         </div>
+      )}
+      {!hasMethods && (
+        <button
+          type="button"
+          disabled={buttonsDisabled}
+          onClick={() => onAuthRetry?.(index)}
+          className="flex w-full items-center justify-center rounded-xl border border-[color-mix(in_srgb,var(--color-warning)_18%,transparent)] bg-[color-mix(in_srgb,var(--color-warning)_7%,transparent)] px-3 py-2.5 text-sm font-medium text-[var(--color-text)] transition-colors hover:bg-[color-mix(in_srgb,var(--color-warning)_12%,transparent)] disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {message.status === "in_progress" ? "Retrying..." : "Retry"}
+        </button>
       )}
     </div>
   );
@@ -9312,7 +12082,7 @@ function normalizeToolVerb(title: string): string {
 }
 
 function isEditTool(message: ToolMessage): boolean {
-  return normalizeToolVerb(message.title) === "edit";
+  return message.kind === "edit" || normalizeToolVerb(message.title) === "edit";
 }
 
 /**
@@ -9326,10 +12096,17 @@ type ActionKind =
   | "todo"
   | "mcp"
   | "permission"
+  | "read"
+  | "edit"
+  | "delete"
+  | "move"
+  | "search"
+  | "fetch"
+  | "switch_mode"
   | "generic";
 
-function classifyActionKind(title: string): ActionKind {
-  const lower = title.toLowerCase().trim();
+function classifyActionKind(message: ToolMessage): ActionKind {
+  const lower = message.title.toLowerCase().trim();
   // 注：不匹配 "terminal"（会被 isBackgroundAction 先剔掉，走不到这里）。
   if (lower === "bash" || lower.startsWith("run ")) return "bash";
   if (lower === "bash_output") return "bash_output";
@@ -9342,6 +12119,19 @@ function classifyActionKind(title: string): ActionKind {
     return "todo";
   if (lower.startsWith("mcp__") || lower.startsWith("mcp_")) return "mcp";
   if (lower.includes("permission")) return "permission";
+  if (message.kind === "execute") return "bash";
+  if (message.kind === "think") return "todo";
+  if (
+    message.kind === "read" ||
+    message.kind === "edit" ||
+    message.kind === "delete" ||
+    message.kind === "move" ||
+    message.kind === "search" ||
+    message.kind === "fetch" ||
+    message.kind === "switch_mode"
+  ) {
+    return message.kind;
+  }
   return "generic";
 }
 
@@ -9368,19 +12158,11 @@ function extractActionChipLabel(
   switch (kind) {
     case "bash":
     case "bash_output": {
-      // 1. Try to extract command from rawInput first if available.
-      if (message.rawInput) {
-        if (typeof message.rawInput === "string") {
-          const firstCmd = firstNonEmptyLine(message.rawInput);
-          if (firstCmd) return firstCmd;
-        } else if (typeof message.rawInput === "object" && message.rawInput !== null) {
-          const obj = message.rawInput as Record<string, unknown>;
-          if (typeof obj.command === "string") {
-            const firstCmd = firstNonEmptyLine(obj.command);
-            if (firstCmd) return firstCmd;
-          }
-        }
-      }
+      const command = message.input?.find(
+        (field) => field.label === "Command",
+      )?.value;
+      const firstCmd = command ? firstNonEmptyLine(command) : "";
+      if (firstCmd) return firstCmd;
 
       // 2. Fallback to content typically starts with the command or its output.
       // If it looks like a shell command (starts with a letter and no obvious
@@ -9478,6 +12260,20 @@ function renderActionKindIcon(
       return <Plug className={className} />;
     case "permission":
       return <ShieldCheck className={className} />;
+    case "read":
+      return <Eye className={className} />;
+    case "edit":
+      return <Pencil className={className} />;
+    case "delete":
+      return <Trash2 className={className} />;
+    case "move":
+      return <ArrowRightLeft className={className} />;
+    case "search":
+      return <Search className={className} />;
+    case "fetch":
+      return <Globe className={className} />;
+    case "switch_mode":
+      return <RefreshCw className={className} />;
     default:
       return <Wrench className={className} />;
   }
@@ -9489,6 +12285,9 @@ function isBackgroundAction(message: ToolMessage): boolean {
   // broad shell output. Treat them as background exploration instead of a primary
   // action so the UI does not surface a low-signal "Terminal" action chip.
   return (
+    message.kind === "read" ||
+    message.kind === "search" ||
+    message.kind === "fetch" ||
     verb === "read" ||
     verb === "search" ||
     verb === "list" ||
@@ -9686,6 +12485,7 @@ function extractFailureReason(tools: ToolSectionItem[]): string | null {
 
 function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean) {
   const running = tools.filter((t) => t.message.status === "running").length;
+  const pending = tools.filter((t) => t.message.status === "pending").length;
   const failed = tools.filter(
     (t) => t.message.status === "error" || t.message.status === "failed",
   ).length;
@@ -9693,11 +12493,12 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
     (t) => t.message.status === "cancelled",
   ).length;
   const total = tools.length;
-  const succeeded = total - running - failed - cancelled;
+  const succeeded = total - running - pending - failed - cancelled;
   // Only compute terminal statuses when the section is truly finished
   // (i.e. a new message/thinking/turn-end appeared after this tool section, or chat is idle)
-  const settled = sectionFinished && running === 0;
+  const settled = sectionFinished && running === 0 && pending === 0;
   const allFailed = settled && failed > 0 && succeeded === 0;
+  const allCancelled = settled && cancelled > 0 && succeeded === 0 && failed === 0;
   const partialFailed = settled && failed > 0 && !allFailed;
 
   // statusLabel: only show when it adds info beyond the title
@@ -9717,6 +12518,7 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
 
   let title = "Working";
   if (allFailed) title = "Action failed";
+  else if (allCancelled) title = "Actions cancelled";
   else if (partialFailed) title = "Completed with errors";
   else if (
     tools.some((t) => normalizeToolVerb(t.message.title) === "permission")
@@ -9731,49 +12533,75 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
 
   // Merge edits on the same file: accumulate +/- and keep the latest tool id/status
   const editItems = (() => {
-    const merged = new Map<string, { key: string; toolId: string; label: string; fullPath: string; additions: number; deletions: number; status: string }>();
+    const merged = new Map<string, {
+      key: string;
+      toolId: string;
+      label: string;
+      fullPath: string;
+      diff: string;
+      additions: number;
+      deletions: number;
+      status: string;
+    }>();
     for (const tool of edits) {
-      const loc = tool.message.locations?.[0];
-      const fullPath = loc?.path ?? "";
-      const label =
-        fullPath.split("/").pop() ||
-        tool.message.title.replace(/^(Edit|Write)\s+/i, "");
-      const stat = parseDiffStat(tool.message.content);
-      const existing = merged.get(label);
-      if (existing) {
-        existing.additions += stat?.additions ?? 0;
-        existing.deletions += stat?.deletions ?? 0;
-        existing.toolId = tool.message.id;
-        existing.status = tool.message.status;
-        // Use the longest (most specific) full path
-        if (fullPath.length > existing.fullPath.length) existing.fullPath = fullPath;
-      } else {
-        merged.set(label, {
-          key: `${tool.message.id}:${label}`,
-          toolId: tool.message.id,
-          label,
+      const editPaths = extractEditToolPaths({
+        locations: tool.message.locations,
+        input: tool.message.input,
+        content: tool.message.content,
+      });
+      const targets = editPaths.length > 0 ? editPaths : [""];
+      for (const fullPath of targets) {
+        const diff = extractDiffForEditPath(
+          tool.message.content,
           fullPath,
-          additions: stat?.additions ?? 0,
-          deletions: stat?.deletions ?? 0,
-          status: tool.message.status,
-        });
+          targets,
+        );
+        const stat = parseDiffStat(diff);
+        const label =
+          fullPath.split("/").pop() ||
+          tool.message.title.replace(/^(Edit|Write)\s+/i, "");
+        const mergeKey = fullPath || label;
+        const existing = merged.get(mergeKey);
+        if (existing) {
+          existing.additions += stat?.additions ?? 0;
+          existing.deletions += stat?.deletions ?? 0;
+          if (diff && !existing.diff.includes(diff)) {
+            existing.diff = existing.diff
+              ? `${existing.diff}\n\n${diff}`
+              : diff;
+          }
+          existing.toolId = tool.message.id;
+          existing.status = tool.message.status;
+        } else {
+          merged.set(mergeKey, {
+            key: `${tool.message.id}:${mergeKey}`,
+            toolId: tool.message.id,
+            label,
+            fullPath,
+            diff,
+            additions: stat?.additions ?? 0,
+            deletions: stat?.deletions ?? 0,
+            status: tool.message.status,
+          });
+        }
       }
     }
     return Array.from(merged.values());
   })();
 
   const buildChipItem = (tool: ToolSectionItem): ActionChipItem => {
-    const kind = classifyActionKind(tool.message.title);
+    const kind = classifyActionKind(tool.message);
     const derived = extractActionChipLabel(tool.message, kind);
     return {
       key: tool.message.id,
       kind,
       label: truncateChipLabel(stripAnsi(derived)),
-      rawTitle: tool.message.title,
       content: tool.message.content ?? "",
       locations: tool.message.locations ?? [],
       status: tool.message.status,
-      rawInput: tool.message.rawInput,
+      input: tool.message.input,
+      output: tool.message.output,
+      hoverText: toolCallHoverText(tool.message.title, tool.message.input),
     };
   };
   const actionItems = foregroundActions.map(buildChipItem);
@@ -9782,7 +12610,11 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
   // action chips so the user can still see what was inspected and expand to read
   // the output.
   const inspectionActionItems = backgroundActions
-    .filter((t) => (t.message.locations?.length ?? 0) === 0)
+    .filter(
+      (t) =>
+        hasReadableToolInput(t.message.input) ||
+        hasReadableToolOutput(t.message.output, t.message.content ?? ""),
+    )
     .map(buildChipItem);
 
   const inspectionEntries = collectLocationChips(tools, isBackgroundAction);
@@ -9843,6 +12675,7 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
     actionVisibleEntries: actionEntries.slice(0, 3),
     actionOverflow: Math.max(0, actionEntries.length - 3),
     failureReason: extractFailureReason(tools),
+    pending,
     running,
     failed,
     cancelled,
@@ -9850,15 +12683,16 @@ function summarizeToolSection(tools: ToolSectionItem[], sectionFinished: boolean
 }
 
 function getStatusChipClasses(status: string, muted = false): string {
-  if (status === "error" || status === "failed") {
+  const tone = toolCallChipTone(status);
+  if (tone === "warning") {
     return "bg-[color-mix(in_srgb,var(--color-warning)_16%,var(--color-bg))] text-[color-mix(in_srgb,var(--color-warning)_92%,white_8%)] border border-[color-mix(in_srgb,var(--color-warning)_28%,transparent)]";
   }
-  if (status === "running") {
+  if (tone === "running") {
     return muted
       ? "bg-[color-mix(in_srgb,var(--color-highlight)_10%,var(--color-bg))] text-[color-mix(in_srgb,var(--color-highlight)_80%,white_8%)] border border-[color-mix(in_srgb,var(--color-highlight)_18%,transparent)]"
       : "bg-[color-mix(in_srgb,var(--color-highlight)_12%,var(--color-bg))] text-[var(--color-text)] border border-[color-mix(in_srgb,var(--color-highlight)_18%,transparent)]";
   }
-  if (status === "cancelled") {
+  if (tone === "cancelled") {
     return "bg-[color-mix(in_srgb,var(--color-text-muted)_10%,var(--color-bg))] text-[var(--color-text-muted)] border border-[color-mix(in_srgb,var(--color-text-muted)_18%,transparent)]";
   }
   return muted
@@ -9870,11 +12704,12 @@ type ActionChipItem = {
   key: string;
   kind: ActionKind;
   label: string;
-  rawTitle: string;
   content: string;
   locations: { path: string; line?: number }[];
   status: string;
-  rawInput?: unknown;
+  input?: ToolCallInputData[];
+  output?: ToolCallContentData[];
+  hoverText: string;
 };
 
 /** Render a diff string with +/-/@@ line coloring. Inline `<pre>` block. */
@@ -9911,24 +12746,143 @@ function DiffPreview({ diff }: { diff: string }) {
   );
 }
 
-/**
- * Pretty-format `tool_call.raw_input` for the expanded panel REQUEST block.
- * Bash 类工具直接渲 `command`(更短更直观);其他工具 JSON.stringify。
- * 返回 null 表示没有可显示的 raw_input,调用方应隐藏整个 REQUEST 块。
- */
-function formatRawInput(raw: unknown, kind: ActionKind): string | null {
-  if (raw == null) return null;
-  if (typeof raw === "string") return raw.trim() || null;
-  if (typeof raw !== "object") return String(raw);
-  const obj = raw as Record<string, unknown>;
-  if ((kind === "bash" || kind === "bash_output") && typeof obj.command === "string") {
-    return obj.command;
+type ToolStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
+
+function normalizedToolStatus(status: string): ToolStatus {
+  if (status === "running" || status === "in_progress") return "running";
+  if (status === "completed" || status === "success") return "completed";
+  if (status === "failed" || status === "error") return "failed";
+  if (status === "cancelled" || status === "canceled") return "cancelled";
+  return "pending";
+}
+
+function toolStatusLabel(status: ToolStatus): string {
+  return {
+    pending: "Pending",
+    running: "Running",
+    completed: "Completed",
+    failed: "Failed",
+    cancelled: "Cancelled",
+  }[status];
+}
+
+function ToolStatusIcon({ status, className = "h-3 w-3" }: { status: ToolStatus; className?: string }) {
+  if (status === "running") {
+    return <Loader2 className={`${className} animate-spin text-[var(--color-highlight)]`} />;
   }
-  try {
-    return JSON.stringify(obj, null, 2);
-  } catch {
-    return null;
+  if (status === "completed") {
+    return <CheckCircle2 className={`${className} text-[var(--color-success)]`} />;
   }
+  if (status === "failed") {
+    return <AlertTriangle className={`${className} text-[var(--color-warning)]`} />;
+  }
+  if (status === "cancelled") {
+    return <X className={`${className} text-[var(--color-text-muted)]`} />;
+  }
+  return <Circle className={`${className} text-[var(--color-text-muted)]`} />;
+}
+
+function ToolInputFields({ fields }: { fields: ToolCallInputData[] }) {
+  return (
+    <dl className="divide-y divide-[color-mix(in_srgb,var(--color-border)_55%,transparent)] overflow-hidden rounded-lg border border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[var(--color-bg)]">
+      {fields.map((field, index) => {
+        const value = formatToolInputValue(field.value);
+        const multiline = value.includes("\n");
+        return (
+          <div
+            key={`${field.label}:${index}`}
+            className={
+              multiline
+                ? "px-3 py-2.5"
+                : "grid grid-cols-[96px_minmax(0,1fr)] gap-3 px-3 py-2.5"
+            }
+          >
+            <dt
+              className={`text-[11px] font-medium text-[var(--color-text-muted)] ${
+                multiline ? "mb-2" : ""
+              }`}
+            >
+              {field.label}
+            </dt>
+            <dd className="min-w-0 whitespace-pre-wrap break-words font-mono text-[11px] leading-[1.5] text-[var(--color-text)]">
+              {value}
+            </dd>
+          </div>
+        );
+      })}
+    </dl>
+  );
+}
+
+function ToolContentBlocks({ content }: { content: ToolCallContentData[] }) {
+  return (
+    <div className="space-y-2.5">
+      {content.map((item, index) => {
+        if (item.type === "content") {
+          return (
+            <AgentContentBlocks
+              key={index}
+              blocks={[item.content]}
+              renderText={(text) => (
+                <div className="text-[12px] leading-[1.45]">
+                  <MarkdownRenderer content={text} />
+                </div>
+              )}
+            />
+          );
+        }
+        if (item.type === "diff") {
+          return <DiffPreview key={index} diff={item.display_text} />;
+        }
+        const hasSnapshot = item.output !== undefined || item.exit_status !== undefined;
+        const exitLabel = item.exit_status
+          ? item.exit_status.signal
+            ? `Signal ${item.exit_status.signal}`
+            : item.exit_status.exit_code !== undefined
+              ? `Exit ${item.exit_status.exit_code}`
+              : "Exited"
+          : "Running";
+        return (
+          <div
+            key={index}
+            className="overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] text-[11px] text-[var(--color-text-muted)]"
+          >
+            <div
+              className={`flex items-center gap-2 px-2.5 py-2 ${
+                hasSnapshot
+                  ? "border-b border-[color-mix(in_srgb,var(--color-border)_55%,transparent)]"
+                  : ""
+              }`}
+            >
+              <Terminal className="h-3.5 w-3.5" />
+              <span>Terminal</span>
+              <code className="min-w-0 flex-1 truncate text-[var(--color-text)]">
+                {item.terminal_id}
+              </code>
+              {hasSnapshot && <span className="shrink-0">{exitLabel}</span>}
+            </div>
+            {hasSnapshot && (
+              <div>
+                {item.truncated && (
+                  <div className="border-b border-[color-mix(in_srgb,var(--color-border)_45%,transparent)] px-2.5 py-1.5 text-[10px]">
+                    Earlier output truncated
+                  </div>
+                )}
+                <pre
+                  className="m-0 max-h-72 overflow-auto whitespace-pre-wrap break-words px-2.5 py-2 font-mono text-[11px] leading-[1.5] text-[var(--color-text)]"
+                  dangerouslySetInnerHTML={{
+                    __html:
+                      ansiToHtml(item.output ?? "") ||
+                      (item.exit_status ? "No output" : "Waiting for output…"),
+                  }}
+                />
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 /** Single clickable / expandable action chip. */
@@ -9947,37 +12901,44 @@ function ActionChip({
     mode?: "diff" | "full",
   ) => Promise<boolean>;
 }) {
-  const hasContent = item.content.trim().length > 0;
+  const status = normalizedToolStatus(item.status);
+  const hasOutput = hasReadableToolOutput(item.output, item.content);
+  const hasInput = hasReadableToolInput(item.input);
+  const hasDetails = hasOutput || hasInput;
   const hasLocation = item.locations.length > 0;
-  // Click priority: navigate to first location if one exists; otherwise
-  // toggle inline expand. If neither exists, the chip is still a button
-  // (keeps UI consistent) but click is a no-op.
+  // Prefer details when the tool exposes a request or response. Running tools
+  // often have input before they have output; treating those as expandable
+  // lets the user inspect the complete command while it is still executing.
+  // Location-only chips retain their direct file navigation behavior.
   const handleClick = (e: React.MouseEvent) => {
     e.stopPropagation();
+    if (hasDetails) {
+      onToggleExpand();
+      return;
+    }
     if (hasLocation) {
       const loc = item.locations[0];
       onFileClick?.(loc.path, loc.line, "full");
-      return;
     }
-    if (hasContent) onToggleExpand();
   };
-  const isInteractive = hasLocation || hasContent;
-  // chip 尾部提示：有 location → 箭头出链（可跳文件）；有 content → Chevron
-  // 指示可展开/已展开；无交互 → 不显示，避免骗点击。
-  const trailingHint = hasLocation ? (
-    <ExternalLink className="h-3 w-3 shrink-0 text-[var(--color-text-muted)] opacity-70" />
-  ) : hasContent ? (
+  const isInteractive = hasLocation || hasDetails;
+  // Details take precedence over navigation so long commands are never hidden
+  // behind truncation. Location-only chips keep the external-link affordance.
+  const trailingHint = hasDetails ? (
     expanded ? (
       <ChevronUp className="h-3 w-3 shrink-0 text-[var(--color-text-muted)]" />
     ) : (
       <ChevronDown className="h-3 w-3 shrink-0 text-[var(--color-text-muted)] opacity-70" />
     )
+  ) : hasLocation ? (
+    <ExternalLink className="h-3 w-3 shrink-0 text-[var(--color-text-muted)] opacity-70" />
   ) : null;
   return (
     <button
       type="button"
       onClick={handleClick}
       disabled={!isInteractive}
+      title={item.hoverText}
       className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] transition-colors max-w-[320px] ${
         isInteractive
           ? "cursor-pointer hover:brightness-110"
@@ -9988,8 +12949,8 @@ function ActionChip({
           : ""
       }`}
     >
-      {item.status === "running" ? (
-        <Loader2 className="h-3 w-3 animate-spin text-[var(--color-highlight)] shrink-0" />
+      {status === "running" ? (
+        <Loader2 className="h-3 w-3 shrink-0 animate-spin text-[var(--color-highlight)]" />
       ) : (
         renderActionKindIcon(item.kind)
       )}
@@ -10008,14 +12969,14 @@ function ActionChipList({
   items,
   overflowCount,
   onShowMore,
-  expandedKeys,
+  expandedKey,
   onToggleExpand,
   onFileClick,
 }: {
   items: ActionChipItem[];
   overflowCount: number;
   onShowMore: () => void;
-  expandedKeys: Set<string>;
+  expandedKey: string | null;
   onToggleExpand: (key: string) => void;
   onFileClick?: (
     filePath: string,
@@ -10023,15 +12984,15 @@ function ActionChipList({
     mode?: "diff" | "full",
   ) => Promise<boolean>;
 }) {
-  const expandedItems = items.filter((it) => expandedKeys.has(it.key));
+  const expandedItem = items.find((item) => item.key === expandedKey);
   return (
     <div className="space-y-2">
-      <div className="flex flex-wrap gap-1.5">
+      <div className="flex flex-wrap gap-1.5 p-px">
         {items.map((item) => (
           <ActionChip
             key={item.key}
             item={item}
-            expanded={expandedKeys.has(item.key)}
+            expanded={expandedKey === item.key}
             onToggleExpand={() => onToggleExpand(item.key)}
             onFileClick={onFileClick}
           />
@@ -10049,73 +13010,86 @@ function ActionChipList({
           </button>
         )}
       </div>
-      {expandedItems.length > 0 && (
-        <div className="space-y-2">
-          {expandedItems.map((item) => {
+      {expandedItem && (
+        <div>
+          {[expandedItem].map((item) => {
             const renderMarkdown =
               item.kind === "skill" ||
               item.kind === "todo" ||
               item.kind === "mcp";
+            const status = normalizedToolStatus(item.status);
+            const hasInput = hasReadableToolInput(item.input);
+            const hasOutput = hasReadableToolOutput(item.output, item.content);
+            const resBody = item.output && item.output.length > 0 ? (
+              <ToolContentBlocks content={item.output} />
+            ) : renderMarkdown ? (
+              <div className="text-[12px] leading-[1.45]">
+                <MarkdownRenderer content={item.content} />
+              </div>
+            ) : (
+              <pre
+                className="m-0 whitespace-pre-wrap break-words font-mono text-[11px] leading-[1.5] text-[var(--color-text)]"
+                dangerouslySetInnerHTML={{
+                  __html:
+                    ansiToHtml(item.content) ||
+                    (status === "running" ? "Waiting for output…" : "No additional output."),
+                }}
+              />
+            );
             return (
               <div
                 key={`${item.key}:expanded`}
-                className="rounded-lg border border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_58%,transparent)] px-3 py-2"
+                className="overflow-hidden rounded-xl border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] bg-[var(--color-bg)]"
               >
-                <div className="flex items-center gap-2 mb-1.5">
-                  <span
-                    className="text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]"
-                    dangerouslySetInnerHTML={{
-                      __html: ansiToHtml(item.rawTitle) || "action",
-                    }}
-                  />
+                <div className="flex items-center gap-2 border-b border-[color-mix(in_srgb,var(--color-border)_55%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_55%,transparent)] px-3 py-2.5">
+                  <span className="shrink-0 text-[var(--color-text-muted)]">
+                    {renderActionKindIcon(item.kind)}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-xs font-medium text-[var(--color-text)]">
+                    {item.label}
+                  </span>
+                  <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] bg-[var(--color-bg)] px-2 py-0.5 text-[10px] text-[var(--color-text-muted)]">
+                    <ToolStatusIcon status={status} className="h-2.5 w-2.5" />
+                    {toolStatusLabel(status)}
+                  </span>
                   <button
                     type="button"
                     onClick={(e) => {
                       e.stopPropagation();
                       onToggleExpand(item.key);
                     }}
-                    className="ml-auto text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] cursor-pointer transition-colors"
+                    className="ml-0 inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-md text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-secondary)] hover:text-[var(--color-text)]"
+                    aria-label="Collapse details"
                   >
-                    collapse
+                    <ChevronUp className="h-3.5 w-3.5" />
                   </button>
                 </div>
-                {(() => {
-                  const reqText = formatRawInput(item.rawInput, item.kind);
-                  const resBody = renderMarkdown ? (
-                    <div className="text-[12px] leading-[1.45]">
-                      <MarkdownRenderer content={item.content} />
-                    </div>
-                  ) : (
-                    <pre
-                      className="text-[11px] leading-[1.45] font-mono whitespace-pre-wrap break-all text-[var(--color-text)] m-0"
-                      dangerouslySetInnerHTML={{
-                        __html: ansiToHtml(item.content) || "(no output)",
-                      }}
-                    />
-                  );
-                  return (
-                    <div className="space-y-2">
-                      {reqText && (
-                        <div>
-                          <div className="mb-1 text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
-                            Request
-                          </div>
-                          <pre className="text-[11px] leading-[1.45] font-mono whitespace-pre-wrap break-all text-[var(--color-text)] m-0">
-                            {reqText}
-                          </pre>
-                        </div>
-                      )}
-                      <div>
-                        {reqText && (
-                          <div className="mb-1 text-[10px] uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
-                            Response
-                          </div>
-                        )}
+                <div className="space-y-4 px-3 py-3">
+                  {hasInput && (
+                    <section>
+                      <h4 className="mb-2 text-xs font-medium text-[var(--color-text)]">
+                        Input
+                      </h4>
+                      <ToolInputFields fields={item.input ?? []} />
+                    </section>
+                  )}
+                  {hasOutput && (
+                    <section>
+                      <h4 className="mb-2 text-xs font-medium text-[var(--color-text)]">
+                        Output
+                      </h4>
+                      <div
+                        className={`rounded-lg border px-3 py-2.5 ${
+                          status === "failed"
+                            ? "border-[color-mix(in_srgb,var(--color-warning)_22%,var(--color-border))] bg-[color-mix(in_srgb,var(--color-warning)_5%,var(--color-bg))]"
+                            : "border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_35%,transparent)]"
+                        }`}
+                      >
                         {resBody}
                       </div>
-                    </div>
-                  );
-                })()}
+                    </section>
+                  )}
+                </div>
               </div>
             );
           })}
@@ -10233,15 +13207,12 @@ const ToolSectionView = memo(function ToolSectionView({
   const [actionExpanded, setActionExpanded] = useState(false);
   const [actionItemsExpanded, setActionItemsExpanded] = useState(false);
   const [inspectionItemsExpanded, setInspectionItemsExpanded] = useState(false);
-  const [expandedActionKeys, setExpandedActionKeys] = useState<Set<string>>(
-    () => new Set(),
-  );
-  const [expandedInspectionKeys, setExpandedInspectionKeys] = useState<
-    Set<string>
-  >(() => new Set());
-  const [expandedEditKeys, setExpandedEditKeys] = useState<Set<string>>(
-    () => new Set(),
-  );
+  // This state intentionally lives inside ToolSectionView: each action block
+  // owns its own accordion, while all tool detail kinds within that block are
+  // mutually exclusive.
+  const [expandedDetailKey, setExpandedDetailKey] = useState<string | null>(null);
+  const toggleDetail = (key: string) =>
+    setExpandedDetailKey((current) => nextExpandedToolDetail(current, key));
   const hasDetails =
     summary.inspectionEntries.length > 0 ||
     summary.inspectionActionItems.length > 0 ||
@@ -10257,8 +13228,12 @@ const ToolSectionView = memo(function ToolSectionView({
   const summaryIcon =
     summary.running > 0 ? (
       <Loader2 className="w-3.5 h-3.5 text-[var(--color-highlight)] animate-spin shrink-0" />
-    ) : summary.failed > 0 || summary.cancelled > 0 ? (
-      <DoneIcon className="w-3.5 h-3.5 text-[var(--color-warning)] shrink-0" />
+    ) : summary.pending > 0 ? (
+      <Circle className="w-3.5 h-3.5 text-[var(--color-text-muted)] shrink-0" />
+    ) : summary.failed > 0 ? (
+      <AlertTriangle className="w-3.5 h-3.5 text-[var(--color-error)] shrink-0" />
+    ) : summary.cancelled > 0 ? (
+      <X className="w-3.5 h-3.5 text-[var(--color-text-muted)] shrink-0" />
     ) : (
       <DoneIcon className="w-3.5 h-3.5 text-[var(--color-success)] shrink-0" />
     );
@@ -10376,15 +13351,8 @@ const ToolSectionView = memo(function ToolSectionView({
                           : summary.inspectionItemOverflow
                       }
                       onShowMore={() => setInspectionItemsExpanded(true)}
-                      expandedKeys={expandedInspectionKeys}
-                      onToggleExpand={(key) =>
-                        setExpandedInspectionKeys((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(key)) next.delete(key);
-                          else next.add(key);
-                          return next;
-                        })
-                      }
+                      expandedKey={expandedDetailKey}
+                      onToggleExpand={toggleDetail}
                       onFileClick={onFileClick}
                     />
                   )}
@@ -10398,12 +13366,18 @@ const ToolSectionView = memo(function ToolSectionView({
                   </div>
                   <div className="flex flex-wrap gap-1.5">
                     {summary.editItems.map((item) => {
-                      const isExpanded = expandedEditKeys.has(item.key);
+                      const isExpanded = expandedDetailKey === item.key;
                       const tool = tools.find(
                         (t) => t.message.id === item.toolId,
                       )?.message;
                       const path = item.fullPath || tool?.locations?.[0]?.path;
-                      const hasDiff = (tool?.content?.trim()?.length ?? 0) > 0;
+                      const hasDiff = item.diff.trim().length > 0;
+                      const hasToolDetails = Boolean(
+                        tool &&
+                          (hasReadableToolInput(tool.input) ||
+                            hasReadableToolOutput(tool.output, tool.content ?? "")),
+                      );
+                      const canExpand = hasDiff || hasToolDetails;
                       return (
                         <div
                           key={item.key}
@@ -10416,16 +13390,11 @@ const ToolSectionView = memo(function ToolSectionView({
                           <button
                             type="button"
                             onClick={() => {
-                              if (!hasDiff) return;
-                              setExpandedEditKeys((prev) => {
-                                const next = new Set(prev);
-                                if (next.has(item.key)) next.delete(item.key);
-                                else next.add(item.key);
-                                return next;
-                              });
+                              if (!canExpand) return;
+                              toggleDetail(item.key);
                             }}
-                            disabled={!hasDiff}
-                            className={`inline-flex items-center gap-1.5 ${hasDiff ? "cursor-pointer" : "cursor-default"} max-w-[320px]`}
+                            disabled={!canExpand}
+                            className={`inline-flex items-center gap-1.5 ${canExpand ? "cursor-pointer" : "cursor-default"} max-w-[320px]`}
                             title={path}
                           >
                             <VSCodeIcon filename={item.label} size={13} />
@@ -10443,7 +13412,7 @@ const ToolSectionView = memo(function ToolSectionView({
                                 </span>
                               </span>
                             )}
-                            {hasDiff ? (
+                            {canExpand ? (
                               isExpanded ? (
                                 <ChevronUp className="h-3 w-3 shrink-0 text-[var(--color-text-muted)]" />
                               ) : (
@@ -10473,37 +13442,88 @@ const ToolSectionView = memo(function ToolSectionView({
                     })}
                   </div>
                   {summary.editItems
-                    .filter((item) => expandedEditKeys.has(item.key))
+                    .filter((item) => expandedDetailKey === item.key)
                     .map((item) => {
                       const tool = tools.find(
-                        (t) => t.message.id === item.toolId,
+                        (candidate) => candidate.message.id === item.toolId,
                       )?.message;
-                      const diff = tool?.content ?? "";
+                      const status = normalizedToolStatus(
+                        tool?.status ?? item.status,
+                      );
+                      const hasInput = hasReadableToolInput(tool?.input);
+                      const hasOutput = hasReadableToolOutput(
+                        tool?.output,
+                        tool?.content ?? "",
+                      );
+                      const outputBody =
+                        tool?.output && tool.output.length > 0 ? (
+                          <ToolContentBlocks content={tool.output} />
+                        ) : item.diff.trim().length > 0 ? (
+                          <DiffPreview diff={item.diff} />
+                        ) : (
+                          <pre
+                            className="m-0 whitespace-pre-wrap break-words font-mono text-[11px] leading-[1.5] text-[var(--color-text)]"
+                            dangerouslySetInnerHTML={{
+                              __html:
+                                ansiToHtml(tool?.content ?? "") ||
+                                (status === "running"
+                                  ? "Waiting for output…"
+                                  : "No additional output."),
+                            }}
+                          />
+                        );
                       return (
                         <div
                           key={`${item.key}:diff`}
-                          className="rounded-lg border border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_58%,transparent)] px-3 py-2"
+                          className="overflow-hidden rounded-xl border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] bg-[var(--color-bg)]"
                         >
-                          <div className="mb-1.5 flex items-center gap-2">
+                          <div className="flex items-center gap-2 border-b border-[color-mix(in_srgb,var(--color-border)_55%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_55%,transparent)] px-3 py-2.5">
                             <VSCodeIcon filename={item.label} size={13} />
-                            <span className="text-[11px] text-[var(--color-text)]">
+                            <span className="min-w-0 flex-1 truncate text-xs font-medium text-[var(--color-text)]">
                               {item.label}
+                            </span>
+                            <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] bg-[var(--color-bg)] px-2 py-0.5 text-[10px] text-[var(--color-text-muted)]">
+                              <ToolStatusIcon
+                                status={status}
+                                className="h-2.5 w-2.5"
+                              />
+                              {toolStatusLabel(status)}
                             </span>
                             <button
                               type="button"
-                              onClick={() =>
-                                setExpandedEditKeys((prev) => {
-                                  const next = new Set(prev);
-                                  next.delete(item.key);
-                                  return next;
-                                })
-                              }
-                              className="ml-auto text-[10px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] cursor-pointer transition-colors"
+                              onClick={() => toggleDetail(item.key)}
+                              className="inline-flex h-5 w-5 cursor-pointer items-center justify-center rounded-md text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-secondary)] hover:text-[var(--color-text)]"
+                              aria-label="Collapse details"
                             >
-                              collapse
+                              <ChevronUp className="h-3.5 w-3.5" />
                             </button>
                           </div>
-                          <DiffPreview diff={diff || "(empty diff)"} />
+                          <div className="space-y-4 px-3 py-3">
+                            {hasInput && (
+                              <section>
+                                <h4 className="mb-2 text-xs font-medium text-[var(--color-text)]">
+                                  Input
+                                </h4>
+                                <ToolInputFields fields={tool?.input ?? []} />
+                              </section>
+                            )}
+                            {hasOutput && (
+                              <section>
+                                <h4 className="mb-2 text-xs font-medium text-[var(--color-text)]">
+                                  Output
+                                </h4>
+                                <div
+                                  className={`rounded-lg border px-3 py-2.5 ${
+                                    status === "failed"
+                                      ? "border-[color-mix(in_srgb,var(--color-warning)_22%,var(--color-border))] bg-[color-mix(in_srgb,var(--color-warning)_5%,var(--color-bg))]"
+                                      : "border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_35%,transparent)]"
+                                  }`}
+                                >
+                                  {outputBody}
+                                </div>
+                              </section>
+                            )}
+                          </div>
                         </div>
                       );
                     })}
@@ -10537,15 +13557,8 @@ const ToolSectionView = memo(function ToolSectionView({
                         actionItemsExpanded ? 0 : summary.actionItemOverflow
                       }
                       onShowMore={() => setActionItemsExpanded(true)}
-                      expandedKeys={expandedActionKeys}
-                      onToggleExpand={(key) =>
-                        setExpandedActionKeys((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(key)) next.delete(key);
-                          else next.add(key);
-                          return next;
-                        })
-                      }
+                      expandedKey={expandedDetailKey}
+                      onToggleExpand={toggleDetail}
                       onFileClick={onFileClick}
                     />
                   )}
@@ -10556,5 +13569,229 @@ const ToolSectionView = memo(function ToolSectionView({
         )}
       </AnimatePresence>
     </motion.div>
+  );
+});
+
+function formatWorkDuration(durationSeconds?: number): string | null {
+  if (durationSeconds === undefined) return null;
+  const seconds = Math.max(0, Math.round(durationSeconds));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder > 0 ? `${minutes}m ${remainder}s` : `${minutes}m`;
+}
+
+/** A completed turn's compact process row. The original messages remain in
+ * state and are available here on demand; only their default presentation is
+ * collapsed. */
+const WorkSummaryView = memo(function WorkSummaryView({
+  sectionId,
+  items,
+  durationSeconds,
+  expanded,
+  onToggleSection,
+  onFileClick,
+}: {
+  sectionId: string;
+  items: WorkSummaryItem[];
+  durationSeconds?: number;
+  expanded: boolean;
+  onToggleSection: (sectionId: string) => void;
+  onFileClick?: (
+    filePath: string,
+    line?: number,
+    mode?: "diff" | "full",
+  ) => Promise<boolean>;
+}) {
+  const [expandedToolIds, setExpandedToolIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const tools = useMemo<ToolSectionItem[]>(
+    () =>
+      items.flatMap(({ message, index }) =>
+        message.type === "tool" ? [{ message, index }] : [],
+      ),
+    [items],
+  );
+  const toolSummary = useMemo(
+    () => (tools.length > 0 ? summarizeToolSection(tools, true) : null),
+    [tools],
+  );
+  const detailItems = useMemo(() => {
+    const result: Array<
+      | { kind: "text"; item: WorkSummaryItem }
+      | { kind: "tools"; tools: ToolSectionItem[] }
+    > = [];
+    for (const item of items) {
+      if (item.message.type === "thinking") continue;
+      if (item.message.type !== "tool") {
+        result.push({ kind: "text", item });
+        continue;
+      }
+      const previous = result.at(-1);
+      if (previous?.kind === "tools") {
+        previous.tools.push({ message: item.message, index: item.index });
+      } else {
+        result.push({
+          kind: "tools",
+          tools: [{ message: item.message, index: item.index }],
+        });
+      }
+    }
+    return result;
+  }, [items]);
+  const duration = formatWorkDuration(durationSeconds);
+  const hasEdits = toolSummary?.editItems.length;
+  const onlyExploration =
+    tools.length > 0 && tools.every(({ message }) => isBackgroundAction(message));
+  const verb = hasEdits
+    ? "Worked"
+    : onlyExploration
+      ? "Explored"
+      : "Worked";
+  const title = duration ? `${verb} for ${duration}` : verb;
+
+  return (
+    <motion.div layout className="text-[var(--color-text)]">
+      <button
+        type="button"
+        onClick={() => onToggleSection(sectionId)}
+        className="group flex w-fit items-center gap-1.5 rounded-md py-1 text-left text-[var(--color-text-muted)] transition-colors hover:text-[var(--color-text)]"
+        aria-expanded={expanded}
+      >
+        {onlyExploration ? (
+          <Eye className="h-3 w-3 shrink-0" />
+        ) : tools.length === 0 ? (
+          <Brain className="h-3 w-3 shrink-0" />
+        ) : (
+          <CheckCircle2 className="h-3 w-3 shrink-0 text-[var(--color-success)]" />
+        )}
+        <span className="text-xs font-medium text-[var(--color-text-muted)]">{title}</span>
+        <ChevronRight
+          className={`h-3 w-3 shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`}
+        />
+      </button>
+
+      <AnimatePresence initial={false}>
+        {expanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="overflow-hidden"
+          >
+            <div className="ml-1 mt-1 space-y-2 border-l border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] pl-4">
+              {detailItems.map((detailItem) => {
+                if (detailItem.kind === "tools") {
+                  const toolSectionId = detailItem.tools[0].message.id;
+                  return (
+                  <ToolSectionView
+                    key={`work-tool-${toolSectionId}`}
+                    sectionId={`${sectionId}-${toolSectionId}`}
+                    tools={detailItem.tools}
+                    expanded={expandedToolIds.has(toolSectionId)}
+                    forceExpanded={false}
+                    sectionFinished
+                    onToggleSection={() =>
+                      setExpandedToolIds((previous) => {
+                        const next = new Set(previous);
+                        if (next.has(toolSectionId)) next.delete(toolSectionId);
+                        else next.add(toolSectionId);
+                        return next;
+                      })
+                    }
+                    onFileClick={onFileClick}
+                  />
+                  );
+                }
+                const { message, index } = detailItem.item;
+                return (
+                  <div key={`work-commentary-${index}`} className="text-sm">
+                    <MarkdownRenderer
+                      content={message.content ?? ""}
+                      onFileClick={onFileClick}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.div>
+  );
+});
+
+const FileChangeSummaryView = memo(function FileChangeSummaryView({
+  tools,
+  onFileClick,
+}: {
+  tools: ToolSectionItem[];
+  onFileClick?: (
+    filePath: string,
+    line?: number,
+    mode?: "diff" | "full",
+  ) => Promise<boolean>;
+}) {
+  const summary = useMemo(() => summarizeToolSection(tools, true), [tools]);
+  const additions = summary.editItems.reduce(
+    (total, item) => total + item.additions,
+    0,
+  );
+  const deletions = summary.editItems.reduce(
+    (total, item) => total + item.deletions,
+    0,
+  );
+  if (summary.editItems.length === 0) return null;
+
+  return (
+    <div className="rounded-xl border border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_62%,transparent)] px-3 py-2.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <Pencil className="h-3.5 w-3.5 shrink-0 text-[var(--color-success)]" />
+        <span className="text-xs font-medium text-[var(--color-text)]">
+          {summary.editItems.length} file
+          {summary.editItems.length === 1 ? "" : "s"} changed
+        </span>
+        {(additions > 0 || deletions > 0) && (
+          <span className="text-[11px] tabular-nums">
+            <span className="text-[var(--color-success)]">+{additions}</span>
+            <span className="mx-1 text-[var(--color-text-muted)]">/</span>
+            <span className="text-[var(--color-error)]">−{deletions}</span>
+          </span>
+        )}
+      </div>
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {summary.editItems.map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            disabled={!item.fullPath}
+            onClick={() =>
+              item.fullPath && onFileClick?.(item.fullPath, undefined, "diff")
+            }
+            title={item.fullPath || item.label}
+            className={`inline-flex max-w-[320px] items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] ${
+              item.fullPath
+                ? `${getStatusChipClasses(item.status)} cursor-pointer hover:brightness-110`
+                : `${getStatusChipClasses(item.status)} cursor-default`
+            }`}
+          >
+            <VSCodeIcon filename={item.label} size={13} />
+            <span className="truncate">{item.label}</span>
+            {(item.additions > 0 || item.deletions > 0) && (
+              <span className="shrink-0 text-[10px] tabular-nums">
+                <span className="text-[var(--color-success)]">
+                  +{item.additions}
+                </span>
+                <span className="mx-0.5 text-[var(--color-text-muted)]">/</span>
+                <span className="text-[var(--color-error)]">
+                  −{item.deletions}
+                </span>
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
+    </div>
   );
 });

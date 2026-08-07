@@ -9,6 +9,8 @@ import {
   cloneProject as apiCloneProject,
   deleteProject as apiDeleteProject,
   renameProject as apiRenameProject,
+  archiveProject as apiArchiveProject,
+  restoreProject as apiRestoreProject,
   type ProjectListItem,
   type ProjectResponse,
   type TaskResponse,
@@ -25,6 +27,8 @@ interface ProjectContextType {
   cloneProject: (url: string, name?: string) => Promise<Project>;
   deleteProject: (id: string) => Promise<void>;
   renameProject: (id: string, name: string) => Promise<void>;
+  archiveProject: (id: string) => Promise<void>;
+  restoreProject: (id: string) => Promise<void>;
   refreshProjects: () => Promise<void>;
   refreshSelectedProject: () => Promise<void>;
   /**
@@ -75,6 +79,7 @@ function convertProject(project: ProjectResponse): Project {
     isGitRepo: project.is_git_repo,
     exists: project.exists,
     projectType: normalizeProjectType(project.project_type),
+    archived: project.archived,
   };
 }
 
@@ -92,6 +97,7 @@ function convertProjectListItem(item: ProjectListItem): Project {
     isGitRepo: item.is_git_repo,
     exists: item.exists,
     projectType: normalizeProjectType(item.project_type),
+    archived: item.archived,
   };
 }
 
@@ -298,6 +304,26 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     [selectedProject, refreshSelectedProject, loadProjects]
   );
 
+  const archiveProject = useCallback(
+    async (id: string): Promise<void> => {
+      await apiArchiveProject(id);
+      if (selectedProject?.id === id) {
+        setSelectedProject(null);
+        localStorage.removeItem("grove-selected-project");
+      }
+      await loadProjects();
+    },
+    [selectedProject, loadProjects],
+  );
+
+  const restoreProject = useCallback(
+    async (id: string): Promise<void> => {
+      await apiRestoreProject(id);
+      await loadProjects();
+    },
+    [loadProjects],
+  );
+
   return (
     <ProjectContext.Provider
       value={{
@@ -311,6 +337,8 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
         applySelectedProject,
         deleteProject,
         renameProject,
+        archiveProject,
+        restoreProject,
         refreshProjects,
         refreshSelectedProject,
         isLoading,

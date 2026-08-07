@@ -146,6 +146,17 @@ export interface TaskStatsResponse {
   hourly_activity: ActivityEntry[];
 }
 
+export interface LinkedProjectItem {
+  id: string;
+  name: string;
+  exists: boolean;
+  project_type: string | null;
+}
+
+export interface LinkedProjectsResponse {
+  linked_projects: LinkedProjectItem[];
+}
+
 // ============================================================================
 // API Functions
 // ============================================================================
@@ -181,6 +192,28 @@ export async function getTask(
   return apiClient.get<TaskResponse>(
     `/api/v1/projects/${projectId}/tasks/${taskId}`,
     signal,
+  );
+}
+
+/** Grove Projects linked to a Task. */
+export async function getLinkedProjects(
+  projectId: string,
+  taskId: string,
+): Promise<LinkedProjectsResponse> {
+  return apiClient.get<LinkedProjectsResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/linked-projects`,
+  );
+}
+
+/** Replace the Task's linked Project set. */
+export async function updateLinkedProjects(
+  projectId: string,
+  taskId: string,
+  projectIds: string[],
+): Promise<LinkedProjectsResponse> {
+  return apiClient.put<{ project_ids: string[] }, LinkedProjectsResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/linked-projects`,
+    { project_ids: projectIds },
   );
 }
 
@@ -483,6 +516,18 @@ export interface ChatSessionResponse {
   launch_mode: string;
 }
 
+export interface ImportableSession {
+  session_id: string;
+  cwd: string;
+  title?: string;
+  updated_at?: string;
+}
+
+export interface ImportSessionsPage {
+  sessions: ImportableSession[];
+  next_cursor?: string;
+}
+
 interface ChatListResponse {
   chats: ChatSessionResponse[];
 }
@@ -763,16 +808,36 @@ export async function forkChat(
   );
 }
 
+export function listImportSessions(projectId: string, taskId: string, chatId: string, cursor?: string) {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+  return apiClient.get<ImportSessionsPage>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/import-sessions${query}`,
+  );
+}
+
+export function importSession(
+  projectId: string,
+  taskId: string,
+  chatId: string,
+  session: Pick<ImportableSession, "session_id" | "title">,
+) {
+  return apiClient.post<typeof session, ChatSessionResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/import-sessions`,
+    session,
+  );
+}
+
 /**
  * Delete a chat
  */
 export async function deleteChat(
   projectId: string,
   taskId: string,
-  chatId: string
+  chatId: string,
+  scope: "grove" | "agent" = "grove",
 ): Promise<void> {
   return apiClient.delete(
-    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}`
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}?scope=${scope}`
   );
 }
 
@@ -897,11 +962,22 @@ export async function deleteFileOrDir(
 export async function openTaskFile(
   projectId: string,
   taskId: string,
+  path: string,
+  action: "app" | "reveal" = "app",
+): Promise<void> {
+  const actionQuery = action !== "app" ? `&action=${encodeURIComponent(action)}` : "";
+  await apiClient.postNoContent(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/fs/open?path=${encodeURIComponent(path)}${actionQuery}`
+  );
+}
+
+/** Reveal a worktree file in the host file manager (selects it in Finder on macOS). */
+export async function revealTaskFile(
+  projectId: string,
+  taskId: string,
   path: string
 ): Promise<void> {
-  await apiClient.postNoContent(
-    `/api/v1/projects/${projectId}/tasks/${taskId}/fs/open?path=${encodeURIComponent(path)}`
-  );
+  return openTaskFile(projectId, taskId, path, "reveal");
 }
 
 interface MoveFileRequest {
@@ -934,12 +1010,15 @@ interface SessionMetadata {
   agent_name: string;
   agent_version: string;
   available_modes?: [string, string][] | null;
+  mode_descriptions?: Record<string, string> | null;
   current_mode_id?: string | null;
   available_models?: [string, string][] | null;
   current_model_id?: string | null;
   available_thought_levels?: [string, string][] | null;
   current_thought_level_id?: string | null;
   thought_level_config_id?: string | null;
+  config_options?: SessionConfigOption[] | null;
+  uses_config_options?: boolean;
   prompt_capabilities?: {
     image?: boolean;
     audio?: boolean;
@@ -957,6 +1036,36 @@ interface SessionMetadata {
   } | null;
 }
 
+export interface SessionConfigSelectValue {
+  value: string;
+  name: string;
+  description?: string | null;
+}
+
+export interface SessionConfigSelectGroup {
+  group: string;
+  name: string;
+  options: SessionConfigSelectValue[];
+}
+
+export type SessionConfigOption = {
+  id: string;
+  name: string;
+  description?: string | null;
+  category?: string | null;
+  currentValue: string | boolean;
+} & (
+  | {
+      type: "select";
+      currentValue: string;
+      options: SessionConfigSelectValue[] | SessionConfigSelectGroup[];
+    }
+  | {
+      type: "boolean";
+      currentValue: boolean;
+    }
+);
+
 interface ChatHistoryResponse {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   events: any[];
@@ -965,6 +1074,10 @@ interface ChatHistoryResponse {
 }
 
 interface TakeControlResponse {
+  success: boolean;
+}
+
+interface ReconnectChatResponse {
   success: boolean;
 }
 
@@ -1002,6 +1115,17 @@ export async function takeControl(
   );
 }
 
+/** Restart the ACP owner while preserving the chat and persisted session. */
+export async function reconnectChat(
+  projectId: string,
+  taskId: string,
+  chatId: string
+): Promise<ReconnectChatResponse> {
+  return apiClient.post<undefined, ReconnectChatResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/reconnect`
+  );
+}
+
 // ============================================================================
 // Studio Artifacts API
 // ============================================================================
@@ -1036,9 +1160,19 @@ export function deleteArtifact(projectId: string, taskId: string, dir: string, p
   return artifactApi(projectId, taskId).delete(path, { dir });
 }
 
-/** Open an artifact file with the OS default application (runs on the server host). */
-export function openArtifactFile(projectId: string, taskId: string, dir: string, path: string) {
-  return artifactApi(projectId, taskId).open(path, { dir });
+/** Open an artifact file with the OS default application or reveal in file manager. */
+export function openArtifactFile(
+  projectId: string,
+  taskId: string,
+  dir: string,
+  path: string,
+  action: "app" | "reveal" = "app",
+) {
+  return artifactApi(projectId, taskId).open(path, action !== "app" ? { dir, action } : { dir });
+}
+
+export function revealArtifactFile(projectId: string, taskId: string, dir: string, path: string) {
+  return openArtifactFile(projectId, taskId, dir, path, "reveal");
 }
 
 export function uploadArtifacts(projectId: string, taskId: string, files: File[]) {

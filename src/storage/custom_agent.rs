@@ -1,8 +1,8 @@
 //! Custom Agent (Persona) DAO
 //!
 //! 表：custom_agent。每行是一条用户在 base agent 之上定制的 persona
-//! （Engineer / QA Reviewer 等），保存对应的 model / mode / effort 偏好以及
-//! 启动时注入的 system prompt。
+//! （Engineer / QA Reviewer 等），保存基于 Agent capability snapshot 选择的
+//! runtime configuration，以及启动时注入的 system prompt。
 //!
 //! 注意：这里的 `CustomAgent` 与 `storage::config::CustomAgentServer` 是两个
 //! 不同的概念——后者是底层 ACP server 的命令/URL 配置（仍在 TOML 里），前者
@@ -19,6 +19,10 @@ pub struct CustomAgent {
     pub id: String,
     pub name: String,
     pub base_agent: String,
+    #[serde(default)]
+    pub agent_config: crate::agent_config::AgentConfigSelection,
+    // Legacy free-text preferences. New clients persist `agent_config`; these
+    // remain readable so existing personas keep their pre-migration behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -38,6 +42,8 @@ pub struct CustomAgentInput {
     pub name: String,
     pub base_agent: String,
     #[serde(default)]
+    pub agent_config: crate::agent_config::AgentConfigSelection,
+    #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
@@ -55,6 +61,8 @@ pub struct CustomAgentPatch {
     pub name: Option<String>,
     #[serde(default)]
     pub base_agent: Option<String>,
+    #[serde(default)]
+    pub agent_config: Option<crate::agent_config::AgentConfigSelection>,
     #[serde(default)]
     pub model: Option<Option<String>>,
     #[serde(default)]
@@ -74,24 +82,26 @@ fn parse_dt(s: &str) -> DateTime<Utc> {
 }
 
 fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<CustomAgent> {
-    let created_at_s: String = row.get(8)?;
-    let updated_at_s: String = row.get(9)?;
+    let agent_config_json: String = row.get(3)?;
+    let created_at_s: String = row.get(9)?;
+    let updated_at_s: String = row.get(10)?;
     Ok(CustomAgent {
         id: row.get(0)?,
         name: row.get(1)?,
         base_agent: row.get(2)?,
-        model: row.get(3)?,
-        mode: row.get(4)?,
-        effort: row.get(5)?,
-        duty: row.get(6)?,
-        system_prompt: row.get(7)?,
+        agent_config: serde_json::from_str(&agent_config_json).unwrap_or_default(),
+        model: row.get(4)?,
+        mode: row.get(5)?,
+        effort: row.get(6)?,
+        duty: row.get(7)?,
+        system_prompt: row.get(8)?,
         created_at: parse_dt(&created_at_s),
         updated_at: parse_dt(&updated_at_s),
     })
 }
 
 const SELECT_COLS: &str =
-    "id, name, base_agent, model, mode, effort, duty, system_prompt, created_at, updated_at";
+    "id, name, base_agent, agent_config_json, model, mode, effort, duty, system_prompt, created_at, updated_at";
 
 /// 列出所有 custom agent（按 created_at 升序）
 pub fn list() -> Result<Vec<CustomAgent>> {
@@ -188,14 +198,16 @@ pub fn create(input: CustomAgentInput) -> Result<CustomAgent> {
     let id = format!("ca-{}", uuid::Uuid::new_v4());
     let now = Utc::now();
     let now_s = now.to_rfc3339();
+    let agent_config_json = serde_json::to_string(&input.agent_config)?;
     conn.execute(
         "INSERT INTO custom_agent
-         (id, name, base_agent, model, mode, effort, duty, system_prompt, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+         (id, name, base_agent, agent_config_json, model, mode, effort, duty, system_prompt, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
         params![
             id,
             input.name,
             input.base_agent,
+            agent_config_json,
             input.model,
             input.mode,
             input.effort,
@@ -208,6 +220,7 @@ pub fn create(input: CustomAgentInput) -> Result<CustomAgent> {
         id,
         name: input.name,
         base_agent: input.base_agent,
+        agent_config: input.agent_config,
         model: input.model,
         mode: input.mode,
         effort: input.effort,
@@ -251,6 +264,9 @@ pub fn update(id: &str, patch: CustomAgentPatch) -> Result<Option<CustomAgent>> 
     if let Some(base) = patch.base_agent {
         existing.base_agent = base;
     }
+    if let Some(agent_config) = patch.agent_config {
+        existing.agent_config = agent_config;
+    }
     if let Some(model) = patch.model {
         existing.model = model;
     }
@@ -268,16 +284,18 @@ pub fn update(id: &str, patch: CustomAgentPatch) -> Result<Option<CustomAgent>> 
     }
     existing.updated_at = Utc::now();
     let updated_s = existing.updated_at.to_rfc3339();
+    let agent_config_json = serde_json::to_string(&existing.agent_config)?;
 
     let n = tx.execute(
         "UPDATE custom_agent SET
-            name = ?2, base_agent = ?3, model = ?4, mode = ?5, effort = ?6,
-            duty = ?7, system_prompt = ?8, updated_at = ?9
+            name = ?2, base_agent = ?3, agent_config_json = ?4, model = ?5,
+            mode = ?6, effort = ?7, duty = ?8, system_prompt = ?9, updated_at = ?10
          WHERE id = ?1",
         params![
             existing.id,
             existing.name,
             existing.base_agent,
+            agent_config_json,
             existing.model,
             existing.mode,
             existing.effort,

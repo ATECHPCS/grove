@@ -4,7 +4,9 @@
 //! `src/api/handlers/automations.rs` REST surface. The scheduler is spawned
 //! once at API server startup (`api::start_server`).
 
+pub mod consumer;
 pub mod cron_util;
+pub mod events;
 pub mod executor;
 pub mod scheduler;
 

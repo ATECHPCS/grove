@@ -4,6 +4,66 @@
   container-name: chatbox;
 }
 
+/* The conversation minimap lives in the gutter outside the centered message
+   column. Once the pane is too narrow to provide that gutter, remove the
+   auxiliary rail instead of letting it overlap Markdown list markers and
+   other outdented content. Container queries are required here because the
+   TaskChat pane can be resized independently of the browser viewport. */
+.task-chat-message-pane {
+  container-type: inline-size;
+  container-name: task-chat-message-pane;
+}
+
+@container task-chat-message-pane (max-width: 1000px) {
+  .conversation-minimap {
+    display: none;
+  }
+}
+
+/* The latest turns are TaskChat's stable, fully rendered hot zone. The global
+   code-block optimization reserves a 600px intrinsic placeholder while a
+   block is off-screen; replacing that estimate with the real height as the
+   block approaches the viewport causes repeated scroll corrections in chats
+   containing many short code snippets. Old virtualized turns keep the global
+   optimization, while hot rows always participate in normal layout. */
+.task-chat-hot-row .markdown-code-block {
+  content-visibility: visible;
+  contain-intrinsic-size: none;
+}
+
+/* Codex-style compact reasoning status. The full thought body stays in chat
+   history but is intentionally not rendered; only its latest bold heading is
+   surfaced while the agent works. */
+.thought-status-shimmer {
+  color: transparent;
+  background-image: linear-gradient(
+    90deg,
+    var(--color-text-muted) 0%,
+    var(--color-text-muted) 42%,
+    var(--color-text) 50%,
+    var(--color-text-muted) 58%,
+    var(--color-text-muted) 100%
+  );
+  background-size: 300% 100%;
+  background-position: 100% 0;
+  background-clip: text;
+  -webkit-background-clip: text;
+  animation: thought-status-sweep 2.4s linear infinite;
+}
+
+@keyframes thought-status-sweep {
+  from { background-position: 100% 0; }
+  to { background-position: 0 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thought-status-shimmer {
+    animation: none;
+    color: var(--color-text-muted);
+    background: none;
+  }
+}
+
 /* Narrow chatbox adaptations (< 400px) */
 @container chatbox (max-width: 400px) {
   /* Reduce outer input area padding */
