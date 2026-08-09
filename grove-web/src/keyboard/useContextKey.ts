@@ -12,12 +12,13 @@ import { contextKeyService } from "./ContextKeyService";
  * owning the same key is allowed but last-write-wins — there is no
  * ref-counting at this layer (use distinct key names instead).
  */
-export function useContextKey(name: string, value: boolean): void {
+export function useContextKey(name: string, value: boolean, enabled: boolean = true): void {
   useEffect(() => {
+    if (!enabled) return;
     const key = contextKeyService.createKey<boolean>(name, false);
     key.set(value);
     return () => {
       key.reset();
     };
-  }, [name, value]);
+  }, [name, value, enabled]);
 }

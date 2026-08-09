@@ -117,6 +117,18 @@ pub fn load_projects() -> Result<Vec<RegisteredProject>> {
     load_projects_by_archived(None)
 }
 
+/// Load the persisted project identifiers used by tasks and group slots.
+/// Startup repair must use these keys directly rather than recomputing a hash
+/// from a path whose normalization rules may have changed since registration.
+pub(crate) fn load_project_hashes() -> Result<Vec<String>> {
+    let conn = crate::storage::database::connection();
+    let mut stmt = conn.prepare("SELECT hash FROM projects ORDER BY added_at DESC")?;
+    let hashes = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(hashes)
+}
+
 /// 加载未归档的注册项目列表。
 pub fn load_active_projects() -> Result<Vec<RegisteredProject>> {
     load_projects_by_archived(Some(false))
@@ -226,7 +238,23 @@ pub fn auto_register_cwd_if_git_repo() {
     // 这覆盖老项目升级到 "Local Task at registration" 重构后缺一行的情况;
     // ensure_local_task 自身幂等,已存在就 no-op。
     let hash = project_hash(&git_root);
-    let _ = crate::storage::tasks::ensure_local_task(&hash, &git_root, &name);
+    if let Err(e) = crate::storage::tasks::ensure_local_task(&hash, &git_root, &name) {
+        eprintln!(
+            "[warning] Failed to ensure Local Task for {}: {}",
+            git_root, e
+        );
+        return;
+    }
+    if let Err(e) = crate::storage::taskgroups::ensure_task_assignment(
+        &hash,
+        crate::storage::tasks::LOCAL_TASK_ID,
+        true,
+    ) {
+        eprintln!(
+            "[warning] Failed to assign Local Task for {} to Local group: {}",
+            git_root, e
+        );
+    }
 }
 
 /// 添加指定类型的项目
@@ -269,7 +297,12 @@ pub fn add_project_with_type(name: &str, path: &str, project_type: ProjectType) 
     drop(conn);
 
     if project_type == ProjectType::Repo {
-        let _ = crate::storage::tasks::ensure_local_task(&hash, &resolved_path, name);
+        crate::storage::tasks::ensure_local_task(&hash, &resolved_path, name)?;
+        crate::storage::taskgroups::ensure_task_assignment(
+            &hash,
+            crate::storage::tasks::LOCAL_TASK_ID,
+            true,
+        )?;
     }
 
     Ok(())
@@ -316,7 +349,12 @@ pub fn upsert_project(name: &str, path: &str) -> Result<()> {
     // pre-dating the eager-creation refactor could have a project row
     // without a Local Task. ensure_local_task is idempotent (checks
     // existence first), so the cost on the common path is one SELECT.
-    let _ = crate::storage::tasks::ensure_local_task(&hash, &resolved_path, name);
+    crate::storage::tasks::ensure_local_task(&hash, &resolved_path, name)?;
+    crate::storage::taskgroups::ensure_task_assignment(
+        &hash,
+        crate::storage::tasks::LOCAL_TASK_ID,
+        true,
+    )?;
     Ok(())
 }
 

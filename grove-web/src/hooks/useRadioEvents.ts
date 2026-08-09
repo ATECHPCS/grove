@@ -13,6 +13,9 @@ export interface RadioEventCallbacks {
     status: "idle" | "busy" | "disconnected",
   ) => void;
   onHookAdded?: (projectId: string, taskId: string) => void;
+  /** Task/group membership changed. Consumers should refresh both task data
+   *  and task-group slots because Blitz joins the two client-side. */
+  onGroupChanged?: () => void;
   /** Fired when the chat list under a task changes — typically after the
    *  `grove_agent_graph_spawn` MCP tool creates a sibling session. Consumers should
    *  refetch the task's chat list (e.g. `listChats(projectId, taskId)`) so the
@@ -92,6 +95,9 @@ function dispatch(event: RadioEvent) {
       break;
     case "hook_added":
       for (const s of subscribers) s.current.onHookAdded?.(event.project_id, event.task_id);
+      break;
+    case "group_changed":
+      for (const s of subscribers) s.current.onGroupChanged?.();
       break;
     case "chat_list_changed":
       for (const s of subscribers)

@@ -37,3 +37,17 @@ export async function setSlots(
 ): Promise<TaskGroup> {
   return apiClient.put(`/api/v1/taskgroups/${groupId}/slots`, { slots });
 }
+
+export async function moveTaskSlot(
+  fromGroupId: string,
+  toGroupId: string,
+  projectId: string,
+  taskId: string,
+): Promise<TaskGroup> {
+  return apiClient.post("/api/v1/taskgroups/move", {
+    from_group_id: fromGroupId,
+    to_group_id: toGroupId,
+    project_id: projectId,
+    task_id: taskId,
+  });
+}

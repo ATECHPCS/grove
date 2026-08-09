@@ -208,4 +208,5 @@ export {
   upsertTaskSlot,
   removeTaskSlot,
   setSlots,
+  moveTaskSlot,
 } from './taskgroups';

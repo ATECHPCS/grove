@@ -865,6 +865,7 @@ pub fn create_api_router() -> Router {
             "/taskgroups",
             get(handlers::taskgroups::list_groups).post(handlers::taskgroups::create_group),
         )
+        .route("/taskgroups/move", post(handlers::taskgroups::move_slot))
         .route(
             "/taskgroups/{id}",
             patch(handlers::taskgroups::update_group).delete(handlers::taskgroups::delete_group),

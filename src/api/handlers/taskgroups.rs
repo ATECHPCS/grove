@@ -36,13 +36,19 @@ pub struct SetSlotsRequest {
     pub slots: Vec<UpsertSlotRequest>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct MoveSlotRequest {
+    pub from_group_id: String,
+    pub to_group_id: String,
+    pub project_id: String,
+    pub task_id: String,
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
 
 /// GET /taskgroups — list all task groups
-/// Note: ensure_system_groups() is called at startup and after task create/archive/delete,
-/// so we don't need to call it on every list request.
 pub async fn list_groups() -> impl IntoResponse {
     match taskgroups::load_groups() {
         Ok(groups) => Ok(Json(serde_json::json!({ "groups": groups }))),
@@ -231,6 +237,33 @@ pub async fn set_slots(
     }
 }
 
+/// POST /taskgroups/move — atomically move a task between groups
+pub async fn move_slot(Json(body): Json<MoveSlotRequest>) -> impl IntoResponse {
+    if body.from_group_id == body.to_group_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Source and target groups must differ".to_string(),
+        ));
+    }
+
+    match taskgroups::move_slot(
+        &body.from_group_id,
+        &body.to_group_id,
+        &body.project_id,
+        &body.task_id,
+    ) {
+        Ok(Some(group)) => {
+            broadcast_radio_event(RadioEvent::GroupChanged);
+            Ok(Json(serde_json::json!(group)))
+        }
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            "Source slot or target group not found".to_string(),
+        )),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::{extract::Path, Json};
@@ -321,6 +354,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_groups_does_not_repair_missing_membership() {
+        let _lock = acquire_lock().await;
+        let home = sandbox_home();
+        let project_path = home.temp.join("read-only-list-project");
+        std::fs::create_dir_all(&project_path).unwrap();
+        let project_path = project_path.to_string_lossy().to_string();
+        crate::storage::workspace::add_project("read-only-list-project", &project_path).unwrap();
+        let registered = crate::storage::workspace::load_projects()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.name == "read-only-list-project")
+            .unwrap();
+        let project_id = crate::storage::workspace::project_hash(&registered.path);
+        let local = taskgroups::load_groups()
+            .unwrap()
+            .into_iter()
+            .find(|group| group.id == taskgroups::LOCAL_GROUP_ID)
+            .unwrap();
+        let position = local
+            .slots
+            .iter()
+            .find(|slot| slot.project_id == project_id && slot.task_id == LOCAL_TASK_ID)
+            .unwrap()
+            .position;
+        taskgroups::remove_slot(taskgroups::LOCAL_GROUP_ID, position).unwrap();
+
+        let response = list_groups().await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(taskgroups::load_groups()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group.slots.iter())
+            .all(|slot| slot.project_id != project_id || slot.task_id != LOCAL_TASK_ID));
+    }
+
+    #[tokio::test]
     async fn test_handler_update_and_delete() {
         let _lock = acquire_lock().await;
         let _home = sandbox_home();
@@ -403,5 +472,51 @@ mod tests {
         .await;
         let resp = resp.into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_handler_moves_slot_in_one_request() {
+        let _lock = acquire_lock().await;
+        let _home = sandbox_home();
+        taskgroups::ensure_system_groups().unwrap();
+        let target = taskgroups::create_group("handler-move".to_string(), None).unwrap();
+        let _guard = TestGroup {
+            id: target.id.clone(),
+        };
+        taskgroups::upsert_slot(
+            taskgroups::LOCAL_GROUP_ID,
+            taskgroups::TaskSlot {
+                position: 1,
+                project_id: "project-a".to_string(),
+                task_id: "_local".to_string(),
+                target_chat_id: None,
+            },
+        )
+        .unwrap();
+
+        let response = move_slot(Json(MoveSlotRequest {
+            from_group_id: taskgroups::LOCAL_GROUP_ID.to_string(),
+            to_group_id: target.id.clone(),
+            project_id: "project-a".to_string(),
+            task_id: "_local".to_string(),
+        }))
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let groups = taskgroups::load_groups().unwrap();
+        assert!(groups
+            .iter()
+            .find(|group| group.id == taskgroups::LOCAL_GROUP_ID)
+            .unwrap()
+            .slots
+            .is_empty());
+        assert!(groups
+            .iter()
+            .find(|group| group.id == target.id)
+            .unwrap()
+            .slots
+            .iter()
+            .any(|slot| slot.project_id == "project-a" && slot.task_id == "_local"));
     }
 }

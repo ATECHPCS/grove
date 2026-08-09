@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -8,6 +8,14 @@ use crate::error::Result;
 /// System group IDs (auto-created, cannot be deleted/renamed)
 pub const MAIN_GROUP_ID: &str = "_main";
 pub const LOCAL_GROUP_ID: &str = "_local";
+
+fn system_group_name(group_id: &str) -> &'static str {
+    if group_id == LOCAL_GROUP_ID {
+        "Local"
+    } else {
+        "Main"
+    }
+}
 
 /// TaskSlot: binds a Task to a position in a TaskGroup
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,7 +241,7 @@ pub fn ensure_system_groups() -> Result<()> {
     }
 
     // Auto-assign unassigned tasks to _main / _local
-    let projects = crate::storage::workspace::load_projects().unwrap_or_default();
+    let project_ids = crate::storage::workspace::load_project_hashes().unwrap_or_default();
 
     // Collect all assigned (project_id, task_id)
     let mut assigned: std::collections::HashSet<(String, String)> =
@@ -255,8 +263,7 @@ pub fn ensure_system_groups() -> Result<()> {
         .map(|g| g.slots.iter().map(|s| s.position).max().unwrap_or(0))
         .unwrap_or(0);
 
-    for project in &projects {
-        let project_id = crate::storage::workspace::project_hash(&project.path);
+    for project_id in project_ids {
         let tasks = crate::storage::tasks::load_tasks(&project_id).unwrap_or_default();
 
         for task in &tasks {
@@ -341,6 +348,54 @@ pub fn ensure_system_groups() -> Result<()> {
         save_groups(&groups)?;
     }
     Ok(())
+}
+
+/// Ensure one active task has a slot without rewriting every task group.
+///
+/// Project registration creates the Local Task and its group membership in
+/// separate storage operations.  Keeping this helper narrow makes that second
+/// operation reliable and idempotent, while preserving an explicit custom
+/// group assignment if one already exists.
+pub fn ensure_task_assignment(project_id: &str, task_id: &str, is_local: bool) -> Result<bool> {
+    let target_group_id = if is_local {
+        LOCAL_GROUP_ID
+    } else {
+        MAIN_GROUP_ID
+    };
+    let conn = crate::storage::database::connection();
+    let tx = conn.unchecked_transaction()?;
+
+    tx.execute(
+        "INSERT OR IGNORE INTO task_groups (id, name, color, created_at) VALUES (?1, ?2, NULL, ?3)",
+        params![
+            target_group_id,
+            system_group_name(target_group_id),
+            Utc::now().to_rfc3339()
+        ],
+    )?;
+
+    let already_assigned: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_group_slots WHERE project_id = ?1 AND task_id = ?2)",
+        params![project_id, task_id],
+        |row| row.get(0),
+    )?;
+    if already_assigned {
+        tx.commit()?;
+        return Ok(false);
+    }
+
+    let next_position: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(position), 0) + 1 FROM task_group_slots WHERE group_id = ?1",
+        params![target_group_id],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO task_group_slots (group_id, position, project_id, task_id, target_chat_id) \
+         VALUES (?1, ?2, ?3, ?4, NULL)",
+        params![target_group_id, next_position, project_id, task_id],
+    )?;
+    tx.commit()?;
+    Ok(true)
 }
 
 /// Replace all slots for a group at once (for reordering). Returns updated group if found.
@@ -508,6 +563,82 @@ pub fn remove_slot(group_id: &str, position: u16) -> Result<Option<TaskGroup>> {
     tx.commit()?;
 
     load_group_by_id(&conn, group_id)
+}
+
+/// Move one task between groups atomically.
+///
+/// A move must not be composed from client-side DELETE and INSERT requests:
+/// that exposes an unassigned intermediate state, emits two change events, and
+/// can leave the task missing or duplicated if the second request fails.
+pub fn move_slot(
+    from_group_id: &str,
+    to_group_id: &str,
+    project_id: &str,
+    task_id: &str,
+) -> Result<Option<TaskGroup>> {
+    let conn = crate::storage::database::connection();
+    let tx = conn.unchecked_transaction()?;
+
+    let groups_exist: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM task_groups WHERE id IN (?1, ?2)",
+        params![from_group_id, to_group_id],
+        |row| row.get(0),
+    )?;
+    let expected_groups = if from_group_id == to_group_id { 1 } else { 2 };
+    if groups_exist != expected_groups {
+        return Ok(None);
+    }
+
+    if from_group_id == to_group_id {
+        tx.commit()?;
+        return load_group_by_id(&conn, to_group_id);
+    }
+
+    let target_chat_id: Option<Option<String>> = tx
+        .query_row(
+            "SELECT target_chat_id FROM task_group_slots \
+             WHERE group_id = ?1 AND project_id = ?2 AND task_id = ?3",
+            params![from_group_id, project_id, task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(target_chat_id) = target_chat_id else {
+        return Ok(None);
+    };
+
+    tx.execute(
+        "DELETE FROM task_group_slots \
+         WHERE group_id = ?1 AND project_id = ?2 AND task_id = ?3",
+        params![from_group_id, project_id, task_id],
+    )?;
+    renumber_positions(&tx, from_group_id)?;
+
+    // Defensive cleanup for data produced by the old two-request move path.
+    tx.execute(
+        "DELETE FROM task_group_slots \
+         WHERE group_id = ?1 AND project_id = ?2 AND task_id = ?3",
+        params![to_group_id, project_id, task_id],
+    )?;
+    let next_position: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(position), 0) + 1 FROM task_group_slots WHERE group_id = ?1",
+        params![to_group_id],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO task_group_slots \
+         (group_id, position, project_id, task_id, target_chat_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            to_group_id,
+            next_position,
+            project_id,
+            task_id,
+            target_chat_id
+        ],
+    )?;
+    tx.commit()?;
+
+    load_group_by_id(&conn, to_group_id)
 }
 
 /// Remove a task from all groups (called when task is archived/deleted).
@@ -757,5 +888,128 @@ mod tests {
         let group = groups.iter().find(|g| g.id == guard.id).unwrap();
         let positions: Vec<u16> = group.slots.iter().map(|s| s.position).collect();
         assert_eq!(positions, vec![1, 2, 3, 5, 9]);
+    }
+
+    #[test]
+    fn test_ensure_task_assignment_repairs_missing_local_slot() {
+        let _lock = FILE_LOCK_FN().blocking_lock();
+        let home = sandbox_home();
+        let project_path = home.temp.join("repair-project");
+        std::fs::create_dir_all(&project_path).unwrap();
+        let project_path = project_path.to_string_lossy().to_string();
+
+        crate::storage::workspace::add_project("repair-project", &project_path).unwrap();
+        let registered = crate::storage::workspace::load_projects()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.name == "repair-project")
+            .unwrap();
+        let project_id = crate::storage::workspace::project_hash(&registered.path);
+
+        // Repo registration itself establishes the Local membership; startup
+        // repair is only for historical or interrupted registrations.
+        let groups = load_groups().unwrap();
+        let local = groups.iter().find(|g| g.id == LOCAL_GROUP_ID).unwrap();
+        assert!(local.slots.iter().any(|slot| {
+            slot.project_id == project_id && slot.task_id == crate::storage::tasks::LOCAL_TASK_ID
+        }));
+
+        {
+            let conn = crate::storage::database::connection();
+            conn.execute(
+                "DELETE FROM task_group_slots WHERE project_id = ?1 AND task_id = ?2",
+                params![project_id, crate::storage::tasks::LOCAL_TASK_ID],
+            )
+            .unwrap();
+        }
+
+        ensure_system_groups().unwrap();
+
+        let groups = load_groups().unwrap();
+        let local = groups.iter().find(|g| g.id == LOCAL_GROUP_ID).unwrap();
+        assert!(local.slots.iter().any(|slot| {
+            slot.project_id == project_id && slot.task_id == crate::storage::tasks::LOCAL_TASK_ID
+        }));
+    }
+
+    #[test]
+    fn test_ensure_task_assignment_preserves_custom_group() {
+        let _lock = FILE_LOCK_FN().blocking_lock();
+        let _home = sandbox_home();
+        ensure_system_groups().unwrap();
+        let custom = create_group("Focused".to_string(), None).unwrap();
+        upsert_slot(
+            &custom.id,
+            TaskSlot {
+                position: 1,
+                project_id: "project-a".to_string(),
+                task_id: "_local".to_string(),
+                target_chat_id: None,
+            },
+        )
+        .unwrap();
+
+        assert!(!ensure_task_assignment("project-a", "_local", true).unwrap());
+        let groups = load_groups().unwrap();
+        assert_eq!(
+            groups
+                .iter()
+                .flat_map(|group| group.slots.iter())
+                .filter(|slot| slot.project_id == "project-a" && slot.task_id == "_local")
+                .count(),
+            1
+        );
+        assert!(groups
+            .iter()
+            .find(|group| group.id == custom.id)
+            .unwrap()
+            .slots
+            .iter()
+            .any(|slot| slot.project_id == "project-a" && slot.task_id == "_local"));
+    }
+
+    #[test]
+    fn test_move_slot_is_atomic_and_preserves_identity() {
+        let _lock = FILE_LOCK_FN().blocking_lock();
+        let _home = sandbox_home();
+        ensure_system_groups().unwrap();
+        let custom = create_group("Focused".to_string(), None).unwrap();
+        upsert_slot(
+            LOCAL_GROUP_ID,
+            TaskSlot {
+                position: 1,
+                project_id: "project-a".to_string(),
+                task_id: "_local".to_string(),
+                target_chat_id: Some("chat-a".to_string()),
+            },
+        )
+        .unwrap();
+
+        let moved = move_slot(LOCAL_GROUP_ID, &custom.id, "project-a", "_local")
+            .unwrap()
+            .unwrap();
+        assert!(moved.slots.iter().any(|slot| {
+            slot.project_id == "project-a"
+                && slot.task_id == "_local"
+                && slot.target_chat_id.as_deref() == Some("chat-a")
+        }));
+
+        let groups = load_groups().unwrap();
+        let local = groups
+            .iter()
+            .find(|group| group.id == LOCAL_GROUP_ID)
+            .unwrap();
+        assert!(local
+            .slots
+            .iter()
+            .all(|slot| { slot.project_id != "project-a" || slot.task_id != "_local" }));
+        assert_eq!(
+            groups
+                .iter()
+                .flat_map(|group| group.slots.iter())
+                .filter(|slot| slot.project_id == "project-a" && slot.task_id == "_local")
+                .count(),
+            1
+        );
     }
 }

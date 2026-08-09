@@ -7,6 +7,7 @@ import {
   upsertTaskSlot,
   removeTaskSlot,
   setSlots,
+  moveTaskSlot,
 } from "../api";
 import type { TaskGroup, TaskSlot } from "../data/types";
 import { MAIN_GROUP_ID, LOCAL_GROUP_ID } from "../data/types";
@@ -196,7 +197,15 @@ export function useTaskGroups(): UseTaskGroupsResult {
       const slot = sourceGroup?.slots.find(
         (s) => s.project_id === projectId && s.task_id === taskId,
       );
-      if (!slot) return;
+      if (!slot) {
+        console.warn("[TaskGroups] moveTask source slot not found; refreshing groups", {
+          fromGroupId,
+          projectId,
+          taskId,
+        });
+        void refresh();
+        return;
+      }
 
       const targetGroup = latestGroups.find((g) => g.id === toGroupId);
       const existingPositions = targetGroup
@@ -226,17 +235,11 @@ export function useTaskGroups(): UseTaskGroupsResult {
         }),
       );
 
-      // Chain API calls sequentially to avoid TOCTOU race on the same TOML file
-      removeTaskSlot(fromGroupId, slot.position)
-        .then(() => upsertTaskSlot(toGroupId, {
-          position: nextPos,
-          project_id: projectId,
-          task_id: taskId,
-        }))
-        .catch((err) => {
-          console.error("[TaskGroups] moveTask failed:", err);
-          refresh();
-        });
+      // One backend transaction owns the full cross-group invariant.
+      moveTaskSlot(fromGroupId, toGroupId, projectId, taskId).catch((err) => {
+        console.error("[TaskGroups] moveTask failed:", err);
+        void refresh();
+      });
     },
     [refresh],
   );
