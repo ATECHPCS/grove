@@ -33,6 +33,22 @@ static STARTING_SESSIONS: once_cell::sync::Lazy<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+/// Plugin launch validation runs for every ACP session. Remember diagnostics
+/// already shown during this Grove process so one broken plugin does not flood
+/// stderr as chats connect and reconnect.
+static REPORTED_PLUGIN_MCP_ISSUES: once_cell::sync::Lazy<Mutex<std::collections::HashSet<String>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+
+fn report_plugin_mcp_issue_once(key: String, message: impl FnOnce() -> String) {
+    let should_report = REPORTED_PLUGIN_MCP_ISSUES
+        .lock()
+        .map(|mut reported| reported.insert(key))
+        .unwrap_or(true);
+    if should_report {
+        eprintln!("{}", message());
+    }
+}
+
 static ACP_SESSIONS: once_cell::sync::Lazy<RwLock<HashMap<String, Arc<AcpSessionHandle>>>> =
     once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 
@@ -1588,9 +1604,14 @@ fn load_plugin_mcp_servers(base_env: &HashMap<String, String>) -> Vec<acp::McpSe
             Some(c) if !c.is_empty() => match resolve_plugin_mcp_command(c, plugin_dir, base_env) {
                 Some(command) => command,
                 None => {
-                    eprintln!(
-                        "grove: skipping MCP server for plugin '{}': executable '{}' was not found",
-                        plugin.name, c
+                    report_plugin_mcp_issue_once(
+                        format!("{}:missing-executable:{c}", plugin.id),
+                        || {
+                            format!(
+                                "grove: skipping MCP server for plugin '{}': executable '{}' was not found",
+                                plugin.name, c
+                            )
+                        },
                     );
                     continue;
                 }
@@ -1620,11 +1641,16 @@ fn load_plugin_mcp_servers(base_env: &HashMap<String, String>) -> Vec<acp::McpSe
         let _ = std::fs::create_dir_all(&storage_root);
         if crate::plugins::runtime::is_node_command(&command) {
             if !crate::plugins::runtime::node_supports_permissions(&command) {
-                eprintln!(
-                    "grove: skipping MCP server for plugin '{}': node >= {} is required \
-                     for enforced permissions (check `node --version`)",
-                    plugin.name,
-                    crate::plugins::runtime::MIN_NODE_MAJOR
+                report_plugin_mcp_issue_once(
+                    format!("{}:node-permissions:{command}", plugin.id),
+                    || {
+                        format!(
+                            "grove: skipping MCP server for plugin '{}': node >= {} is required \
+                             for enforced permissions (check `node --version`)",
+                            plugin.name,
+                            crate::plugins::runtime::MIN_NODE_MAJOR
+                        )
+                    },
                 );
                 continue;
             }
@@ -4212,24 +4238,16 @@ pub async fn get_or_start_session(
                 let session_agent_name = config.agent_name.clone();
 
                 let session_result = run_acp_session(handle, config, cmd_rx).await;
-                match &session_result {
-                    Ok(()) => {
-                        eprintln!(
-                            "[ACP] session ended normally (key={} agent={} task={} chat={:?})",
-                            key_clone, session_agent_name, session_task_id, session_chat_id
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[ACP] session ended with error (key={} agent={} task={} chat={:?}): {}",
-                            key_clone, session_agent_name, session_task_id, session_chat_id, e
-                        );
-                        let message = match e {
-                            crate::error::GroveError::Session(message) => message.clone(),
-                            other => other.to_string(),
-                        };
-                        let _ = update_tx.send(AcpUpdate::Error { message });
-                    }
+                if let Err(e) = &session_result {
+                    eprintln!(
+                        "[ACP] session ended with error (key={} agent={} task={} chat={:?}): {}",
+                        key_clone, session_agent_name, session_task_id, session_chat_id, e
+                    );
+                    let message = match e {
+                        crate::error::GroveError::Session(message) => message.clone(),
+                        other => other.to_string(),
+                    };
+                    let _ = update_tx.send(AcpUpdate::Error { message });
                 }
                 let _ = update_tx.send(AcpUpdate::SessionEnded);
 
@@ -5386,10 +5404,13 @@ async fn drive_session(
             ) = extract_thought_level(&config_options);
             saved_id
         }
-        // Resume 路线(优先):agent 支持 session/resume。不 replay 历史,所以
-        // 完全不需要 suppress_emit + 300ms 那套抛弃 agent 回放的机制 — 直接发
-        // ResumeSessionRequest,Grove 照常从磁盘加载自己的历史。
-        (Some(saved_id), true, _, false) => {
+        // Prefer resume because it does not replay history. Some agents expose
+        // both lifecycle methods but only keep resumable resources in memory;
+        // after an agent restart, resume can return Resource not found while
+        // session/load can still restore the persisted session. Fall back to
+        // load in that case, suppressing its replay because Grove's local
+        // history remains the display source of truth.
+        (Some(saved_id), true, supports_load, false) => {
             let mcp_servers = build_mcp_servers(
                 &config.env_vars,
                 agent_graph_token,
@@ -5398,7 +5419,8 @@ async fn drive_session(
                 config.mcp_server_policy,
             )
             .map_err(to_acp_err)?;
-            let resp = loop {
+            let mut resume_failure = None;
+            let resume_response = loop {
                 match conn
                     .send_request(
                         acp::ResumeSessionRequest::new(
@@ -5411,29 +5433,81 @@ async fn drive_session(
                     .block_task()
                     .await
                 {
-                    Ok(resp) => break resp,
+                    Ok(resp) => break Some(resp),
                     Err(error) if is_auth_required_error(&error) => {
                         await_authentication!();
                     }
                     Err(error) => {
-                        return Err(acp::Error::internal_error()
-                            .data(format!("Resume session failed: {}", error)));
+                        resume_failure = Some(error);
+                        break None;
                     }
                 }
             };
             if let Ok(mut slot) = handle.pending_auth.lock() {
                 *slot = None;
             }
-            uses_config_options = resp.config_options.is_some();
-            config_options = resp.config_options.clone().unwrap_or_default();
-            (available_modes, current_mode_id, _, mode_descriptions) =
-                extract_modes(&resp.modes, &config_options, uses_config_options);
-            (available_models, current_model_id, model_config_id) = extract_models(&config_options);
-            (
-                available_thought_levels,
-                current_thought_level_id,
-                thought_level_config_id,
-            ) = extract_thought_level(&config_options);
+            if let Some(resp) = resume_response {
+                uses_config_options = resp.config_options.is_some();
+                config_options = resp.config_options.clone().unwrap_or_default();
+                (available_modes, current_mode_id, _, mode_descriptions) =
+                    extract_modes(&resp.modes, &config_options, uses_config_options);
+                (available_models, current_model_id, model_config_id) =
+                    extract_models(&config_options);
+                (
+                    available_thought_levels,
+                    current_thought_level_id,
+                    thought_level_config_id,
+                ) = extract_thought_level(&config_options);
+            } else if supports_load {
+                handle
+                    .suppress_emit
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let load_response = loop {
+                    match conn
+                        .send_request(
+                            acp::LoadSessionRequest::new(
+                                acp::SessionId::new(&*saved_id),
+                                &config.working_dir,
+                            )
+                            .additional_directories(additional_directories.clone())
+                            .mcp_servers(mcp_servers.clone()),
+                        )
+                        .block_task()
+                        .await
+                    {
+                        Ok(resp) => break resp,
+                        Err(error) if is_auth_required_error(&error) => {
+                            await_authentication!();
+                        }
+                        Err(load_error) => {
+                            return Err(acp::Error::internal_error().data(format!(
+                                "Resume session failed: {}; load fallback failed: {}",
+                                resume_failure.expect("missing resume failure"),
+                                load_error
+                            )));
+                        }
+                    }
+                };
+                if let Ok(mut slot) = handle.pending_auth.lock() {
+                    *slot = None;
+                }
+                uses_config_options = load_response.config_options.is_some();
+                config_options = load_response.config_options.clone().unwrap_or_default();
+                (available_modes, current_mode_id, _, mode_descriptions) =
+                    extract_modes(&load_response.modes, &config_options, uses_config_options);
+                (available_models, current_model_id, model_config_id) =
+                    extract_models(&config_options);
+                (
+                    available_thought_levels,
+                    current_thought_level_id,
+                    thought_level_config_id,
+                ) = extract_thought_level(&config_options);
+            } else {
+                return Err(acp::Error::internal_error().data(format!(
+                    "Resume session failed: {}",
+                    resume_failure.expect("missing resume failure")
+                )));
+            }
             saved_id
         }
         // Load 路线:agent 不支持 resume 但支持 load_session。agent 会 replay 历史

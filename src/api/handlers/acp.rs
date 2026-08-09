@@ -827,7 +827,6 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
     let history_project_key = config.project_key.clone();
     let history_task_id = config.task_id.clone();
     let history_chat_id = config.chat_id.clone();
-    let session_key_for_log = session_key.clone();
 
     // Get or start ACP session (thread managed by acp module)
     let (handle, mut update_rx) = match acp::get_or_start_session(session_key, config).await {
@@ -1077,9 +1076,7 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
     let handle_for_input = handle.clone();
 
     // Task: Forward ACP updates to WebSocket
-    let updates_ws_log_key = session_key_for_log.clone();
     let mut updates_to_ws = tokio::spawn(async move {
-        let mut end_reason = "update_rx closed unexpectedly";
         loop {
             match update_rx.recv().await {
                 Ok(update) => {
@@ -1087,12 +1084,10 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                     let msg: ServerMessage = update.into();
                     if let Ok(json) = serde_json::to_string(&msg) {
                         if ws_sender.send(Message::Text(json.into())).await.is_err() {
-                            end_reason = "client write failed (browser likely already gone)";
                             break;
                         }
                     }
                     if is_ended {
-                        end_reason = "AcpUpdate::SessionEnded (agent session terminated)";
                         break;
                     }
                 }
@@ -1107,18 +1102,12 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
         // half and the underlying connection stays technically open, so the
         // browser never learns the session is gone and sits on "Connecting…"
         // forever until the user manually refreshes.
-        eprintln!(
-            "[ACP] chat ws: closing connection to client (key={}, reason={})",
-            updates_ws_log_key, end_reason
-        );
         let _ = ws_sender.send(Message::Close(None)).await;
         let _ = ws_sender.close().await;
     });
 
     // Task: Forward WebSocket messages to ACP
-    let ws_to_acp_log_key = session_key_for_log.clone();
     let mut ws_to_acp = tokio::spawn(async move {
-        let mut end_reason = "ws_receiver stream ended (client socket closed)";
         while let Some(msg) = ws_receiver.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
@@ -1136,7 +1125,6 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                                     .await
                                 {
                                     eprintln!("Failed to send prompt: {}", e);
-                                    end_reason = "send_prompt failed";
                                     break;
                                 }
                             }
@@ -1145,7 +1133,6 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                             }
                             ClientMessage::Kill => {
                                 let _ = handle_for_input.kill().await;
-                                end_reason = "ClientMessage::Kill (user explicitly killed session)";
                                 break;
                             }
                             ClientMessage::PermissionResponse { id, option_id } => {
@@ -1283,24 +1270,12 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                     }
                 }
                 Ok(Message::Close(_)) => {
-                    end_reason = "client sent WS Close frame";
                     break;
                 }
-                Err(e) => {
-                    eprintln!(
-                        "[ACP] chat ws: read error from client (key={}): {}",
-                        ws_to_acp_log_key, e
-                    );
-                    end_reason = "read error from client socket";
-                    break;
-                }
+                Err(_) => break,
                 _ => {}
             }
         }
-        eprintln!(
-            "[ACP] chat ws: ws-to-acp task ending (key={}, reason={})",
-            ws_to_acp_log_key, end_reason
-        );
     });
 
     // Wait for either task to finish, then abort the other. Without the
