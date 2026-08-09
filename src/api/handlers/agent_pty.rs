@@ -260,7 +260,14 @@ pub async fn agent_pty_handler(
         }
         let _token_guard = TokenGuard(agent_graph_token);
 
-        handle_pty_terminal(socket, cmd, cols, rows).await;
+        handle_pty_terminal(
+            socket,
+            cmd,
+            cols,
+            rows,
+            Some((project_key, task_id, chat_id)),
+        )
+        .await;
     }))
 }
 

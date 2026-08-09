@@ -431,7 +431,13 @@ pub async fn grove_agent_contacts(
     cx: &ToolContext,
     _input: ContactsInput,
 ) -> AgentGraphResult<ContactsOutput> {
-    let (_caller_project, caller_task, caller_chat) = cx.caller_context()?;
+    let (caller_project, caller_task, caller_chat) = cx.caller_context()?;
+    let active_ids: std::collections::HashSet<String> =
+        tasks::load_chat_sessions(&caller_project, &caller_task)
+            .map_err(AgentGraphError::from)?
+            .into_iter()
+            .map(|chat| chat.id)
+            .collect();
 
     let conn = database::connection();
     let outgoing =
@@ -444,6 +450,7 @@ pub async fn grove_agent_contacts(
 
     let can_contact = outgoing
         .into_iter()
+        .filter(|contact| active_ids.contains(&contact.to_session_id))
         .map(|c| ContactsCanContact {
             session_id: c.to_session_id,
             name: c.to_session_name,
@@ -453,6 +460,7 @@ pub async fn grove_agent_contacts(
         .collect();
     let pending_replies = incoming_pending
         .into_iter()
+        .filter(|pending| active_ids.contains(&pending.from_session))
         .map(|p| ContactsPendingReply {
             msg_id: p.msg_id,
             from: p.from_session,
@@ -462,6 +470,7 @@ pub async fn grove_agent_contacts(
         .collect();
     let awaiting_reply = outgoing_pending
         .into_iter()
+        .filter(|pending| active_ids.contains(&pending.to_session))
         .map(|p| ContactsAwaitingReply {
             msg_id: p.msg_id,
             to: p.to_session,

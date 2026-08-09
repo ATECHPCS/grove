@@ -7024,6 +7024,22 @@ impl AcpSessionHandle {
                     chat_id,
                     &update,
                 );
+                if matches!(
+                    &update,
+                    AcpUpdate::UserMessage { .. } | AcpUpdate::Complete { .. }
+                ) && crate::storage::tasks::touch_chat_session(
+                    &self.project_key,
+                    &self.task_id,
+                    chat_id,
+                )
+                .unwrap_or(false)
+                {
+                    use crate::api::handlers::walkie_talkie::{broadcast_radio_event, RadioEvent};
+                    broadcast_radio_event(RadioEvent::ChatListChanged {
+                        project_id: self.project_key.clone(),
+                        task_id: self.task_id.clone(),
+                    });
+                }
             }
             if let Some(ref artifact_dir) = self.artifact_dir {
                 crate::storage::chat_history::append_event_to_path(

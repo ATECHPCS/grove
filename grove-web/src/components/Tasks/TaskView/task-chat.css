@@ -51,6 +51,39 @@
   animation: thought-status-sweep 2.4s linear infinite;
 }
 
+/* Session-list activity is intentionally ephemeral: a restrained breathing
+   ring while work is active, then a compact unread dot after background work
+   finishes. The corresponding state lives only in TaskChat memory. */
+.taskchat-session-running::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  pointer-events: none;
+  border: 1px solid color-mix(in srgb, var(--color-highlight) 72%, transparent);
+  border-radius: 6px;
+  animation: taskchat-session-running-pulse 1.45s ease-out infinite;
+}
+
+@keyframes taskchat-session-running-pulse {
+  0% {
+    opacity: 0.78;
+    transform: scale(0.94);
+  }
+  72%, 100% {
+    opacity: 0;
+    transform: scale(1.16);
+  }
+}
+
+.taskchat-session-unread-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 9999px;
+  background: var(--color-highlight);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-highlight) 12%, transparent);
+}
+
 @keyframes thought-status-sweep {
   from { background-position: 100% 0; }
   to { background-position: 0 0; }
@@ -61,6 +94,12 @@
     animation: none;
     color: var(--color-text-muted);
     background: none;
+  }
+
+  .taskchat-session-running::after {
+    animation: none;
+    opacity: 0.72;
+    transform: none;
   }
 }
 

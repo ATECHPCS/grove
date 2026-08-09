@@ -617,13 +617,62 @@ pub fn load_chat_sessions(project: &str, task_id: &str) -> Result<Vec<ChatSessio
     let mut stmt = conn.prepare(
         "SELECT session_id, title, agent, acp_session_id, created_at, duty, launch_mode
          FROM session
-         WHERE project = ?1 AND task_id = ?2
-         ORDER BY created_at ASC",
+         WHERE project = ?1 AND task_id = ?2 AND archived_at IS NULL
+         ORDER BY COALESCE(updated_at, created_at) DESC, created_at DESC",
     )?;
     let chats = stmt
         .query_map(params![project, task_id], row_to_chat_session)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(chats)
+}
+
+/// Load archived sessions for the dedicated read-only SessionList section.
+/// Normal discovery paths intentionally use `load_chat_sessions` and therefore
+/// cannot see these rows until they are restored.
+pub fn load_archived_chat_sessions(project: &str, task_id: &str) -> Result<Vec<ChatSession>> {
+    let conn = crate::storage::database::connection();
+    let mut stmt = conn.prepare(
+        "SELECT session_id, title, agent, acp_session_id, created_at, duty, launch_mode
+         FROM session
+         WHERE project = ?1 AND task_id = ?2 AND archived_at IS NOT NULL
+         ORDER BY archived_at DESC",
+    )?;
+    let chats = stmt
+        .query_map(params![project, task_id], row_to_chat_session)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(chats)
+}
+
+pub fn archive_chat_session(project: &str, task_id: &str, chat_id: &str) -> Result<bool> {
+    let conn = crate::storage::database::connection();
+    let changed = conn.execute(
+        "UPDATE session SET archived_at = ?1
+         WHERE project = ?2 AND task_id = ?3 AND session_id = ?4 AND archived_at IS NULL",
+        params![Utc::now().to_rfc3339(), project, task_id, chat_id],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn restore_chat_session(project: &str, task_id: &str, chat_id: &str) -> Result<bool> {
+    let conn = crate::storage::database::connection();
+    let changed = conn.execute(
+        "UPDATE session SET archived_at = NULL
+         WHERE project = ?1 AND task_id = ?2 AND session_id = ?3 AND archived_at IS NOT NULL",
+        params![project, task_id, chat_id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Mark a session as recently active without changing any presentation metadata.
+/// Archived sessions are deliberately excluded: activity cannot implicitly restore one.
+pub fn touch_chat_session(project: &str, task_id: &str, chat_id: &str) -> Result<bool> {
+    let conn = crate::storage::database::connection();
+    let changed = conn.execute(
+        "UPDATE session SET updated_at = ?1
+         WHERE project = ?2 AND task_id = ?3 AND session_id = ?4 AND archived_at IS NULL",
+        params![Utc::now().to_rfc3339(), project, task_id, chat_id],
+    )?;
+    Ok(changed > 0)
 }
 
 pub fn load_acp_session_ids_for_agent(agent: &str) -> Result<std::collections::HashSet<String>> {
@@ -654,14 +703,15 @@ pub fn add_chat_session(project: &str, task_id: &str, chat: ChatSession) -> Resu
     }
     conn.execute(
         "INSERT INTO session
-         (session_id, project, task_id, title, agent, acp_session_id, duty, created_at, launch_mode)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         (session_id, project, task_id, title, agent, acp_session_id, duty, created_at, updated_at, launch_mode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)
          ON CONFLICT(session_id) DO UPDATE SET
             title = excluded.title,
             agent = excluded.agent,
             acp_session_id = excluded.acp_session_id,
             duty = excluded.duty,
-            created_at = excluded.created_at",
+            created_at = excluded.created_at,
+            updated_at = COALESCE(session.updated_at, excluded.updated_at)",
         params![
             chat.id,
             project,
@@ -782,6 +832,26 @@ pub fn get_chat_session(
         .query_row(
             "SELECT session_id, title, agent, acp_session_id, created_at, duty, launch_mode
              FROM session
+             WHERE project = ?1 AND task_id = ?2 AND session_id = ?3 AND archived_at IS NULL",
+            params![project, task_id, chat_id],
+            row_to_chat_session,
+        )
+        .optional()?;
+    Ok(chat)
+}
+
+/// Fetch a session regardless of lifecycle state. Reserved for archive/restore
+/// and read-only history; live Agent paths should use `get_chat_session`.
+pub fn get_chat_session_including_archived(
+    project: &str,
+    task_id: &str,
+    chat_id: &str,
+) -> Result<Option<ChatSession>> {
+    let conn = crate::storage::database::connection();
+    let chat = conn
+        .query_row(
+            "SELECT session_id, title, agent, acp_session_id, created_at, duty, launch_mode
+             FROM session
              WHERE project = ?1 AND task_id = ?2 AND session_id = ?3",
             params![project, task_id, chat_id],
             row_to_chat_session,
@@ -799,7 +869,7 @@ pub fn find_chat_session(chat_id: &str) -> Result<Option<(String, String, ChatSe
         .query_row(
             "SELECT project, task_id, session_id, title, agent, acp_session_id, created_at, duty, launch_mode
              FROM session
-             WHERE session_id = ?1",
+             WHERE session_id = ?1 AND archived_at IS NULL",
             params![chat_id],
             |row| {
                 let project: String = row.get(0)?;

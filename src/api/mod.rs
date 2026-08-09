@@ -281,6 +281,18 @@ pub fn create_api_router() -> Router {
             patch(handlers::acp::update_chat).delete(handlers::acp::delete_chat),
         )
         .route(
+            "/projects/{id}/tasks/{taskId}/chats/archived",
+            get(handlers::acp::list_archived_chats),
+        )
+        .route(
+            "/projects/{id}/tasks/{taskId}/chats/{chatId}/archive",
+            post(handlers::acp::archive_chat),
+        )
+        .route(
+            "/projects/{id}/tasks/{taskId}/chats/{chatId}/restore",
+            post(handlers::acp::restore_chat),
+        )
+        .route(
             "/projects/{id}/tasks/{taskId}/chats/{chatId}/attachments",
             post(handlers::acp::upload_chat_attachment),
         )

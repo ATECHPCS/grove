@@ -374,7 +374,9 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             acp_session_id TEXT,
             duty           TEXT,
             created_at     TEXT NOT NULL,
-            launch_mode    TEXT NOT NULL DEFAULT 'acp'
+            updated_at     TEXT,
+            launch_mode    TEXT NOT NULL DEFAULT 'acp',
+            archived_at    TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_session_task ON session(project, task_id);
 
@@ -719,6 +721,9 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch("ALTER TABLE chat_token_usage ADD COLUMN cost_amount REAL;");
     let _ = conn.execute_batch("ALTER TABLE chat_token_usage ADD COLUMN cost_currency TEXT;");
     let _ = conn.execute_batch("ALTER TABLE chat_token_usage ADD COLUMN automation_run_id TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE session ADD COLUMN archived_at TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE session ADD COLUMN updated_at TEXT;");
+    conn.execute_batch("UPDATE session SET updated_at = created_at WHERE updated_at IS NULL;")?;
     let usage_task_not_null = {
         let mut stmt = conn.prepare("PRAGMA table_info(chat_token_usage)")?;
         let rows = stmt.query_map([], |row| {

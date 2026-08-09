@@ -1503,6 +1503,96 @@ pub async fn list_chats(
     }))
 }
 
+/// List archived chats for the SessionList's collapsed read-only section.
+/// All normal chat discovery continues to use `list_chats` and excludes them.
+pub async fn list_archived_chats(
+    Path((project_id, task_id)): Path<(String, String)>,
+) -> Result<Json<ChatListResponse>, AcpError> {
+    let (project_key, _, _) = resolve_project_key(&project_id)?;
+    let _ = tasks::get_task(&project_key, &task_id)
+        .map_err(|e| AcpError::Internal(e.to_string()))?
+        .ok_or(AcpError::NotFound("Task not found".to_string()))?;
+    let chats = tasks::load_archived_chat_sessions(&project_key, &task_id)
+        .map_err(|e| AcpError::Internal(e.to_string()))?;
+    Ok(Json(ChatListResponse {
+        chats: chats
+            .iter()
+            .map(|chat| ChatSessionResponse::build(&project_key, &task_id, chat))
+            .collect(),
+    }))
+}
+
+pub async fn archive_chat(
+    Path((project_id, task_id, chat_id)): Path<(String, String, String)>,
+) -> Result<Json<ChatSessionResponse>, AcpError> {
+    let (project_key, _, _) = resolve_project_key(&project_id)?;
+    let _ = tasks::get_task(&project_key, &task_id)
+        .map_err(|e| AcpError::Internal(e.to_string()))?
+        .ok_or(AcpError::NotFound("Task not found".to_string()))?;
+    let active = tasks::load_chat_sessions(&project_key, &task_id)
+        .map_err(|e| AcpError::Internal(e.to_string()))?;
+    if active.len() <= 1 {
+        return Err(AcpError::BadRequest(
+            "Cannot archive the last active session".to_string(),
+        ));
+    }
+    let chat = tasks::get_chat_session(&project_key, &task_id, &chat_id)
+        .map_err(|e| AcpError::Internal(e.to_string()))?
+        .ok_or_else(|| AcpError::NotFound("Active session not found".to_string()))?;
+
+    let session_key = format!("{}:{}:{}", project_key, task_id, chat_id);
+    if let Some(handle) = acp::get_session_handle(&session_key) {
+        handle
+            .kill()
+            .await
+            .map_err(|error| AcpError::Internal(error.to_string()))?;
+    }
+    if !tasks::archive_chat_session(&project_key, &task_id, &chat_id)
+        .map_err(|e| AcpError::Internal(e.to_string()))?
+    {
+        return Err(AcpError::NotFound("Active session not found".to_string()));
+    }
+    crate::api::handlers::walkie_talkie::broadcast_radio_event(
+        crate::api::handlers::walkie_talkie::RadioEvent::ChatListChanged {
+            project_id: project_id.clone(),
+            task_id: task_id.clone(),
+        },
+    );
+    Ok(Json(ChatSessionResponse::build(
+        &project_key,
+        &task_id,
+        &chat,
+    )))
+}
+
+pub async fn restore_chat(
+    Path((project_id, task_id, chat_id)): Path<(String, String, String)>,
+) -> Result<Json<ChatSessionResponse>, AcpError> {
+    let (project_key, _, _) = resolve_project_key(&project_id)?;
+    let _ = tasks::get_task(&project_key, &task_id)
+        .map_err(|e| AcpError::Internal(e.to_string()))?
+        .ok_or(AcpError::NotFound("Task not found".to_string()))?;
+    let chat = tasks::get_chat_session_including_archived(&project_key, &task_id, &chat_id)
+        .map_err(|e| AcpError::Internal(e.to_string()))?
+        .ok_or_else(|| AcpError::NotFound("Archived session not found".to_string()))?;
+    if !tasks::restore_chat_session(&project_key, &task_id, &chat_id)
+        .map_err(|e| AcpError::Internal(e.to_string()))?
+    {
+        return Err(AcpError::NotFound("Archived session not found".to_string()));
+    }
+    crate::api::handlers::walkie_talkie::broadcast_radio_event(
+        crate::api::handlers::walkie_talkie::RadioEvent::ChatListChanged {
+            project_id: project_id.clone(),
+            task_id: task_id.clone(),
+        },
+    );
+    Ok(Json(ChatSessionResponse::build(
+        &project_key,
+        &task_id,
+        &chat,
+    )))
+}
+
 /// Create a new chat for a task
 pub async fn create_chat(
     Path((project_id, task_id)): Path<(String, String)>,

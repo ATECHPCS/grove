@@ -63,6 +63,8 @@ import {
   SlidersHorizontal,
   Box,
   Database,
+  Archive,
+  ArchiveRestore,
 } from "lucide-react";
 import { iconUrlForFile } from "../../ui/iconUrl";
 import {
@@ -146,6 +148,12 @@ import { useInitialChatLoad } from "./useInitialChatLoad";
 import { useActiveChatId } from "./useActiveChatId";
 import { useTypewriter } from "./useTypewriter";
 import {
+  markSessionRead,
+  removeSessionActivity,
+  updateSessionRunning,
+  type SessionActivityMap,
+} from "./sessionActivity";
+import {
   appendStructuredContentBlock,
   appendTextContentBlock,
   type AgentContentBlock,
@@ -191,7 +199,10 @@ import {
 import {
   getConfig,
   listChats,
+  listArchivedChats,
   createChat,
+  archiveChat,
+  restoreChat,
   updateChatTitle,
   deleteChat,
   forkChat,
@@ -528,6 +539,7 @@ interface SessionActionsMenuProps {
   reconnectDisabled: boolean;
   actionsDisabled: boolean;
   deleteDisabled: boolean;
+  archiveDisabled: boolean;
   onFork: (chatId: string) => void;
   onOpenImport: () => void;
   onLoadMoreImport: () => void;
@@ -536,6 +548,7 @@ interface SessionActionsMenuProps {
   onLogout: () => void;
   onReconnect: () => void;
   onDelete: (chatId: string) => void;
+  onArchive: (chatId: string) => void;
 }
 
 function SessionActionsMenu({
@@ -551,6 +564,7 @@ function SessionActionsMenu({
   reconnectDisabled,
   actionsDisabled,
   deleteDisabled,
+  archiveDisabled,
   onFork,
   onOpenImport,
   onLoadMoreImport,
@@ -559,6 +573,7 @@ function SessionActionsMenu({
   onLogout,
   onReconnect,
   onDelete,
+  onArchive,
 }: SessionActionsMenuProps) {
   const items: Parameters<typeof DropdownMenu>[0]["items"] = [];
 
@@ -623,6 +638,13 @@ function SessionActionsMenu({
       disabled: actionsDisabled,
     });
   }
+  items.push({
+    id: "archive",
+    label: "Archive",
+    icon: Archive,
+    onClick: () => onArchive(chatId),
+    disabled: archiveDisabled,
+  });
   items.push({
     id: "delete",
     label: "Delete",
@@ -2383,6 +2405,12 @@ export function TaskChat({
   onUserMessageSent,
   onBusyStateChange,
 }: TaskChatProps) {
+  // Session management is the default TaskChat surface. Keep local aliases so
+  // this feature remains independent of the separate fixed-session refactor.
+  const taskId = task.id;
+  const fixedChatId: string | undefined = undefined;
+  const canManageSessions = true;
+  const finished = false;
   // Three sub-concerns have been extracted into their own hooks
   // (useChatPositioning, useACPAvailability, useInitialChatLoad) — those
   // hooks ARE Compiler-optimized. The remaining TaskChat body still has
@@ -2395,6 +2423,8 @@ export function TaskChat({
   const sessionModeStorageKey = `taskchat:session-mode:${projectId}`;
   // ─── Multi-chat state ───────────────────────────────────────────────────
   const [chats, setChats] = useState<ChatSessionResponse[]>([]);
+  const [archivedChats, setArchivedChats] = useState<ChatSessionResponse[]>([]);
+  const [showArchivedSessions, setShowArchivedSessions] = useState(false);
   // Mirror of `chats` for stable callbacks/event handlers that shouldn't
   // re-register every time the chat list changes.
   const chatsRef = useRef<ChatSessionResponse[]>([]);
@@ -2549,6 +2579,7 @@ export function TaskChat({
   const [hasContent, setHasContent] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
   const busyRef = useRef(false);
+  const [sessionActivity, setSessionActivity] = useState<SessionActivityMap>({});
   // True from the moment the user clicks a cancel-emitting button (Send Now /
   // Stop) until the server acks by transitioning busy → false. Prevents the
   // "click 11 times spams 11 CancelNotifications" pattern that previously
@@ -2557,9 +2588,15 @@ export function TaskChat({
   const updateBusy = useCallback((value: boolean) => {
     busyRef.current = value;
     setIsBusy(value);
+    const chatId = getActiveChatId();
+    if (chatId) {
+      setSessionActivity((previous) =>
+        updateSessionRunning(previous, chatId, value, chatId),
+      );
+    }
     if (!value) setIsCancelling(false);
     onBusyStateChange?.(value);
-  }, [onBusyStateChange]);
+  }, [getActiveChatId, onBusyStateChange]);
   const terminalRunningRef = useRef(false);
   const composingRef = useRef(false);
   const [selectedModel, setSelectedModel] = useState("");
@@ -2995,7 +3032,7 @@ export function TaskChat({
   const quotaBadgePercentRemaining = agentQuota
     ? quotaBadgePercent(agentQuota)
     : null;
-  const orderedChats = useMemo(() => [...chats].reverse(), [chats]);
+  const orderedChats = chats;
   const displayedPlanEntries = useMemo(
     () => sortPlanEntries(planEntries),
     [planEntries],
@@ -4138,10 +4175,24 @@ export function TaskChat({
   // Initial chat list load is encapsulated in useInitialChatLoad.
   useInitialChatLoad({
     projectId,
-    taskId: task.id,
+    taskId,
+    fixedChatId,
     setChats,
     setActiveChatId,
   });
+
+  useEffect(() => {
+    if (!canManageSessions) return;
+    let cancelled = false;
+    void listArchivedChats(projectId, taskId)
+      .then((archived) => {
+        if (!cancelled) setArchivedChats(archived);
+      })
+      .catch((error) => console.error("Failed to load archived sessions:", error));
+    return () => {
+      cancelled = true;
+    };
+  }, [canManageSessions, projectId, taskId]);
 
   // Restore the composer draft on initial mount.
   //
@@ -4187,15 +4238,21 @@ export function TaskChat({
   // the UI until the user manually refreshed.
   useRadioEvents({
     onChatListChanged: (evtProjectId, evtTaskId) => {
-      if (evtProjectId !== projectId || evtTaskId !== task.id) return;
+      if (!canManageSessions) return;
+      if (evtProjectId !== projectId || evtTaskId !== taskId) return;
       void (async () => {
         let fresh: ChatSessionResponse[];
+        let freshArchived: ChatSessionResponse[];
         try {
-          fresh = await listChats(projectId, task.id);
+          [fresh, freshArchived] = await Promise.all([
+            listChats(projectId, taskId),
+            listArchivedChats(projectId, taskId),
+          ]);
         } catch (err) {
           console.error("Failed to refetch chats after ChatListChanged:", err);
           return;
         }
+        setArchivedChats(freshArchived);
         const freshIds = new Set(fresh.map((chat) => chat.id));
         wsMapRef.current.forEach((ws, chatId) => {
           if (freshIds.has(chatId)) return;
@@ -4218,13 +4275,13 @@ export function TaskChat({
         const pendingMatches =
           pending !== undefined &&
           pending.projectId === projectId &&
-          pending.taskId === task.id &&
+          pending.taskId === taskId &&
           freshIds.has(pending.chatId);
         if (pendingMatches && pending) {
           const targetId = pending.chatId;
           delete (window as unknown as Record<string, unknown>).__grove_pending_chat;
           setActiveChatId(targetId);
-          writeLastActiveTab("chat", projectId, task.id, targetId);
+          writeLastActiveTab("chat", projectId, taskId, targetId);
           restoreChatState(targetId);
           await connectChatWsRef.current(targetId);
           wsRef.current = wsMapRef.current.get(targetId) ?? null;
@@ -4234,10 +4291,10 @@ export function TaskChat({
         const current = getActiveChatId();
         if (current && freshIds.has(current)) return;
 
-        const next = fresh[fresh.length - 1];
+        const next = fresh[0];
         if (next) {
           setActiveChatId(next.id);
-          writeLastActiveTab("chat", projectId, task.id, next.id);
+          writeLastActiveTab("chat", projectId, taskId, next.id);
           restoreChatState(next.id);
           await connectChatWsRef.current(next.id);
           wsRef.current = wsMapRef.current.get(next.id) ?? null;
@@ -5403,6 +5460,12 @@ export function TaskChat({
         case "terminal_chunk":
         case "terminal_complete":
           state.messages = reduceHistoryMessages(state.messages, msg);
+          if (msg.type === "terminal_execute") {
+            state.isBusy = true;
+            setSessionActivity((previous) =>
+              updateSessionRunning(previous, chatId, true, getActiveChatId()),
+            );
+          }
           if (msg.type === "complete" || msg.type === "terminal_complete") {
             const pruned = pruneChatViewMessages(
               state.messages,
@@ -5412,6 +5475,9 @@ export function TaskChat({
             state.messages = pruned.messages;
             state.hiddenMessageCount = pruned.hiddenMessageCount;
             state.isBusy = false;
+            setSessionActivity((previous) =>
+              updateSessionRunning(previous, chatId, false, getActiveChatId()),
+            );
           }
           break;
         case "queue_update":
@@ -5532,24 +5598,32 @@ export function TaskChat({
       clearInterval(timer);
       pollingTimerRef.current = null;
     };
-  }, [isRemoteSession, activeChatId, projectId, task.id]);
+  }, [isRemoteSession, activeChatId, projectId, taskId]);
 
   // ─── Chat switching ────────────────────────────────────────────────────
 
   const switchChat = useCallback(
     async (chatId: string) => {
+      if (!canManageSessions && chatId !== fixedChatId) return;
+      setSessionActivity((previous) => markSessionRead(previous, chatId));
       if (chatId === activeChatId) return;
       perfMark("TaskChat:switchChat", { from: activeChatId, to: chatId });
       saveCurrentChatState();
       setActiveChatId(chatId);
-      writeLastActiveTab("chat", projectId, task.id, chatId);
+      writeLastActiveTab("chat", projectId, taskId, chatId);
       restoreChatState(chatId);
       setShowChatMenu(false);
-      // Connect WS if needed
-      await connectChatWs(chatId);
-      wsRef.current = wsMapRef.current.get(chatId) ?? null;
+      const archived = archivedChats.some((chat) => chat.id === chatId);
+      if (!archived) {
+        await connectChatWs(chatId);
+        wsRef.current = wsMapRef.current.get(chatId) ?? null;
+      } else {
+        wsRef.current = null;
+        setIsConnected(false);
+        updateBusy(false);
+      }
     },
-    [activeChatId, projectId, task.id, saveCurrentChatState, restoreChatState, connectChatWs, setActiveChatId],
+    [activeChatId, archivedChats, canManageSessions, fixedChatId, projectId, taskId, saveCurrentChatState, restoreChatState, connectChatWs, setActiveChatId, updateBusy],
   );
   useEffect(() => {
     switchChatRef.current = switchChat;
@@ -5649,28 +5723,93 @@ export function TaskChat({
       console.error("Failed to update chat title:", err);
     }
     setEditingTitle(null);
-  }, [editingTitle, editTitleValue, projectId, task.id]);
+  }, [editingTitle, editTitleValue, projectId, taskId]);
+
+  const handleArchiveChat = useCallback(
+    async (chatId: string) => {
+      if (chats.length <= 1 || sessionActivity[chatId]?.running) return;
+      try {
+        const archived = await archiveChat(projectId, taskId, chatId);
+        const ws = wsMapRef.current.get(chatId);
+        if (ws) {
+          intentionalCloseRef.current.add(chatId);
+          ws.close();
+          wsMapRef.current.delete(chatId);
+        }
+        cancelPendingReconnectRef.current(chatId);
+        setArchivedChats((previous) =>
+          previous.some((chat) => chat.id === archived.id)
+            ? previous
+            : [archived, ...previous],
+        );
+        const remaining = chats.filter((chat) => chat.id !== chatId);
+        setChats(remaining);
+        setSessionActivity((previous) => removeSessionActivity(previous, chatId));
+        if (chatId === activeChatId) {
+          const next = remaining[0];
+          if (next) {
+            setActiveChatId(next.id);
+            writeLastActiveTab("chat", projectId, taskId, next.id);
+            restoreChatState(next.id);
+            await connectChatWs(next.id);
+            wsRef.current = wsMapRef.current.get(next.id) ?? null;
+          }
+        }
+      } catch (error) {
+        console.error("Failed to archive session:", error);
+      }
+      setShowChatMenu(false);
+    },
+    [activeChatId, chats, connectChatWs, projectId, restoreChatState, sessionActivity, setActiveChatId, taskId],
+  );
+
+  const handleRestoreChat = useCallback(
+    async (chatId: string) => {
+      try {
+        await restoreChat(projectId, taskId, chatId);
+        const [fresh, freshArchived] = await Promise.all([
+          listChats(projectId, taskId),
+          listArchivedChats(projectId, taskId),
+        ]);
+        setArchivedChats(freshArchived);
+        setChats(fresh);
+        if (chatId === activeChatId) {
+          await connectChatWs(chatId);
+          wsRef.current = wsMapRef.current.get(chatId) ?? null;
+        }
+      } catch (error) {
+        console.error("Failed to restore session:", error);
+      }
+    },
+    [activeChatId, connectChatWs, projectId, taskId],
+  );
 
   // ─── Chat deletion ─────────────────────────────────────────────────────
 
   const requestDeleteChat = useCallback(
     (chatId: string) => {
+      const isArchived = archivedChats.some((chat) => chat.id === chatId);
       setShowChatMenu(false);
       setDeleteError(null);
       setDeleteConfirmTargetCapable(
-        chatId === activeChatId && isConnected && !isRemoteSession && deleteCapable,
+        !isArchived &&
+          chatId === activeChatId &&
+          isConnected &&
+          !isRemoteSession &&
+          deleteCapable,
       );
       setDeleteConfirmChatId(chatId);
     },
-    [activeChatId, deleteCapable, isConnected, isRemoteSession],
+    [activeChatId, archivedChats, deleteCapable, isConnected, isRemoteSession],
   );
 
   const handleDeleteChat = useCallback(
     async (chatId: string, scope: "grove" | "agent") => {
-      if (chats.length <= 1) return; // Don't delete the last chat
+      const deletingArchived = archivedChats.some((chat) => chat.id === chatId);
+      if (!deletingArchived && chats.length <= 1) return; // Keep one active chat
       setIsDeletingChat(true);
       try {
-        await deleteChat(projectId, task.id, chatId, scope);
+        await deleteChat(projectId, taskId, chatId, scope);
         // Close WebSocket if connected; cancel any pending reconnect timer so
         // it doesn't fire later trying to reconnect a deleted chat.
         const ws = wsMapRef.current.get(chatId);
@@ -8718,10 +8857,34 @@ export function TaskChat({
                               }`}
                               onClick={() => switchChat(chat.id)}
                             >
-                              <ChatIcon className="h-3.5 w-3.5 shrink-0" />
+                              <div
+                                className={`relative flex h-6 w-6 shrink-0 items-center justify-center rounded-md ${isRunning ? "taskchat-session-running" : ""}`}
+                                aria-label={isRunning ? "Session running" : undefined}
+                              >
+                                <ChatIcon className="h-3.5 w-3.5" />
+                              </div>
                               <div className="min-w-0 flex-1">
                                 <div className="truncate">{chat.title}</div>
                               </div>
+                              {hasUnreadCompletion && (
+                                <span
+                                  className="taskchat-session-unread-dot"
+                                  title="New completed activity"
+                                  aria-label="New completed activity"
+                                />
+                              )}
+                              {chats.length > 1 && !isRunning && (
+                                <button
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    void handleArchiveChat(chat.id);
+                                  }}
+                                  className="shrink-0 p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-highlight)] group-hover:opacity-100"
+                                  title="Archive session"
+                                >
+                                  <Archive className="h-3 w-3" />
+                                </button>
+                              )}
                               {chats.length > 1 && (
                                 <button
                                   onClick={(e) => {
@@ -8737,6 +8900,57 @@ export function TaskChat({
                             </div>
                           );
                         })}
+                        {archivedChats.length > 0 && (
+                          <div className="mt-1 border-t border-[color-mix(in_srgb,var(--color-border)_64%,transparent)] pt-1">
+                            <button
+                              type="button"
+                              onClick={() => setShowArchivedSessions((value) => !value)}
+                              className="flex w-full items-center gap-2 px-3 py-1.5 text-[11px] text-[var(--color-text-muted)] transition-colors hover:text-[var(--color-text)]"
+                            >
+                              <ChevronRight className={`h-3 w-3 transition-transform ${showArchivedSessions ? "rotate-90" : ""}`} />
+                              <Archive className="h-3 w-3" />
+                              <span className="flex-1 text-left">Archived</span>
+                              <span>{archivedChats.length}</span>
+                            </button>
+                            {showArchivedSessions && archivedChats.map((chat) => {
+                              const ChatIcon = getChatIcon(chat.agent);
+                              return (
+                                <div
+                                  key={chat.id}
+                                  className={`group flex cursor-pointer items-center gap-2 px-3 py-2 text-sm transition-colors ${chat.id === activeChatId ? "bg-[var(--color-bg-tertiary)] text-[var(--color-text)]" : "text-[var(--color-text-muted)] hover:bg-[var(--color-bg-secondary)] hover:text-[var(--color-text)]"}`}
+                                  onClick={() => switchChat(chat.id)}
+                                >
+                                  <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md opacity-65">
+                                    <ChatIcon className="h-3.5 w-3.5" />
+                                  </div>
+                                  <div className="min-w-0 flex-1 truncate">{chat.title}</div>
+                                  <button
+                                    type="button"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      void handleRestoreChat(chat.id);
+                                    }}
+                                    className="shrink-0 rounded p-0.5 opacity-0 transition-all hover:text-[var(--color-highlight)] group-hover:opacity-100"
+                                    title="Restore session"
+                                  >
+                                    <ArchiveRestore className="h-3 w-3" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      requestDeleteChat(chat.id);
+                                    }}
+                                    className="shrink-0 rounded p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-error)] group-hover:opacity-100"
+                                    title="Delete archived session"
+                                  >
+                                    <Trash2 className="h-3 w-3" />
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}
@@ -8757,7 +8971,17 @@ export function TaskChat({
                   <span>New</span>
                 </button>
               </div>
-              {activeChat && (
+              {activeChat && isViewingArchived ? (
+                <button
+                  type="button"
+                  onClick={() => void handleRestoreChat(activeChat.id)}
+                  className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-highlight)]"
+                  title="Restore session"
+                >
+                  <ArchiveRestore className="h-3.5 w-3.5" />
+                  <span>Restore</span>
+                </button>
+              ) : activeChat ? (
                 <SessionActionsMenu
                   surface="header"
                   chatId={activeChat.id}
@@ -8771,6 +8995,7 @@ export function TaskChat({
                   reconnectDisabled={isReconnecting || activeChat.launch_mode === "terminal"}
                   actionsDisabled={!isConnected || isBusy || !!activeAuthMessage}
                   deleteDisabled={chats.length <= 1}
+                  archiveDisabled={chats.length <= 1 || isBusy}
                   onFork={handleForkChat}
                   onOpenImport={() => { if (importSessions.length === 0) void loadImportSessions(); }}
                   onLoadMoreImport={() => { if (importNextCursor) void loadImportSessions(importNextCursor); }}
@@ -8922,6 +9147,7 @@ export function TaskChat({
                       reconnectDisabled={isReconnecting || activeChat.launch_mode === "terminal"}
                       actionsDisabled={!isConnected || isBusy || !!activeAuthMessage}
                       deleteDisabled={chats.length <= 1}
+                      archiveDisabled={chats.length <= 1 || isBusy}
                       onFork={handleForkChat}
                       onOpenImport={() => { if (importSessions.length === 0) void loadImportSessions(); }}
                       onLoadMoreImport={() => { if (importNextCursor) void loadImportSessions(importNextCursor); }}
@@ -8930,12 +9156,16 @@ export function TaskChat({
                       onLogout={handleLogout}
                       onReconnect={handleReconnect}
                       onDelete={requestDeleteChat}
+                      onArchive={(chatId) => void handleArchiveChat(chatId)}
                     />
-                  )}
+                  ) : null}
                 </div>
                 {orderedChats.map((chat) => {
                   const ChatIcon = getChatIcon(chat.agent);
                   const isActive = chat.id === activeChatId;
+                  const activity = sessionActivity[chat.id];
+                  const isRunning = activity?.running ?? false;
+                  const hasUnreadCompletion = !isRunning && (activity?.unread ?? false);
                   return (
                     <div
                       key={chat.id}
@@ -8959,7 +9189,7 @@ export function TaskChat({
                         title={chat.title}
                       >
                         <div
-                          className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-sm border ${
+                          className={`relative flex h-6 w-6 shrink-0 items-center justify-center rounded-sm border ${isRunning ? "taskchat-session-running" : ""} ${
                             isActive
                               ? "border-[color-mix(in_srgb,var(--color-highlight)_26%,transparent)] bg-[color-mix(in_srgb,var(--color-highlight)_10%,transparent)] text-[var(--color-highlight)]"
                               : "border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-transparent text-[var(--color-text-muted)]"
@@ -8985,6 +9215,27 @@ export function TaskChat({
                           )}
                         </div>
                       </button>
+                      {hasUnreadCompletion && (
+                        <span
+                          className="taskchat-session-unread-dot"
+                          title="New completed activity"
+                          aria-label="New completed activity"
+                        />
+                      )}
+                      {chats.length > 1 && !isRunning &&
+                        !(
+                          editingTitle?.chatId === chat.id &&
+                          editingTitle.surface === "sidebar-list"
+                        ) && (
+                          <button
+                            type="button"
+                            onClick={() => void handleArchiveChat(chat.id)}
+                            className="shrink-0 rounded p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-highlight)] group-hover:opacity-100"
+                            title="Archive session"
+                          >
+                            <Archive className="h-3 w-3" />
+                          </button>
+                        )}
                       {chats.length > 1 &&
                         !(
                           editingTitle?.chatId === chat.id &&
@@ -9001,13 +9252,68 @@ export function TaskChat({
                     </div>
                   );
                 })}
+                {archivedChats.length > 0 && (
+                  <div className="mt-1 border-t border-[color-mix(in_srgb,var(--color-border)_64%,transparent)] pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setShowArchivedSessions((value) => !value)}
+                      className="flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-[11px] text-[var(--color-text-muted)] transition-colors hover:bg-[color-mix(in_srgb,var(--color-bg-secondary)_72%,transparent)] hover:text-[var(--color-text)]"
+                    >
+                      <ChevronRight className={`h-3 w-3 transition-transform ${showArchivedSessions ? "rotate-90" : ""}`} />
+                      <Archive className="h-3 w-3" />
+                      <span className="flex-1 text-left">Archived</span>
+                      <span>{archivedChats.length}</span>
+                    </button>
+                    {showArchivedSessions && archivedChats.map((chat) => {
+                      const ChatIcon = getChatIcon(chat.agent);
+                      const isActive = chat.id === activeChatId;
+                      return (
+                        <div
+                          key={chat.id}
+                          className={`group mt-0.5 flex items-center gap-1.5 rounded-md border border-transparent px-1.5 py-1 transition-colors ${isActive ? "bg-[color-mix(in_srgb,var(--color-highlight)_7%,transparent)]" : "text-[var(--color-text-muted)] hover:bg-[color-mix(in_srgb,var(--color-bg-secondary)_72%,transparent)] hover:text-[var(--color-text)]"}`}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => switchChat(chat.id)}
+                            className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                            title={`${chat.title} · Archived`}
+                          >
+                            <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-sm border border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] opacity-65">
+                              <ChatIcon className="h-3 w-3" />
+                            </div>
+                            <OverflowTitle
+                              text={chat.title}
+                              className={`text-[12px] leading-5 ${isActive ? "font-medium text-[var(--color-text)]" : ""}`}
+                            />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleRestoreChat(chat.id)}
+                            className="shrink-0 rounded p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-highlight)] group-hover:opacity-100"
+                            title="Restore session"
+                          >
+                            <ArchiveRestore className="h-3 w-3" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => requestDeleteChat(chat.id)}
+                            className="shrink-0 rounded p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-error)] group-hover:opacity-100"
+                            title="Delete archived session"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             </div>
           </div>
-        </div>
+        </div>}
 
         {/* Drag handle */}
-        {!sessionRailCollapsed && (
+        {canManageSessions && !sessionRailCollapsed && (
           <div
             className="diff-resizer"
             onPointerDown={startSessionRailResize}
@@ -9031,7 +9337,7 @@ export function TaskChat({
           />
           {/* Terminal launch mode: agent CLI runs in xterm.js (PTY).
               Chatbox input still writes lines to PTY stdin via handleSend. */}
-          {isTerminalLaunchMode && agentPtyWsUrl ? (
+          {!isReadOnlyHistory && isTerminalLaunchMode && agentPtyWsUrl ? (
             // Constrain xterm's height so the floating chatbox doesn't cover
             // the agent's bottom prompt. inputAreaHeight is the live-measured
             // chatbox height (ResizeObserver on inputAreaRef); +16 matches

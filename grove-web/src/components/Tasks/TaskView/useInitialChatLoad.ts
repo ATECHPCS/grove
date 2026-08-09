@@ -85,11 +85,11 @@ export function useInitialChatLoad({
         delete win.__grove_pending_chat;
       } else {
         const remembered = readLastActiveTab("chat", projectId, taskId);
-        const lastId = chatList[chatList.length - 1].id;
+        const latestId = chatList[0].id;
         const restoredId =
           remembered && chatList.some((c) => c.id === remembered)
             ? remembered
-            : lastId;
+            : latestId;
         setActiveChatId(restoredId);
       }
     };
