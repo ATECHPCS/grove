@@ -9444,7 +9444,35 @@ export function TaskChat({
           </ChatListErrorBoundary>
           )}
 
-          {/* Input */}
+          {/* Input / finished state */}
+          {isReadOnlyHistory ? (
+            <div
+              ref={inputAreaRef}
+              className="pointer-events-none absolute inset-x-0 z-10 px-3 pb-4 pt-2"
+              style={{ bottom: "max(var(--grove-kb-inset, 0px), env(safe-area-inset-bottom))" }}
+            >
+              <div className="pointer-events-none absolute inset-x-0 bottom-0 h-20 bg-[linear-gradient(to_top,color-mix(in_srgb,var(--color-bg)_96%,transparent),transparent)]" />
+              <div className="pointer-events-auto relative mx-auto flex w-fit max-w-full items-center gap-2 rounded-full border border-[color-mix(in_srgb,var(--color-success)_28%,var(--color-border))] bg-[color-mix(in_srgb,var(--color-bg)_94%,var(--color-success))] px-3.5 py-2 text-xs text-[var(--color-text-secondary)] shadow-sm backdrop-blur-md">
+                {isViewingArchived ? (
+                  <Archive className="h-4 w-4 shrink-0 text-[var(--color-text-muted)]" />
+                ) : (
+                  <CheckCircle2 className="h-4 w-4 shrink-0 text-[var(--color-success)]" />
+                )}
+                <span>{isViewingArchived ? "Archived session · Read-only history" : "Run finished · Read-only history"}</span>
+                {isViewingArchived && activeChat && (
+                  <button
+                    type="button"
+                    onClick={() => void handleRestoreChat(activeChat.id)}
+                    className="ml-1 flex shrink-0 items-center gap-1 rounded-full border border-[color-mix(in_srgb,var(--color-highlight)_30%,var(--color-border))] bg-[color-mix(in_srgb,var(--color-highlight)_9%,transparent)] px-2 py-0.5 font-medium text-[var(--color-highlight)] transition-colors hover:bg-[color-mix(in_srgb,var(--color-highlight)_16%,transparent)]"
+                    title="Restore session"
+                  >
+                    <ArchiveRestore className="h-3 w-3" />
+                    <span>Restore</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          ) : (
           <div ref={inputAreaRef} className="pointer-events-none absolute inset-x-0 z-10 px-3 pb-4 pt-2" style={{ bottom: "max(var(--grove-kb-inset, 0px), env(safe-area-inset-bottom))" }}>
             <div className="pointer-events-none absolute inset-x-0 bottom-0 h-24 bg-[linear-gradient(to_top,color-mix(in_srgb,var(--color-bg)_96%,transparent),transparent)]" />
             <div className="chatbox-cq-root pointer-events-auto relative mx-auto w-full max-w-[920px]">
@@ -10682,6 +10710,7 @@ export function TaskChat({
               </div>
             </div>
           </div>
+          )}
         </div>
       </div>
       {/* Image / SVG Lightbox */}
