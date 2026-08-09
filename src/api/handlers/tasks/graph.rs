@@ -702,7 +702,11 @@ mod tests {
             assert_eq!(resp.edges[0].state, "blocked");
             assert_eq!(resp.edges[0].purpose.as_deref(), Some("delegate"));
 
-            let sender = &resp.nodes[0];
+            let sender = resp
+                .nodes
+                .iter()
+                .find(|node| node.chat_id == "chat-1")
+                .unwrap();
             assert_eq!(sender.chat_id, "chat-1");
             assert_eq!(sender.pending_in, 0);
             assert_eq!(sender.pending_out, 1);
@@ -711,7 +715,11 @@ mod tests {
             assert_eq!(sender.pending_messages[0].to_name, "Chat 2");
             assert!(sender.pending_messages[0].body_excerpt.contains("Hello"));
 
-            let receiver = &resp.nodes[1];
+            let receiver = resp
+                .nodes
+                .iter()
+                .find(|node| node.chat_id == "chat-2")
+                .unwrap();
             assert_eq!(receiver.chat_id, "chat-2");
             assert_eq!(receiver.pending_in, 1);
             assert_eq!(receiver.pending_out, 0);
