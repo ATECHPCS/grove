@@ -154,9 +154,16 @@ Terminal · Chat · Review · Editor · Stats · Git · Notes · Comments · Art
 - **Shared Assets file manager** — upload, organize, sync
 
 ### 5.2 Memory editing
-- **Project Memory** panel with markdown preview
+- **Project Memory** with searchable Graph and List views
+- Durable Markdown **Entities** with titles, structured tags, descriptions, and scored importance
+- Append-only **Memory Logs** associated with their source Task and Chat
+- Lightweight **Relations** between Entities, with category filtering and bounded graph rendering
+- Scheduled and event-driven **Organization Runs** that reconcile Logs into long-term Memory
+- Working-agent tools for candidate recall, explicit full reads, recent Logs, related Memories, and append
+- TaskChat **Memory pill** derived from completed `memory_read` calls in the current turn
+- Visible read and Run history; Entity and Log lifecycle controls remain in the UI
 - **Workspace Instructions** panel with markdown preview
-- Visual editors — no markdown CLI required
+- Visual controls — no markdown CLI required
 
 ### 5.3 Artifact preview
 - Live auto-refresh during agent activity

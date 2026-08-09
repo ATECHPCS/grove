@@ -483,6 +483,40 @@ pub fn get_entity(project_id: &str, entity_id: &str) -> Result<Option<MemoryEnti
     .map_err(Into::into)
 }
 
+pub fn resolve_entities(project_id: &str, entity_ids: &[String]) -> Result<Vec<MemoryEntity>> {
+    validate_path_segment(project_id, "project_id")?;
+    if entity_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    for entity_id in entity_ids {
+        validate_path_segment(entity_id, "entity_id")?;
+    }
+
+    let placeholders = vec!["?"; entity_ids.len()].join(", ");
+    let sql = format!(
+        "SELECT project_id, entity_id, file_path, title, description, tags_json,
+                base_score, access_count,
+                base_score + MIN(access_count, 20), created_at, updated_at
+         FROM memory_entities WHERE project_id = ? AND entity_id IN ({placeholders})"
+    );
+    let mut values = Vec::with_capacity(entity_ids.len() + 1);
+    values.push(project_id.to_string());
+    values.extend(entity_ids.iter().cloned());
+    let conn = database::connection();
+    let mut stmt = conn.prepare(&sql)?;
+    let entities = stmt
+        .query_map(rusqlite::params_from_iter(values.iter()), row_to_entity)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut by_id = entities
+        .into_iter()
+        .map(|entity| (entity.entity_id.clone(), entity))
+        .collect::<HashMap<_, _>>();
+    Ok(entity_ids
+        .iter()
+        .filter_map(|entity_id| by_id.remove(entity_id))
+        .collect())
+}
+
 pub fn get_entity_document(
     project_id: &str,
     entity_id: &str,
@@ -1998,6 +2032,59 @@ fn normalize_tags(tags: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_entities_returns_requested_metadata_without_recording_reads() {
+        let _lock = database::test_lock().blocking_lock();
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        let first = create_entity(
+            "project-resolve-memory",
+            "First memory",
+            "First summary",
+            &[MemoryTag {
+                key: "topic".to_string(),
+                value: "architecture".to_string(),
+                icon: None,
+            }],
+            50,
+        )
+        .unwrap()
+        .entity;
+        let second = create_entity(
+            "project-resolve-memory",
+            "Second memory",
+            "Second summary",
+            &[],
+            40,
+        )
+        .unwrap()
+        .entity;
+
+        let resolved = resolve_entities(
+            "project-resolve-memory",
+            &[
+                second.entity_id.clone(),
+                "memory-missing".to_string(),
+                first.entity_id.clone(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|entity| entity.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Second memory", "First memory"]
+        );
+        assert_eq!(resolved[1].tags[0].value, "architecture");
+        assert_eq!(resolved[0].access_count, 0);
+        assert_eq!(resolved[1].access_count, 0);
+
+        crate::storage::set_grove_dir_override(None);
+    }
 
     #[test]
     fn append_log_persists_normalized_record() {

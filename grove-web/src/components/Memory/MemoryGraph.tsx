@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent } from "react";
 import { Maximize2, Minus, Pause, Play, Plus } from "lucide-react";
 import type { MemoryEntity, MemoryRelation } from "../../api/memory";
+import { selectVisibleRelations } from "./memoryGraphRelations";
 
 const COLORS = ["#55b98b", "#b37ad9", "#e8bd58", "#e98273", "#69a8d8", "#8bc46b"];
 const MIN_ZOOM = 0.65;
@@ -31,6 +32,7 @@ interface SpatialLink {
 interface SpatialScene {
   nodes: SpatialNode[];
   links: SpatialLink[];
+  bounds: { x: number; y: number; z: number };
   spaceRadius: number;
 }
 
@@ -111,8 +113,8 @@ export function MemoryGraph({
   const [containerSize, setContainerSize] = useState({ width: 720, height: 480 });
 
   const scene = useMemo(
-    () => buildSpatialScene(entities, relations, categoryColors, activeCategory),
-    [activeCategory, categoryColors, entities, relations],
+    () => buildSpatialScene(entities, relations, categoryColors, activeCategory, containerSize),
+    [activeCategory, categoryColors, containerSize, entities, relations],
   );
   const activeColor = activeCategory ? categoryColors.get(activeCategory) : undefined;
 
@@ -164,7 +166,11 @@ export function MemoryGraph({
     const observer = new ResizeObserver(() => {
       resize();
       const bounds = container.getBoundingClientRect();
-      setContainerSize({ width: Math.max(1, bounds.width), height: Math.max(1, bounds.height) });
+      const nextWidth = Math.max(1, Math.round(bounds.width));
+      const nextHeight = Math.max(1, Math.round(bounds.height));
+      setContainerSize((current) => current.width === nextWidth && current.height === nextHeight
+        ? current
+        : { width: nextWidth, height: nextHeight });
     });
     observer.observe(container);
     frame = requestAnimationFrame(draw);
@@ -413,12 +419,19 @@ function buildSpatialScene(
   relations: MemoryRelation[],
   categoryColors: ReadonlyMap<string, string>,
   activeCategory?: string | null,
+  viewport = { width: 720, height: 480 },
 ): SpatialScene {
   const nodeScores = entities.map((entity) => entity.score);
   const nodeMin = nodeScores.length > 0 ? Math.min(...nodeScores) : 0;
   const nodeMax = nodeScores.length > 0 ? Math.max(...nodeScores) : 100;
   const count = Math.max(entities.length, 1);
-  const spaceRadius = count <= 8 ? 225 : count <= 30 ? 300 : 390;
+  const density = count <= 8 ? 0.82 : count <= 30 ? 1 : 1.12;
+  const bounds = {
+    x: clamp(viewport.width * 0.38 * density, 250, 720),
+    y: clamp(viewport.height * 0.36 * density, 190, 440),
+    z: clamp(Math.min(viewport.width, viewport.height) * 0.28 * density, 150, 360),
+  };
+  const spaceRadius = Math.max(bounds.x, bounds.y, bounds.z);
   const nodes = entities.map((entity): SpatialNode => {
     // A deterministic point inside a volume, rather than a point on a sphere.
     // The cubic root keeps density even throughout the available 3D space.
@@ -426,15 +439,15 @@ function buildSpatialScene(
     const azimuth = stableRandom(entity.entity_id, 2) * Math.PI * 2;
     const vertical = stableRandom(entity.entity_id, 3) * 2 - 1;
     const ring = Math.sqrt(Math.max(0, 1 - vertical * vertical));
-    const distance = spaceRadius * (0.18 + 0.72 * Math.cbrt(radialSeed));
+    const distance = 0.18 + 0.78 * Math.cbrt(radialSeed);
     return {
       id: entity.entity_id,
       entity,
       color: categoryColors.get(activeCategory ?? primaryCategory(entity)) ?? COLORS[0],
       radius: nodeRadius(entity.score, nodeMin, nodeMax, count),
-      x: Math.cos(azimuth) * ring * distance,
-      y: vertical * distance * 0.78,
-      z: Math.sin(azimuth) * ring * distance,
+      x: Math.cos(azimuth) * ring * distance * bounds.x,
+      y: vertical * distance * bounds.y,
+      z: Math.sin(azimuth) * ring * distance * bounds.z,
       vx: 0,
       vy: 0,
       vz: 0,
@@ -442,10 +455,11 @@ function buildSpatialScene(
     };
   });
   const byId = new Map(nodes.map((node) => [node.id, node]));
-  const relationScores = relations.map((relation) => relation.score);
+  const visibleRelations = selectVisibleRelations(relations, byId, 3);
+  const relationScores = visibleRelations.map((relation) => relation.score);
   const relationMin = relationScores.length > 0 ? Math.min(...relationScores) : 0;
   const relationMax = relationScores.length > 0 ? Math.max(...relationScores) : 100;
-  const links = relations.flatMap((relation): SpatialLink[] => {
+  const links = visibleRelations.flatMap((relation): SpatialLink[] => {
     const source = byId.get(relation.source_entity_id);
     const target = byId.get(relation.target_entity_id);
     if (!source || !target) return [];
@@ -454,11 +468,11 @@ function buildSpatialScene(
       relation,
       source,
       target,
-      width: 0.85 + salience * 3.4,
-      opacity: 0.35 + salience * 0.5,
+      width: 0.4 + salience * 1.15,
+      opacity: 0.14 + salience * 0.28,
     }];
   });
-  const scene = { nodes, links, spaceRadius };
+  const scene = { nodes, links, bounds, spaceRadius };
   // Settle the initial layout before the first paint without freezing it into a
   // permanent arrangement. Runtime motion continues from this physical state.
   for (let step = 0; step < 140; step += 1) simulateSpatialScene(scene, 16.67, step * 16.67, false);
@@ -521,7 +535,7 @@ function drawScene(
     context.moveTo(source.x, source.y);
     context.lineTo(target.x, target.y);
     context.lineCap = "round";
-    context.lineWidth = projected.width + (isFocused ? 1.4 : 0);
+    context.lineWidth = projected.width + (isFocused ? 0.8 : 0);
     context.strokeStyle = isFocused ? (focusedNodeColor ?? highlight) : textMuted;
     context.globalAlpha = hasFocus ? (isFocused ? 0.92 : 0.09) : link.opacity * depthOpacity(projected.depth, scene.spaceRadius);
     context.stroke();
@@ -545,10 +559,10 @@ function drawScene(
     const focused = focusedNodeId === node.id;
     const dimmed = connectedIds.size > 0 && !connectedIds.has(node.id);
     const opacity = dimmed ? 0.16 : depthOpacity(projected.z, scene.spaceRadius);
-    context.globalAlpha = opacity * (focused ? 0.25 : 0.12);
+    context.globalAlpha = opacity * (focused ? 0.22 : 0.08);
     context.fillStyle = node.color;
     context.beginPath();
-    context.arc(projected.x, projected.y, projected.radius + (focused ? 7 : 4), 0, Math.PI * 2);
+    context.arc(projected.x, projected.y, projected.radius + (focused ? 4 : 2), 0, Math.PI * 2);
     context.fill();
     context.globalAlpha = opacity;
     context.fillStyle = node.color;
@@ -560,7 +574,7 @@ function drawScene(
       context.strokeStyle = node.color;
       context.lineWidth = 1.5;
       context.beginPath();
-      context.arc(projected.x, projected.y, projected.radius + 4, 0, Math.PI * 2);
+      context.arc(projected.x, projected.y, projected.radius + 3, 0, Math.PI * 2);
       context.stroke();
     }
   }
@@ -583,12 +597,12 @@ function drawSpatialBackdrop(context: CanvasRenderingContext2D, width: number, h
 }
 
 function simulateSpatialScene(scene: SpatialScene, elapsed: number, now: number, wandering: boolean) {
-  const { nodes, links, spaceRadius } = scene;
+  const { nodes, links, bounds } = scene;
   if (nodes.length < 2) return;
   const step = clamp(elapsed / 16.67, 0.25, 2);
   const forces = new Float64Array(nodes.length * 3);
   const indices = new Map(nodes.map((node, index) => [node.id, index]));
-  const repulsion = 780 + Math.min(nodes.length, 80) * 17;
+  const repulsion = 980 + Math.min(nodes.length, 80) * 22;
 
   // Nodes repel one another in all three axes. This is what lets a large set
   // occupy the volume instead of collapsing into the center of the viewport.
@@ -634,8 +648,9 @@ function simulateSpatialScene(scene: SpatialScene, elapsed: number, now: number,
     const dz = link.target.z - link.source.z;
     const distance = Math.max(1, Math.hypot(dx, dy, dz));
     const normalizedScore = clamp(link.relation.score / 100, 0, 1);
-    const targetDistance = 105 + (1 - normalizedScore) * 105;
-    const magnitude = (distance - targetDistance) * (0.0013 + normalizedScore * 0.0017);
+    const linkScale = Math.min(bounds.x, bounds.y);
+    const targetDistance = linkScale * (0.5 + (1 - normalizedScore) * 0.42);
+    const magnitude = (distance - targetDistance) * (0.0009 + normalizedScore * 0.0013);
     const fx = dx / distance * magnitude;
     const fy = dy / distance * magnitude;
     const fz = dz / distance * magnitude;
@@ -647,13 +662,16 @@ function simulateSpatialScene(scene: SpatialScene, elapsed: number, now: number,
     forces[targetIndex * 3 + 2] -= fz;
   }
 
-  const boundary = spaceRadius * 1.08;
   for (let index = 0; index < nodes.length; index += 1) {
     const node = nodes[index];
     const offset = index * 3;
-    const distanceFromCenter = Math.max(1, Math.hypot(node.x, node.y, node.z));
-    const outside = Math.max(0, distanceFromCenter - boundary);
-    const centerStrength = 0.00008 + outside * 0.00045;
+    const normalizedDistance = Math.hypot(
+      node.x / Math.max(bounds.x, 1),
+      node.y / Math.max(bounds.y, 1),
+      node.z / Math.max(bounds.z, 1),
+    );
+    const outside = Math.max(0, normalizedDistance - 1.04);
+    const centerStrength = 0.000025 + outside * 0.0012;
     forces[offset] -= node.x * centerStrength;
     forces[offset + 1] -= node.y * centerStrength;
     forces[offset + 2] -= node.z * centerStrength;
@@ -731,7 +749,7 @@ function distanceToSegment(px: number, py: number, x1: number, y1: number, x2: n
 
 function nodeRadius(score: number, minimum: number, maximum: number, count: number) {
   const salience = scoreSalience(score, minimum, maximum);
-  const [small, large] = count <= 12 ? [4, 8.5] : count <= 40 ? [3.2, 7] : [2.4, 5.5];
+  const [small, large] = count <= 12 ? [2.5, 5.5] : count <= 40 ? [2.2, 4.8] : [1.8, 4];
   return small + (large - small) * salience;
 }
 

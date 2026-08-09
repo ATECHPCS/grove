@@ -930,6 +930,10 @@ pub fn create_api_router() -> Router {
             get(handlers::memory::list_entities),
         )
         .route(
+            "/projects/{id}/memory/entities/resolve",
+            post(handlers::memory::resolve_entities),
+        )
+        .route(
             "/projects/{id}/memory/entities/{entity_id}",
             get(handlers::memory::get_entity).delete(handlers::memory::delete_entity),
         )

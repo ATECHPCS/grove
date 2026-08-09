@@ -86,6 +86,23 @@ pub struct DeleteMemoryLogsResponse {
     pub deleted: usize,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ResolveMemoryEntities {
+    pub entity_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MemoryEntityMetadata {
+    pub entity_id: String,
+    pub title: String,
+    pub tags: Vec<memory::MemoryTag>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResolveMemoryEntitiesResponse {
+    pub items: Vec<MemoryEntityMetadata>,
+}
+
 pub async fn get_config(
     Path(project_id): Path<String>,
 ) -> Result<Json<MemoryConfigResponse>, (StatusCode, String)> {
@@ -252,6 +269,43 @@ pub async fn get_entity(
         .map_err(internal)?
         .map(Json)
         .ok_or((StatusCode::NOT_FOUND, "Memory not found".into()))
+}
+
+pub async fn resolve_entities(
+    Path(project_id): Path<String>,
+    Json(input): Json<ResolveMemoryEntities>,
+) -> Result<Json<ResolveMemoryEntitiesResponse>, (StatusCode, String)> {
+    let (_, project_key) =
+        find_project_by_id(&project_id).map_err(|status| (status, "project not found".into()))?;
+    if input.entity_ids.is_empty() || input.entity_ids.len() > 200 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "entity_ids must contain between 1 and 200 Memory Entity IDs".into(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let entity_ids = input
+        .entity_ids
+        .into_iter()
+        .map(|entity_id| entity_id.trim().to_string())
+        .filter(|entity_id| !entity_id.is_empty() && seen.insert(entity_id.clone()))
+        .collect::<Vec<_>>();
+    if entity_ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "entity_ids must not be empty".into(),
+        ));
+    }
+    let items = memory::resolve_entities(&project_key, &entity_ids)
+        .map_err(internal)?
+        .into_iter()
+        .map(|entity| MemoryEntityMetadata {
+            entity_id: entity.entity_id,
+            title: entity.title,
+            tags: entity.tags,
+        })
+        .collect();
+    Ok(Json(ResolveMemoryEntitiesResponse { items }))
 }
 
 pub async fn delete_entity(

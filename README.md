@@ -51,15 +51,28 @@ Studio is a separate project type for specs, design briefs, brand exploration, p
 
 Sketches are Excalidraw canvases with checkpoint history. Agents read and modify them — a layout sketch is something a coder can build against.
 
-Project Memory and Workspace Instructions live in the same UI as markdown, and load into every agent on every task automatically. Shared Assets are hard-linked into dependent Coding Tasks, so reference docs stay in sync without manual copy.
+Project Memory, Workspace Instructions, and Shared Assets live in the same UI. Shared Assets are hard-linked into dependent Coding Tasks, so reference docs stay in sync without manual copy.
 
 Engineers, designers, and PMs use Studio for the same reason: the work isn't code.
 
-![Project Memory, Shared Assets, Workspace Instructions — one shared context per project](docs/images/shared-memory.png)
+---
+
+## 2. Project Memory — context that compounds
+
+![Grove Project Memory graph — durable knowledge connected across a project](docs/images/memory-graph.png)
+
+Chat history records what happened. **Project Memory preserves what should matter next.** Agents search concise summaries, explicitly read the relevant long-term Memory, and append new decisions or corrections as short-term Logs while they work. The TaskChat Memory pill shows exactly which Entities were read in the current turn.
+
+- **Memory Entities** — durable Markdown knowledge with a title, structured tags, and an importance score.
+- **Memory Logs** — append-only observations tied to the Task and Chat where they were learned.
+- **Relations** — a lightweight graph for exploring how durable knowledge connects.
+- **Organization Runs** — scheduled or event-driven agents that reconcile new Logs into a coherent long-term Memory.
+
+Search or browse in Graph/List view, inspect every read and Run, and edit or delete what Grove keeps. Memory stays selective and visible instead of silently stuffing an entire transcript into every prompt.
 
 ---
 
-## 2. A team of agents, in parallel
+## 3. A team of agents, in parallel
 
 Ten coding agents are built in: Claude Code, Codex, Cursor, Gemini, Copilot, Junie, Kimi, OpenCode, Qwen, Trae. Add any ACP agent from the Add Agent dialog. Define **Custom Agents** as personas — a base model, system prompt, and effort level reusable across tasks (e.g. "adversarial reviewer", "doc writer", "test-first coder").
 
@@ -73,7 +86,7 @@ An orchestrator agent spawns a coder. The coder spawns a reviewer. Replies route
 
 ---
 
-## 3. Code review with an AI batch fixer
+## 4. Code review with an AI batch fixer
 
 ![Code review with inline comments and AI batch fixer](docs/images/code-review.png)
 
@@ -85,7 +98,7 @@ Agents can also review each other's diffs.
 
 ---
 
-## 4. Anywhere — Web, GUI, TUI, Mobile, Voice
+## 5. Anywhere — Web, GUI, TUI, Mobile, Voice
 
 Same workspace, five surfaces.
 

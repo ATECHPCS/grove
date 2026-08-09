@@ -179,6 +179,7 @@ import {
   type PlanEntry,
 } from "./planEntries";
 import { listSketches, type SketchMeta } from "../../../api/sketches";
+import { resolveMemoryEntities, type MemoryEntityMetadata } from "../../../api/memory";
 import { writeLastActiveTab } from "../../../utils/lastActiveTab";
 import { XTerminal } from "../TaskDetail/XTerminal";
 import { sendInputToTerminal } from "../TaskDetail/terminalCache";
@@ -190,7 +191,7 @@ import { useAgentQuota, useRadioEvents } from "../../../hooks";
 import { AgentQuotaPopover } from "./AgentQuotaPopover";
 import { ContextUsagePill } from "./ContextUsagePill";
 import { TurnUsageMeta } from "./TurnUsageMeta";
-import { collectCurrentTurnRecalledMemories } from "./memoryRecall";
+import { collectCurrentTurnReadMemoryIds } from "./memoryRead";
 import {
   quotaBadgePercent,
   quotaBatteryIcon,
@@ -3040,11 +3041,48 @@ export function TaskChat({
   const hasTodoPanel = planEntries.length > 0;
   const hasPlanPanel = !!planFileContent;
   const hasPendingPanel = pendingMessages.length > 0;
-  const recalledMemories = useMemo(
-    () => collectCurrentTurnRecalledMemories(messages),
+  const readMemoryIds = useMemo(
+    () => collectCurrentTurnReadMemoryIds(messages),
     [messages],
   );
-  const hasMemoryPanel = recalledMemories.length > 0;
+  const readMemoryIdsKey = readMemoryIds.join("\u0000");
+  const readMemoryMetadataKey = `${projectId}\u0000${readMemoryIdsKey}`;
+  const [readMemoryMetadata, setReadMemoryMetadata] = useState<{
+    key: string;
+    items: Map<string, MemoryEntityMetadata>;
+  }>({ key: "", items: new Map() });
+  useEffect(() => {
+    let cancelled = false;
+    const entityIds = readMemoryIdsKey ? readMemoryIdsKey.split("\u0000") : [];
+    if (entityIds.length === 0) return () => { cancelled = true; };
+    resolveMemoryEntities(projectId, entityIds)
+      .then(({ items }) => {
+        if (!cancelled) {
+          setReadMemoryMetadata({
+            key: readMemoryMetadataKey,
+            items: new Map(items.map((item) => [item.entity_id, item])),
+          });
+        }
+      })
+      .catch(() => {
+        // The completed ToolCall remains the source of truth. If metadata
+        // hydration fails, keep the ID fallback instead of hiding the pill.
+      });
+    return () => { cancelled = true; };
+  }, [projectId, readMemoryIdsKey, readMemoryMetadataKey]);
+  const readMemories = useMemo(
+    () => readMemoryIds.map((entityId) => (
+      readMemoryMetadata.key === readMemoryMetadataKey
+        ? readMemoryMetadata.items.get(entityId)
+        : undefined
+    ) ?? {
+      entity_id: entityId,
+      title: entityId,
+      tags: [],
+    }),
+    [readMemoryIds, readMemoryMetadata, readMemoryMetadataKey],
+  );
+  const hasMemoryPanel = readMemoryIds.length > 0;
   const activePermissionMessage = useMemo(
     () =>
       [...messages]
@@ -9550,41 +9588,35 @@ export function TaskChat({
                           <div className="flex items-center gap-2 px-0.5">
                             <Database className="h-3.5 w-3.5 text-[var(--color-highlight)]" />
                             <div className="text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
-                              Recalled Memory · {recalledMemories.length}
+                              Read Memory · {readMemories.length}
                             </div>
                           </div>
                           <div className="space-y-1.5">
-                            {recalledMemories.map((memory) => (
+                            {readMemories.map((memory) => (
                               <div
-                                key={memory.entityId || memory.title}
+                                key={memory.entity_id}
                                 className="rounded-xl border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] bg-[color-mix(in_srgb,var(--color-bg)_72%,transparent)] px-3 py-2.5"
                               >
                                 <div className="flex min-w-0 items-start justify-between gap-3">
                                   <div className="min-w-0 text-sm font-medium leading-5 text-[var(--color-text)]">
                                     {memory.title}
                                   </div>
-                                  {memory.entityId && (
-                                    <span
-                                      className="max-w-28 shrink-0 truncate font-mono text-[9px] text-[var(--color-text-muted)] opacity-60"
-                                      title={memory.entityId}
-                                    >
-                                      {memory.entityId}
-                                    </span>
-                                  )}
+                                  <span
+                                    className="max-w-28 shrink-0 truncate font-mono text-[9px] text-[var(--color-text-muted)] opacity-60"
+                                    title={memory.entity_id}
+                                  >
+                                    {memory.entity_id}
+                                  </span>
                                 </div>
-                                {memory.description && (
-                                  <div className="mt-1 line-clamp-2 text-[11px] leading-4 text-[var(--color-text-muted)]">
-                                    {memory.description}
-                                  </div>
-                                )}
                                 {memory.tags.length > 0 && (
                                   <div className="mt-2 flex flex-wrap gap-1">
-                                    {memory.tags.slice(0, 6).map((tag) => (
+                                    {memory.tags.map((tag) => (
                                       <span
-                                        key={tag}
+                                        key={`${tag.key}:${tag.value}`}
+                                        title={`${tag.key}: ${tag.value}`}
                                         className="rounded-full bg-[color-mix(in_srgb,var(--color-highlight)_10%,transparent)] px-1.5 py-0.5 text-[9px] text-[var(--color-highlight)]"
                                       >
-                                        {tag}
+                                        {tag.value}
                                       </span>
                                     ))}
                                   </div>
@@ -10211,11 +10243,11 @@ export function TaskChat({
                             ? "bg-[color-mix(in_srgb,var(--color-highlight)_14%,transparent)] text-[var(--color-highlight)]"
                             : "bg-[var(--color-bg)] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
                         }`}
-                        title="Memory recalled by the agent in this turn"
+                        title="Memory read by the agent in this turn"
                       >
                         <Database className="h-3 w-3" />
                         <span>Memory</span>
-                        <span className="opacity-70">{recalledMemories.length}</span>
+                        <span className="opacity-70">{readMemories.length}</span>
                       </button>
                     )}
                     {hasTodoPanel && (
