@@ -828,9 +828,12 @@ fn build_full_snapshot() -> Vec<GroupSnapshot> {
         .collect();
     groups
         .into_iter()
-        .map(|group| {
+        .map(|mut group| {
             let mut slot_statuses = HashMap::new();
-            for slot in &group.slots {
+            for (index, slot) in group.slots.iter().enumerate() {
+                let Ok(display_position) = u16::try_from(index + 1) else {
+                    break;
+                };
                 let agent_status = check_agent_status(&slot.project_id, &slot.task_id);
                 let task_name = resolve_task_name(&slot.project_id, &slot.task_id);
                 let project_name = project_names
@@ -838,13 +841,18 @@ fn build_full_snapshot() -> Vec<GroupSnapshot> {
                     .cloned()
                     .unwrap_or_else(|| slot.project_id.clone());
                 slot_statuses.insert(
-                    slot.position,
+                    display_position,
                     SlotStatus {
                         agent_status,
                         task_name,
                         project_name,
                     },
                 );
+            }
+            // Radio's wire protocol keeps stable 1-based channel numbers even
+            // though storage uses sparse ranks for O(1)-average insertion.
+            for (index, slot) in group.slots.iter_mut().enumerate() {
+                slot.position = (index as u32) + 1;
             }
             GroupSnapshot {
                 group,
@@ -1117,10 +1125,11 @@ fn find_slot_in(
     group_id: &str,
     position: u16,
 ) -> Option<taskgroups::TaskSlot> {
+    let index = usize::from(position.checked_sub(1)?);
     groups
         .iter()
         .find(|g| g.id == group_id)
-        .and_then(|g| g.slots.iter().find(|s| s.position == position).cloned())
+        .and_then(|g| g.slots.get(index).cloned())
 }
 
 // ─── Radio Server Endpoints ───────────────────────────────────────────────
@@ -1563,5 +1572,32 @@ mod tests {
         let json = r#"{"type":"switch_group"}"#;
         let result = serde_json::from_str::<ClientMessage>(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_radio_position_resolves_sorted_slot_ordinal() {
+        let groups = vec![taskgroups::TaskGroup {
+            id: "g1".to_string(),
+            name: "Group".to_string(),
+            color: None,
+            slots: vec![
+                taskgroups::TaskSlot {
+                    position: 1_000,
+                    project_id: "project".to_string(),
+                    task_id: "first".to_string(),
+                    target_chat_id: None,
+                },
+                taskgroups::TaskSlot {
+                    position: 5_000,
+                    project_id: "project".to_string(),
+                    task_id: "second".to_string(),
+                    target_chat_id: None,
+                },
+            ],
+            created_at: chrono::Utc::now(),
+        }];
+
+        assert_eq!(find_slot_in(&groups, "g1", 2).unwrap().task_id, "second");
+        assert!(find_slot_in(&groups, "g1", 3).is_none());
     }
 }

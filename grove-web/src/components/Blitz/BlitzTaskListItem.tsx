@@ -18,6 +18,7 @@ interface BlitzTaskListItemProps {
   onDragLeave?: () => void;
   isDragging?: boolean;
   isDragOver?: boolean;
+  dragPlacement?: "before" | "after" | null;
   onMoveUp?: () => void;
   onMoveDown?: () => void;
   isFirst?: boolean;
@@ -133,6 +134,7 @@ export function BlitzTaskListItem({
   onDragLeave,
   isDragging,
   isDragOver,
+  dragPlacement,
   onMoveUp,
   onMoveDown,
   isFirst,
@@ -167,7 +169,9 @@ export function BlitzTaskListItem({
             ? "bg-[var(--color-highlight)]/5 ring-2 ring-inset ring-[var(--color-highlight)]"
             : ""
         } ${!isTouchDevice && isDragging ? "opacity-40 cursor-grabbing" : !isTouchDevice ? "cursor-grab" : ""} ${
-          isDragOver ? "border-t-2 border-t-[var(--color-highlight)]" : ""
+          isDragOver && dragPlacement === "before" ? "border-t-2 border-t-[var(--color-highlight)]" : ""
+        } ${
+          isDragOver && dragPlacement === "after" ? "border-b-2 border-b-[var(--color-highlight)]" : ""
         }`}
       >
         {notification && (

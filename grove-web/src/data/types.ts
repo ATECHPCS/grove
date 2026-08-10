@@ -126,7 +126,7 @@ export const MAIN_GROUP_ID = "_main";
 export const LOCAL_GROUP_ID = "_local";
 
 export interface TaskSlot {
-  /** Slot position — any positive integer (u16 on backend). */
+  /** Sparse positive sort rank (u32 on backend). */
   position: number;
   project_id: string;
   task_id: string;

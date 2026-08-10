@@ -126,19 +126,26 @@ export function BlitzPage({
   // ── Unified drag-and-drop state ──────────────────────────────────────────
   // Single ref tracks the drag source; render state tracks visual feedback
   const dragInfoRef = useRef<DragInfo | null>(null);
-  const dropTargetRef = useRef<{ zone: "main" | "group" | "local"; index?: number; groupId?: string } | null>(null);
+  const dropTargetRef = useRef<{
+    zone: "main" | "group" | "local";
+    index?: number;
+    groupId?: string;
+    taskKey?: string;
+    placement: "before" | "after";
+  } | null>(null);
   const [dragState, setDragState] = useState<{
     source: "main" | "group" | "local" | null;
     taskKey: string | null;
     overZone: "main" | "group" | "local" | null;
     overIndex: number | null;
     overGroupId: string | null;
-  }>({ source: null, taskKey: null, overZone: null, overIndex: null, overGroupId: null });
+    overPlacement: "before" | "after" | null;
+  }>({ source: null, taskKey: null, overZone: null, overIndex: null, overGroupId: null, overPlacement: null });
 
   const clearDrag = useCallback(() => {
     dragInfoRef.current = null;
     dropTargetRef.current = null;
-    setDragState({ source: null, taskKey: null, overZone: null, overIndex: null, overGroupId: null });
+    setDragState({ source: null, taskKey: null, overZone: null, overIndex: null, overGroupId: null, overPlacement: null });
   }, []);
 
   const mainListRef = useRef<HTMLDivElement | null>(null);
@@ -614,28 +621,29 @@ export function BlitzPage({
 
   const startDrag = useCallback((source: "main" | "group" | "local", index: number, taskKey: string, groupId: string) => {
     dragInfoRef.current = { source, taskKey, index, groupId };
-    setDragState({ source, taskKey, overZone: null, overIndex: null, overGroupId: null });
+    setDragState({ source, taskKey, overZone: null, overIndex: null, overGroupId: null, overPlacement: null });
   }, []);
 
-  const handleItemDragOver = useCallback((e: React.DragEvent, zone: "main" | "group" | "local", index: number, groupId?: string) => {
+  const handleItemDragOver = useCallback((e: React.DragEvent, zone: "main" | "group" | "local", index: number, taskKey: string, groupId?: string) => {
     if (!dragInfoRef.current) return;
     e.stopPropagation(); // Prevent zone-level handler from overriding index to -1
-    dropTargetRef.current = { zone, index, groupId };
-    setDragState(prev => ({ ...prev, overZone: zone, overIndex: index, overGroupId: groupId ?? null }));
+    const rect = e.currentTarget.getBoundingClientRect();
+    const placement = e.clientY < rect.top + rect.height / 2 ? "before" : "after";
+    dropTargetRef.current = { zone, index, groupId, taskKey, placement };
+    setDragState(prev => ({ ...prev, overZone: zone, overIndex: index, overGroupId: groupId ?? null, overPlacement: placement }));
   }, []);
 
   const handleZoneDragOver = useCallback((e: React.DragEvent, zone: "main" | "group" | "local", groupId?: string) => {
     if (!dragInfoRef.current) return;
-    // Don't accept drop from same group to same group header (only to items within)
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
-    dropTargetRef.current = { zone, index: -1, groupId };
-    setDragState(prev => ({ ...prev, overZone: zone, overIndex: null, overGroupId: groupId ?? null }));
+    dropTargetRef.current = { zone, index: -1, groupId, placement: "after" };
+    setDragState(prev => ({ ...prev, overZone: zone, overIndex: null, overGroupId: groupId ?? null, overPlacement: null }));
   }, []);
 
   const handleDragLeave = useCallback(() => {
     dropTargetRef.current = null;
-    setDragState(prev => ({ ...prev, overZone: null, overIndex: null, overGroupId: null }));
+    setDragState(prev => ({ ...prev, overZone: null, overIndex: null, overGroupId: null, overPlacement: null }));
   }, []);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
@@ -646,7 +654,6 @@ export function BlitzPage({
 
     const { taskKey, groupId: srcGroupId } = info;
     const { groupId: tgtGroupId } = target;
-    const targetIndex = target.index ?? -1;
 
     // Find the BlitzTask
     const bt = blitzTasks.find(b => `${b.projectId}:${b.task.id}` === taskKey);
@@ -654,40 +661,21 @@ export function BlitzPage({
 
     const resolvedTgtGroupId = tgtGroupId ?? srcGroupId;
 
-    // ── Same group reorder ──
-    if (srcGroupId === resolvedTgtGroupId && targetIndex >= 0 && info.index !== targetIndex) {
-      const group = taskGroups.find(g => g.id === srcGroupId);
-      if (group) {
-        const tasksInGroup = getGroupTasks(group);
-        if (info.index < tasksInGroup.length && targetIndex < tasksInGroup.length) {
-          const srcTask = tasksInGroup[info.index];
-          const tgtTask = tasksInGroup[targetIndex];
-          // Find their slots in the full list and swap positions
-          const newSlots = group.slots.map(s => {
-            if (s.project_id === srcTask.projectId && s.task_id === srcTask.task.id) {
-              const tgtSlot = group.slots.find(ts => ts.project_id === tgtTask.projectId && ts.task_id === tgtTask.task.id);
-              return { ...s, position: tgtSlot?.position ?? s.position };
-            }
-            if (s.project_id === tgtTask.projectId && s.task_id === tgtTask.task.id) {
-              const srcSlot = group.slots.find(ss => ss.project_id === srcTask.projectId && ss.task_id === srcTask.task.id);
-              return { ...s, position: srcSlot?.position ?? s.position };
-            }
-            return s;
-          }).sort((a, b) => a.position - b.position);
-          taskGroupsHook.setSlots(srcGroupId, newSlots);
-        }
-      }
-      clearDrag();
-      return;
-    }
-
-    // ── Cross-group move ──
-    if (srcGroupId !== resolvedTgtGroupId) {
-      taskGroupsHook.moveTask(srcGroupId, resolvedTgtGroupId, bt.projectId, bt.task.id);
-    }
+    const anchor = target.taskKey
+      ? blitzTasks.find(candidate => `${candidate.projectId}:${candidate.task.id}` === target.taskKey)
+      : undefined;
+    taskGroupsHook.moveTask(
+      srcGroupId,
+      resolvedTgtGroupId,
+      bt.projectId,
+      bt.task.id,
+      anchor?.projectId,
+      anchor?.task.id,
+      target.placement,
+    );
 
     clearDrag();
-  }, [blitzTasks, taskGroups, getGroupTasks, taskGroupsHook, clearDrag]);
+  }, [blitzTasks, taskGroupsHook, clearDrag]);
 
 
   // Toggle group folder expansion
@@ -702,21 +690,17 @@ export function BlitzPage({
     const groupTaskList = getGroupTasks(group);
     const targetIndex = direction === "up" ? index - 1 : index + 1;
     if (targetIndex < 0 || targetIndex >= groupTaskList.length) return;
-    const srcTask = groupTaskList[index];
     const tgtTask = groupTaskList[targetIndex];
-    // Swap positions in the full slot list to preserve hidden (filtered-out) tasks
-    const newSlots = group.slots.map(s => {
-      if (s.project_id === srcTask.projectId && s.task_id === srcTask.task.id) {
-        const tgtSlot = group.slots.find(ts => ts.project_id === tgtTask.projectId && ts.task_id === tgtTask.task.id);
-        return { ...s, position: tgtSlot?.position ?? s.position };
-      }
-      if (s.project_id === tgtTask.projectId && s.task_id === tgtTask.task.id) {
-        const srcSlot = group.slots.find(ss => ss.project_id === srcTask.projectId && ss.task_id === srcTask.task.id);
-        return { ...s, position: srcSlot?.position ?? s.position };
-      }
-      return s;
-    }).sort((a, b) => a.position - b.position);
-    taskGroupsHook.setSlots(groupId, newSlots);
+    const srcTask = groupTaskList[index];
+    taskGroupsHook.moveTask(
+      groupId,
+      groupId,
+      srcTask.projectId,
+      srcTask.task.id,
+      tgtTask.projectId,
+      tgtTask.task.id,
+      direction === "up" ? "before" : "after",
+    );
   }, [taskGroups, getGroupTasks, taskGroupsHook]);
 
   // Context menu handler (Blitz-specific: handle BlitzTask)
@@ -1336,11 +1320,12 @@ export function BlitzPage({
                         notification={notif ? { level: notif.level } : undefined}
                         shortcutNumber={index < 10 ? (index === 9 ? 0 : index + 1) : undefined}
                         onDragStart={() => startDrag("main", index, taskKey, MAIN_GROUP_ID)}
-                        onDragOver={(e: React.DragEvent) => handleItemDragOver(e, "main", index, MAIN_GROUP_ID)}
+                        onDragOver={(e: React.DragEvent) => handleItemDragOver(e, "main", index, taskKey, MAIN_GROUP_ID)}
                         onDragEnd={clearDrag}
                         onDragLeave={handleDragLeave}
                         isDragging={dragState.taskKey === taskKey && dragState.source === "main"}
                         isDragOver={dragState.overZone === "main" && dragState.overIndex === index}
+                        dragPlacement={dragState.overZone === "main" && dragState.overIndex === index ? dragState.overPlacement : null}
                         onMoveUp={() => handleMoveTask(MAIN_GROUP_ID, index, "up")}
                         onMoveDown={() => handleMoveTask(MAIN_GROUP_ID, index, "down")}
                         isFirst={index === 0}
@@ -1454,11 +1439,12 @@ export function BlitzPage({
                                     onContextMenu={(e) => handleContextMenu(bt, e)}
                                     notification={notif ? { level: notif.level } : undefined}
                                     onDragStart={() => startDrag("group", gIdx, taskKey, group.id)}
-                                    onDragOver={(e: React.DragEvent) => handleItemDragOver(e, "group", gIdx, group.id)}
+                                    onDragOver={(e: React.DragEvent) => handleItemDragOver(e, "group", gIdx, taskKey, group.id)}
                                     onDragEnd={clearDrag}
                                     onDragLeave={handleDragLeave}
                                     isDragging={dragState.taskKey === taskKey && dragState.source === "group"}
                                     isDragOver={dragState.overZone === "group" && dragState.overGroupId === group.id && dragState.overIndex === gIdx}
+                                    dragPlacement={dragState.overZone === "group" && dragState.overGroupId === group.id && dragState.overIndex === gIdx ? dragState.overPlacement : null}
                                   />
                                 );
                               })
@@ -1567,11 +1553,12 @@ export function BlitzPage({
                                 onContextMenu={(e) => handleContextMenu(bt, e)}
                                 notification={notif ? { level: notif.level } : undefined}
                                 onDragStart={() => startDrag("local", index, taskKey, LOCAL_GROUP_ID)}
-                                onDragOver={(e: React.DragEvent) => handleItemDragOver(e, "local", index, LOCAL_GROUP_ID)}
+                                onDragOver={(e: React.DragEvent) => handleItemDragOver(e, "local", index, taskKey, LOCAL_GROUP_ID)}
                                 onDragEnd={clearDrag}
                                 onDragLeave={handleDragLeave}
                                 isDragging={dragState.taskKey === taskKey && dragState.source === "local"}
                                 isDragOver={dragState.overZone === "local" && dragState.overIndex === index}
+                                dragPlacement={dragState.overZone === "local" && dragState.overIndex === index ? dragState.overPlacement : null}
                               />
                             );
                           })}

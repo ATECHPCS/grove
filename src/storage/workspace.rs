@@ -381,43 +381,10 @@ pub fn remove_project(path: &str) -> Result<()> {
             rusqlite::params![&hash],
         )?;
 
-        // Find affected groups before deleting slots
-        let affected_groups: Vec<String> = {
-            let mut stmt =
-                tx.prepare("SELECT DISTINCT group_id FROM task_group_slots WHERE project_id = ?1")?;
-            let rows = stmt.query_map(rusqlite::params![&hash], |row| row.get::<_, String>(0))?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-
         tx.execute(
             "DELETE FROM task_group_slots WHERE project_id = ?1",
             rusqlite::params![&hash],
         )?;
-
-        // Renumber positions for each affected group
-        for gid in &affected_groups {
-            let slots: Vec<(i64, String, String, Option<String>)> = {
-                let mut stmt = tx.prepare(
-                    "SELECT position, project_id, task_id, target_chat_id \
-                     FROM task_group_slots WHERE group_id = ?1 ORDER BY position",
-                )?;
-                let rows = stmt.query_map(rusqlite::params![gid], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                })?;
-                rows.filter_map(|r| r.ok()).collect()
-            };
-            tx.execute(
-                "DELETE FROM task_group_slots WHERE group_id = ?1",
-                rusqlite::params![gid],
-            )?;
-            for (i, (_, proj, task, chat)) in slots.iter().enumerate() {
-                tx.execute(
-                    "INSERT INTO task_group_slots (group_id, position, project_id, task_id, target_chat_id) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![gid, (i + 1) as i64, proj, task, chat],
-                )?;
-            }
-        }
 
         // 删 tasks + session 等项目作用域行 —— 这些表没有 FK 到 projects,
         // 不显式删会留下孤儿。session 上有 FK ON DELETE CASCADE,所以

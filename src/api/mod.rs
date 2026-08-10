@@ -1609,15 +1609,12 @@ pub fn start_automation_runtime() {
     crate::automation::scheduler::spawn();
 }
 
-/// Start the web server (API + static files)
-pub async fn start_server(
-    host: &str,
-    port: u16,
-    static_dir: Option<PathBuf>,
-    open_browser: bool,
-    auth: Arc<ServerAuth>,
-    tls_mode: crate::cli::web::TlsMode,
-) -> std::io::Result<()> {
+/// Initialize the local backend runtime shared by Web and GUI servers.
+///
+/// Listener binding, TLS, remote proxying, readiness signals, and process/UI
+/// lifecycle stay with each surface. Everything that prepares the local Grove
+/// backend belongs here so those surfaces cannot silently drift apart.
+pub async fn initialize_local_server_runtime(port: u16) -> std::io::Result<()> {
     // Record our loopback base so a plugin's MCP server (a node child process,
     // not an authenticated Grove client) knows where to POST events. Always
     // loopback — the MCP server runs on this same machine regardless of bind.
@@ -1717,6 +1714,20 @@ pub async fn start_server(
     // Pre-build Grove.app notification bundle (macOS only, first run compiles Swift)
     #[cfg(target_os = "macos")]
     crate::hooks::ensure_grove_app();
+
+    Ok(())
+}
+
+/// Start the web server (API + static files)
+pub async fn start_server(
+    host: &str,
+    port: u16,
+    static_dir: Option<PathBuf>,
+    open_browser: bool,
+    auth: Arc<ServerAuth>,
+    tls_mode: crate::cli::web::TlsMode,
+) -> std::io::Result<()> {
+    initialize_local_server_runtime(port).await?;
 
     let has_ui = static_dir.is_some() || has_embedded_assets();
     let app = create_router(static_dir, auth.clone(), None);

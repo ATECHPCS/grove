@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { collectCurrentTurnReadMemoryIds } from "./memoryRead";
+import { collectReadMemoryIds } from "./memoryRead";
 import type { ToolCallMessage } from "./toolCallReducer";
 
 function tool(overrides: Partial<ToolCallMessage>): ToolCallMessage {
@@ -33,16 +33,16 @@ function tool(overrides: Partial<ToolCallMessage>): ToolCallMessage {
   };
 }
 
-describe("collectCurrentTurnReadMemoryIds", () => {
+describe("collectReadMemoryIds", () => {
   it("collects completed memory_read results and keeps their entity ids", () => {
-    expect(collectCurrentTurnReadMemoryIds([
+    expect(collectReadMemoryIds([
       { type: "user" },
       tool({}),
     ])).toEqual(["memory-1"]);
   });
 
   it("does not treat memory_recall as a read", () => {
-    expect(collectCurrentTurnReadMemoryIds([
+    expect(collectReadMemoryIds([
       { type: "user" },
       tool({
         title: "mcp.grove_agent.memory_recall",
@@ -51,16 +51,16 @@ describe("collectCurrentTurnReadMemoryIds", () => {
     ])).toEqual([]);
   });
 
-  it("only reports reads after the latest user message", () => {
-    expect(collectCurrentTurnReadMemoryIds([
+  it("keeps reads from earlier user turns", () => {
+    expect(collectReadMemoryIds([
       { type: "user" },
       tool({}),
       { type: "user" },
-    ])).toEqual([]);
+    ])).toEqual(["memory-1"]);
   });
 
   it("does not depend on persisted output being parseable", () => {
-    expect(collectCurrentTurnReadMemoryIds([
+    expect(collectReadMemoryIds([
       { type: "user" },
       tool({
         output: [{
@@ -72,7 +72,7 @@ describe("collectCurrentTurnReadMemoryIds", () => {
   });
 
   it("ignores a malformed read without an Entity ID", () => {
-    expect(collectCurrentTurnReadMemoryIds([
+    expect(collectReadMemoryIds([
       { type: "user" },
       tool({ input: [{ label: "Tool", value: "memory_read" }] }),
     ])).toEqual([]);

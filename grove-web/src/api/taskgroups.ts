@@ -43,11 +43,17 @@ export async function moveTaskSlot(
   toGroupId: string,
   projectId: string,
   taskId: string,
+  anchorProjectId?: string,
+  anchorTaskId?: string,
+  placement: "before" | "after" = "after",
 ): Promise<TaskGroup> {
   return apiClient.post("/api/v1/taskgroups/move", {
     from_group_id: fromGroupId,
     to_group_id: toGroupId,
     project_id: projectId,
     task_id: taskId,
+    anchor_project_id: anchorProjectId,
+    anchor_task_id: anchorTaskId,
+    placement,
   });
 }

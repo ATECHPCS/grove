@@ -3,11 +3,12 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::Result;
+use crate::error::{GroveError, Result};
 
 /// System group IDs (auto-created, cannot be deleted/renamed)
 pub const MAIN_GROUP_ID: &str = "_main";
 pub const LOCAL_GROUP_ID: &str = "_local";
+pub const POSITION_STEP: u32 = 1_000;
 
 fn system_group_name(group_id: &str) -> &'static str {
     if group_id == LOCAL_GROUP_ID {
@@ -20,8 +21,8 @@ fn system_group_name(group_id: &str) -> &'static str {
 /// TaskSlot: binds a Task to a position in a TaskGroup
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSlot {
-    /// Sort position (1-based, no upper limit for system groups; 1-9 for Radio grid)
-    pub position: u16,
+    /// Sparse sort rank. Radio derives its 1-based slot number from sorted order.
+    pub position: u32,
     /// Project hash
     pub project_id: String,
     /// Task ID
@@ -29,6 +30,13 @@ pub struct TaskSlot {
     /// Target chat ID (None = auto-select)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_chat_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotPlacement {
+    Before,
+    After,
 }
 
 /// TaskGroup: a group of tasks (frequency band for walkie-talkie)
@@ -95,7 +103,7 @@ fn load_slots_for_group(conn: &rusqlite::Connection, group_id: &str) -> Result<V
     )?;
     let rows = stmt.query_map(params![group_id], |row| {
         Ok(TaskSlot {
-            position: row.get::<_, i64>(0)? as u16,
+            position: row.get::<_, i64>(0)? as u32,
             project_id: row.get(1)?,
             task_id: row.get(2)?,
             target_chat_id: row.get(3)?,
@@ -108,24 +116,62 @@ fn load_slots_for_group(conn: &rusqlite::Connection, group_id: &str) -> Result<V
     Ok(slots)
 }
 
-/// Renumber positions for a group so they are sequential 1, 2, 3, ...
-/// Caller must hold the DB lock.
-fn renumber_positions(conn: &rusqlite::Connection, group_id: &str) -> Result<()> {
+/// Re-space one group's ranks. This is the rare O(n) fallback when an insertion
+/// gap is exhausted; ordinary moves only delete/insert the moved row.
+fn rebalance_positions(conn: &rusqlite::Connection, group_id: &str) -> Result<()> {
     let slots = load_slots_for_group(conn, group_id)?;
-    // Delete all slots for the group and re-insert with sequential positions
+    if slots.len() > (u32::MAX / POSITION_STEP) as usize {
+        return Err(GroveError::storage("task group is too large to rebalance"));
+    }
+
+    // Move ranks into the negative domain first so the composite primary key
+    // cannot collide while positive ranks are assigned in sorted order.
     conn.execute(
-        "DELETE FROM task_group_slots WHERE group_id = ?1",
+        "UPDATE task_group_slots SET position = -position WHERE group_id = ?1",
         params![group_id],
     )?;
-    for (i, slot) in slots.iter().enumerate() {
-        let new_pos = (i as i64) + 1;
+    for (index, slot) in slots.iter().enumerate() {
+        let rank = ((index as u32) + 1) * POSITION_STEP;
         conn.execute(
-            "INSERT INTO task_group_slots (group_id, position, project_id, task_id, target_chat_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![group_id, new_pos, slot.project_id, slot.task_id, slot.target_chat_id],
+            "UPDATE task_group_slots SET position = ?1 \
+             WHERE group_id = ?2 AND project_id = ?3 AND task_id = ?4",
+            params![rank as i64, group_id, slot.project_id, slot.task_id],
         )?;
     }
     Ok(())
+}
+
+fn insertion_rank(
+    slots: &[TaskSlot],
+    anchor_project_id: Option<&str>,
+    anchor_task_id: Option<&str>,
+    placement: SlotPlacement,
+) -> Option<u32> {
+    let insertion_index = match (anchor_project_id, anchor_task_id) {
+        (Some(project_id), Some(task_id)) => {
+            let anchor_index = slots
+                .iter()
+                .position(|slot| slot.project_id == project_id && slot.task_id == task_id)?;
+            anchor_index + usize::from(placement == SlotPlacement::After)
+        }
+        (None, None) => slots.len(),
+        _ => return None,
+    };
+
+    let previous = insertion_index
+        .checked_sub(1)
+        .and_then(|index| slots.get(index))
+        .map(|slot| slot.position);
+    let next = slots.get(insertion_index).map(|slot| slot.position);
+    match (previous, next) {
+        (None, None) => Some(POSITION_STEP),
+        (Some(previous), None) => previous.checked_add(POSITION_STEP),
+        (None, Some(next)) if next > 1 => Some(next / 2),
+        (Some(previous), Some(next)) if next.saturating_sub(previous) > 1 => {
+            Some(previous + (next - previous) / 2)
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -281,10 +327,10 @@ pub fn ensure_system_groups() -> Result<()> {
                 MAIN_GROUP_ID
             };
             let pos = if is_local {
-                local_max += 1;
+                local_max = local_max.saturating_add(POSITION_STEP);
                 local_max
             } else {
-                main_max += 1;
+                main_max = main_max.saturating_add(POSITION_STEP);
                 main_max
             };
 
@@ -321,14 +367,6 @@ pub fn ensure_system_groups() -> Result<()> {
             .retain(|s| seen_in_group.insert((s.project_id.clone(), s.task_id.clone())));
         if g.slots.len() < before2 {
             changed = true;
-        }
-        // Re-number positions to be sequential (1, 2, 3, ...)
-        for (i, slot) in g.slots.iter_mut().enumerate() {
-            let new_pos = (i as u16) + 1;
-            if slot.position != new_pos {
-                slot.position = new_pos;
-                changed = true;
-            }
         }
     }
 
@@ -385,8 +423,8 @@ pub fn ensure_task_assignment(project_id: &str, task_id: &str, is_local: bool) -
     }
 
     let next_position: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(position), 0) + 1 FROM task_group_slots WHERE group_id = ?1",
-        params![target_group_id],
+        "SELECT COALESCE(MAX(position), 0) + ?2 FROM task_group_slots WHERE group_id = ?1",
+        params![target_group_id, POSITION_STEP as i64],
         |row| row.get(0),
     )?;
     tx.execute(
@@ -538,10 +576,9 @@ pub fn upsert_slot(group_id: &str, slot: TaskSlot) -> Result<Option<TaskGroup>> 
     load_group_by_id(&conn, group_id)
 }
 
-/// Remove a slot from a task group by position.
-/// Renumbers remaining positions sequentially.
+/// Remove a slot from a task group by sparse rank.
 /// Returns the updated group if found.
-pub fn remove_slot(group_id: &str, position: u16) -> Result<Option<TaskGroup>> {
+pub fn remove_slot(group_id: &str, position: u32) -> Result<Option<TaskGroup>> {
     let conn = crate::storage::database::connection();
 
     // Check group exists
@@ -559,13 +596,12 @@ pub fn remove_slot(group_id: &str, position: u16) -> Result<Option<TaskGroup>> {
         "DELETE FROM task_group_slots WHERE group_id = ?1 AND position = ?2",
         params![group_id, position as i64],
     )?;
-    renumber_positions(&tx, group_id)?;
     tx.commit()?;
 
     load_group_by_id(&conn, group_id)
 }
 
-/// Move one task between groups atomically.
+/// Move or reorder one task atomically using a sparse insertion rank.
 ///
 /// A move must not be composed from client-side DELETE and INSERT requests:
 /// that exposes an unassigned intermediate state, emits two change events, and
@@ -575,6 +611,9 @@ pub fn move_slot(
     to_group_id: &str,
     project_id: &str,
     task_id: &str,
+    anchor_project_id: Option<&str>,
+    anchor_task_id: Option<&str>,
+    placement: SlotPlacement,
 ) -> Result<Option<TaskGroup>> {
     let conn = crate::storage::database::connection();
     let tx = conn.unchecked_transaction()?;
@@ -589,7 +628,10 @@ pub fn move_slot(
         return Ok(None);
     }
 
-    if from_group_id == to_group_id {
+    if from_group_id == to_group_id
+        && anchor_project_id == Some(project_id)
+        && anchor_task_id == Some(task_id)
+    {
         tx.commit()?;
         return load_group_by_id(&conn, to_group_id);
     }
@@ -611,26 +653,41 @@ pub fn move_slot(
          WHERE group_id = ?1 AND project_id = ?2 AND task_id = ?3",
         params![from_group_id, project_id, task_id],
     )?;
-    renumber_positions(&tx, from_group_id)?;
-
     // Defensive cleanup for data produced by the old two-request move path.
     tx.execute(
         "DELETE FROM task_group_slots \
          WHERE group_id = ?1 AND project_id = ?2 AND task_id = ?3",
         params![to_group_id, project_id, task_id],
     )?;
-    let next_position: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(position), 0) + 1 FROM task_group_slots WHERE group_id = ?1",
-        params![to_group_id],
-        |row| row.get(0),
-    )?;
+    let mut target_slots = load_slots_for_group(&tx, to_group_id)?;
+    let mut next_position =
+        insertion_rank(&target_slots, anchor_project_id, anchor_task_id, placement);
+    if next_position.is_none() {
+        // Distinguish a missing anchor from an exhausted numeric gap. A stale
+        // anchor must fail instead of silently moving the task elsewhere.
+        if let (Some(anchor_project_id), Some(anchor_task_id)) = (anchor_project_id, anchor_task_id)
+        {
+            if !target_slots
+                .iter()
+                .any(|slot| slot.project_id == anchor_project_id && slot.task_id == anchor_task_id)
+            {
+                return Ok(None);
+            }
+        }
+        rebalance_positions(&tx, to_group_id)?;
+        target_slots = load_slots_for_group(&tx, to_group_id)?;
+        next_position = insertion_rank(&target_slots, anchor_project_id, anchor_task_id, placement);
+    }
+    let Some(next_position) = next_position else {
+        return Err(GroveError::storage("failed to allocate task-group rank"));
+    };
     tx.execute(
         "INSERT INTO task_group_slots \
          (group_id, position, project_id, task_id, target_chat_id) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             to_group_id,
-            next_position,
+            next_position as i64,
             project_id,
             task_id,
             target_chat_id
@@ -669,11 +726,6 @@ pub fn remove_task_from_all_groups(project_id: &str, task_id: &str) -> bool {
             "DELETE FROM task_group_slots WHERE project_id = ?1 AND task_id = ?2",
             params![project_id, task_id],
         )?;
-
-        // Renumber positions for each affected group
-        for gid in &affected_groups {
-            renumber_positions(&tx, gid)?;
-        }
 
         tx.commit()?;
         Ok(deleted > 0)
@@ -886,7 +938,7 @@ mod tests {
         // Load and verify slots are sorted by position
         let groups = load_groups().unwrap();
         let group = groups.iter().find(|g| g.id == guard.id).unwrap();
-        let positions: Vec<u16> = group.slots.iter().map(|s| s.position).collect();
+        let positions: Vec<u32> = group.slots.iter().map(|s| s.position).collect();
         assert_eq!(positions, vec![1, 2, 3, 5, 9]);
     }
 
@@ -985,9 +1037,17 @@ mod tests {
         )
         .unwrap();
 
-        let moved = move_slot(LOCAL_GROUP_ID, &custom.id, "project-a", "_local")
-            .unwrap()
-            .unwrap();
+        let moved = move_slot(
+            LOCAL_GROUP_ID,
+            &custom.id,
+            "project-a",
+            "_local",
+            None,
+            None,
+            SlotPlacement::After,
+        )
+        .unwrap()
+        .unwrap();
         assert!(moved.slots.iter().any(|slot| {
             slot.project_id == "project-a"
                 && slot.task_id == "_local"
@@ -1011,5 +1071,84 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn test_move_slot_inserts_between_ranks_without_rewriting_neighbors() {
+        let _lock = FILE_LOCK_FN().blocking_lock();
+        let _home = sandbox_home();
+        let (guard, _) = TestGroup::create("sparse-insert", None);
+        for (rank, task_id) in [(1_000, "a"), (2_000, "b"), (3_000, "c"), (4_000, "d")] {
+            upsert_slot(
+                &guard.id,
+                TaskSlot {
+                    position: rank,
+                    project_id: "project".to_string(),
+                    task_id: task_id.to_string(),
+                    target_chat_id: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let moved = move_slot(
+            &guard.id,
+            &guard.id,
+            "project",
+            "a",
+            Some("project"),
+            Some("d"),
+            SlotPlacement::Before,
+        )
+        .unwrap()
+        .unwrap();
+
+        let ordered: Vec<(&str, u32)> = moved
+            .slots
+            .iter()
+            .map(|slot| (slot.task_id.as_str(), slot.position))
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![("b", 2_000), ("c", 3_000), ("a", 3_500), ("d", 4_000)]
+        );
+    }
+
+    #[test]
+    fn test_move_slot_rebalances_only_when_gap_is_exhausted() {
+        let _lock = FILE_LOCK_FN().blocking_lock();
+        let _home = sandbox_home();
+        let (guard, _) = TestGroup::create("sparse-rebalance", None);
+        for (rank, task_id) in [(1, "a"), (2, "b"), (3, "c")] {
+            upsert_slot(
+                &guard.id,
+                TaskSlot {
+                    position: rank,
+                    project_id: "project".to_string(),
+                    task_id: task_id.to_string(),
+                    target_chat_id: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let moved = move_slot(
+            &guard.id,
+            &guard.id,
+            "project",
+            "c",
+            Some("project"),
+            Some("b"),
+            SlotPlacement::Before,
+        )
+        .unwrap()
+        .unwrap();
+
+        let ordered: Vec<(&str, u32)> = moved
+            .slots
+            .iter()
+            .map(|slot| (slot.task_id.as_str(), slot.position))
+            .collect();
+        assert_eq!(ordered, vec![("a", 1_000), ("c", 1_500), ("b", 2_000)]);
     }
 }

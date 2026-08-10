@@ -17,21 +17,12 @@ function memoryEntityId(message: ToolCallMessage): string | undefined {
     ?.value.trim() || undefined;
 }
 
-/** Collect Entity IDs from successful memory_read calls in the current user turn. */
-export function collectCurrentTurnReadMemoryIds(
+/** Collect Entity IDs from successful memory_read calls across a chat history. */
+export function collectReadMemoryIds(
   messages: readonly { type: string }[],
 ): string[] {
-  let turnStart = -1;
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (messages[i].type === "user") {
-      turnStart = i;
-      break;
-    }
-  }
-
   const read = new Set<string>();
-  for (let i = turnStart + 1; i < messages.length; i += 1) {
-    const message = messages[i];
+  for (const message of messages) {
     if (message.type !== "tool") continue;
     const tool = message as ToolCallMessage;
     if (!isMemoryReadTool(tool) || tool.status !== "completed") continue;

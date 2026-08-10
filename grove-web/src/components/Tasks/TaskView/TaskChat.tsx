@@ -191,7 +191,7 @@ import { useAgentQuota, useRadioEvents } from "../../../hooks";
 import { AgentQuotaPopover } from "./AgentQuotaPopover";
 import { ContextUsagePill } from "./ContextUsagePill";
 import { TurnUsageMeta } from "./TurnUsageMeta";
-import { collectCurrentTurnReadMemoryIds } from "./memoryRead";
+import { collectReadMemoryIds } from "./memoryRead";
 import {
   quotaBadgePercent,
   quotaBatteryIcon,
@@ -693,6 +693,8 @@ type ChatDropdownOption = {
 /** Per-chat cached state (preserved across chat switches) */
 interface PerChatState {
   messages: ChatMessage[];
+  /** Completed memory_read Entity IDs across the full persisted chat history. */
+  readMemoryIds: string[];
   hiddenMessageCount: number;
   attachmentCounters: AttachmentCounters;
   isBusy: boolean;
@@ -774,6 +776,7 @@ const applyConfigOptionsToCachedState = (
 function defaultPerChatState(): PerChatState {
   return {
     messages: [],
+    readMemoryIds: [],
     hiddenMessageCount: 0,
     attachmentCounters: { image: 0, audio: 0, resource: 0 },
     isBusy: false,
@@ -3041,10 +3044,19 @@ export function TaskChat({
   const hasTodoPanel = planEntries.length > 0;
   const hasPlanPanel = !!planFileContent;
   const hasPendingPanel = pendingMessages.length > 0;
-  const readMemoryIds = useMemo(
-    () => collectCurrentTurnReadMemoryIds(messages),
-    [messages],
-  );
+  // Memory evidence is chat-scoped, not render-window-scoped. History load
+  // seeds this from the full transcript before old messages are pruned; live
+  // ToolCalls then accumulate into it without removing earlier reads.
+  const [readMemoryIds, setReadMemoryIds] = useState<string[]>([]);
+  useEffect(() => {
+    const observed = collectReadMemoryIds(messages);
+    if (observed.length === 0) return;
+    setReadMemoryIds((previous) => {
+      const merged = new Set(previous);
+      observed.forEach((entityId) => merged.add(entityId));
+      return merged.size === previous.length ? previous : [...merged];
+    });
+  }, [messages]);
   const readMemoryIdsKey = readMemoryIds.join("\u0000");
   const readMemoryMetadataKey = `${projectId}\u0000${readMemoryIdsKey}`;
   const [readMemoryMetadata, setReadMemoryMetadata] = useState<{
@@ -4037,6 +4049,7 @@ export function TaskChat({
     if (!activeChatId) return;
     perChatStateRef.current.set(activeChatId, {
       messages,
+      readMemoryIds,
       hiddenMessageCount,
       attachmentCounters: { ...attachCountersRef.current },
       isBusy,
@@ -4072,6 +4085,7 @@ export function TaskChat({
   }, [
     activeChatId,
     messages,
+    readMemoryIds,
     hiddenMessageCount,
     isBusy,
     selectedModel,
@@ -4108,6 +4122,7 @@ export function TaskChat({
     const cached = perChatStateRef.current.get(chatId);
     if (cached) {
       setMessages(cached.messages);
+      setReadMemoryIds(cached.readMemoryIds ?? collectReadMemoryIds(cached.messages));
       updateHiddenMessageCount(cached.hiddenMessageCount);
       updateBusy(cached.isBusy);
       setSelectedModel(cached.selectedModel);
@@ -4143,6 +4158,7 @@ export function TaskChat({
       setContextUsage(cached.contextUsage);
     } else {
       setMessages([]);
+      setReadMemoryIds([]);
       updateHiddenMessageCount(0);
       updateBusy(false);
       setSelectedModel("");
@@ -4593,6 +4609,9 @@ export function TaskChat({
         for (const evt of buffered) {
           msgs = reduceHistoryMessages(msgs, evt);
         }
+        // Capture the complete History evidence before applying the optional
+        // render window. A visual optimization must not erase Memory usage.
+        setReadMemoryIds(collectReadMemoryIds(msgs));
         const attachmentCounters = buildAttachmentCounters(msgs);
         const prunedHistory = pruneChatViewMessages(
           msgs,
@@ -5498,6 +5517,12 @@ export function TaskChat({
         case "terminal_chunk":
         case "terminal_complete":
           state.messages = reduceHistoryMessages(state.messages, msg);
+          state.readMemoryIds = [
+            ...new Set([
+              ...(state.readMemoryIds ?? []),
+              ...collectReadMemoryIds(state.messages),
+            ]),
+          ];
           if (msg.type === "terminal_execute") {
             state.isBusy = true;
             setSessionActivity((previous) =>
