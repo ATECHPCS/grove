@@ -42,6 +42,12 @@ use super::{awarn, consumer, cron_util};
 /// before its next scheduled tick, so picking 30 min keeps long agent turns
 /// (research, multi-tool workflows) alive without unbounded resource use.
 const AGENT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+// `AcpUpdate::Complete` is emitted immediately before TaskChat drains its next
+// queued prompt. Give that synchronous drain one scheduler window to surface a
+// `QueueUpdate`/`UserMessage` before treating a project Run as truly settled.
+// The biased receive below still observes an already-buffered follow-up even
+// when the runtime is busy and this wall-clock deadline has elapsed.
+const PROJECT_RUN_FOLLOWUP_GRACE: Duration = Duration::from_millis(100);
 
 /// Grace window between "our entry vanished from the pending queue" and
 /// "treat that as a user cancellation".
@@ -473,7 +479,33 @@ async fn run_handler(automation: &Automation, trigger: consumer::TriggerContext)
             &format!("Agent is not available: {agent_id}"),
         );
     };
-    let session_key = format!("automation-run:{run_id}");
+    // `_memory` is only an ordinary TaskChat storage namespace. It is not a
+    // Task entity and has no row in the tasks table.
+    let task_id = tasks::MEMORY_TASK_ID.to_string();
+    let chat_id = tasks::generate_chat_id();
+    let chat = tasks::ChatSession {
+        id: chat_id.clone(),
+        title: format!(
+            "{} · {}",
+            automation.name,
+            Utc::now().format("%Y-%m-%d %H:%M")
+        ),
+        agent: agent_id.clone(),
+        acp_session_id: None,
+        created_at: Utc::now(),
+        duty: None,
+        launch_mode: "acp".to_string(),
+    };
+    if let Err(error) = tasks::add_chat_session(&automation.project, &task_id, chat) {
+        return fail_handler(
+            automation,
+            handler.as_ref(),
+            &run_id,
+            "resolve_session",
+            &format!("create Automation Run chat: {error}"),
+        );
+    }
+    let session_key = format!("{}:{}:{}", automation.project, task_id, chat_id);
     let start_config = AcpStartConfig {
         agent_command: resolved_agent.command,
         agent_name: resolved_agent.agent_name,
@@ -481,9 +513,12 @@ async fn run_handler(automation: &Automation, trigger: consumer::TriggerContext)
         working_dir: bindings.working_dir,
         env_vars: bindings.env_vars,
         project_key: automation.project.clone(),
-        task_id: run_id.clone(),
-        chat_id: None,
-        artifact_dir: bindings.artifact_dir,
+        task_id: task_id.clone(),
+        chat_id: Some(chat_id.clone()),
+        // Use the ordinary TaskChat history/session.jsonl location. Runtime
+        // bindings still provide Memory MCP/env configuration, but no second
+        // persistence path is introduced for the same conversation.
+        artifact_dir: None,
         additional_mcp_servers: bindings.additional_mcp_servers,
         mcp_server_policy: bindings.mcp_server_policy,
         agent_type: resolved_agent.agent_type,
@@ -497,15 +532,27 @@ async fn run_handler(automation: &Automation, trigger: consumer::TriggerContext)
         match crate::acp::get_or_start_session(session_key.clone(), start_config).await {
             Ok(value) => value,
             Err(error) => {
+                let _ = tasks::delete_chat_session(&automation.project, &task_id, &chat_id);
                 return fail_handler(
                     automation,
                     handler.as_ref(),
                     &run_id,
                     "spawn_acp",
                     &format!("start Automation Agent Session: {error}"),
-                )
+                );
             }
         };
+    if let Err(error) = automations::mark_run_resolved(&run_id, &task_id, &chat_id) {
+        let _ = handle.kill().await;
+        let _ = tasks::delete_chat_session(&automation.project, &task_id, &chat_id);
+        return fail_handler(
+            automation,
+            handler.as_ref(),
+            &run_id,
+            "stamp_resolved",
+            &format!("mark_run_resolved: {error}"),
+        );
+    }
     if let Err(error) = automations::mark_run_running(&run_id) {
         let _ = handle.kill().await;
         return fail_handler(
@@ -573,7 +620,6 @@ async fn run_handler(automation: &Automation, trigger: consumer::TriggerContext)
             task_handler,
             task_automation,
             task_run,
-            session_key,
             bindings.timeout,
             rx,
         )
@@ -608,14 +654,27 @@ async fn wait_for_handler_completion(
     handler: std::sync::Arc<dyn consumer::AutomationHandler>,
     automation: Automation,
     initial_run: AutomationRun,
-    session_key: String,
     timeout: Duration,
     mut rx: tokio::sync::broadcast::Receiver<AcpUpdate>,
 ) {
     let mut response = String::new();
+    let mut settle_after_complete: Option<tokio::time::Instant> = None;
     let terminal = tokio::time::timeout(timeout, async {
         loop {
-            match rx.recv().await {
+            let received = match settle_after_complete {
+                Some(deadline) => {
+                    tokio::select! {
+                        biased;
+                        update = rx.recv() => Some(update),
+                        _ = tokio::time::sleep_until(deadline) => None,
+                    }
+                }
+                None => Some(rx.recv().await),
+            };
+            let Some(received) = received else {
+                break Ok(());
+            };
+            match received {
                 Ok(update) => {
                     automations::publish_run_event(
                         &automation.project,
@@ -623,9 +682,53 @@ async fn wait_for_handler_completion(
                         &initial_run.id,
                         &update,
                     );
+                    // A product-level completion action (for example
+                    // memory_mark_organization_finished) can finish the Run
+                    // independently of the ordinary Chat Session. Stop only
+                    // this Run watcher; never terminate the Session.
+                    if matches!(
+                        automations::get_run(&initial_run.id),
+                        Ok(Some(ref run)) if run.status != "running"
+                    ) {
+                        break Ok(());
+                    }
                     match update {
-                        AcpUpdate::MessageChunk { text } => response.push_str(&text),
-                        AcpUpdate::Complete { .. } => break Ok(()),
+                        AcpUpdate::MessageChunk { text } => {
+                            settle_after_complete = None;
+                            response.push_str(&text);
+                        }
+                        AcpUpdate::Complete { .. } => {
+                            let latest = automations::get_run(&initial_run.id)
+                                .ok()
+                                .flatten()
+                                .unwrap_or_else(|| initial_run.clone());
+                            match handler.completion_requested(consumer::RuntimeContext {
+                                automation: &automation,
+                                run: &latest,
+                            }) {
+                                Ok(true) => {
+                                    settle_after_complete = Some(
+                                        tokio::time::Instant::now() + PROJECT_RUN_FOLLOWUP_GRACE,
+                                    );
+                                }
+                                Ok(false) => {
+                                    // The Agent only finished one ordinary
+                                    // Chat turn. Keep the Run watcher and the
+                                    // Session alive for the user's next turn.
+                                    settle_after_complete = None;
+                                }
+                                Err(error) => break Err(error.to_string()),
+                            }
+                        }
+                        // A successful TaskChat auto-drain emits QueueUpdate
+                        // directly after Complete, before the next UserMessage.
+                        // Keep the Run alive so queued human guidance is not
+                        // discarded when the first Agent turn finishes.
+                        AcpUpdate::QueueUpdate { .. }
+                        | AcpUpdate::UserMessage { .. }
+                        | AcpUpdate::Busy { value: true } => {
+                            settle_after_complete = None;
+                        }
                         AcpUpdate::Error { message } => break Err(message),
                         AcpUpdate::SessionEnded => {
                             break Err(
@@ -722,7 +825,6 @@ async fn wait_for_handler_completion(
             let _ = automations::mark_run_timeout(&latest.id, now(), truncated.as_deref());
         }
     }
-    let _ = crate::acp::kill_session(&session_key);
 }
 
 fn fail(

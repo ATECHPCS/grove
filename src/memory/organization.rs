@@ -16,6 +16,18 @@ Understand the existing Memory and examine all evidence sources made available f
 
 Restructure, enrich, consolidate, or extend the Memory wherever the evidence supports a more useful result. Preserve the meaning, scope, and future applicability of the knowledge you retain, then review the complete Memory and publish this Run."#;
 
+const ORGANIZATION_SESSION_INSTRUCTION: &str = r#"You are working inside an active Grove Memory Organization Run. This is a normal, long-lived TaskChat Session: the user may send corrections, answer permission requests, or provide additional guidance across multiple turns.
+
+Follow these lifecycle rules strictly:
+
+- Finishing an assistant response or an ordinary Chat turn does not finish the Memory Run. Remain available for the user's next message.
+- Handle user messages, permission requests, elicitation, and recoverable errors through the normal TaskChat interaction. If required input or permission is unresolved, ask for it and wait; do not finalize the Run.
+- Only `memory_mark_organization_finished` finishes the Memory Run. Call it exactly once, and only after all supported Entity and Relation work is complete, all required checks have passed, and no user decision or permission needed for the work remains unresolved.
+- Do not call `memory_mark_organization_finished` merely because the initial turn is ending or because you have produced a progress update.
+- After `memory_mark_organization_finished` succeeds, the Memory Run is finished, but the underlying Chat Session remains usable. Do not attempt to end or kill the Session as part of finishing the Run.
+
+Use the Grove Memory MCP tools as the authoritative interface for reading and changing managed Memory during the active Run."#;
+
 const DEEP_ORGANIZATION_HISTORY_INSTRUCTION: &str = r#"Deep organization includes Task Chat histories. Use the recent-Chats tool to list the relevant files and the review window for this Run.
 
 Each item contains `task_name`, `session_name`, `absolute_history_path`, `new_content_start_line`, and `total_lines`. Use the names to understand the conversation's purpose. The path is absolute. Start with the suggested new-content line for efficiency, but read earlier lines whenever they provide necessary context; it is a hint, not a restriction. A direct range read is `sed -n '<new_content_start_line>,<total_lines>p' <absolute_history_path>`.
@@ -30,6 +42,14 @@ Use structural searches before reading large ranges:
 - Search for a concept across the raw history with `rg -ni '<query>' <absolute_history_path>`, then inspect the surrounding turn with a bounded `sed -n '<start>,<end>p'` range.
 
 Thought, configuration, permission, terminal, and detailed tool-call events are normally lower-value evidence. Inspect tool-call titles, status, inputs, or outputs only when they are needed to verify what the assistant actually did or why the user reacted as they did."#;
+
+fn organization_session_instruction(deep_organization: bool) -> String {
+    if deep_organization {
+        format!("{ORGANIZATION_SESSION_INSTRUCTION}\n\n{DEEP_ORGANIZATION_HISTORY_INSTRUCTION}")
+    } else {
+        ORGANIZATION_SESSION_INSTRUCTION.to_string()
+    }
+}
 
 pub struct MemoryOrganizationHandler;
 
@@ -58,9 +78,6 @@ impl AutomationHandler for MemoryOrganizationHandler {
     fn runtime_bindings(&self, context: RuntimeContext<'_>) -> Result<RuntimeBindings> {
         let project = workspace::load_project_by_hash(&context.automation.project)?
             .ok_or_else(|| GroveError::not_found("Project is not registered"))?;
-        let artifact_dir = memory::runs_dir(&context.automation.project)?.join(&context.run.id);
-        std::fs::create_dir_all(&artifact_dir)?;
-
         let token = uuid::Uuid::new_v4().to_string();
         memory_mcp::register_organization_token(
             token.clone(),
@@ -84,18 +101,20 @@ impl AutomationHandler for MemoryOrganizationHandler {
             .unwrap_or(false);
         Ok(RuntimeBindings {
             working_dir: workspace::project_directory(&project),
-            artifact_dir: Some(artifact_dir),
             env_vars,
             additional_mcp_servers: vec![LoopbackMcpServer {
                 name: "grove_memory".to_string(),
                 url: mcp_url,
                 route: "memory-mcp".to_string(),
-                session_instruction: deep_organization
-                    .then(|| DEEP_ORGANIZATION_HISTORY_INSTRUCTION.to_string()),
+                session_instruction: Some(organization_session_instruction(deep_organization)),
             }],
             mcp_server_policy: McpServerPolicy::ExplicitOnly,
             timeout: Duration::from_secs(30 * 60),
         })
+    }
+
+    fn completion_requested(&self, context: RuntimeContext<'_>) -> Result<bool> {
+        memory::organization_submission_staged(&context.automation.project, &context.run.id)
     }
 
     fn post_action(
@@ -126,11 +145,54 @@ impl AutomationHandler for MemoryOrganizationHandler {
         Ok(())
     }
 
-    fn remove_run_artifacts(&self, project_id: &str, run_id: &str) -> Result<()> {
+    fn remove_run_artifacts(
+        &self,
+        project_id: &str,
+        run_id: &str,
+        resolved_task_id: Option<&str>,
+        resolved_chat_id: Option<&str>,
+    ) -> Result<()> {
+        if let (Some(task_id), Some(chat_id)) = (resolved_task_id, resolved_chat_id) {
+            let session_key = format!("{project_id}:{task_id}:{chat_id}");
+            let _ = crate::acp::kill_session(&session_key);
+            crate::storage::tasks::delete_chat_session(project_id, task_id, chat_id)?;
+            let chat_dir = crate::storage::grove_dir()
+                .join("projects")
+                .join(project_id)
+                .join("tasks")
+                .join(task_id)
+                .join("chats")
+                .join(chat_id);
+            if chat_dir.exists() {
+                std::fs::remove_dir_all(chat_dir)?;
+            }
+        }
         let path = memory::runs_dir(project_id)?.join(run_id);
         if path.exists() {
             std::fs::remove_dir_all(path)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn organization_instruction_always_enforces_interactive_run_lifecycle() {
+        let instruction = organization_session_instruction(false);
+        assert!(instruction.contains("ordinary Chat turn does not finish the Memory Run"));
+        assert!(instruction.contains("permission is unresolved"));
+        assert!(instruction.contains("Only `memory_mark_organization_finished` finishes"));
+        assert!(instruction.contains("Chat Session remains usable"));
+        assert!(!instruction.contains("Deep organization includes Task Chat histories"));
+    }
+
+    #[test]
+    fn deep_organization_appends_history_guidance_to_lifecycle_rules() {
+        let instruction = organization_session_instruction(true);
+        assert!(instruction.contains("Only `memory_mark_organization_finished` finishes"));
+        assert!(instruction.contains("Deep organization includes Task Chat histories"));
     }
 }

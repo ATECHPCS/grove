@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { listChats, createChat } from "../../../api";
+import { listChats, listArchivedChats, createChat } from "../../../api";
 import type { ChatSessionResponse } from "../../../api";
 import {
   readLastActiveTab,
@@ -15,6 +15,7 @@ function buildDefaultSessionTitle(): string {
 interface Params {
   projectId: string;
   taskId: string;
+  fixedChatId?: string;
   setChats: (chats: ChatSessionResponse[]) => void;
   setActiveChatId: (id: string) => void;
 }
@@ -30,6 +31,7 @@ interface Params {
 export function useInitialChatLoad({
   projectId,
   taskId,
+  fixedChatId,
   setChats,
   setActiveChatId,
 }: Params): void {
@@ -37,6 +39,26 @@ export function useInitialChatLoad({
     let cancelled = false;
 
     const init = async () => {
+      if (fixedChatId) {
+        try {
+          const chatList = await listChats(projectId, taskId);
+          let chat = chatList.find((item) => item.id === fixedChatId);
+          if (!chat) {
+            const archived = await listArchivedChats(projectId, taskId);
+            chat = archived.find((item) => item.id === fixedChatId);
+          }
+          if (cancelled) return;
+          if (!chat) {
+            console.error("Fixed chat not found:", fixedChatId);
+            return;
+          }
+          setChats([chat]);
+          setActiveChatId(chat.id);
+        } catch (err) {
+          console.error("Failed to load fixed chat:", err);
+        }
+        return;
+      }
       // Pull as much branching logic as possible OUT of the try/catch:
       // React Compiler 1.0 bails out when a try block contains optional
       // chaining / logical-or / ternary / `if` over computed values.
@@ -97,5 +119,5 @@ export function useInitialChatLoad({
     return () => {
       cancelled = true;
     };
-  }, [projectId, taskId, setChats, setActiveChatId]);
+  }, [projectId, taskId, fixedChatId, setChats, setActiveChatId]);
 }

@@ -118,7 +118,7 @@ export const BUILT_IN_PANELS: PanelDescriptor[] = [
         <TaskChat
           key={`${ctx.projectId}:${ctx.task.id}`}
           projectId={ctx.projectId}
-          task={ctx.task}
+          taskId={ctx.task.id}
           fullscreen
           onNavigateToFile={ctx.navigateToFile}
           onChatBecameIdle={ctx.onChatBecameIdle}

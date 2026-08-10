@@ -990,6 +990,8 @@ struct RunArtifact {
     run_id: String,
     project_id: String,
     handler_key: String,
+    resolved_task_id: Option<String>,
+    resolved_chat_id: Option<String>,
 }
 
 fn collect_run_artifacts(
@@ -997,7 +999,8 @@ fn collect_run_artifacts(
     automation_id: &str,
     only_trimmed: bool,
 ) -> Result<Vec<RunArtifact>> {
-    let mut sql = "SELECT r.id, a.project, a.handler_key
+    let mut sql = "SELECT r.id, a.project, a.handler_key,
+                          r.resolved_task_id, r.resolved_chat_id
                    FROM automation_runs r
                    JOIN automations a ON a.id = r.automation_id
                    WHERE r.automation_id = ?1"
@@ -1018,6 +1021,8 @@ fn collect_run_artifacts(
             run_id: row.get(0)?,
             project_id: row.get(1)?,
             handler_key: row.get(2)?,
+            resolved_task_id: row.get(3)?,
+            resolved_chat_id: row.get(4)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1029,6 +1034,8 @@ fn cleanup_run_artifacts(artifacts: Vec<RunArtifact>) {
             &artifact.handler_key,
             &artifact.project_id,
             &artifact.run_id,
+            artifact.resolved_task_id.as_deref(),
+            artifact.resolved_chat_id.as_deref(),
         ) {
             crate::automation::awarn!(
                 "remove artifacts for Automation Run {}: {}",
@@ -1079,6 +1086,28 @@ pub fn get_run(run_id: &str) -> Result<Option<AutomationRun>> {
     Ok(row)
 }
 
+pub fn nonterminal_run_id_for_chat(
+    project_id: &str,
+    task_id: &str,
+    chat_id: &str,
+) -> Result<Option<String>> {
+    let conn = super::database::connection();
+    Ok(conn
+        .query_row(
+            "SELECT r.id
+             FROM automation_runs r
+             JOIN automations a ON a.id = r.automation_id
+             WHERE a.project = ?1 AND r.resolved_task_id = ?2
+               AND r.resolved_chat_id = ?3
+               AND r.status IN ('queued','running','cancelling')
+             ORDER BY r.triggered_at DESC, r.rowid DESC
+             LIMIT 1",
+            params![project_id, task_id, chat_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 pub fn list_runs(automation_id: &str, limit: usize) -> Result<Vec<AutomationRun>> {
     let conn = super::database::connection();
     let mut stmt = conn.prepare(&format!(
@@ -1112,7 +1141,8 @@ pub fn delete_finished_run(automation_id: &str, run_id: &str) -> Result<bool> {
     let tx = conn.unchecked_transaction()?;
     let artifact = tx
         .query_row(
-            "SELECT r.id, a.project, a.handler_key, r.status
+            "SELECT r.id, a.project, a.handler_key, r.resolved_task_id,
+                    r.resolved_chat_id, r.status
              FROM automation_runs r
              JOIN automations a ON a.id = r.automation_id
              WHERE r.automation_id = ?1 AND r.id = ?2",
@@ -1123,8 +1153,10 @@ pub fn delete_finished_run(automation_id: &str, run_id: &str) -> Result<bool> {
                         run_id: row.get(0)?,
                         project_id: row.get(1)?,
                         handler_key: row.get(2)?,
+                        resolved_task_id: row.get(3)?,
+                        resolved_chat_id: row.get(4)?,
                     },
-                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )

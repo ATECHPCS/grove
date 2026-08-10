@@ -8,6 +8,9 @@ use crate::error::{GroveError, Result};
 
 /// Local Task 的固定 ID
 pub const LOCAL_TASK_ID: &str = "_local";
+/// Internal TaskChat storage namespace for Memory Organization chats.
+/// This is not a persisted Task record.
+pub const MEMORY_TASK_ID: &str = "_memory";
 
 /// Chat 会话（一个 Task 下可以有多个 Chat）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1083,6 +1086,147 @@ mod tests {
 
         assert_eq!(uuid.len(), 32);
         assert!(uuid.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn memory_namespace_uses_ordinary_chat_storage_without_a_task_record() {
+        let _lock = crate::storage::database::test_lock().blocking_lock();
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        let project = format!("project-{}", uuid::Uuid::new_v4().simple());
+        let now = Utc::now();
+        assert!(get_task_any(&project, MEMORY_TASK_ID).unwrap().is_none());
+
+        let chat_id = generate_chat_id();
+        add_chat_session(
+            &project,
+            MEMORY_TASK_ID,
+            ChatSession {
+                id: chat_id.clone(),
+                title: "Memory Run".to_string(),
+                agent: "claude".to_string(),
+                acp_session_id: None,
+                created_at: now,
+                duty: None,
+                launch_mode: "acp".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(get_task_any(&project, MEMORY_TASK_ID).unwrap().is_none());
+        assert_eq!(
+            load_chat_sessions(&project, MEMORY_TASK_ID)
+                .unwrap()
+                .into_iter()
+                .map(|chat| chat.id)
+                .collect::<Vec<_>>(),
+            vec![chat_id]
+        );
+
+        crate::storage::set_grove_dir_override(None);
+    }
+
+    #[test]
+    fn archived_sessions_leave_normal_discovery_until_restored() {
+        let _lock = crate::storage::database::test_lock().blocking_lock();
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        let project = format!("project-{}", uuid::Uuid::new_v4().simple());
+        let task_id = "task-archive";
+        let make_chat = |id: &str| ChatSession {
+            id: id.to_string(),
+            title: id.to_string(),
+            agent: "codex".to_string(),
+            acp_session_id: None,
+            created_at: Utc::now(),
+            duty: None,
+            launch_mode: "acp".to_string(),
+        };
+        add_chat_session(&project, task_id, make_chat("active")).unwrap();
+        add_chat_session(&project, task_id, make_chat("archive-me")).unwrap();
+
+        assert!(archive_chat_session(&project, task_id, "archive-me").unwrap());
+        assert_eq!(
+            load_chat_sessions(&project, task_id)
+                .unwrap()
+                .into_iter()
+                .map(|chat| chat.id)
+                .collect::<Vec<_>>(),
+            vec!["active"]
+        );
+        assert_eq!(
+            load_archived_chat_sessions(&project, task_id)
+                .unwrap()
+                .into_iter()
+                .map(|chat| chat.id)
+                .collect::<Vec<_>>(),
+            vec!["archive-me"]
+        );
+        assert!(get_chat_session(&project, task_id, "archive-me")
+            .unwrap()
+            .is_none());
+        assert!(
+            get_chat_session_including_archived(&project, task_id, "archive-me")
+                .unwrap()
+                .is_some()
+        );
+
+        assert!(restore_chat_session(&project, task_id, "archive-me").unwrap());
+        assert!(load_archived_chat_sessions(&project, task_id)
+            .unwrap()
+            .is_empty());
+        assert!(get_chat_session(&project, task_id, "archive-me")
+            .unwrap()
+            .is_some());
+
+        crate::storage::set_grove_dir_override(None);
+    }
+
+    #[test]
+    fn active_sessions_are_ordered_by_recent_activity() {
+        let _lock = crate::storage::database::test_lock().blocking_lock();
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        let project = format!("project-{}", uuid::Uuid::new_v4().simple());
+        let task_id = "task-recent-activity";
+        let now = Utc::now();
+        let make_chat = |id: &str, created_at| ChatSession {
+            id: id.to_string(),
+            title: id.to_string(),
+            agent: "codex".to_string(),
+            acp_session_id: None,
+            created_at,
+            duty: None,
+            launch_mode: "acp".to_string(),
+        };
+        add_chat_session(
+            &project,
+            task_id,
+            make_chat("older", now - chrono::Duration::days(1)),
+        )
+        .unwrap();
+        add_chat_session(&project, task_id, make_chat("newer", now)).unwrap();
+
+        let ids = || {
+            load_chat_sessions(&project, task_id)
+                .unwrap()
+                .into_iter()
+                .map(|chat| chat.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(), vec!["newer", "older"]);
+
+        assert!(touch_chat_session(&project, task_id, "older").unwrap());
+        assert_eq!(ids(), vec!["older", "newer"]);
+
+        assert!(archive_chat_session(&project, task_id, "older").unwrap());
+        assert!(!touch_chat_session(&project, task_id, "older").unwrap());
+        assert!(restore_chat_session(&project, task_id, "older").unwrap());
+        assert_eq!(ids(), vec!["older", "newer"]);
+
+        crate::storage::set_grove_dir_override(None);
     }
 
     #[test]

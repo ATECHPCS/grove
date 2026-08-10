@@ -1094,9 +1094,13 @@ const WORKING_BROWSER_INSTRUCTION: &str = r#"Use browser control when the work d
 
 const WORKING_MEMORY_INSTRUCTION: &str = r#"Project Memory preserves long-term knowledge about both the Project and its working context.
 
-Recall applicable Memory when previous context may affect the current work, especially goals, decisions, rationale, constraints, terminology, user preferences, communication and collaboration patterns, interaction rules, workflows, recurring problems, and reusable lessons. Apply each Memory according to its recorded scope, conditions, and current validity. Treat organized long-term Memory as established context and recent unorganized Logs as evidence that may still require reconciliation.
+When context required for the current work is missing, incomplete, ambiguous, or appears to depend on prior work, search Project Memory before guessing, acting, or asking the user to repeat information. This is a required first step, not optional background research.
 
-When the current work establishes, changes, or corrects durable context, append a Memory Log. Preserve the meaning a future Agent will need:
+Use `memory_recall` with the missing subject, current Task scope, and relevant terminology. Also use `memory_get_recent_logs` to find recent decisions, corrections, instructions, and unfinished work that may not yet be organized. For every potentially relevant Entity returned by recall, use `memory_read` before relying on it. Reconcile organized long-term Memory and recent unorganized Logs with the current Task notes and the user's latest instruction. If the required context is still missing after this search, then ask the user for it.
+
+Apply each Memory according to its recorded scope, conditions, and current validity. Treat organized long-term Memory as established context and recent unorganized Logs as evidence that may still require reconciliation.
+
+When the user or the current work establishes, changes, corrects, rejects, or supersedes durable context, use `memory_append_log` in the same turn as soon as its meaning is clear. Do not defer the Log until Task completion, Session completion, or a later reminder from the user. Preserve the meaning a future Agent will need:
 
 - A decision preserves its context, outcome, rationale, status, and relevant boundaries.
 - A rule preserves when it applies, the behavior it requires, and its scope.
@@ -3565,6 +3569,54 @@ fn store_config_snapshot(handle: &AcpSessionHandle, config_options: &[acp::Sessi
     *handle.current_config_options.lock().unwrap() = config_options.to_vec();
 }
 
+fn config_option_current_value(option: &acp::SessionConfigOption) -> Option<ConfigOptionValue> {
+    match &option.kind {
+        acp::SessionConfigKind::Boolean(boolean) => {
+            Some(ConfigOptionValue::Boolean(boolean.current_value))
+        }
+        acp::SessionConfigKind::Select(select) => {
+            Some(ConfigOptionValue::Select(select.current_value.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// Return persisted values that are still accepted by the newly-started ACP
+/// Session and differ from its current values. Iterating in the live Agent's
+/// advertised order keeps dependent options deterministic.
+fn config_options_to_restore(
+    persisted: &[acp::SessionConfigOption],
+    advertised: &[acp::SessionConfigOption],
+) -> Vec<(String, ConfigOptionValue)> {
+    let persisted_values = persisted
+        .iter()
+        .filter_map(|option| {
+            config_option_current_value(option).map(|value| (option.id.to_string(), value))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    advertised
+        .iter()
+        .filter_map(|option| {
+            let config_id = option.id.to_string();
+            let value = persisted_values.get(&config_id)?.clone();
+            (crate::agent_config::config_option_accepts(option, &value)
+                && !crate::agent_config::config_option_has_current_value(option, &value))
+            .then_some((config_id, value))
+        })
+        .collect()
+}
+
+fn legacy_mode_to_restore(
+    persisted: Option<&str>,
+    current: Option<&str>,
+    available: &[(String, String)],
+) -> Option<String> {
+    let persisted = persisted?;
+    (current != Some(persisted) && available.iter().any(|(id, _)| id == persisted))
+        .then(|| persisted.to_string())
+}
+
 fn replace_config_snapshot(
     handle: &AcpSessionHandle,
     config_options: Vec<acp::SessionConfigOption>,
@@ -4939,6 +4991,14 @@ async fn drive_session(
             .flatten()
             .and_then(|c| c.acp_session_id)
     });
+    // Capture the last confirmed runtime settings before SessionReady replaces
+    // session.json with the Agent's startup defaults. This snapshot is used
+    // below to restore settings after an app/process restart.
+    let persisted_session_metadata = config
+        .chat_id
+        .as_ref()
+        .and_then(|cid| read_session_metadata(&config.project_key, &config.task_id, cid));
+    let should_restore_persisted_settings = saved_id.is_some();
 
     let persist_session_id = |sid: &str| {
         if let Some(ref cid) = config.chat_id {
@@ -5623,6 +5683,87 @@ async fn drive_session(
 
     let session_id_arc = acp::SessionId::new(&*session_id);
 
+    // A restarted Agent may successfully resume/load the conversation while
+    // still returning default config values. Re-apply the last values Grove
+    // confirmed in session.json before publishing SessionReady, so the UI and
+    // the actual Agent runtime cannot diverge. Removed or invalid options are
+    // deliberately skipped; the new Agent snapshot remains the capability
+    // authority.
+    if should_restore_persisted_settings {
+        if let Some(persisted) = persisted_session_metadata.as_ref() {
+            if uses_config_options {
+                let restore = config_options_to_restore(&persisted.config_options, &config_options);
+                for (config_id, value) in restore {
+                    let request_value = match config_request_value(
+                        &config_options,
+                        &config_id,
+                        value,
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            handle.emit(AcpUpdate::ConfigOptionError {
+                                config_id: config_id.clone(),
+                                message: format!(
+                                    "Could not restore saved session setting '{config_id}'; using the Agent's current value. {error}"
+                                ),
+                            });
+                            continue;
+                        }
+                    };
+                    let result = conn
+                        .send_request(acp::SetSessionConfigOptionRequest::new(
+                            session_id_arc.clone(),
+                            acp::SessionConfigId::new(config_id.clone()),
+                            request_value,
+                        ))
+                        .block_task()
+                        .await;
+                    match result {
+                    Ok(response) => {
+                        config_options = response.config_options;
+                        (available_modes, current_mode_id, _, mode_descriptions) =
+                            extract_modes(&None, &config_options, true);
+                        (available_models, current_model_id, model_config_id) =
+                            extract_models(&config_options);
+                        (
+                            available_thought_levels,
+                            current_thought_level_id,
+                            thought_level_config_id,
+                        ) = extract_thought_level(&config_options);
+                    }
+                    Err(error) => handle.emit(AcpUpdate::ConfigOptionError {
+                        config_id: config_id.clone(),
+                        message: format!(
+                            "Could not restore saved session setting '{config_id}'; using the Agent's current value. {error}"
+                        ),
+                    }),
+                    }
+                }
+            } else if let Some(saved_mode) = legacy_mode_to_restore(
+                persisted.current_mode_id.as_deref(),
+                current_mode_id.as_deref(),
+                &available_modes,
+            ) {
+                let result = conn
+                    .send_request(acp::SetSessionModeRequest::new(
+                        session_id_arc.clone(),
+                        acp::SessionModeId::new(saved_mode.clone()),
+                    ))
+                    .block_task()
+                    .await;
+                match result {
+                    Ok(_) => current_mode_id = Some(saved_mode.clone()),
+                    Err(error) => handle.emit(AcpUpdate::ConfigOptionError {
+                        config_id: "__legacy_mode".to_string(),
+                        message: format!(
+                            "Could not restore saved session mode '{saved_mode}'; using the Agent's current mode. {error}"
+                        ),
+                    }),
+                }
+            }
+        }
+    }
+
     let prompt_capabilities = PromptCapabilitiesData {
         image: init_resp.agent_capabilities.prompt_capabilities.image,
         audio: init_resp.agent_capabilities.prompt_capabilities.audio,
@@ -6039,6 +6180,21 @@ async fn drive_session(
                 // 选取 send_request 而非用户点 send 的时刻,是为了排除 prompt 队列
                 // 等待时间,只反映 agent 真正"思考"了多久。
                 let turn_start_ts = chrono::Utc::now().timestamp();
+                // Resolve Automation ownership at turn start. A product-level
+                // completion tool can make the Run terminal before ACP returns
+                // this turn's usage; looking it up at `Complete` would then
+                // incorrectly charge the `_memory` TaskChat namespace instead.
+                // Later turns in the still-usable Chat correctly have no Run
+                // owner because the original Run is already terminal.
+                let automation_run_id_owned = config.chat_id.as_deref().and_then(|chat_id| {
+                    crate::storage::automations::nonterminal_run_id_for_chat(
+                        &config.project_key,
+                        &config.task_id,
+                        chat_id,
+                    )
+                    .ok()
+                    .flatten()
+                });
 
                 // 用 SentRequest::block_task() 得到可被 select 的 future
                 let prompt_fut = conn
@@ -6265,14 +6421,17 @@ async fn drive_session(
                         if let Some(usage) = &turn_usage {
                             let model_owned =
                                 handle.current_model_id.lock().ok().and_then(|g| g.clone());
-                            let automation_run_id = config
-                                .artifact_dir
-                                .as_ref()
-                                .map(|_| config.task_id.as_str());
+                            let automation_run_id = automation_run_id_owned.as_deref();
                             let rec = crate::storage::token_usage::TokenUsageRecord {
                                 project_key: &config.project_key,
-                                task_id: config.chat_id.as_ref().map(|_| config.task_id.as_str()),
-                                chat_id: config.chat_id.as_deref(),
+                                task_id: automation_run_id
+                                    .is_none()
+                                    .then_some(config.task_id.as_str())
+                                    .filter(|_| config.chat_id.is_some()),
+                                chat_id: automation_run_id
+                                    .is_none()
+                                    .then_some(config.chat_id.as_deref())
+                                    .flatten(),
                                 automation_run_id,
                                 agent: &config.agent_name,
                                 model: model_owned.as_deref(),
@@ -9152,6 +9311,29 @@ mod tests {
         assert!(!is_short_memory_tool("memory_append_log"));
     }
 
+    #[test]
+    fn working_memory_instruction_requires_recall_before_proceeding_and_timely_append() {
+        for tool in [
+            "memory_recall",
+            "memory_get_recent_logs",
+            "memory_read",
+            "memory_append_log",
+        ] {
+            assert!(WORKING_MEMORY_INSTRUCTION.contains(tool));
+        }
+        assert!(WORKING_MEMORY_INSTRUCTION
+            .contains("search Project Memory before guessing, acting, or asking the user"));
+        assert!(WORKING_MEMORY_INSTRUCTION.contains(
+            "If the required context is still missing after this search, then ask the user"
+        ));
+        assert!(
+            WORKING_MEMORY_INSTRUCTION.contains("in the same turn as soon as its meaning is clear")
+        );
+        assert!(WORKING_MEMORY_INSTRUCTION.contains(
+            "Do not defer the Log until Task completion, Session completion, or a later reminder"
+        ));
+    }
+
     fn client_state_for_test(
         handle: Arc<AcpSessionHandle>,
         terminals: Arc<Mutex<HashMap<String, TerminalState>>>,
@@ -10190,6 +10372,81 @@ mod tests {
                 ("deep".to_string(), "Deep".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn restart_restore_keeps_only_valid_changed_config_values_in_live_order() {
+        let persisted = vec![
+            acp::SessionConfigOption::boolean("autoApprove", "Auto approve", true),
+            acp::SessionConfigOption::select(
+                "model",
+                "Model",
+                "opus",
+                vec![
+                    acp::SessionConfigSelectOption::new("sonnet", "Sonnet"),
+                    acp::SessionConfigSelectOption::new("opus", "Opus"),
+                ],
+            ),
+            acp::SessionConfigOption::select(
+                "removed",
+                "Removed",
+                "old",
+                vec![acp::SessionConfigSelectOption::new("old", "Old")],
+            ),
+        ];
+        let advertised = vec![
+            acp::SessionConfigOption::select(
+                "model",
+                "Model",
+                "sonnet",
+                vec![
+                    acp::SessionConfigSelectOption::new("sonnet", "Sonnet"),
+                    acp::SessionConfigSelectOption::new("opus", "Opus"),
+                ],
+            ),
+            acp::SessionConfigOption::boolean("autoApprove", "Auto approve", true),
+        ];
+
+        assert_eq!(
+            config_options_to_restore(&persisted, &advertised),
+            vec![(
+                "model".to_string(),
+                ConfigOptionValue::Select("opus".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn restart_restore_rejects_saved_values_removed_by_the_agent() {
+        let persisted = vec![acp::SessionConfigOption::select(
+            "model",
+            "Model",
+            "opus",
+            vec![acp::SessionConfigSelectOption::new("opus", "Opus")],
+        )];
+        let advertised = vec![acp::SessionConfigOption::select(
+            "model",
+            "Model",
+            "sonnet",
+            vec![acp::SessionConfigSelectOption::new("sonnet", "Sonnet")],
+        )];
+
+        assert!(config_options_to_restore(&persisted, &advertised).is_empty());
+    }
+
+    #[test]
+    fn restart_restore_only_reapplies_an_available_changed_legacy_mode() {
+        let available = vec![
+            ("code".to_string(), "Code".to_string()),
+            ("plan".to_string(), "Plan".to_string()),
+        ];
+
+        assert_eq!(
+            legacy_mode_to_restore(Some("plan"), Some("code"), &available).as_deref(),
+            Some("plan")
+        );
+        assert!(legacy_mode_to_restore(Some("plan"), Some("plan"), &available).is_none());
+        assert!(legacy_mode_to_restore(Some("removed"), Some("code"), &available).is_none());
     }
 
     #[test]

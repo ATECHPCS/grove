@@ -914,6 +914,10 @@ pub fn create_api_router() -> Router {
             post(handlers::automations::cancel_run),
         )
         .route(
+            "/projects/{id}/automations/{aid}/runs/{run_id}/finish",
+            post(handlers::automations::finish_run),
+        )
+        .route(
             "/projects/{id}/automation-runs/ws",
             get(handlers::automations::run_updates_ws),
         )
@@ -1675,38 +1679,26 @@ pub async fn initialize_local_server_runtime(port: u16) -> std::io::Result<()> {
 
     // Automation cron scheduler — fires while Grove is running. Missed runs
     // during downtime are not back-filled; the next fire window is the next
-    // scheduled tick.
-    //
-    // Sweep any `queued` runs left over from a previous Grove process (whose
-    // ACP subscriber died with the process) into `interrupted` first, so
-    // the run-history UI doesn't display them as "still running forever".
+    // scheduled tick. Sweep interrupted runs before starting the scheduler.
     start_automation_runtime();
 
     // Start the in-process agent_graph MCP listener (loopback-only). Failure to
     // bind is non-fatal — the rest of the server still boots; ACP sessions will
     // simply spawn without agent_graph tools available.
-    match crate::api::handlers::agent_graph_mcp::start_listener(
+    if let Err(e) = crate::api::handlers::agent_graph_mcp::start_listener(
         crate::api::handlers::agent_graph_mcp::DEFAULT_BASE_PORT,
         crate::api::handlers::agent_graph_mcp::DEFAULT_MAX_ATTEMPTS,
     )
     .await
     {
-        Ok(_port) => {
-            // Listener bound successfully; success is silent. Failures still
-            // print since they disable agent_graph tools downstream.
-        }
-        Err(e) => {
-            eprintln!(
-                "[agent_graph_mcp] failed to bind listener: {} — agent_graph tools disabled",
-                e
-            );
-        }
+        eprintln!(
+            "[agent_graph_mcp] failed to bind listener: {} — agent_graph tools disabled",
+            e
+        );
     }
 
-    // Initialize FileWatchers for all live tasks
     init_file_watchers();
 
-    // Ensure _main and _local system groups exist
     if let Err(e) = crate::storage::taskgroups::ensure_system_groups() {
         eprintln!("[warning] Failed to ensure system groups: {}", e);
     }

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { motion } from "framer-motion";
+import { createPortal } from "react-dom";
+import { AnimatePresence, motion } from "framer-motion";
 import cronstrue from "cronstrue";
 import {
   Activity,
@@ -43,6 +44,7 @@ import {
   type AgentConfigSelection,
   type AutomationRun,
   cancelAutomationRun,
+  finishAutomationRun,
   listAutomationRuns,
   triggerAutomation,
 } from "../../api/automations";
@@ -80,6 +82,7 @@ import {
   hasReadableToolOutput,
   type ToolCallMessage,
 } from "../Tasks/TaskView/toolCallReducer";
+import { TaskChat } from "../Tasks/TaskView/TaskChat";
 
 type Tab = "overview" | "memories" | "logs" | "runs";
 
@@ -1357,6 +1360,7 @@ function RunsTab({
   const [error, setError] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<AutomationRun | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [finishingRunId, setFinishingRunId] = useState<string | null>(null);
   const historySequenceRef = useRef(0);
   const autoOpenedRunRef = useRef<string | null>(null);
   const load = useCallback(async () => {
@@ -1374,6 +1378,11 @@ function RunsTab({
     void Promise.resolve().then(() => {
       if (!active) return;
       if (latestUpdate.run) {
+        if (isTerminal(latestUpdate.run.status)) {
+          setFinishingRunId((current) =>
+            current === latestUpdate.run_id ? null : current,
+          );
+        }
         setRuns((current) => {
           const index = current.findIndex((run) => run.id === latestUpdate.run_id);
           if (index < 0) return [latestUpdate.run!, ...current];
@@ -1463,25 +1472,124 @@ function RunsTab({
     }
   };
 
+  const finishRun = async (run: AutomationRun) => {
+    if (!config || finishingRunId) return;
+    setFinishingRunId(run.id);
+    try {
+      await finishAutomationRun(projectId, config.organization.id, run.id);
+    } catch (reason) {
+      setFinishingRunId(null);
+      setError(errorMessage(reason));
+    }
+  };
+
+  const selectedRun = expanded
+    ? runs.find((run) => run.id === expanded) ?? null
+    : null;
+
+  useEffect(() => {
+    if (!selectedRun) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setExpanded(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [selectedRun]);
+
   if (!config) return <EmptyPage title="Memory is not configured" description="Open Overview, choose an Agent, and save the project settings first." />;
-  return <div className="h-full min-h-0 space-y-3 overflow-y-auto pr-1 pb-2">
-    {error && <InlineNotice tone="error" message={error} onClose={() => setError(null)} />}
-    {!loading && runs.length === 0 ? <EmptyPage title="No organization runs" description="Use Run now from Overview or wait for the configured schedule." /> : runs.map((run) => (
-      <div key={run.id} className="rounded-2xl border border-[var(--color-border)] overflow-hidden">
+  return <div className="h-full min-h-0">
+    <div className="h-full min-h-0 space-y-3 overflow-y-auto pr-1 pb-2">
+      {error && <InlineNotice tone="error" message={error} onClose={() => setError(null)} />}
+      {!loading && runs.length === 0 ? <EmptyPage title="No organization runs" description="Use Run now from Overview or wait for the configured schedule." /> : runs.map((run) => (
+      <div key={run.id} className={`rounded-2xl border overflow-hidden transition-colors ${expanded === run.id ? "border-[var(--color-highlight)] bg-[var(--color-highlight)]/[0.025]" : "border-[var(--color-border)]"}`}>
         <div className="px-4 py-4 flex items-center gap-3 hover:bg-[var(--color-bg-secondary)]/55 transition-colors">
           <button onClick={() => toggle(run.id)} className="min-w-0 flex-1 flex items-center gap-3 text-left">
             <RunStatus status={run.status} />
             <div className="min-w-0 flex-1"><div className="flex items-center gap-2"><span className="truncate font-medium text-sm text-[var(--color-text)]">{runTitle(run)}</span><span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]">{humanize(run.trigger_kind)}</span></div><p className="text-xs text-[var(--color-text-muted)] mt-1">{formatDate(run.triggered_at * 1000)} · {durationLabel(run)}{run.agent_snapshot ? ` · ${run.agent_snapshot}` : ""}</p></div>
             <RunCounts result={run.result} />
           </button>
-          {!isTerminal(run.status) && <Button variant="ghost" size="sm" onClick={() => void cancelAutomationRun(projectId, config.organization.id, run.id)}>Cancel</Button>}
+          {run.status === "running" && <Button variant="ghost" size="sm" disabled={finishingRunId === run.id} onClick={() => void finishRun(run)}>{finishingRunId === run.id ? "Finishing…" : "Finish"}</Button>}
+          {["queued", "running"].includes(run.status) && <Button variant="ghost" size="sm" onClick={() => void cancelAutomationRun(projectId, config.organization.id, run.id)}>Cancel</Button>}
           {isTerminal(run.status) && <button type="button" onClick={() => setDeleteTarget(run)} className="rounded-lg p-2 text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-error)]/10 hover:text-[var(--color-error)]" aria-label="Delete organization run" title="Delete run"><Trash2 className="h-4 w-4" /></button>}
-          <button onClick={() => toggle(run.id)} className="p-1 text-[var(--color-text-muted)]">{expanded === run.id ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}</button>
+          <button onClick={() => toggle(run.id)} className="p-1 text-[var(--color-text-muted)]" aria-label={expanded === run.id ? "Close run" : "Open run"}><ChevronRight className={`w-4 h-4 transition-transform ${expanded === run.id ? "rotate-180" : ""}`} /></button>
         </div>
-        {expanded === run.id && <div className="border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)]/25 px-4 py-3"><RunTranscript events={history} usage={historyUsage} loading={historyLoading} active={!isTerminal(run.status)} error={run.error} summary={typeof run.result?.summary === "string" ? run.result.summary : undefined} /></div>}
       </div>
-    ))}
-    {loading && <CenteredLoading compact />}
+      ))}
+      {loading && <CenteredLoading compact />}
+    </div>
+
+    {typeof document !== "undefined" && createPortal(
+      <AnimatePresence>
+        {selectedRun && (
+          <>
+            <motion.button
+              key="memory-run-backdrop"
+              type="button"
+              aria-label="Close run"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.18 }}
+              onClick={() => setExpanded(null)}
+              className="fixed inset-0 z-[80] cursor-default bg-black/25 backdrop-blur-[1px]"
+            />
+            <motion.section
+              key={selectedRun.id}
+              initial={{ x: "calc(100% + 2rem)", opacity: 0 }}
+              animate={{ x: 0, opacity: 1 }}
+              exit={{ x: "calc(100% + 2rem)", opacity: 0 }}
+              transition={{ type: "spring", damping: 30, stiffness: 300 }}
+              className="fixed bottom-4 right-4 top-4 z-[81] flex w-[min(72vw,1120px)] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-2xl border border-[var(--color-border)] bg-[var(--color-bg)] shadow-[0_24px_80px_rgba(0,0,0,0.28)] ring-1 ring-black/5"
+              role="dialog"
+              aria-modal="true"
+              aria-label={runTitle(selectedRun)}
+            >
+              <header className="flex flex-shrink-0 items-center gap-3 border-b border-[var(--color-border)] bg-[var(--color-bg-secondary)]/55 px-4 py-3 backdrop-blur-xl">
+                <RunStatus status={selectedRun.status} />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <h2 className="truncate text-sm font-medium text-[var(--color-text)]">{runTitle(selectedRun)}</h2>
+                    <span className="rounded bg-[var(--color-bg-tertiary)] px-1.5 py-0.5 text-[10px] text-[var(--color-text-muted)]">{humanize(selectedRun.trigger_kind)}</span>
+                  </div>
+                  <p className="mt-0.5 truncate text-xs text-[var(--color-text-muted)]">{formatDate(selectedRun.triggered_at * 1000)} · {durationLabel(selectedRun)}{selectedRun.agent_snapshot ? ` · ${selectedRun.agent_snapshot}` : ""}</p>
+                </div>
+                {selectedRun.status === "running" && <Button variant="ghost" size="sm" disabled={finishingRunId === selectedRun.id} onClick={() => void finishRun(selectedRun)}>{finishingRunId === selectedRun.id ? "Finishing…" : "Finish"}</Button>}
+                {["queued", "running"].includes(selectedRun.status) && <Button variant="ghost" size="sm" onClick={() => void cancelAutomationRun(projectId, config.organization.id, selectedRun.id)}>Cancel</Button>}
+                <button type="button" onClick={() => setExpanded(null)} className="rounded-lg p-1.5 text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]" aria-label="Close run"><X className="h-4 w-4" /></button>
+              </header>
+
+              <div className="flex min-h-0 flex-1 bg-[var(--color-bg)]">
+                {selectedRun.resolved_task_id === "_memory" && selectedRun.resolved_chat_id ? (
+                  <TaskChat
+                    key={selectedRun.id}
+                    projectId={projectId}
+                    taskId={selectedRun.resolved_task_id}
+                    fixedChatId={selectedRun.resolved_chat_id}
+                    sessionManagement={false}
+                    finished={isTerminal(selectedRun.status)}
+                    fullscreen
+                    hideHeader
+                  />
+                ) : (
+                  <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+                    <RunTranscript
+                      events={history}
+                      usage={historyUsage}
+                      loading={historyLoading}
+                      active={!isTerminal(selectedRun.status)}
+                      error={selectedRun.error}
+                      summary={typeof selectedRun.result?.summary === "string" ? selectedRun.result.summary : undefined}
+                    />
+                  </div>
+                )}
+              </div>
+            </motion.section>
+          </>
+        )}
+      </AnimatePresence>,
+      document.body,
+    )}
+
     <ConfirmDialog
       isOpen={Boolean(deleteTarget)}
       title="Delete Run"

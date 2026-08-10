@@ -1071,8 +1071,9 @@ pub fn prepare_organization_input(
     }))
 }
 
-/// Store the Agent's proposed publication while the Run remains active.
-/// Automation commits it only after ACP reports a successful Session end.
+/// Stage the Agent's final publication inside the active Run. The MCP handler
+/// immediately commits this staged value and finishes the business Run; the
+/// ordinary Chat Session has an independent lifecycle.
 pub fn stage_organization_submission(
     project_id: &str,
     run_id: &str,
@@ -1125,6 +1126,31 @@ pub fn stage_organization_submission(
     )?;
     tx.commit()?;
     Ok(true)
+}
+
+pub fn organization_submission_staged(project_id: &str, run_id: &str) -> Result<bool> {
+    validate_path_segment(project_id, "project_id")?;
+    let conn = database::connection();
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT r.result_json FROM automation_runs r
+             JOIN automations a ON a.id = r.automation_id
+             WHERE r.id = ?1 AND r.status = 'running' AND a.project = ?2
+               AND a.handler_key = ?3",
+            params![
+                run_id,
+                project_id,
+                super::automations::MEMORY_ORGANIZATION_HANDLER
+            ],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(raw
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|value| value.get("organization_submission").cloned())
+        .is_some())
 }
 
 /// Memory post action. The Automation framework calls this inside the same
@@ -2082,6 +2108,70 @@ mod tests {
         assert_eq!(resolved[1].tags[0].value, "architecture");
         assert_eq!(resolved[0].access_count, 0);
         assert_eq!(resolved[1].access_count, 0);
+
+        crate::storage::set_grove_dir_override(None);
+    }
+
+    #[test]
+    fn organization_submission_only_finishes_after_mark_finished_is_staged() {
+        let _lock = database::test_lock().blocking_lock();
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        let project = format!("project-{}", Uuid::new_v4().simple());
+        let automation_id = format!("auto-{}", Uuid::new_v4().simple());
+        let now = Utc::now().timestamp();
+        let agent_config = crate::agent_config::AgentConfigSelection::default();
+        let automation = crate::storage::automations::Automation {
+            id: automation_id.clone(),
+            project: project.clone(),
+            name: "Memory organization".to_string(),
+            enabled: true,
+            handler_key: crate::storage::automations::MEMORY_ORGANIZATION_HANDLER.to_string(),
+            agent_config: agent_config.clone(),
+            task_mode: crate::storage::automations::TargetMode::New,
+            task_id: None,
+            task_template: None,
+            session_mode: crate::storage::automations::TargetMode::New,
+            chat_id: None,
+            session_template: None,
+            prompt: "Organize Memory".to_string(),
+            schedule_cron: "0 2 * * *".to_string(),
+            event_triggers: Vec::new(),
+            last_run_at: None,
+            last_run_status: None,
+            last_run_error: None,
+            next_run_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        crate::storage::automations::insert(&automation).unwrap();
+        let run_id = match crate::storage::automations::claim_run(
+            &automation_id,
+            "manual",
+            None,
+            &automation.prompt,
+            None,
+            &agent_config,
+            &serde_json::json!({}),
+            "project_run",
+            now,
+            true,
+        )
+        .unwrap()
+        {
+            crate::storage::automations::RunClaim::Created(run_id) => run_id,
+            crate::storage::automations::RunClaim::Existing(_) => {
+                panic!("unexpected existing run")
+            }
+        };
+        crate::storage::automations::mark_run_running(&run_id).unwrap();
+
+        assert!(!organization_submission_staged(&project, &run_id).unwrap());
+        assert!(
+            stage_organization_submission(&project, &run_id, &HashMap::new(), "Finished").unwrap()
+        );
+        assert!(organization_submission_staged(&project, &run_id).unwrap());
 
         crate::storage::set_grove_dir_override(None);
     }

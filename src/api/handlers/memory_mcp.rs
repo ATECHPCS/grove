@@ -380,7 +380,7 @@ impl MemoryMcpService {
 
     #[tool(
         name = "memory_mark_organization_finished",
-        description = "Stage the final organization summary and the base score for each managed Entity. Every base_score must be an integer from 0 through 80 inclusive. Call exactly once after Entity and Relation work is complete. Grove publishes the staged submission only if the Agent Session then completes successfully.",
+        description = "Publish the final organization summary and the base score for each managed Entity, and finish the Memory Run. Every base_score must be an integer from 0 through 80 inclusive. Call exactly once after Entity and Relation work is complete. Finishing the Run does not end the underlying Chat Session.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<FinishOutput>()
     )]
     async fn mark_finished(
@@ -423,6 +423,20 @@ impl MemoryMcpService {
                 None,
             ));
         }
+        let completed =
+            automations::complete_consumer_run(&run_id, chrono::Utc::now().timestamp(), |tx| {
+                let result = memory::commit_organization_on(tx, &project_id, &run_id)?;
+                Ok(((), result))
+            })
+            .map_err(storage_error)?;
+        if completed.is_none() {
+            return Err(McpError::invalid_request(
+                "Memory Organization Run is no longer running".to_string(),
+                None,
+            ));
+        }
+        let _ = memory::emit_pending_log_threshold_if_needed(&project_id);
+        unregister_organization_run(&project_id, &run_id);
         json_success(&FinishOutput { staged: true })
     }
 }
@@ -785,7 +799,7 @@ struct UpdateRelationsOutput {
 
 #[derive(Debug, Serialize, JsonSchema)]
 struct FinishOutput {
-    /// True when Grove staged the submission for publication after Agent completion.
+    /// True when Grove accepted and published the final Run submission.
     staged: bool,
 }
 

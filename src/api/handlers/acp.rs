@@ -1456,6 +1456,53 @@ fn resolve_project_key(project_id: &str) -> Result<(String, String, String), Acp
     Ok((project_key, project.path.clone(), project.name.clone()))
 }
 
+fn require_chat_namespace(project_key: &str, task_id: &str) -> Result<(), AcpError> {
+    if task_id == tasks::MEMORY_TASK_ID {
+        return Ok(());
+    }
+    tasks::get_task(project_key, task_id)
+        .map_err(|e| AcpError::Internal(e.to_string()))?
+        .ok_or(AcpError::NotFound("Task not found".to_string()))?;
+    Ok(())
+}
+
+/// Resolve the runtime workspace for a TaskChat namespace. `_memory` is a
+/// storage namespace, not a Task row, so its transient context comes directly
+/// from the registered Project and is never persisted in the tasks table.
+fn resolve_chat_task_context(project_key: &str, task_id: &str) -> Result<tasks::Task, AcpError> {
+    if task_id != tasks::MEMORY_TASK_ID {
+        return tasks::get_task(project_key, task_id)
+            .map_err(|e| AcpError::Internal(format!("Failed to get task: {e}")))?
+            .ok_or(AcpError::NotFound("Task not found".to_string()));
+    }
+
+    let project = workspace::load_project_by_hash(project_key)
+        .map_err(|e| AcpError::Internal(format!("Failed to get project: {e}")))?
+        .ok_or(AcpError::NotFound("Project not found".to_string()))?;
+    let now = chrono::Utc::now();
+    Ok(tasks::Task {
+        id: tasks::MEMORY_TASK_ID.to_string(),
+        name: "Memory".to_string(),
+        branch: String::new(),
+        target: String::new(),
+        worktree_path: workspace::project_directory(&project)
+            .to_string_lossy()
+            .into_owned(),
+        initial_commit: None,
+        created_at: now,
+        updated_at: now,
+        status: tasks::TaskStatus::Active,
+        multiplexer: "tmux".to_string(),
+        session_name: String::new(),
+        created_by: "system".to_string(),
+        archived_at: None,
+        code_additions: 0,
+        code_deletions: 0,
+        files_changed: 0,
+        is_local: true,
+    })
+}
+
 // ─── Chat CRUD Handlers ─────────────────────────────────────────────────────
 
 /// List all chats for a task
@@ -1463,9 +1510,7 @@ pub async fn list_chats(
     Path((project_id, task_id)): Path<(String, String)>,
 ) -> Result<Json<ChatListResponse>, AcpError> {
     let (project_key, _, _) = resolve_project_key(&project_id)?;
-    let _ = tasks::get_task(&project_key, &task_id)
-        .map_err(|e| AcpError::Internal(e.to_string()))?
-        .ok_or(AcpError::NotFound("Task not found".to_string()))?;
+    require_chat_namespace(&project_key, &task_id)?;
 
     let chats = tasks::load_chat_sessions(&project_key, &task_id)
         .map_err(|e| AcpError::Internal(e.to_string()))?;
@@ -1484,9 +1529,7 @@ pub async fn list_archived_chats(
     Path((project_id, task_id)): Path<(String, String)>,
 ) -> Result<Json<ChatListResponse>, AcpError> {
     let (project_key, _, _) = resolve_project_key(&project_id)?;
-    let _ = tasks::get_task(&project_key, &task_id)
-        .map_err(|e| AcpError::Internal(e.to_string()))?
-        .ok_or(AcpError::NotFound("Task not found".to_string()))?;
+    require_chat_namespace(&project_key, &task_id)?;
     let chats = tasks::load_archived_chat_sessions(&project_key, &task_id)
         .map_err(|e| AcpError::Internal(e.to_string()))?;
     Ok(Json(ChatListResponse {
@@ -1501,9 +1544,7 @@ pub async fn archive_chat(
     Path((project_id, task_id, chat_id)): Path<(String, String, String)>,
 ) -> Result<Json<ChatSessionResponse>, AcpError> {
     let (project_key, _, _) = resolve_project_key(&project_id)?;
-    let _ = tasks::get_task(&project_key, &task_id)
-        .map_err(|e| AcpError::Internal(e.to_string()))?
-        .ok_or(AcpError::NotFound("Task not found".to_string()))?;
+    require_chat_namespace(&project_key, &task_id)?;
     let active = tasks::load_chat_sessions(&project_key, &task_id)
         .map_err(|e| AcpError::Internal(e.to_string()))?;
     if active.len() <= 1 {
@@ -1544,9 +1585,7 @@ pub async fn restore_chat(
     Path((project_id, task_id, chat_id)): Path<(String, String, String)>,
 ) -> Result<Json<ChatSessionResponse>, AcpError> {
     let (project_key, _, _) = resolve_project_key(&project_id)?;
-    let _ = tasks::get_task(&project_key, &task_id)
-        .map_err(|e| AcpError::Internal(e.to_string()))?
-        .ok_or(AcpError::NotFound("Task not found".to_string()))?;
+    require_chat_namespace(&project_key, &task_id)?;
     let chat = tasks::get_chat_session_including_archived(&project_key, &task_id, &chat_id)
         .map_err(|e| AcpError::Internal(e.to_string()))?
         .ok_or_else(|| AcpError::NotFound("Archived session not found".to_string()))?;
@@ -1574,9 +1613,7 @@ pub async fn create_chat(
     Json(body): Json<CreateChatRequest>,
 ) -> Result<Json<ChatSessionResponse>, AcpError> {
     let (project_key, _, _) = resolve_project_key(&project_id)?;
-    let _ = tasks::get_task(&project_key, &task_id)
-        .map_err(|e| AcpError::Internal(e.to_string()))?
-        .ok_or(AcpError::NotFound("Task not found".to_string()))?;
+    require_chat_namespace(&project_key, &task_id)?;
 
     let cfg = config::load_config();
     // Resolve to canonical id BEFORE any installed_agents / registry
@@ -1900,9 +1937,7 @@ pub async fn fork_chat(
     Path((project_id, task_id, chat_id)): Path<(String, String, String)>,
 ) -> Result<Json<ChatSessionResponse>, AcpError> {
     let (project_key, _, _) = resolve_project_key(&project_id)?;
-    let _ = tasks::get_task(&project_key, &task_id)
-        .map_err(|e| AcpError::Internal(e.to_string()))?
-        .ok_or(AcpError::NotFound("Task not found".to_string()))?;
+    require_chat_namespace(&project_key, &task_id)?;
 
     // 拿源 chat 元数据(用于继承 agent / title / duty)
     let src_chat = tasks::get_chat_session(&project_key, &task_id, &chat_id)
@@ -2065,9 +2100,7 @@ pub async fn chat_ws_handler(
 ) -> Result<Response, AcpError> {
     let (project_key, project_path, project_name) = resolve_project_key(&project_id)?;
 
-    let task = tasks::get_task(&project_key, &task_id)
-        .map_err(|e| AcpError::Internal(format!("Failed to get task: {}", e)))?
-        .ok_or(AcpError::NotFound("Task not found".to_string()))?;
+    let task = resolve_chat_task_context(&project_key, &task_id)?;
 
     // Find the chat session
     let chat = tasks::get_chat_session(&project_key, &task_id, &chat_id)

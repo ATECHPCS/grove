@@ -97,6 +97,13 @@ fn open_at(db_path: &std::path::Path) -> Result<Connection> {
     )?;
 
     create_schema(&conn)?;
+    // `_memory` is a TaskChat storage namespace, not a Task entity. Remove
+    // rows created by the short-lived implementation that persisted it in
+    // `tasks`; Chat/session rows remain intact because they are independent.
+    conn.execute(
+        "DELETE FROM tasks WHERE id = ?1",
+        rusqlite::params![super::tasks::MEMORY_TASK_ID],
+    )?;
     Ok(conn)
 }
 

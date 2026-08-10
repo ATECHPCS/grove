@@ -151,3 +151,13 @@ export async function cancelAutomationRun(
     `/api/v1/projects/${projectId}/automations/${automationId}/runs/${runId}/cancel`,
   );
 }
+
+export async function finishAutomationRun(
+  projectId: string,
+  automationId: string,
+  runId: string,
+): Promise<{ status: string }> {
+  return apiClient.post<undefined, { status: string }>(
+    `/api/v1/projects/${projectId}/automations/${automationId}/runs/${runId}/finish`,
+  );
+}

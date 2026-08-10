@@ -42,7 +42,6 @@ pub struct RuntimeContext<'a> {
 #[derive(Debug)]
 pub struct RuntimeBindings {
     pub working_dir: PathBuf,
-    pub artifact_dir: Option<PathBuf>,
     pub env_vars: HashMap<String, String>,
     pub additional_mcp_servers: Vec<LoopbackMcpServer>,
     pub mcp_server_policy: McpServerPolicy,
@@ -83,6 +82,13 @@ pub trait AutomationHandler: Send + Sync {
     /// come from the Automation Run snapshot and are intentionally absent.
     fn runtime_bindings(&self, context: RuntimeContext<'_>) -> Result<RuntimeBindings>;
 
+    /// Whether the business Run should finish after the current ordinary Chat
+    /// turn completes. A Chat turn ending does not itself imply that a
+    /// long-lived product workflow is finished.
+    fn completion_requested(&self, _context: RuntimeContext<'_>) -> Result<bool> {
+        Ok(true)
+    }
+
     /// Commit business output inside the same SQLite transaction that marks
     /// the Automation Run successful.
     fn post_action(
@@ -104,7 +110,13 @@ pub trait AutomationHandler: Send + Sync {
         Ok(())
     }
 
-    fn remove_run_artifacts(&self, _project_id: &str, _run_id: &str) -> Result<()> {
+    fn remove_run_artifacts(
+        &self,
+        _project_id: &str,
+        _run_id: &str,
+        _resolved_task_id: Option<&str>,
+        _resolved_chat_id: Option<&str>,
+    ) -> Result<()> {
         Ok(())
     }
 }
@@ -129,9 +141,15 @@ pub fn get(handler_key: &str) -> Option<Arc<dyn AutomationHandler>> {
         .cloned()
 }
 
-pub fn remove_run_artifacts(handler_key: &str, project_id: &str, run_id: &str) -> Result<()> {
+pub fn remove_run_artifacts(
+    handler_key: &str,
+    project_id: &str,
+    run_id: &str,
+    resolved_task_id: Option<&str>,
+    resolved_chat_id: Option<&str>,
+) -> Result<()> {
     if let Some(handler) = get(handler_key) {
-        handler.remove_run_artifacts(project_id, run_id)?;
+        handler.remove_run_artifacts(project_id, run_id, resolved_task_id, resolved_chat_id)?;
     }
     Ok(())
 }

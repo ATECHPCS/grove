@@ -183,7 +183,6 @@ import { resolveMemoryEntities, type MemoryEntityMetadata } from "../../../api/m
 import { writeLastActiveTab } from "../../../utils/lastActiveTab";
 import { XTerminal } from "../TaskDetail/XTerminal";
 import { sendInputToTerminal } from "../TaskDetail/terminalCache";
-import type { Task } from "../../../data/types";
 import { perfMark } from "../../../perf/marks";
 import { useReportDebugId } from "../../../perf/debugIdsStore";
 import { getApiHost, appendHmacToUrl } from "../../../api/client";
@@ -357,7 +356,11 @@ function gcChatDraftsOnce(): void {
 
 interface TaskChatProps {
   projectId: string;
-  task: Task;
+  taskId: string;
+  fixedChatId?: string;
+  sessionManagement?: boolean;
+  /** Render persisted history without attaching to the live Agent session. */
+  finished?: boolean;
   collapsed?: boolean;
   onExpand?: () => void;
   onCollapse?: () => void;
@@ -2395,7 +2398,10 @@ function DownloadingLabel({ startedAt, compact }: { startedAt: number; compact?:
 
 export function TaskChat({
   projectId,
-  task,
+  taskId,
+  fixedChatId,
+  sessionManagement = true,
+  finished = false,
   collapsed = false,
   onExpand,
   onCollapse,
@@ -2409,12 +2415,7 @@ export function TaskChat({
   onUserMessageSent,
   onBusyStateChange,
 }: TaskChatProps) {
-  // Session management is the default TaskChat surface. Keep local aliases so
-  // this feature remains independent of the separate fixed-session refactor.
-  const taskId = task.id;
-  const fixedChatId: string | undefined = undefined;
-  const canManageSessions = true;
-  const finished = false;
+  const canManageSessions = sessionManagement;
   // Three sub-concerns have been extracted into their own hooks
   // (useChatPositioning, useACPAvailability, useInitialChatLoad) — those
   // hooks ARE Compiler-optimized. The remaining TaskChat body still has
@@ -2480,6 +2481,7 @@ export function TaskChat({
   const showAgentPickerRef = useRef(false);
   const [sessionRailCollapsed, setSessionRailCollapsed] = useState<boolean>(
     () => {
+      if (!canManageSessions) return true;
       if (typeof window === "undefined") return true;
       return window.localStorage.getItem(sessionModeStorageKey) !== "sidebar";
     },
@@ -2506,13 +2508,14 @@ export function TaskChat({
   });
 
   useEffect(() => {
+    if (!canManageSessions) return;
     if (typeof window === "undefined") return;
     try {
       window.localStorage.setItem(`taskchat:session-rail-width:${projectId}`, sessionRailWidth.toString());
     } catch {
       // ignore
     }
-  }, [sessionRailWidth, projectId]);
+  }, [canManageSessions, sessionRailWidth, projectId]);
 
   const startSessionRailResize = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -2537,6 +2540,8 @@ export function TaskChat({
   const perChatStateRef = useRef<Map<string, PerChatState>>(new Map());
   // Per-chat WebSocket connections
   const wsMapRef = useRef<Map<string, WebSocket>>(new Map());
+  const finishedRef = useRef(finished);
+  finishedRef.current = finished;
   // Track intentionally closed WebSockets (don't auto-reconnect these)
   const intentionalCloseRef = useRef<Set<string>>(new Set());
   // Per-chat reconnect attempt count for exponential backoff. Reset on
@@ -3017,15 +3022,19 @@ export function TaskChat({
   const wsEventBufferRef = useRef<any[]>([]);
   const historyLoadingRef = useRef(false);
 
-  const activeChat = chats.find((c) => c.id === activeChatId);
+  const activeChat =
+    chats.find((c) => c.id === activeChatId) ??
+    archivedChats.find((c) => c.id === activeChatId);
+  const isViewingArchived = archivedChats.some((chat) => chat.id === activeChatId);
+  const isReadOnlyHistory = finished || isViewingArchived;
   // Terminal-mode chat: agent CLI runs under a PTY (no ACP). Messages area
   // becomes xterm.js; chatbox input writes to PTY stdin instead of session/prompt.
   const isTerminalLaunchMode = activeChat?.launch_mode === "terminal";
   const agentPtyWsUrl = useMemo(() => {
     if (!isTerminalLaunchMode || !activeChatId) return null;
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    return `${protocol}//${window.location.host}/api/v1/projects/${projectId}/tasks/${task.id}/chats/${activeChatId}/agent-pty`;
-  }, [isTerminalLaunchMode, activeChatId, projectId, task.id]);
+    return `${protocol}//${window.location.host}/api/v1/projects/${projectId}/tasks/${taskId}/chats/${activeChatId}/agent-pty`;
+  }, [isTerminalLaunchMode, activeChatId, projectId, taskId]);
   // Quota for built-in AI coding agents (Claude Code / Codex / Gemini).
   // Unsupported agents return null, which hides the quota badge entirely.
   const {
@@ -3138,8 +3147,8 @@ export function TaskChat({
     return -1;
   }, [activeAuthMessage, messages]);
   const taskPreviewCommentDrafts = useMemo(
-    () => previewCommentDrafts.filter((draft) => draft.projectId === projectId && draft.taskId === task.id),
-    [previewCommentDrafts, projectId, task.id],
+    () => previewCommentDrafts.filter((draft) => draft.projectId === projectId && draft.taskId === taskId),
+    [previewCommentDrafts, projectId, taskId],
   );
   const hasPreviewCommentsPanel = taskPreviewCommentDrafts.length > 0;
   const activeComposerPanel =
@@ -3575,7 +3584,7 @@ export function TaskChat({
     taskFilesLoadingRef.current = true;
     taskFilesFetchTimeRef.current = now;
 
-    getTaskFiles(projectId, task.id)
+    getTaskFiles(projectId, taskId)
       .then((res) => {
         setTaskFiles(res.files);
         setTaskFilesMeta(res.metadata || []);
@@ -3586,9 +3595,9 @@ export function TaskChat({
       });
 
     if (isStudioProject) {
-      listSketches(projectId, task.id).catch(() => {});
+      listSketches(projectId, taskId).catch(() => {});
     }
-  }, [projectId, task.id, isStudioProject]);
+  }, [projectId, taskId, isStudioProject]);
 
   const refreshProjectsIfNeeded = useCallback(() => {
     if (allProjects.length > 0) return;
@@ -3600,14 +3609,14 @@ export function TaskChat({
   }, [allProjects.length]);
 
   // Initial load on mount / task switch. refreshTaskFilesIfNeeded is a
-  // useCallback whose deps are [projectId, task.id, isStudioProject], so
+  // useCallback whose deps are [projectId, taskId, isStudioProject], so
   // including it here only adds isStudioProject as a transitive dep.
   // Workspace-level isStudioProject changes already imply a task switch,
   // so the extra refire is harmless.
   useEffect(() => {
     taskFilesFetchTimeRef.current = 0; // force stale on task switch
     refreshTaskFilesIfNeeded();
-  }, [projectId, task.id, refreshTaskFilesIfNeeded]);
+  }, [projectId, taskId, refreshTaskFilesIfNeeded]);
 
   // Refresh agent-graph @-mention candidates whenever the active chat changes
   // or the user opens the popover. Spawn candidates come from `acpAgentOptions`
@@ -3639,7 +3648,7 @@ export function TaskChat({
         agent: c.agent,
         history_path: c.history_path,
       }));
-    getMentionCandidates(projectId, task.id, activeChatId)
+    getMentionCandidates(projectId, taskId, activeChatId)
       .then((resp) => {
         setAgentMentionItems(
           buildAgentMentionItems({
@@ -3662,7 +3671,7 @@ export function TaskChat({
           }),
         );
       });
-  }, [projectId, task.id, activeChatId, acpAgentOptions, customAgentPersonas, chats]);
+  }, [projectId, taskId, activeChatId, acpAgentOptions, customAgentPersonas, chats]);
 
   // Defer to a microtask so the synchronous setAgentMentionItems([]) path
   // for !activeChatId doesn't trip the set-state-in-effect rule. We still
@@ -3690,7 +3699,7 @@ export function TaskChat({
         setSketchMeta([]);
         return;
       }
-      listSketches(projectId, task.id)
+      listSketches(projectId, taskId)
         .then((meta) => {
           if (!cancelled) setSketchMeta(meta);
         })
@@ -3701,7 +3710,7 @@ export function TaskChat({
     return () => {
       cancelled = true;
     };
-  }, [isStudioProject, projectId, task.id]);
+  }, [isStudioProject, projectId, taskId]);
 
   // Dynamically measure the input area height. With Virtuoso, we feed this
   // into the Footer component's height so the last message is never
@@ -3915,12 +3924,13 @@ export function TaskChat({
 
   // Close dropdown menus when clicking outside
   useEffect(() => {
+    if (!canManageSessions) return;
     if (typeof window === "undefined") return;
     window.localStorage.setItem(
       sessionModeStorageKey,
       sessionRailCollapsed ? "header" : "sidebar",
     );
-  }, [sessionModeStorageKey, sessionRailCollapsed]);
+  }, [canManageSessions, sessionModeStorageKey, sessionRailCollapsed]);
 
   // Reload session-rail preference from localStorage when the storage key
   // changes (project switch). Set-state-during-render with a prev-key guard
@@ -4366,9 +4376,10 @@ export function TaskChat({
   const switchChatRef = useRef<(chatId: string) => void>(() => {});
   useEffect(() => {
     const handler = (e: Event) => {
+      if (!canManageSessions) return;
       const detail = (e as CustomEvent).detail;
       if (!detail?.chatId) return;
-      if (detail.projectId !== projectId || detail.taskId !== task.id) return;
+      if (detail.projectId !== projectId || detail.taskId !== taskId) return;
       // If the target chat isn't in our list yet (just spawned, MCP write
       // hasn't propagated to listChats), park it as pending so the
       // ChatListChanged handler picks it up. Otherwise switch immediately.
@@ -4385,7 +4396,7 @@ export function TaskChat({
     };
     window.addEventListener("grove:switch-chat", handler);
     return () => window.removeEventListener("grove:switch-chat", handler);
-  }, [projectId, task.id]);
+  }, [canManageSessions, projectId, taskId]);
 
   // ─── Per-chat WebSocket management ─────────────────────────────────────
 
@@ -4406,6 +4417,7 @@ export function TaskChat({
   /** Connect a WebSocket for a given chat ID (idempotent) */
   const connectChatWs = useCallback(
     async (chatId: string, importing = false) => {
+      if (finishedRef.current) return;
       if (wsMapRef.current.has(chatId)) return; // Already connected
       if (connectingRef.current.has(chatId)) return; // Connection already in-flight
       // Terminal-mode chats have no ACP WebSocket — they speak PTY only.
@@ -4428,10 +4440,13 @@ export function TaskChat({
       const host = getApiHost();
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const url = await appendHmacToUrl(
-        `${protocol}//${host}/api/v1/projects/${projectId}/tasks/${task.id}/chats/${chatId}/ws${importing ? "?import=true" : ""}`,
+        `${protocol}//${host}/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/ws${importing ? "?import=true" : ""}`,
       );
 
       connectingRef.current.delete(chatId);
+      // The Run may have reached its terminal state while URL signing was in
+      // flight. A finished view must never create a late live attachment.
+      if (finishedRef.current) return;
       // Re-check after async gap: another call may have connected while we awaited
       if (wsMapRef.current.has(chatId)) return;
 
@@ -4534,7 +4549,7 @@ export function TaskChat({
           reconnectAttemptRef.current.set(chatId, attempt + 1);
           const timer = setTimeout(() => {
             reconnectTimerRef.current.delete(chatId);
-            if (!wsMapRef.current.has(chatId)) {
+            if (!finishedRef.current && !wsMapRef.current.has(chatId)) {
               connectChatWsRef.current(chatId).then(() => {
                 if (chatId === getActiveChatId()) {
                   wsRef.current = wsMapRef.current.get(chatId) ?? null;
@@ -4553,13 +4568,34 @@ export function TaskChat({
         }
       };
     },
-    [projectId, task.id, getActiveChatId],
+    [projectId, taskId, getActiveChatId],
   );
 
 
   useEffect(() => {
     connectChatWsRef.current = connectChatWs;
   }, [connectChatWs]);
+
+  // A finished Run is a persisted, read-only transcript. Detach this view
+  // from every live transport without killing the Agent-owned session.
+  useEffect(() => {
+    if (!finished) return;
+
+    reconnectTimerRef.current.forEach((timer) => clearTimeout(timer));
+    reconnectTimerRef.current.clear();
+    reconnectAttemptRef.current.clear();
+    connectingRef.current.clear();
+    wsMapRef.current.forEach((_, chatId) => intentionalCloseRef.current.add(chatId));
+    wsMapRef.current.forEach((ws) => ws.close());
+    wsMapRef.current.clear();
+    intentionalCloseRef.current.clear();
+    wsRef.current = null;
+    wsEventBufferRef.current = [];
+    setIsConnected(false);
+    setConnectPhase(null);
+    setConnectPhaseStartedAt(null);
+    updateBusy(false);
+  }, [finished, updateBusy]);
 
   // activeChatIdRef is owned by useActiveChatId — no separate declaration here.
 
@@ -4572,7 +4608,7 @@ export function TaskChat({
     if (!isInitialImport) wsEventBufferRef.current = [];
     (async () => {
       // Step 1: Connect WS for real-time events
-      await connectChatWs(chatId);
+      if (!isReadOnlyHistory) await connectChatWs(chatId);
       wsRef.current = wsMapRef.current.get(chatId) ?? null;
       // A newly imported chat has no Grove history yet. Its first render is
       // the live session/load replay; later opens use the normal HTTP history
@@ -4585,7 +4621,7 @@ export function TaskChat({
       if (chatId !== getActiveChatId()) return;
       let res: Awaited<ReturnType<typeof getChatHistory>>;
       try {
-        res = await getChatHistory(projectId, task.id, chatId);
+        res = await getChatHistory(projectId, taskId, chatId);
       } catch {
         historyLoadingRef.current = false;
         wsEventBufferRef.current = [];
@@ -4602,7 +4638,7 @@ export function TaskChat({
           }
         }
         // Drain buffered WS events that arrived during HTTP load
-        const buffered = wsEventBufferRef.current;
+        const buffered = isReadOnlyHistory ? [] : wsEventBufferRef.current;
         wsEventBufferRef.current = [];
         historyLoadingRef.current = false;
         // Reduce buffered message events into msgs locally (avoids React batching concerns)
@@ -4846,7 +4882,7 @@ export function TaskChat({
     // loading after this effect's first run (when launch_mode was still
     // undefined → connectChatWs bailed), the effect re-fires with the
     // resolved mode and routes the chat correctly (ACP WS vs PTY-only).
-  }, [activeChatId, activeChat?.launch_mode, connectChatWs, projectId, task.id, updateBusy, chatRenderWindowSettings, updateHiddenMessageCount, getActiveChatId, applyConfigOptionsSnapshot]);
+  }, [activeChatId, activeChat?.launch_mode, connectChatWs, isReadOnlyHistory, projectId, taskId, updateBusy, chatRenderWindowSettings, updateHiddenMessageCount, getActiveChatId, applyConfigOptionsSnapshot]);
 
   // Cleanup all WebSockets on unmount, plus any pending reconnect timers —
   // otherwise an in-flight backoff timer fires after unmount and creates a
@@ -5560,6 +5596,9 @@ export function TaskChat({
           break;
         case "busy":
           state.isBusy = msg.value;
+          setSessionActivity((previous) =>
+            updateSessionRunning(previous, chatId, msg.value, getActiveChatId()),
+          );
           if (!msg.value) {
             const pruned = pruneChatViewMessages(
               state.messages,
@@ -5597,7 +5636,7 @@ export function TaskChat({
       }
       perChatStateRef.current.set(chatId, state);
     },
-    [chatRenderWindowSettings],
+    [chatRenderWindowSettings, getActiveChatId],
   );
 
   // Keep refs in sync so connectChatWs WS handlers always call latest versions
@@ -5618,7 +5657,7 @@ export function TaskChat({
 
     // Load initial history
     const chatId = activeChatId;
-    getChatHistory(projectId, task.id, chatId, 0)
+    getChatHistory(projectId, taskId, chatId, 0)
       .then((res) => {
         if (res.events.length > 0) {
           for (const evt of res.events) {
@@ -5635,7 +5674,7 @@ export function TaskChat({
       try {
         res = await getChatHistory(
           projectId,
-          task.id,
+          taskId,
           chatId,
           pollingOffsetRef.current,
         );
@@ -5707,21 +5746,22 @@ export function TaskChat({
 
   const handleNewChatWithAgent = useCallback(
     async (agent: string) => {
+      if (!canManageSessions) return;
       setShowAgentPicker(false);
       try {
         const newChat = await createChat(
           projectId,
-          task.id,
+          taskId,
           buildDefaultSessionTitle(),
           agent,
         );
-        setChats((prev) => [...prev, newChat]);
+        setChats((prev) => [newChat, ...prev]);
         switchChat(newChat.id);
       } catch (err) {
         console.error("Failed to create chat:", err);
       }
     },
-    [projectId, task.id, switchChat],
+    [canManageSessions, projectId, taskId, switchChat],
   );
 
   // Listen for the two agent-related catalog dispatches:
@@ -5732,10 +5772,11 @@ export function TaskChat({
   //   agent.picker.show    → just open the picker, user chooses.
   useEffect(() => {
     const onDefault = () => {
+      if (!canManageSessions) return;
       // Prefer the agent used by the most recent chat. If no chats exist,
       // open the picker rather than guessing — agent identity is the
       // user's choice, not a hardcoded fallback.
-      const fallback = chats[chats.length - 1]?.agent;
+      const fallback = chats[0]?.agent;
       if (fallback) {
         void handleNewChatWithAgent(fallback);
       } else {
@@ -5746,6 +5787,7 @@ export function TaskChat({
       }
     };
     const onPicker = () => {
+      if (!canManageSessions) return;
       // Prefer the header button as anchor; fall back to the sidebar
       // rail (Studio task) or just open without an anchor.
       const anchor =
@@ -5759,7 +5801,7 @@ export function TaskChat({
       window.removeEventListener("grove:new-session-default-agent", onDefault);
       window.removeEventListener("grove:show-agent-picker", onPicker);
     };
-  }, [handleNewChatWithAgent, chats, toggleAgentPicker]);
+  }, [canManageSessions, handleNewChatWithAgent, chats, toggleAgentPicker]);
 
   // ─── Chat title editing ─────────────────────────────────────────────────
 
@@ -5771,7 +5813,7 @@ export function TaskChat({
     try {
       await updateChatTitle(
         projectId,
-        task.id,
+        taskId,
         editingTitle.chatId,
         editTitleValue.trim(),
       );
@@ -5883,16 +5925,25 @@ export function TaskChat({
         }
         cancelPendingReconnectRef.current(chatId);
         perChatStateRef.current.delete(chatId);
-        setChats((prev) => {
-          const updated = prev.filter((c) => c.id !== chatId);
-          if (chatId === activeChatId && updated.length > 0) {
-            const next = updated[updated.length - 1];
+        setSessionActivity((previous) => removeSessionActivity(previous, chatId));
+        const remaining = chats.filter((chat) => chat.id !== chatId);
+        if (deletingArchived) {
+          setArchivedChats((previous) =>
+            previous.filter((chat) => chat.id !== chatId),
+          );
+        } else {
+          setChats(remaining);
+        }
+        if (chatId === activeChatId) {
+          const next = remaining[0];
+          if (next) {
             setActiveChatId(next.id);
-            writeLastActiveTab("chat", projectId, task.id, next.id);
+            writeLastActiveTab("chat", projectId, taskId, next.id);
             restoreChatState(next.id);
+            await connectChatWs(next.id);
+            wsRef.current = wsMapRef.current.get(next.id) ?? null;
           }
-          return updated;
-        });
+        }
         setDeleteConfirmChatId(null);
         setDeleteConfirmTargetCapable(false);
         setDeleteError(null);
@@ -5904,7 +5955,7 @@ export function TaskChat({
       }
       setShowChatMenu(false);
     },
-    [chats.length, projectId, task.id, activeChatId, restoreChatState, setActiveChatId],
+    [activeChatId, archivedChats, chats, connectChatWs, projectId, restoreChatState, setActiveChatId, taskId],
   );
 
   // ─── Chat fork ─────────────────────────────────────────────────────────
@@ -5914,10 +5965,10 @@ export function TaskChat({
   const handleForkChat = useCallback(
     async (chatId: string) => {
       try {
-        const created = await forkChat(projectId, task.id, chatId);
-        setChats((prev) => [...prev, created]);
+        const created = await forkChat(projectId, taskId, chatId);
+        setChats((prev) => [created, ...prev]);
         setActiveChatId(created.id);
-        writeLastActiveTab("chat", projectId, task.id, created.id);
+        writeLastActiveTab("chat", projectId, taskId, created.id);
         restoreChatState(created.id);
       } catch (err) {
         // Fork 通常因 source agent 进程已退出 / agent busy / agent 拒绝
@@ -5932,7 +5983,7 @@ export function TaskChat({
       }
       setShowChatMenu(false);
     },
-    [projectId, task.id, restoreChatState, setActiveChatId],
+    [projectId, taskId, restoreChatState, setActiveChatId],
   );
 
   const loadImportSessions = useCallback(async (cursor?: string) => {
@@ -5941,7 +5992,7 @@ export function TaskChat({
     const requestId = ++importRequestRef.current;
     setImportLoading(true);
     try {
-      const page = await listImportSessions(projectId, task.id, requestedChatId, cursor);
+      const page = await listImportSessions(projectId, taskId, requestedChatId, cursor);
       if (importRequestRef.current !== requestId || getActiveChatId() !== requestedChatId) return;
       setImportSessions((previous) => cursor ? [...previous, ...page.sessions] : page.sessions);
       setImportNextCursor(page.next_cursor);
@@ -5953,13 +6004,13 @@ export function TaskChat({
         setImportLoading(false);
       }
     }
-  }, [activeChatId, getActiveChatId, importLoading, projectId, task.id]);
+  }, [activeChatId, getActiveChatId, importLoading, projectId, taskId]);
 
   const handleImportSession = useCallback(async (session: ImportableSession) => {
     if (!activeChatId || importLoading) return;
     setImportLoading(true);
     try {
-      const created = await importSession(projectId, task.id, activeChatId, session);
+      const created = await importSession(projectId, taskId, activeChatId, session);
       if (!chatsRef.current.some((chat) => chat.id === created.id)) {
         chatsRef.current = [...chatsRef.current, created];
       }
@@ -5974,7 +6025,7 @@ export function TaskChat({
       initialImportChatIdRef.current = created.id;
       const connecting = connectChatWs(created.id, true);
       setActiveChatId(created.id);
-      writeLastActiveTab("chat", projectId, task.id, created.id);
+      writeLastActiveTab("chat", projectId, taskId, created.id);
       restoreChatState(created.id);
       await connecting;
       wsRef.current = wsMapRef.current.get(created.id) ?? null;
@@ -5984,7 +6035,7 @@ export function TaskChat({
     } finally {
       setImportLoading(false);
     }
-  }, [activeChatId, connectChatWs, importLoading, projectId, restoreChatState, saveCurrentChatState, setActiveChatId, task.id]);
+  }, [activeChatId, connectChatWs, importLoading, projectId, restoreChatState, saveCurrentChatState, setActiveChatId, taskId]);
 
   // ─── User actions ────────────────────────────────────────────────────────
 
@@ -6225,7 +6276,7 @@ export function TaskChat({
     setIsTakingControl(true);
     let ok = true;
     try {
-      await takeControl(projectId, task.id, activeChatId);
+      await takeControl(projectId, taskId, activeChatId);
     } catch {
       ok = false;
     }
@@ -6267,14 +6318,14 @@ export function TaskChat({
     await connectChatWs(activeChatId);
     wsRef.current = wsMapRef.current.get(activeChatId) ?? null;
     setIsTakingControl(false);
-  }, [activeChatId, isTakingControl, projectId, task.id, connectChatWs]);
+  }, [activeChatId, isTakingControl, projectId, taskId, connectChatWs]);
 
   const handleSavePlanToNote = useCallback(async () => {
     if (!planFileContent || isSavingToNote) return;
     setIsSavingToNote(true);
     setSaveToNoteDone(false);
     try {
-      await updateNotes(projectId, task.id, planFileContent);
+      await updateNotes(projectId, taskId, planFileContent);
       setSaveToNoteDone(true);
       setTimeout(() => setSaveToNoteDone(false), 2000);
     } catch {
@@ -6284,7 +6335,7 @@ export function TaskChat({
       ]);
     }
     setIsSavingToNote(false);
-  }, [planFileContent, isSavingToNote, projectId, task.id]);
+  }, [planFileContent, isSavingToNote, projectId, taskId]);
 
   // Legacy compatibility for queued messages created before full ACP
   // configOptions support. New sessions change settings immediately and do
@@ -6402,7 +6453,7 @@ export function TaskChat({
               const data = att.pendingFile
                 ? await fileToBase64(att.pendingFile)
                 : att.data;
-              return uploadChatAttachment(projectId, task.id, activeChatId, {
+              return uploadChatAttachment(projectId, taskId, activeChatId, {
                 name: att.pendingFile?.name ?? att.name,
                 mime_type: att.mimeType || undefined,
                 data,
@@ -6509,7 +6560,7 @@ export function TaskChat({
         const uploadResults = await Promise.all(
           pendingOnes.map(async (att) => {
             const data = await fileToBase64(att.pendingFile!);
-            return uploadChatAttachment(projectId, task.id, activeChatId, {
+            return uploadChatAttachment(projectId, taskId, activeChatId, {
               name: att.pendingFile!.name,
               mime_type: att.pendingFile!.type || undefined,
               data,
@@ -6622,7 +6673,7 @@ export function TaskChat({
       onUserMessageSent?.();
       el.focus();
     }
-  }, [isTerminalMode, isBusy, attachments, activeChatId, isConnected, projectId, task.id, enableAutoStickToBottom, onUserMessageSent, buildPromptConfig, isTerminalLaunchMode, agentPtyWsUrl]);
+  }, [isTerminalMode, isBusy, attachments, activeChatId, isConnected, projectId, taskId, enableAutoStickToBottom, onUserMessageSent, buildPromptConfig, isTerminalLaunchMode, agentPtyWsUrl]);
 
   const sendPreviewComments = useCallback((comments: PreviewCommentDraft[]) => {
     if (
@@ -6845,8 +6896,8 @@ export function TaskChat({
   useCommand(
     "chat.fork",
     () => { if (activeChatId && forkCapable) void handleForkChat(activeChatId); },
-    { enabled: () => !!activeChatId && forkCapable },
-    [activeChatId, forkCapable, handleForkChat],
+    { enabled: () => canManageSessions && !!activeChatId && forkCapable },
+    [activeChatId, canManageSessions, forkCapable, handleForkChat],
   );
   useCommand(
     "chat.clear",
@@ -6890,6 +6941,7 @@ export function TaskChat({
   // Cycle through chats — switch active chat to the next/previous in the
   // chats list, wrapping at the ends. No-op when there's 0 or 1 chat.
   const cycleChat = useCallback((delta: 1 | -1) => {
+    if (!canManageSessions) return;
     const list = chatsRef.current;
     if (list.length < 2) return;
     const cur = list.findIndex((c) => c.id === activeChatId);
@@ -6899,12 +6951,13 @@ export function TaskChat({
     }
     const next = (cur + delta + list.length) % list.length;
     void switchChat(list[next].id);
-  }, [activeChatId, switchChat]);
+  }, [activeChatId, canManageSessions, switchChat]);
   useCommand("agent.switch.next", () => cycleChat(1), [cycleChat]);
   useCommand("agent.switch.previous", () => cycleChat(-1), [cycleChat]);
   useCommand(
     "chat.switchSession",
     (args?: unknown) => {
+      if (!canManageSessions) return;
       const typedArgs = args as { sessionId?: string; sessionTitle?: string; sessionIndex?: number } | undefined;
       if (typedArgs?.sessionId) {
         void switchChat(typedArgs.sessionId);
@@ -6924,7 +6977,7 @@ export function TaskChat({
         }
       }
     },
-    [switchChat],
+    [canManageSessions, switchChat],
   );
 
   /** Submit an ask_form response as a regular user prompt. Mirrors the queue /
@@ -7085,7 +7138,7 @@ export function TaskChat({
     intentionalCloseRef.current.add(chatId);
 
     try {
-      await reconnectChat(projectId, task.id, chatId);
+      await reconnectChat(projectId, taskId, chatId);
 
       // The backend normally closes this socket through SessionEnded. Keep a
       // local fallback for broken links where that close frame never arrives.
@@ -7127,7 +7180,7 @@ export function TaskChat({
     } finally {
       setIsReconnecting(false);
     }
-  }, [activeChatId, connectChatWs, getActiveChatId, isReconnecting, projectId, task.id, updateBusy]);
+  }, [activeChatId, connectChatWs, getActiveChatId, isReconnecting, projectId, taskId, updateBusy]);
 
   const handleReconnect = useCallback(() => {
     if (isReconnecting) return;
@@ -8657,7 +8710,7 @@ export function TaskChat({
             isBusy={isBusy}
             agentLabel={agentLabel}
             projectId={projectId}
-            taskId={task.id}
+            taskId={taskId}
             activeChatId={activeChatId ?? undefined}
             previewCommentDrafts={taskPreviewCommentDrafts}
             onAddPreviewComment={addPreviewCommentDraft}
@@ -8867,6 +8920,7 @@ export function TaskChat({
                     <button
                       onClick={() => setShowChatMenu((prev) => !prev)}
                       onDoubleClick={() => {
+                        if (isViewingArchived) return;
                         setEditTitleValue(activeChat.title);
                         setEditingTitle({
                           chatId: activeChat.id,
@@ -8875,7 +8929,7 @@ export function TaskChat({
                         setShowChatMenu(false);
                       }}
                       className="flex max-w-full min-w-0 items-center gap-2 text-left"
-                      title="Double-click to rename"
+                      title={isViewingArchived ? "Archived session" : "Double-click to rename"}
                     >
                       {AgentIcon ? (
                         <AgentIcon
@@ -8910,6 +8964,9 @@ export function TaskChat({
                       <div className="max-h-64 overflow-y-auto py-1">
                         {orderedChats.map((chat) => {
                           const ChatIcon = getChatIcon(chat.agent);
+                          const activity = sessionActivity[chat.id];
+                          const isRunning = activity?.running ?? false;
+                          const hasUnreadCompletion = !isRunning && (activity?.unread ?? false);
                           return (
                             <div
                               key={chat.id}
@@ -9067,16 +9124,19 @@ export function TaskChat({
                   onLogout={handleLogout}
                   onReconnect={handleReconnect}
                   onDelete={requestDeleteChat}
+                  onArchive={(chatId) => void handleArchiveChat(chatId)}
                 />
-              )}
+              ) : null}
             </div>
 
             <div className="flex shrink-0 items-center gap-1.5 select-none">
               <div
-                className={`w-2.5 h-2.5 rounded-full ${isConnected ? "bg-[var(--color-success)] animate-pulse" : "bg-[var(--color-warning)]"}`}
+                className={`w-2.5 h-2.5 rounded-full ${isViewingArchived ? "bg-[var(--color-text-muted)]" : isConnected ? "bg-[var(--color-success)] animate-pulse" : "bg-[var(--color-warning)]"}`}
               />
               <span className="text-xs text-[var(--color-text-muted)]">
-                {isConnected
+                {isViewingArchived
+                  ? "Archived"
+                  : isConnected
                   ? "Connected"
                   : connectPhase === "downloading" && connectPhaseStartedAt
                     ? <DownloadingLabel startedAt={connectPhaseStartedAt} />
@@ -9110,7 +9170,7 @@ export function TaskChat({
       )}
 
       <div className="flex min-h-0 flex-1">
-        <div
+        {canManageSessions && <div
           className={`taskchat-session-rail shrink-0 border-r border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_20%,transparent)] transition-all duration-200 ${sessionRailCollapsed ? "w-0 overflow-hidden border-r-transparent" : "overflow-hidden"}`}
           style={{ width: sessionRailCollapsed ? 0 : sessionRailWidth }}
         >
@@ -9127,14 +9187,14 @@ export function TaskChat({
                 <div
                   className="min-w-0 flex items-center gap-2"
                   onDoubleClick={() => {
-                    if (!activeChat) return;
+                    if (!activeChat || isViewingArchived) return;
                     setEditTitleValue(activeChat.title);
                     setEditingTitle({
                       chatId: activeChat.id,
                       surface: "sidebar-header",
                     });
                   }}
-                  title="Double-click to rename"
+                  title={isViewingArchived ? "Archived session" : "Double-click to rename"}
                 >
                   {AgentIcon ? (
                     <AgentIcon
@@ -9168,10 +9228,12 @@ export function TaskChat({
                 </div>
                 <div className="flex items-center gap-1.5 text-[11px] text-[var(--color-text-muted)]">
                   <span
-                    className={`h-1.5 w-1.5 rounded-full ${isConnected ? "bg-[var(--color-success)]" : "bg-[var(--color-warning)]"}`}
+                    className={`h-1.5 w-1.5 rounded-full ${isViewingArchived ? "bg-[var(--color-text-muted)]" : isConnected ? "bg-[var(--color-success)]" : "bg-[var(--color-warning)]"}`}
                   />
                   <span>
-                    {isConnected
+                    {isViewingArchived
+                      ? "Archived"
+                      : isConnected
                       ? "Connected"
                       : connectPhase === "downloading" && connectPhaseStartedAt
                         ? <DownloadingLabel startedAt={connectPhaseStartedAt} compact />
@@ -9196,7 +9258,17 @@ export function TaskChat({
                       <span className="font-medium">New Session</span>
                     </button>
                   </div>
-                  {activeChat && (
+                  {activeChat && isViewingArchived ? (
+                    <button
+                      type="button"
+                      onClick={() => void handleRestoreChat(activeChat.id)}
+                      className="flex h-full shrink-0 items-center gap-1.5 rounded-md border border-dashed border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] px-2 text-[12px] text-[var(--color-text-muted)] transition-colors hover:border-[color-mix(in_srgb,var(--color-highlight)_34%,transparent)] hover:text-[var(--color-highlight)]"
+                      title="Restore session"
+                    >
+                      <ArchiveRestore className="h-3 w-3" />
+                      <span>Restore</span>
+                    </button>
+                  ) : activeChat ? (
                     <SessionActionsMenu
                       surface="sidebar"
                       chatId={activeChat.id}
@@ -9427,7 +9499,7 @@ export function TaskChat({
           <ChatListErrorBoundary
             resetKey={activeChatId}
             projectId={projectId}
-            taskId={task.id}
+            taskId={taskId}
           >
           {shouldVirtualizeChat ? (
           <Virtuoso
@@ -9680,7 +9752,7 @@ export function TaskChat({
                             onMermaidClick={setLightboxSvg}
                             onD2Click={setLightboxSvg}
                             onImageClick={setLightboxUrl}
-                            sketchContext={isStudioProject ? { projectId, taskId: task.id } : undefined}
+                            sketchContext={isStudioProject ? { projectId, taskId: taskId } : undefined}
                           />
                         </div>
                       )}
