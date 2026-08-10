@@ -1094,9 +1094,11 @@ const WORKING_BROWSER_INSTRUCTION: &str = r#"Use browser control when the work d
 
 const WORKING_MEMORY_INSTRUCTION: &str = r#"Project Memory preserves long-term knowledge about both the Project and its working context.
 
-When context required for the current work is missing, incomplete, ambiguous, or appears to depend on prior work, search Project Memory before guessing, acting, or asking the user to repeat information. This is a required first step, not optional background research.
+At the start of every new Working Session, before substantive work, always search Project Memory. Do not decide that Memory is unnecessary without performing this initial retrieval. A search with no relevant result is valid and satisfies this requirement.
 
-Use `memory_recall` with the missing subject, current Task scope, and relevant terminology. Also use `memory_get_recent_logs` to find recent decisions, corrections, instructions, and unfinished work that may not yet be organized. For every potentially relevant Entity returned by recall, use `memory_read` before relying on it. Reconcile organized long-term Memory and recent unorganized Logs with the current Task notes and the user's latest instruction. If the required context is still missing after this search, then ask the user for it.
+Use `memory_recall` with the user's request, current Task scope, and relevant terminology. Also use `memory_get_recent_logs` to find recent decisions, corrections, instructions, and unfinished work that may not yet be organized. For every potentially relevant Entity returned by recall, use `memory_read` before relying on it or proceeding with the work. Reconcile organized long-term Memory and recent unorganized Logs with the current Task notes and the user's latest instruction. If required context is still missing after this search, then ask the user for it rather than guessing.
+
+Repeat Memory retrieval when the user's primary intent materially changes or the work moves to a different subject whose history may matter. Do not repeat an equivalent search when the applicable Memory has already been read in the current Session and remains current.
 
 Apply each Memory according to its recorded scope, conditions, and current validity. Treat organized long-term Memory as established context and recent unorganized Logs as evidence that may still require reconciliation.
 
@@ -1174,15 +1176,15 @@ fn build_working_session_instruction(
         grove_sections.push(task_kind);
     }
     if agent_runtime_available {
+        if crate::storage::memory::project_memory_enabled(&config.project_key).unwrap_or(false) {
+            grove_sections.push(WORKING_MEMORY_INSTRUCTION);
+        }
         grove_sections.push(WORKING_AGENT_RUNTIME_INSTRUCTION);
         if crate::storage::config::load_config()
             .browser_control
             .enabled
         {
             grove_sections.push(WORKING_BROWSER_INSTRUCTION);
-        }
-        if crate::storage::memory::project_memory_enabled(&config.project_key).unwrap_or(false) {
-            grove_sections.push(WORKING_MEMORY_INSTRUCTION);
         }
     }
 
@@ -9312,7 +9314,7 @@ mod tests {
     }
 
     #[test]
-    fn working_memory_instruction_requires_recall_before_proceeding_and_timely_append() {
+    fn working_memory_instruction_requires_initial_retrieval_and_timely_append() {
         for tool in [
             "memory_recall",
             "memory_get_recent_logs",
@@ -9321,11 +9323,22 @@ mod tests {
         ] {
             assert!(WORKING_MEMORY_INSTRUCTION.contains(tool));
         }
-        assert!(WORKING_MEMORY_INSTRUCTION
-            .contains("search Project Memory before guessing, acting, or asking the user"));
         assert!(WORKING_MEMORY_INSTRUCTION.contains(
-            "If the required context is still missing after this search, then ask the user"
+            "At the start of every new Working Session, before substantive work, always search Project Memory"
         ));
+        assert!(WORKING_MEMORY_INSTRUCTION.contains(
+            "Do not decide that Memory is unnecessary without performing this initial retrieval"
+        ));
+        assert!(
+            WORKING_MEMORY_INSTRUCTION.contains("before relying on it or proceeding with the work")
+        );
+        assert!(WORKING_MEMORY_INSTRUCTION
+            .contains("Repeat Memory retrieval when the user's primary intent materially changes"));
+        assert!(WORKING_MEMORY_INSTRUCTION.contains(
+            "Do not repeat an equivalent search when the applicable Memory has already been read"
+        ));
+        assert!(WORKING_MEMORY_INSTRUCTION
+            .contains("If required context is still missing after this search, then ask the user"));
         assert!(
             WORKING_MEMORY_INSTRUCTION.contains("in the same turn as soon as its meaning is clear")
         );
