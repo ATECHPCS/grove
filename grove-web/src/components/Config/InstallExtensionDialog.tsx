@@ -1,11 +1,16 @@
 /**
  * Install Chrome Companion — 2-step wizard.
  *
- * Step 1: "Choose Folder & Install" — user picks a directory via native
- *         OS folder picker, backend unpacks the embedded companion into
- *         that path, then launches the user's default browser on
- *         chrome://extensions/ (Chromium browsers forward to their own
- *         protocol automatically).
+ * Step 1: "Choose Folder & Install". User picks a directory, backend
+ *         unpacks the embedded companion into that path, then launches the
+ *         user's default browser on chrome://extensions/ (Chromium browsers
+ *         forward to their own protocol automatically).
+ *
+ *         The directory normally comes from the server's native OS folder
+ *         picker. That picker is unusable when the browser is on a different
+ *         machine (the dialog would open on the server's desktop) or when the
+ *         server is headless, so both cases fall back to the in-app
+ *         FolderTreePickerDialog.
  *
  * Step 2: "Load Unpacked" — always shows the chosen install path with
  *         click-to-copy and a "Reveal in Finder" button, plus three short
@@ -39,6 +44,7 @@ import {
   browseInstallFolder,
   getExtensionStatus,
 } from "../../api/extension";
+import { FolderTreePickerDialog } from "../Projects/FolderTreePickerDialog";
 
 interface Props {
   /** Parent should mount with `{open && <InstallExtensionDialog ... />}`.
@@ -57,6 +63,8 @@ export function InstallExtensionDialog({ onClose }: Props) {
   const [chromeWarning, setChromeWarning] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [revealError, setRevealError] = useState<string | null>(null);
+  // In-app folder browser, used when the native picker cannot be shown.
+  const [pickerOpen, setPickerOpen] = useState(false);
   // Extension connection — fetched on dialog mount only. No polling. If the
   // user plugs in the extension AFTER opening this dialog, closing + reopening
   // the dialog refreshes the badge (the parent conditionally mounts us).
@@ -67,25 +75,23 @@ export function InstallExtensionDialog({ onClose }: Props) {
     return () => { cancelled = true; };
   }, []);
 
-  const handleInstall = async () => {
+  // `window.__GROVE_REMOTE__` is set by AuthGate when `/api/v1/auth/info`
+  // reports either `remote: true` or `required: true`.
+  const isRemoteMode = (): boolean =>
+    (window as unknown as Record<string, unknown>).__GROVE_REMOTE__ === true;
+
+  // Unpack the companion into `dir`, then best-effort launch the user's
+  // default browser on chrome://extensions/. All Chromium browsers forward
+  // to their own protocol; non-Chromium browsers surface a non-fatal warning
+  // so the user can paste the URL by hand.
+  const installAt = async (dir: string) => {
     setInstalling(true);
     setInstallError(null);
     setChromeWarning(null);
     try {
-      // 1. Pop native folder picker. Cancelled = stay on step 1.
-      const picked = await browseInstallFolder();
-      if (!picked.path) {
-        setInstalling(false);
-        return;
-      }
-      // 2. Unpack the embedded companion into the chosen path.
-      const result = await installCompanion(picked.path);
+      const result = await installCompanion(dir);
       setInstallPath(result.path);
       setStep(2);
-      // 3. Best-effort: launch the user's default browser on
-      //    chrome://extensions/. All Chromium browsers forward to their
-      //    own protocol; non-Chromium browsers surface a non-fatal warning
-      //    so the user can paste the URL by hand.
       try {
         await openChromeExtensions();
       } catch (err) {
@@ -94,6 +100,36 @@ export function InstallExtensionDialog({ onClose }: Props) {
       }
     } catch (err) {
       setInstallError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  const handleInstall = async () => {
+    // Browsing from another machine: the native dialog would open on the
+    // server's desktop where the user cannot reach it, so go straight to the
+    // in-app folder browser.
+    if (isRemoteMode()) {
+      setPickerOpen(true);
+      return;
+    }
+    setInstalling(true);
+    setInstallError(null);
+    try {
+      const picked = await browseInstallFolder();
+      if (picked.path) {
+        await installAt(picked.path);
+        return;
+      }
+      if (!picked.cancelled) {
+        // Native dialog unavailable (headless host, or DISPLAY pointing at a
+        // dead session). Open the web picker instead of dead-ending.
+        setPickerOpen(true);
+      }
+      // cancelled === true → user dismissed the native dialog; do nothing.
+    } catch (err) {
+      console.error("Failed to browse install folder:", err);
+      setPickerOpen(true);
     } finally {
       setInstalling(false);
     }
@@ -222,6 +258,24 @@ export function InstallExtensionDialog({ onClose }: Props) {
           )}
         </div>
       </motion.div>
+      {/* The picker portals to document.body, but a portal's events still
+          bubble through the React tree. Without this stopPropagation wrapper
+          a click on the picker (its backdrop especially) would reach the
+          overlay's onClick and close the whole wizard underneath it. */}
+      {pickerOpen && (
+        <div onClick={(e) => e.stopPropagation()}>
+          <FolderTreePickerDialog
+            isOpen={pickerOpen}
+            onClose={() => setPickerOpen(false)}
+            onSelect={(dir) => {
+              setPickerOpen(false);
+              void installAt(dir);
+            }}
+            title="Where to install Grove Companion?"
+            zIndex={210}
+          />
+        </div>
+      )}
     </div>,
     document.body,
   );
