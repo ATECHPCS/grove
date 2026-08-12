@@ -36,6 +36,29 @@ struct ExtensionAssets;
 
 static EXTENSION_ZIP_CACHE: OnceLock<Vec<u8>> = OnceLock::new();
 
+/// Filename every Chrome extension must ship. Its presence is what separates
+/// a real companion build from an empty placeholder directory.
+const MANIFEST_FILENAME: &str = "manifest.json";
+
+/// Error surfaced when the companion was never built into this binary.
+const ASSETS_MISSING: &str =
+    "extension assets are not bundled in this build (build grove-extension first)";
+
+/// True when `paths` contains the extension manifest at the top level.
+///
+/// `grove-extension/dist` is gitignored, so a checkout that has never run the
+/// extension build can still hold a placeholder file such as `.gitkeep`, and
+/// release builds bake whatever is in that directory into the binary. Merely
+/// counting embedded files therefore reports success for an embed holding
+/// nothing Chrome can load, so require the manifest itself.
+fn manifest_present<I, S>(paths: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    paths.into_iter().any(|p| p.as_ref() == MANIFEST_FILENAME)
+}
+
 /// REST endpoint: GET /api/v1/extension/status
 /// Lightweight probe — returns whether the Chrome companion extension is
 /// currently connected over WebSocket. Pure read of EXTENSION_SESSION,
@@ -501,8 +524,10 @@ pub async fn browser_screenshot(tab_id: u32) -> Result<serde_json::Value, String
 /// Build the companion zip in memory from the embedded `grove-extension/dist`
 /// files. Returns an error if the embed is empty (extension dist not built).
 fn build_extension_zip() -> Result<Vec<u8>, String> {
+    if !manifest_present(ExtensionAssets::iter()) {
+        return Err(ASSETS_MISSING.to_string());
+    }
     let mut buf: Vec<u8> = Vec::new();
-    let mut any = false;
     {
         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
         let options = zip::write::SimpleFileOptions::default()
@@ -516,15 +541,8 @@ fn build_extension_zip() -> Result<Vec<u8>, String> {
             writer
                 .write_all(file.data.as_ref())
                 .map_err(|e| format!("zip write {}: {}", path, e))?;
-            any = true;
         }
         writer.finish().map_err(|e| format!("zip finish: {}", e))?;
-    }
-    if !any {
-        return Err(
-            "extension assets are not bundled in this build (build grove-extension first)"
-                .to_string(),
-        );
     }
     Ok(buf)
 }
@@ -605,6 +623,13 @@ pub async fn install_extension_to_disk(
     Json(req): Json<InstallExtensionRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     let parent = validate_install_path(&req.path).map_err(ApiError::bad_request)?;
+    // Check before creating anything. A binary built without the extension
+    // would otherwise leave an empty grove-companion directory in the user's
+    // folder and still report success, sending them to Chrome with a path
+    // that has no manifest to load.
+    if !manifest_present(ExtensionAssets::iter()) {
+        return Err(ApiError::internal(ASSETS_MISSING));
+    }
     // Create the dedicated subfolder. Without this, the user's chosen folder
     // (e.g. ~/Documents) ends up littered with manifest.json + assets/ —
     // breaking their organisation and making cleanup hard.
@@ -630,11 +655,6 @@ pub async fn install_extension_to_disk(
             ApiError::bad_request(format!("could not write {}: {}", dest.display(), e))
         })?;
         written += 1;
-    }
-    if written == 0 {
-        return Err(ApiError::internal(
-            "extension assets are not bundled in this build (build grove-extension first)",
-        ));
     }
     Ok(Json(json!({
         "ok": true,
@@ -908,4 +928,37 @@ fn macos_default_browser_bundle_id() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_present_accepts_a_real_build() {
+        assert!(manifest_present([
+            "manifest.json",
+            "index.html",
+            "assets/background.js"
+        ]));
+        assert!(manifest_present(vec![
+            "icons/32.png".to_string(),
+            "manifest.json".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn manifest_present_rejects_placeholder_only_embed() {
+        // The exact shape that shipped a "successful" install of nothing: an
+        // unbuilt grove-extension/dist holding only the directory placeholder.
+        assert!(!manifest_present([".gitkeep"]));
+        assert!(!manifest_present(Vec::<&str>::new()));
+    }
+
+    #[test]
+    fn manifest_present_requires_the_manifest_at_the_top_level() {
+        // Chrome loads the manifest from the directory root, so a nested one
+        // does not make the embed loadable.
+        assert!(!manifest_present(["nested/manifest.json"]));
+    }
 }
