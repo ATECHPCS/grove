@@ -38,3 +38,21 @@ export function previewCommentTaskLabel(
     .findIndex((draft) => draft.id === target.id);
   return String(index >= 0 ? index + 1 : 1);
 }
+
+/** Rehydrate a persisted draft into the complete marker payload expected by
+ * preview renderers. Keeping the full locator is required for exact textRange
+ * highlights; selector/xpath alone only identify the surrounding block. */
+export function previewCommentMarkerData(
+  draft: PreviewCommentDraft,
+  label: string,
+) {
+  return {
+    id: draft.id,
+    label,
+    selector: draft.locator.selector,
+    xpath: draft.locator.xpath,
+    extraBlocks: draft.locator.extraBlocks,
+    locator: draft.locator,
+    comment: draft.comment,
+  };
+}

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   firstVisibleTaskChatRow,
   scrollVirtuosoToBottom,
+  shouldDisengageTaskChatAutoStick,
   shouldVirtualizeTaskChat,
   taskChatHeightEstimates,
   taskChatLayoutTransitionTarget,
@@ -47,23 +48,41 @@ describe("scrollVirtuosoToBottom", () => {
     });
   });
 
-  it("starts a new measurement generation for boundary and width changes", () => {
+  it("does not mistake Virtuoso layout correction for a user scroll", () => {
+    expect(
+      shouldDisengageTaskChatAutoStick({
+        atBottom: false,
+        userGestureActive: false,
+        programmaticScroll: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldDisengageTaskChatAutoStick({
+        atBottom: false,
+        userGestureActive: true,
+        programmaticScroll: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldDisengageTaskChatAutoStick({
+        atBottom: false,
+        userGestureActive: true,
+        programmaticScroll: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("keeps the virtual scroller mounted as the cold boundary advances", () => {
     const base = {
       chatId: "chat-a",
       hiddenMessageCount: 0,
-      measurementWidth: 900,
       virtualized: true,
-      coldBoundaryIndex: 72,
     };
     expect(taskChatVirtualizationLayoutKey(base)).toBe(
-      "virtual:chat-a:0:900:72",
+      "virtual:chat-a:0",
     );
-    expect(
-      taskChatVirtualizationLayoutKey({ ...base, coldBoundaryIndex: 76 }),
-    ).not.toBe(taskChatVirtualizationLayoutKey(base));
-    expect(
-      taskChatVirtualizationLayoutKey({ ...base, measurementWidth: 760 }),
-    ).not.toBe(taskChatVirtualizationLayoutKey(base));
+    // The cold-boundary index is deliberately absent from both the input and
+    // output. Advancing it appends data and must not create a new React key.
   });
 
   it("reuses measured hot-row heights as Virtuoso estimates", () => {

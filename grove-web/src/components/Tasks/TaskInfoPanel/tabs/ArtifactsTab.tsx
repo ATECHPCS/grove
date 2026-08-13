@@ -30,7 +30,7 @@ import {
   parseLinkFile,
 } from "../../../ui";
 import { openExternalUrl } from "../../../../utils/openExternal";
-import { previewCommentTaskLabel, usePreviewComments, type PreviewCommentLocator } from "../../../../context";
+import { previewCommentMarkerData, previewCommentTaskLabel, usePreviewComments, type PreviewCommentLocator } from "../../../../context";
 import { getPreviewRenderer, type PreviewCommentMarker } from "../../../Review/previewRenderers";
 
 interface ArtifactsTabProps {
@@ -483,13 +483,12 @@ export function ArtifactsTab({ projectId, task, previewRequest, lastChatIdleAt, 
     );
   }, [previewCommentDrafts, projectId, task.id, previewFilePath]);
   const currentFilePreviewMarkers = useMemo<PreviewCommentMarker[]>(
-    () => currentFilePreviewDrafts.map((d) => ({
-      id: d.id,
-      label: previewCommentTaskLabel(previewCommentDrafts, d),
-      selector: d.locator.selector,
-      xpath: d.locator.xpath,
-      extraBlocks: d.locator.extraBlocks,
-    })),
+    () => currentFilePreviewDrafts.map((draft) =>
+      previewCommentMarkerData(
+        draft,
+        previewCommentTaskLabel(previewCommentDrafts, draft),
+      ),
+    ),
     [currentFilePreviewDrafts, previewCommentDrafts],
   );
 

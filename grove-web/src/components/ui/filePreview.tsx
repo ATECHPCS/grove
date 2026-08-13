@@ -732,7 +732,7 @@ export function FilePreviewDrawer({
           )}
         </div>
       </motion.div>
-      {pendingLocator && (
+      {pendingLocator && typeof document !== "undefined" && createPortal(
         <>
           {pendingLocator.rect && (
             <div
@@ -807,7 +807,8 @@ export function FilePreviewDrawer({
                 </div>
               </div>
           </div>
-        </>
+        </>,
+        document.body,
       )}
       <ImageLightbox
         imageUrl={lightboxUrl}

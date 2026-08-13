@@ -137,6 +137,7 @@ import { extractThoughtStatus } from "./thoughtStatus";
 import {
   firstVisibleTaskChatRow,
   scrollVirtuosoToBottom,
+  shouldDisengageTaskChatAutoStick,
   shouldVirtualizeTaskChat,
   taskChatHeightEstimates,
   taskChatLayoutTransitionTarget,
@@ -3003,6 +3004,11 @@ export function TaskChat({
   const planFilePathRef = useRef("");
   const planFileToolIdsRef = useRef<Set<string>>(new Set());
   const autoStickToBottomRef = useRef(true);
+  // Capture the reader's intent before a completion commit replaces the live
+  // sequential rows with a much shorter WorkSummary. Virtuoso emits transient
+  // off-bottom measurements during that height collapse; those measurements
+  // must not erase the fact that the reader was following the tail.
+  const preserveBottomOnBusyEndRef = useRef(false);
   const suppressNextSmoothScrollRef = useRef(false);
   const messagesCountRef = useRef(messages.length);
   useEffect(() => {
@@ -3861,7 +3867,6 @@ export function TaskChat({
   // disable auto-stick when atBottom flips while isScrolling is true —
   // i.e. there's a live user-driven scroll in progress. Re-enabling
   // happens unconditionally when atBottom becomes true.
-  const isUserScrollingRef = useRef(false);
   // `isScrolling` alone cannot identify the source: Virtuoso sets it for
   // both a wheel/drag from the user and our own scrollToIndex calls. Record
   // a short-lived user gesture before the scroll begins so an upward scroll
@@ -3890,7 +3895,6 @@ export function TaskChat({
     userScrollGestureUntilRef.current = Date.now() + 1_000;
   }, []);
   const handleIsScrolling = useCallback((scrolling: boolean) => {
-    isUserScrollingRef.current = scrolling;
     if (scrolling && Date.now() < userScrollGestureUntilRef.current) {
       disengageAutoStick();
     }
@@ -3944,10 +3948,11 @@ export function TaskChat({
       // Chat-switch reveal: as soon as Virtuoso confirms we're at bottom,
       // fade the list in (vs waiting the hard fallback timeout).
       notifyPositionedAtBottom();
-    } else if (
-      isUserScrollingRef.current &&
-      !programmaticScrollRef.current
-    ) {
+    } else if (shouldDisengageTaskChatAutoStick({
+      atBottom,
+      userGestureActive: Date.now() < userScrollGestureUntilRef.current,
+      programmaticScroll: programmaticScrollRef.current,
+    })) {
       autoStickToBottomRef.current = false;
     }
     setShowScrollToBottom(!atBottom && messagesCountRef.current > 0);
@@ -5268,6 +5273,9 @@ export function TaskChat({
           setMessages((prev) => reduceHistoryMessages(prev, msg));
           break;
         case "complete":
+          // Snapshot this before the WorkSummary compaction changes the list
+          // height and Virtuoso emits transient atBottom=false callbacks.
+          preserveBottomOnBusyEndRef.current = autoStickToBottomRef.current;
           setAutoExpandSectionId((prev) => {
             if (prev) {
               setExpandedSections((s) => {
@@ -5291,6 +5299,9 @@ export function TaskChat({
           onChatBecameIdle?.();
           break;
         case "busy":
+          if (!msg.value) {
+            preserveBottomOnBusyEndRef.current = autoStickToBottomRef.current;
+          }
           updateBusy(msg.value);
           if (!msg.value) {
             setMessages((prev) => pruneActiveChatMessages(prev));
@@ -8425,16 +8436,15 @@ export function TaskChat({
     measuredRowHeights,
     TASK_CHAT_DEFAULT_ITEM_HEIGHT,
   );
-  // Virtuoso only consumes heightEstimates while constructing an empty size
-  // tree. Remount whenever the cold/hot boundary advances, or after the pane
-  // settles at a new width, so a turn leaving the hot zone enters the cold
-  // zone with the real height already measured for this generation.
+  // Keep the scroller mounted while the pane width and cold/hot boundary
+  // settle. Virtuoso remeasures mounted rows through ResizeObserver, while our
+  // height cache remains width-scoped. Including either transient value in
+  // the React key remounts the scroller after initial bottom positioning (and
+  // on every long-chat send), which can strand a streaming reader mid-chat.
   const virtualizationLayoutKey = taskChatVirtualizationLayoutKey({
     chatId: activeChatId ?? "none",
     hiddenMessageCount,
-    measurementWidth,
     virtualized: shouldVirtualizeChat,
-    coldBoundaryIndex: recentTurnStartRenderIndex,
   });
   const resolveActiveConversationTurnMessageIndex = useCallback((range: { startIndex: number }) => {
     let active = conversationTurns[0];
@@ -8695,11 +8705,14 @@ export function TaskChat({
     let secondFrame: number | null = null;
     const turnJustCompleted = !isBusy && wasBusyRef.current;
     wasBusyRef.current = isBusy;
+    const preserveCompletedTail = preserveBottomOnBusyEndRef.current;
+    if (turnJustCompleted) preserveBottomOnBusyEndRef.current = false;
     // Completing a turn automatically replaces its live sequential rows with
     // a compact WorkSummary. That can remove a large amount of height in one
     // commit. Preserve the tail only for readers who were already following
     // it; someone who intentionally scrolled into history remains detached.
-    if (turnJustCompleted && autoStickToBottomRef.current) {
+    if (turnJustCompleted && preserveCompletedTail) {
+      autoStickToBottomRef.current = true;
       firstFrame = requestAnimationFrame(() => {
         secondFrame = requestAnimationFrame(() => {
           if (autoStickToBottomRef.current) {
@@ -8714,10 +8727,9 @@ export function TaskChat({
     };
   }, [isBusy, scrollMessagesToBottom]);
 
-  // A layout generation changes when the direct/virtual renderer swaps, when
-  // the 50-turn boundary advances, or when the pane settles at a new width.
-  // All three rebuild Virtuoso's size tree. Preserve either the complete tail
-  // or an exact row + pixel-offset anchor across that rebuild.
+  // A layout generation changes when the direct/virtual renderer swaps.
+  // Preserve either the complete tail or an exact row + pixel-offset anchor
+  // across that rebuild.
   const previousVirtualizationLayoutRef = useRef({
     chatId: activeChatId,
     key: virtualizationLayoutKey,

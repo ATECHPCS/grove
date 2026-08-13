@@ -21,5 +21,6 @@ export {
 } from "./PreviewCommentContext";
 export {
   previewCommentLocatorInParentViewport,
+  previewCommentMarkerData,
   previewCommentTaskLabel,
 } from "./previewCommentUtils";

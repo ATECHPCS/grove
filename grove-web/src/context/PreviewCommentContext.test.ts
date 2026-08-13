@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { PreviewCommentDraft } from "./PreviewCommentContext";
 import {
   previewCommentLocatorInParentViewport,
+  previewCommentMarkerData,
   previewCommentTaskLabel,
 } from "./previewCommentUtils";
 
@@ -76,5 +77,52 @@ describe("previewCommentLocatorInParentViewport", () => {
     };
 
     expect(previewCommentLocatorInParentViewport(locator, window, document)).toBe(locator);
+  });
+});
+
+describe("previewCommentMarkerData", () => {
+  it("preserves the exact text range when restoring an artifact marker", () => {
+    const item = draft("sentence", "project-1", "task-1");
+    item.locator = {
+      type: "dom",
+      selector: "p:nth-of-type(1)",
+      xpath: "/div[1]/p[1]",
+      tagName: "p",
+      text: "Integration Issue Insights 是集成问题洞察平台。",
+      textRange: {
+        start: 0,
+        end: 39,
+        quote: "Integration Issue Insights 是集成问题洞察平台。",
+      },
+    };
+
+    const marker = previewCommentMarkerData(item, "1");
+
+    expect(marker.locator).toBe(item.locator);
+    expect(marker.locator.textRange).toEqual(item.locator.textRange);
+    expect(marker.comment).toBe(item.comment);
+  });
+
+  it("keeps block comments as block markers without inventing a text range", () => {
+    const item = draft("paragraph", "project-1", "task-1");
+    item.locator = {
+      type: "dom",
+      selector: "p:nth-of-type(1)",
+      xpath: "/div[1]/p[1]",
+      tagName: "p",
+      text: "Integration Issue Insights 是集成问题洞察平台。",
+      extraBlocks: [
+        {
+          selector: "p:nth-of-type(2)",
+          xpath: "/div[1]/p[2]",
+        },
+      ],
+    };
+
+    const marker = previewCommentMarkerData(item, "2");
+
+    expect(marker.locator).toBe(item.locator);
+    expect(marker.locator.textRange).toBeUndefined();
+    expect(marker.extraBlocks).toEqual(item.locator.extraBlocks);
   });
 });
