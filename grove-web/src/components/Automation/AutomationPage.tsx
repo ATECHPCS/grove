@@ -16,8 +16,8 @@ import {
   Pencil,
   Trash2,
   CircleCheck,
+  CircleAlert,
   CircleX,
-  Clock,
   Calendar,
   Clock4,
   Sparkles,
@@ -29,7 +29,6 @@ import {
   Wand2,
   Zap,
   Hand,
-  PauseCircle,
   X,
   RotateCcw,
   LockKeyhole,
@@ -135,7 +134,7 @@ export function AutomationPage({
     setTriggeringId(id);
     try {
       const result = await triggerAutomation(projectId, id);
-      setErrorMsg(result.status === "failed" ? result.error ?? "Trigger failed" : null);
+      setErrorMsg(result.error ?? null);
       // Trigger is async now — the row is `queued` and the agent will
       // complete in the background. Bump the refresh tick so any open
       // run-history panel re-fetches and shows the new row immediately,
@@ -887,19 +886,15 @@ function RunRow({
   };
 
   // Row-level actions depend on the run's terminal-ness:
-  //   queued / running  → Cancel
-  //   failed / timeout / interrupted / cancelled → Rerun (manual trigger)
+  //   every non-terminal state → Cancel
+  //   cancelled → Run now (manual trigger)
   //   success           → no action (use Open Session to inspect)
-  const inFlight = run.status === "queued" || run.status === "running";
-  const reRunnable =
-    run.status === "failed" ||
-    run.status === "timeout" ||
-    run.status === "interrupted" ||
-    run.status === "cancelled";
+  const cancellable = run.status !== "success" && run.status !== "cancelled";
+  const reRunnable = run.status === "cancelled";
 
   // Body content depends on status. Success with text → show excerpt; success
-  // without text → friendly "tool-only" note; failure / timeout / interrupted
-  // → render the error so users don't have to dig into the DB.
+  // without text → friendly "tool-only" note; setup failure renders the
+  // error so users don't have to dig into the DB.
   const body = renderRunBody(run);
 
   return (
@@ -929,7 +924,7 @@ function RunRow({
           </span>
         )}
         <div className="ml-auto inline-flex items-center gap-2">
-          {!readOnly && inFlight && (
+          {!readOnly && cancellable && (
             <RowAction
               variant="danger"
               icon={<X className="w-3 h-3" />}
@@ -1011,6 +1006,12 @@ function renderRunBody(run: AutomationRun): React.ReactNode {
           Agent is processing…
         </span>
       );
+    case "waiting":
+      return (
+        <span className="text-[var(--color-warning)]">
+          Waiting for input…
+        </span>
+      );
     case "cancelled":
       return (
         <span className="text-[var(--color-text-muted)]">
@@ -1046,19 +1047,6 @@ function renderRunBody(run: AutomationRun): React.ReactNode {
           </span>
         </div>
       );
-    case "timeout":
-      return (
-        <span className="text-amber-500">
-          Agent did not report completion within the timeout window
-          {run.agent_response && " (captured partial output)"}
-        </span>
-      );
-    case "interrupted":
-      return (
-        <span className="text-[var(--color-text-muted)]">
-          Grove restarted before the agent finished
-        </span>
-      );
     default:
       return null;
   }
@@ -1067,45 +1055,40 @@ function renderRunBody(run: AutomationRun): React.ReactNode {
 function RunStatusBadge({ status }: { status: string }) {
   const styles: Record<string, { label: string; icon: React.ReactNode; cls: string }> = {
     success: {
-      label: "success",
+      label: "Completed",
       icon: <CircleCheck className="w-3 h-3" />,
       cls: "bg-emerald-500/15 text-emerald-500",
     },
     failed: {
-      label: "failed",
+      label: "Failed",
       icon: <CircleX className="w-3 h-3" />,
       cls: "bg-rose-500/15 text-rose-500",
     },
-    timeout: {
-      label: "timeout",
-      icon: <Clock className="w-3 h-3" />,
-      cls: "bg-amber-500/15 text-amber-500",
-    },
-    interrupted: {
-      label: "interrupted",
-      icon: <PauseCircle className="w-3 h-3" />,
-      cls: "bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]",
-    },
     queued: {
-      label: "queued",
+      label: "In Progress",
       icon: <Loader2 className="w-3 h-3 animate-spin" />,
       cls: "bg-[var(--color-highlight)]/15 text-[var(--color-highlight)]",
     },
     running: {
-      label: "running",
+      label: "In Progress",
       icon: <Loader2 className="w-3 h-3 animate-spin" />,
       cls: "bg-sky-500/15 text-sky-500",
     },
+    waiting: {
+      label: "Waiting",
+      icon: <CircleAlert className="w-3 h-3" />,
+      cls: "bg-amber-500/15 text-amber-500",
+    },
     cancelled: {
-      label: "cancelled",
+      label: "Cancelled",
       icon: <X className="w-3 h-3" />,
       cls: "bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]",
     },
   };
   const s = styles[status] ?? {
-    label: status,
-    icon: null,
-    cls: "bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]",
+    label: "Failed",
+    icon: <CircleX className="w-3 h-3" />,
+    cls: "bg-rose-500/15 text-rose-500",
   };
   return (
     <span
@@ -1184,22 +1167,10 @@ function EmptyState({ onCreate }: { onCreate: () => void }) {
   );
 }
 
-/// Parent-row last-run badge. Delegates to the same renderer
-/// `RunStatusBadge` uses, so cancelled / timeout / interrupted get the
-/// same colored pill as in the run history (instead of falling through to
-/// a generic grey chip that's visually identical to currently-running).
-/// The label maps `success → ok` for the parent surface — shorter, fits
-/// next to the automation name in the card header.
+/// Parent-row last-run badge. Delegates to the same five-state renderer used
+/// by Run history.
 function StatusBadge({ status }: { status?: string }) {
   if (!status) return null;
-  if (status === "success") {
-    return (
-      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-medium rounded-full bg-emerald-500/15 text-emerald-500">
-        <CircleCheck className="w-3 h-3" />
-        ok
-      </span>
-    );
-  }
   return <RunStatusBadge status={status} />;
 }
 

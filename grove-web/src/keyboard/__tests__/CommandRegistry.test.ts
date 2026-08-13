@@ -58,6 +58,33 @@ describe("CommandRegistry", () => {
     expect(reg.invoke("a")).toBe(false);
   });
 
+  it("invokes the newest enabled handler when multiple owners register the same command", () => {
+    reg.setStaticCatalog([def("a")]);
+    const visible = vi.fn();
+    const hidden = vi.fn();
+    reg.registerHandler("a", visible, () => true);
+    reg.registerHandler("a", hidden, () => false);
+
+    expect(reg.getEnabled("a")?.()).toBe(true);
+    expect(reg.invoke("a")).toBe(true);
+    expect(visible).toHaveBeenCalledOnce();
+    expect(hidden).not.toHaveBeenCalled();
+  });
+
+  it("restores the previous handler when the newest owner unregisters", () => {
+    reg.setStaticCatalog([def("a")]);
+    const first = vi.fn();
+    const second = vi.fn();
+    reg.registerHandler("a", first);
+    const disposeSecond = reg.registerHandler("a", second);
+
+    expect(reg.invoke("a")).toBe(true);
+    expect(second).toHaveBeenCalledOnce();
+    disposeSecond();
+    expect(reg.invoke("a")).toBe(true);
+    expect(first).toHaveBeenCalledOnce();
+  });
+
   it("invoke returns false when no handler", () => {
     reg.setStaticCatalog([def("a")]);
     expect(reg.invoke("a")).toBe(false);

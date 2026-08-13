@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
-import { Code, Download, FolderOpen, Puzzle, Trash2 } from "lucide-react";
+import { Download, FolderOpen, Puzzle, Trash2 } from "lucide-react";
 import { Button } from "../ui";
 import { listPlugins, deletePlugin, revealPluginFolder, type Plugin } from "../../api/plugins";
-import { DevelopPluginDialog } from "./DevelopPluginDialog";
 import { AddPluginDialog } from "./AddPluginDialog";
 import { PluginDetailDialog } from "./PluginDetailDialog";
 import { PluginIcon } from "../Plugins/PluginIcon";
@@ -34,7 +33,6 @@ const permLabel = (perm: string): string => PERMISSION_LABELS[perm] ?? perm;
 export function PluginsSection() {
   const [plugins, setPlugins] = useState<Plugin[]>([]);
   const [loading, setLoading] = useState(true);
-  const [showDevelop, setShowDevelop] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [detailPlugin, setDetailPlugin] = useState<Plugin | null>(null);
 
@@ -80,10 +78,6 @@ export function PluginsSection() {
         <Button variant="secondary" size="sm" onClick={() => setShowAdd(true)}>
           <Download className="mr-1.5 h-4 w-4" />
           Add Plugin
-        </Button>
-        <Button variant="secondary" size="sm" onClick={() => setShowDevelop(true)}>
-          <Code className="mr-1.5 h-4 w-4" />
-          Develop Plugin
         </Button>
       </div>
 
@@ -221,14 +215,6 @@ export function PluginsSection() {
         <AddPluginDialog
           onClose={() => {
             setShowAdd(false);
-            reload();
-          }}
-        />
-      )}
-      {showDevelop && (
-        <DevelopPluginDialog
-          onClose={() => {
-            setShowDevelop(false);
             reload();
           }}
         />

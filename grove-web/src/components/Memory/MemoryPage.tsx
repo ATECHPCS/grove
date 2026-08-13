@@ -108,6 +108,8 @@ const EMPTY_OVERVIEW: MemoryOverview = {
   run_count: 0,
   successful_run_count: 0,
   failed_run_count: 0,
+  in_progress_run_count: 0,
+  waiting_run_count: 0,
   active_run_count: 0,
   usage: {
     input_tokens: 0,
@@ -119,7 +121,7 @@ const EMPTY_OVERVIEW: MemoryOverview = {
 };
 
 const DEFAULT_DRAFT: MemoryConfigInput = {
-  enabled: true,
+  enabled: false,
   deep_organization: false,
   pending_log_threshold: null,
   organization_enabled: true,
@@ -220,7 +222,7 @@ export function MemoryPage() {
     setRunStarting(true);
     try {
       const result = await triggerAutomation(projectId, config.organization.id);
-      if (result.status === "failed") throw new Error(result.error ?? "Could not start Memory organization");
+      if (result.error) throw new Error(result.error);
       showBanner("Memory organization started.", "success");
       setRefreshTick((value) => value + 1);
     } catch (reason) {
@@ -440,13 +442,27 @@ function OverviewTab({
     await onRunOrganization();
   };
 
-  const state = overview.active_run_count > 0
+  const state = overview.in_progress_run_count > 0
     ? {
         label: "Organizing",
         tone: "active" as const,
         title: "Grove is organizing recent project knowledge.",
         description: "Follow the active run to see what is being consolidated.",
       }
+    : overview.waiting_run_count > 0
+      ? {
+          label: "Waiting",
+          tone: "pending" as const,
+          title: "Memory organization is waiting for you.",
+          description: "Open the Run to provide input, guidance, or permission.",
+        }
+      : overview.failed_run_count > 0 && overview.active_run_count > 0
+        ? {
+            label: "Failed",
+            tone: "error" as const,
+            title: "The current Memory organization attempt failed.",
+            description: "Open the Run to review the error, retry, or cancel it.",
+          }
     : !draft.enabled
       ? {
           label: "Disabled",
@@ -574,7 +590,7 @@ function OverviewTab({
             </div>
             <div className="mt-3 grid grid-cols-3 gap-px overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-border)] lg:grid-cols-6">
               <OverviewActivityMetric value={formatNumber(overview.successful_run_count)} label="Completed" />
-              <OverviewActivityMetric value={formatNumber(overview.failed_run_count)} label="Failed" tone={overview.failed_run_count > 0 ? "danger" : "default"} />
+              <OverviewActivityMetric value={formatNumber(overview.failed_run_count)} label="Errors" tone={overview.failed_run_count > 0 ? "danger" : "default"} />
               <OverviewActivityMetric value={formatMetricCost(overview.usage.cost_by_currency)} label="Cost" />
               <OverviewActivityMetric value={compactNumber(overview.usage.input_tokens)} label="Input tokens" />
               <OverviewActivityMetric value={compactNumber(overview.usage.cached_input_tokens)} label="Cached input" />
@@ -731,13 +747,15 @@ function OverviewFitFrame({ children }: { children: ReactNode }) {
   );
 }
 
-function MemoryStateBadge({ label, tone }: { label: string; tone: "success" | "pending" | "active" | "muted" }) {
+function MemoryStateBadge({ label, tone }: { label: string; tone: "success" | "pending" | "active" | "error" | "muted" }) {
   const color = tone === "success"
     ? "text-[var(--color-success)]"
     : tone === "pending"
       ? "text-[var(--color-warning)]"
       : tone === "active"
         ? "text-[var(--color-highlight)]"
+        : tone === "error"
+          ? "text-[var(--color-error)]"
         : "text-[var(--color-text-muted)]";
   return (
     <span className={`inline-flex items-center gap-2 whitespace-nowrap text-xs font-medium ${color}`}>
@@ -1316,24 +1334,29 @@ function OrganizeMemoryButton({
   blockedByUnsavedChanges?: boolean;
   onClick: () => void;
 }) {
-  const runActive = overview.active_run_count > 0;
+  const runOpen = overview.active_run_count > 0;
+  const agentRunning = overview.in_progress_run_count > 0;
   return (
     <Button
       onClick={onClick}
-      disabled={runStarting || !config?.enabled || runActive || blockedByUnsavedChanges}
+      disabled={runStarting || !config?.enabled || runOpen || blockedByUnsavedChanges}
       title={blockedByUnsavedChanges ? "Save configuration changes before organizing Memory" : undefined}
       className="flex-shrink-0 self-start sm:self-auto"
     >
-      {runStarting || runActive
+      {runStarting || agentRunning
         ? <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-        : <Play className="mr-2 h-4 w-4" />}
-      {runActive
+        : runOpen
+          ? <CircleAlert className="mr-2 h-4 w-4" />
+          : <Play className="mr-2 h-4 w-4" />}
+      {agentRunning
         ? "Organization running"
-        : blockedByUnsavedChanges
-          ? "Save changes first"
-          : overview.log_count > 0
-            ? `Organize ${formatNumber(overview.log_count)} ${plural(overview.log_count, "log", "logs")}`
-            : "Organize now"}
+        : runOpen
+          ? (overview.waiting_run_count > 0 ? "Organization waiting" : "Organization failed")
+          : blockedByUnsavedChanges
+            ? "Save changes first"
+            : overview.log_count > 0
+              ? `Organize ${formatNumber(overview.log_count)} ${plural(overview.log_count, "log", "logs")}`
+              : "Organize now"}
     </Button>
   );
 }
@@ -1378,7 +1401,7 @@ function RunsTab({
     void Promise.resolve().then(() => {
       if (!active) return;
       if (latestUpdate.run) {
-        if (isTerminal(latestUpdate.run.status)) {
+        if (!isAgentRunning(latestUpdate.run.status)) {
           setFinishingRunId((current) =>
             current === latestUpdate.run_id ? null : current,
           );
@@ -1508,8 +1531,8 @@ function RunsTab({
             <div className="min-w-0 flex-1"><div className="flex items-center gap-2"><span className="truncate font-medium text-sm text-[var(--color-text)]">{runTitle(run)}</span><span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]">{humanize(run.trigger_kind)}</span></div><p className="text-xs text-[var(--color-text-muted)] mt-1">{formatDate(run.triggered_at * 1000)} · {durationLabel(run)}{run.agent_snapshot ? ` · ${run.agent_snapshot}` : ""}</p></div>
             <RunCounts result={run.result} />
           </button>
-          {run.status === "running" && <Button variant="ghost" size="sm" disabled={finishingRunId === run.id} onClick={() => void finishRun(run)}>{finishingRunId === run.id ? "Finishing…" : "Finish"}</Button>}
-          {["queued", "running"].includes(run.status) && <Button variant="ghost" size="sm" onClick={() => void cancelAutomationRun(projectId, config.organization.id, run.id)}>Cancel</Button>}
+          {["running", "waiting", "failed"].includes(run.status) && <Button variant="ghost" size="sm" disabled={finishingRunId === run.id} onClick={() => void finishRun(run)}>{finishingRunId === run.id ? "Finishing…" : "Finish"}</Button>}
+          {!isTerminal(run.status) && <Button variant="ghost" size="sm" onClick={() => void cancelAutomationRun(projectId, config.organization.id, run.id)}>Cancel</Button>}
           {isTerminal(run.status) && <button type="button" onClick={() => setDeleteTarget(run)} className="rounded-lg p-2 text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-error)]/10 hover:text-[var(--color-error)]" aria-label="Delete organization run" title="Delete run"><Trash2 className="h-4 w-4" /></button>}
           <button onClick={() => toggle(run.id)} className="p-1 text-[var(--color-text-muted)]" aria-label={expanded === run.id ? "Close run" : "Open run"}><ChevronRight className={`w-4 h-4 transition-transform ${expanded === run.id ? "rotate-180" : ""}`} /></button>
         </div>
@@ -1553,8 +1576,8 @@ function RunsTab({
                   </div>
                   <p className="mt-0.5 truncate text-xs text-[var(--color-text-muted)]">{formatDate(selectedRun.triggered_at * 1000)} · {durationLabel(selectedRun)}{selectedRun.agent_snapshot ? ` · ${selectedRun.agent_snapshot}` : ""}</p>
                 </div>
-                {selectedRun.status === "running" && <Button variant="ghost" size="sm" disabled={finishingRunId === selectedRun.id} onClick={() => void finishRun(selectedRun)}>{finishingRunId === selectedRun.id ? "Finishing…" : "Finish"}</Button>}
-                {["queued", "running"].includes(selectedRun.status) && <Button variant="ghost" size="sm" onClick={() => void cancelAutomationRun(projectId, config.organization.id, selectedRun.id)}>Cancel</Button>}
+                {["running", "waiting", "failed"].includes(selectedRun.status) && <Button variant="ghost" size="sm" disabled={finishingRunId === selectedRun.id} onClick={() => void finishRun(selectedRun)}>{finishingRunId === selectedRun.id ? "Finishing…" : "Finish"}</Button>}
+                {!isTerminal(selectedRun.status) && <Button variant="ghost" size="sm" onClick={() => void cancelAutomationRun(projectId, config.organization.id, selectedRun.id)}>Cancel</Button>}
                 <button type="button" onClick={() => setExpanded(null)} className="rounded-lg p-1.5 text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]" aria-label="Close run"><X className="h-4 w-4" /></button>
               </header>
 
@@ -1576,7 +1599,7 @@ function RunsTab({
                       events={history}
                       usage={historyUsage}
                       loading={historyLoading}
-                      active={!isTerminal(selectedRun.status)}
+                      active={isAgentRunning(selectedRun.status)}
                       error={selectedRun.error}
                       summary={typeof selectedRun.result?.summary === "string" ? selectedRun.result.summary : undefined}
                     />
@@ -1904,7 +1927,13 @@ function InlineNotice({ tone, message, onClose }: { tone: "success" | "error"; m
 function CenteredLoading({ compact = false }: { compact?: boolean }) { return <div className={`flex items-center justify-center text-[var(--color-text-muted)] ${compact ? "py-5" : "py-16"}`}><Loader2 className="w-5 h-5 animate-spin" /></div>; }
 function EmptyPage({ title, description }: { title: string; description: string }) { return <div className="min-h-[360px] flex items-center justify-center"><div className="text-center max-w-sm"><div className="mx-auto w-11 h-11 rounded-xl bg-[var(--color-bg-secondary)] flex items-center justify-center"><Brain className="w-5 h-5 text-[var(--color-text-muted)]" /></div><h2 className="mt-4 font-semibold text-[var(--color-text)]">{title}</h2><p className="mt-2 text-sm text-[var(--color-text-muted)] leading-relaxed">{description}</p></div></div>; }
 
-function RunStatus({ status }: { status: string }) { const terminalSuccess = status === "success"; const active = !isTerminal(status); const Icon = terminalSuccess ? CircleCheck : active ? Loader2 : CircleX; return <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${terminalSuccess ? "bg-[var(--color-success)]/10 text-[var(--color-success)]" : active ? "bg-[var(--color-highlight)]/10 text-[var(--color-highlight)]" : "bg-[var(--color-error)]/10 text-[var(--color-error)]"}`}><Icon className={`w-4 h-4 ${active ? "animate-spin" : ""}`} /></div>; }
+function RunStatus({ status }: { status: string }) {
+  if (status === "success") return <div title="Completed" className="w-8 h-8 rounded-lg flex items-center justify-center bg-[var(--color-success)]/10 text-[var(--color-success)]"><CircleCheck className="w-4 h-4" /></div>;
+  if (status === "cancelled") return <div title="Cancelled" className="w-8 h-8 rounded-lg flex items-center justify-center bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]"><X className="w-4 h-4" /></div>;
+  if (status === "waiting") return <div title="Waiting" className="w-8 h-8 rounded-lg flex items-center justify-center bg-[var(--color-warning)]/10 text-[var(--color-warning)]"><CircleAlert className="w-4 h-4" /></div>;
+  if (status === "failed") return <div title="Failed" className="w-8 h-8 rounded-lg flex items-center justify-center bg-[var(--color-error)]/10 text-[var(--color-error)]"><CircleX className="w-4 h-4" /></div>;
+  return <div title="In Progress" className="w-8 h-8 rounded-lg flex items-center justify-center bg-[var(--color-highlight)]/10 text-[var(--color-highlight)]"><Loader2 className="w-4 h-4 animate-spin" /></div>;
+}
 function RunCounts({ result }: { result?: Record<string, unknown> }) { if (!result) return null; const changed = ["entities_created", "entities_updated", "entities_deleted"].reduce((sum, key) => sum + Number(result[key] ?? 0), 0); return <div className="hidden sm:flex items-center gap-3 text-xs text-[var(--color-text-muted)]"><span>{changed} memories changed</span><span>{Number(result.relations_changed ?? 0)} relations</span></div>; }
 
 function configToDraft(config: MemoryConfig | null): MemoryConfigInput { return config ? { enabled: config.enabled, deep_organization: config.deep_organization, pending_log_threshold: config.pending_log_threshold, organization_enabled: config.organization.enabled, agent_config: config.organization.agent_config, schedule_cron: config.organization.schedule_cron, event_triggers: config.organization.event_triggers } : { ...DEFAULT_DRAFT, event_triggers: [...DEFAULT_DRAFT.event_triggers] }; }
@@ -1964,7 +1993,8 @@ function relativeTime(timestampSeconds: number) {
 }
 function lastOrganizedText(timestampSeconds?: number) { return timestampSeconds ? `Last organized ${relativeTime(timestampSeconds)} ago` : "Not organized yet"; }
 function shortId(value: string) { return value.length > 10 ? `${value.slice(0, 8)}…` : value; }
-function isTerminal(status: string) { return ["success", "failed", "timeout", "cancelled", "interrupted"].includes(status); }
+function isTerminal(status: string) { return status === "success" || status === "cancelled"; }
+function isAgentRunning(status: string) { return status === "queued" || status === "running"; }
 function durationLabel(run: AutomationRun) { const end = run.completed_at ?? Math.floor(Date.now() / 1000); const start = run.started_at ?? run.triggered_at; const seconds = Math.max(0, end - start); if (seconds < 60) return `${seconds}s`; return `${Math.floor(seconds / 60)}m ${seconds % 60}s`; }
 function runTitle(run: AutomationRun) {
   if (run.trigger_kind === "manual") return "Manual organization";

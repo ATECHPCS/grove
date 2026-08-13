@@ -482,7 +482,7 @@ pub async fn finish_run(
             "run does not support Finish".into(),
         ));
     }
-    if run.status != "running" {
+    if matches!(run.status.as_str(), "success" | "cancelled" | "cancelling") {
         return Err((
             StatusCode::CONFLICT,
             format!("run is already {}", run.status),
@@ -497,7 +497,9 @@ pub async fn finish_run(
     let session_key = format!("{}:{}:{}", project_key, task_id, chat_id);
     let handle = crate::acp::get_session_handle(&session_key)
         .ok_or((StatusCode::CONFLICT, "run session is offline".into()))?;
-    handle
+    automations::mark_run_running(&run_id)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if let Err(error) = handle
         .send_prompt(
             "Finish this Memory organization now. Complete any remaining checks, then call memory_mark_organization_finished exactly once with the final summary and Entity base scores.".to_string(),
             Vec::new(),
@@ -506,7 +508,11 @@ pub async fn finish_run(
             None,
         )
         .await
-        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    {
+        let message = error.to_string();
+        let _ = automations::mark_run_failed(&run_id, "queue", &message);
+        return Err((StatusCode::CONFLICT, message));
+    }
     Ok(Json(FinishRunResponse {
         status: "finishing".to_string(),
     }))

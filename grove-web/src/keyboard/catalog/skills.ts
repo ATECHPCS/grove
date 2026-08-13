@@ -1,28 +1,28 @@
 import type { CommandDef } from "../types";
 
 /**
- * Skills settings commands — adding agents/sources and managing the
- * installed skill catalog. Selection-based operations (edit/delete a
+ * Extensions commands — adding agents/sources and managing the
+ * installed extension catalog. Selection-based operations (edit/delete a
  * specific row) are intentionally NOT registered: those belong to row
  * context menus, not global shortcuts.
  */
 export const SKILLS_COMMANDS: CommandDef[] = [
   {
     id: "skills.tab.explore",
-    name: "Skills: Explore Tab",
-    category: "Skills",
+    name: "Extensions: Catalog",
+    category: "Extensions",
     scope: "settings",
   },
   {
     id: "skills.tab.sources",
-    name: "Skills: Sources Tab",
-    category: "Skills",
+    name: "Extensions: Sources Tab",
+    category: "Extensions",
     scope: "settings",
   },
   {
     id: "skills.tab.agents",
-    name: "Skills: Agents Tab",
-    category: "Skills",
+    name: "Extensions: Agents Tab",
+    category: "Extensions",
     scope: "settings",
   },
   {
@@ -40,12 +40,6 @@ export const SKILLS_COMMANDS: CommandDef[] = [
   {
     id: "skills.source.syncAll",
     name: "Sync All Sources",
-    category: "Skills",
-    scope: "settings",
-  },
-  {
-    id: "skills.source.checkUpdates",
-    name: "Check for Updates",
     category: "Skills",
     scope: "settings",
   },

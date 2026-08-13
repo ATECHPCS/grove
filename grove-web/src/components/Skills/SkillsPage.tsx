@@ -1,18 +1,21 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { motion } from "framer-motion";
-import { Compass, FolderGit2, Bot } from "lucide-react";
-import { ExploreTab } from "./ExploreTab";
+import { Bot, Boxes, FolderGit2, PackagePlus, Plus, Server } from "lucide-react";
+import { ExtensionsExplore, AddMcpDialog } from "./ExtensionsExplore";
 import { SourcesTab } from "./SourcesTab";
 import { AgentsTab } from "./AgentsTab";
+import { AddSourceDialog } from "./AddSourceDialog";
+import { AddPluginDialog } from "../Config/AddPluginDialog";
+import { DropdownMenu } from "../ui";
 import type { AgentDef, SkillSource, InstalledSkill } from "../../api";
 import { getAgentDefs, listSources, listInstalled } from "../../api";
 import { useProject } from "../../context";
 import { useCommand } from "../../keyboard";
 
-type TabId = "explore" | "sources" | "agents";
+type TabId = "catalog" | "sources" | "agents";
 
 const tabs: { id: TabId; label: string; icon: React.ElementType }[] = [
-  { id: "explore", label: "Explore", icon: Compass },
+  { id: "catalog", label: "Catalog", icon: Boxes },
   { id: "sources", label: "Sources", icon: FolderGit2 },
   { id: "agents", label: "Agents", icon: Bot },
 ];
@@ -20,11 +23,15 @@ const tabs: { id: TabId; label: string; icon: React.ElementType }[] = [
 export function SkillsPage() {
   const { selectedProject } = useProject();
   const projectPath = selectedProject?.path ?? null;
-  const [activeTab, setActiveTab] = useState<TabId>("explore");
+  const [activeTab, setActiveTab] = useState<TabId>("catalog");
   const [agents, setAgents] = useState<AgentDef[]>([]);
   const [sources, setSources] = useState<SkillSource[]>([]);
   const [installed, setInstalled] = useState<InstalledSkill[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [refreshToken, setRefreshToken] = useState(0);
+  const [sourceDialog, setSourceDialog] = useState<"git" | "local" | null>(null);
+  const [showAddPlugin, setShowAddPlugin] = useState(false);
+  const [showAddMcp, setShowAddMcp] = useState(false);
 
   // Only enabled agents are used for install/display
   const enabledAgents = useMemo(() => agents.filter((a) => a.enabled), [agents]);
@@ -73,22 +80,38 @@ export function SkillsPage() {
   // Catalog-declared tab switchers — Command Palette / Settings shortcut
   // both call setActiveTab so the page jumps to that tab regardless of
   // current selection.
-  useCommand("skills.tab.explore", () => setActiveTab("explore"), []);
+  useCommand("skills.tab.explore", () => setActiveTab("catalog"), []);
   useCommand("skills.tab.sources", () => setActiveTab("sources"), []);
   useCommand("skills.tab.agents", () => setActiveTab("agents"), []);
+  useCommand("skills.source.add", () => setSourceDialog("git"), []);
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <div className="w-6 h-6 border-2 border-[var(--color-highlight)] border-t-transparent rounded-full animate-spin" />
+      <div className="flex h-full flex-col animate-pulse">
+        <div className="mb-5 flex items-center justify-between border-b border-[var(--color-border)] pb-5"><div className="flex items-center gap-3"><div className="h-12 w-12 rounded-2xl bg-[var(--color-bg-secondary)]" /><div className="space-y-2"><div className="h-5 w-32 rounded bg-[var(--color-bg-secondary)]" /><div className="h-3 w-80 rounded bg-[var(--color-bg-secondary)]" /></div></div><div className="h-9 w-40 rounded-lg bg-[var(--color-bg-secondary)]" /></div>
+        <div className="h-12 rounded-xl bg-[var(--color-bg-secondary)]" />
       </div>
     );
   }
 
   return (
     <div className="flex flex-col h-full">
+      <header className="shrink-0 border-b border-[var(--color-border)]">
+      <div className="flex items-start justify-between gap-4 pb-5">
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-[var(--color-highlight)]/12 text-[var(--color-highlight)]"><Boxes className="h-5 w-5" /></div>
+          <div className="min-w-0"><h1 className="text-2xl font-semibold tracking-tight text-[var(--color-text)]">Extensions</h1><p className="mt-1 truncate text-sm text-[var(--color-text-muted)]">Discover capabilities, manage installations, and keep their sources connected.</p></div>
+        </div>
+        <div className="flex items-center gap-2">
+          <DropdownMenu align="right" items={[
+            { id: "source", label: "Source…", description: "Scan a Git repository or local folder", icon: FolderGit2, onClick: () => setSourceDialog("git") },
+            { id: "plugin", label: "Plugin…", description: "Install or register a development plugin", icon: PackagePlus, onClick: () => setShowAddPlugin(true) },
+            { id: "mcp", label: "MCP Server…", description: "Create a managed server definition", icon: Server, onClick: () => setShowAddMcp(true) },
+          ]} trigger={<span className="flex items-center gap-1.5"><Plus className="h-4 w-4" />Add</span>} triggerClassName="inline-flex h-9 items-center rounded-lg bg-[var(--color-highlight)] px-3.5 text-sm font-medium text-white shadow-sm transition-opacity hover:opacity-90" />
+        </div>
+      </div>
       {/* Tab Bar */}
-      <div className="flex items-center gap-1 pb-4 border-b border-[var(--color-border)]">
+      <nav className="flex items-center gap-1 overflow-x-auto">
         {tabs.map((tab) => {
           const Icon = tab.icon;
           const isActive = activeTab === tab.id;
@@ -96,19 +119,15 @@ export function SkillsPage() {
             <button
               key={tab.id}
               onClick={() => setActiveTab(tab.id)}
-              className={`relative flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg transition-colors
+              className={`relative flex items-center gap-2 px-3 py-2.5 text-sm font-medium transition-colors
                 ${isActive
-                  ? "text-[var(--color-highlight)] bg-[var(--color-highlight)]/10"
-                  : "text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-secondary)]"
+                  ? "text-[var(--color-text)]"
+                  : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
                 }`}
             >
               <Icon className="w-4 h-4" />
               {tab.label}
-              {tab.id === "agents" && (
-                <span className="ml-1 px-1.5 py-0.5 text-[10px] font-semibold rounded-full bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)]">
-                  {enabledAgents.length}
-                </span>
-              )}
+              <span className="rounded-full bg-[var(--color-bg-secondary)] px-1.5 py-0.5 text-[10px] font-semibold tabular-nums text-[var(--color-text-muted)]">{tab.id === "catalog" ? sources.reduce((sum, source) => sum + source.skill_count + source.plugin_count + source.mcp_count, 0) : tab.id === "sources" ? sources.length : agents.length}</span>
               {isActive && (
                 <motion.div
                   layoutId="skillsTabIndicator"
@@ -119,17 +138,19 @@ export function SkillsPage() {
             </button>
           );
         })}
-      </div>
+      </nav>
+      </header>
 
       {/* Tab Content */}
-      <div className={`flex-1 min-h-0 pt-4 ${activeTab === "explore" ? "overflow-hidden" : "overflow-y-auto"}`}>
-        {activeTab === "explore" && (
-          <ExploreTab
+      <div className="flex-1 min-h-0 pt-5 overflow-hidden">
+        {activeTab === "catalog" && (
+          <ExtensionsExplore
             sources={sources}
             agents={enabledAgents}
             installed={installed}
             projectPath={projectPath}
             onInstalled={refreshAfterInstall}
+            refreshToken={refreshToken}
           />
         )}
         {activeTab === "sources" && (
@@ -141,10 +162,14 @@ export function SkillsPage() {
         {activeTab === "agents" && (
           <AgentsTab
             agents={agents}
+            installed={installed}
             onRefresh={refreshAgents}
           />
         )}
       </div>
+      <AddSourceDialog isOpen={sourceDialog !== null} editingSource={null} initialSourceType={sourceDialog ?? "git"} onClose={() => setSourceDialog(null)} onSaved={async () => { setSourceDialog(null); await refreshSources(); setRefreshToken((value) => value + 1); }} />
+      {showAddPlugin && <AddPluginDialog onClose={() => { setShowAddPlugin(false); setRefreshToken((value) => value + 1); }} />}
+      {showAddMcp && <AddMcpDialog onClose={() => setShowAddMcp(false)} onCreated={async () => { setShowAddMcp(false); await refreshSources(); setRefreshToken((value) => value + 1); }} />}
     </div>
   );
 }

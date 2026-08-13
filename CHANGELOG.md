@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.2] - 2026-08-10
+
+### Added
+
+- **Interactive memory organization** — Memory organization runs can ask for guidance while preserving clearer graph, documentation, and read-visibility context.
+- **Archived session restore** — Archived chat history can be restored directly from its history actions.
+
+### Improved
+
+- **Session activity and lifecycle** — Meaningful chat activity updates recency consistently, while session cleanup and archived-history actions remain available across lifecycle states.
+- **Working agent memory retrieval** — Agent instructions more reliably retrieve durable project context before substantive work.
+
+### Fixed
+
+- **Blitz task discovery and ordering** — Projects preserve workspace membership, repair missing task-group placement, and keep task ordering stable across views.
+- **ACP lifecycle diagnostics** — Routine shutdown noise is suppressed without hiding actionable session and plugin failures.
+
 ## [0.12.1] - 2026-08-06
 
 ### Added

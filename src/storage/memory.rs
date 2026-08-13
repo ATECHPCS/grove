@@ -152,6 +152,8 @@ pub struct MemoryOverview {
     pub run_count: i64,
     pub successful_run_count: i64,
     pub failed_run_count: i64,
+    pub in_progress_run_count: i64,
+    pub waiting_run_count: i64,
     pub active_run_count: i64,
     pub last_organized_at: Option<i64>,
     pub usage: MemoryUsageTotals,
@@ -1561,12 +1563,22 @@ pub fn get_overview(project_id: &str, automation_id: &str) -> Result<MemoryOverv
         params![project_id],
         |row| row.get(0),
     )?;
-    let (run_count, successful_run_count, failed_run_count, active_run_count, last_organized_at) =
+    let (
+        run_count,
+        successful_run_count,
+        failed_run_count,
+        in_progress_run_count,
+        waiting_run_count,
+        active_run_count,
+        last_organized_at,
+    ) =
         conn.query_row(
             "SELECT COUNT(*),
                     COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN status IN ('failed', 'timeout', 'interrupted') THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN status IN ('queued', 'running', 'cancelling') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status IN ('queued', 'running') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'waiting' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status NOT IN ('success', 'cancelled') THEN 1 ELSE 0 END), 0),
                     MAX(CASE WHEN status = 'success' THEN completed_at END)
              FROM automation_runs WHERE automation_id = ?1",
             params![automation_id],
@@ -1577,6 +1589,8 @@ pub fn get_overview(project_id: &str, automation_id: &str) -> Result<MemoryOverv
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )?;
@@ -1611,6 +1625,8 @@ pub fn get_overview(project_id: &str, automation_id: &str) -> Result<MemoryOverv
         run_count,
         successful_run_count,
         failed_run_count,
+        in_progress_run_count,
+        waiting_run_count,
         active_run_count,
         last_organized_at,
         usage: MemoryUsageTotals {

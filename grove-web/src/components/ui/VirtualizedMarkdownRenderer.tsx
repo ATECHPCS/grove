@@ -306,6 +306,19 @@ export const VirtualizedMarkdownRenderer = forwardRef<
 
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const { blocks, headings } = useMemo(() => parseContent(content), [content]);
+  const scrollToHeadingId = useCallback((id: string): boolean => {
+    const normalized = id.normalize("NFKC").toLowerCase().replace(/[\s_-]+/g, "");
+    const heading = headings.find((item) => item.id === id) ?? headings.find(
+      (item) => item.id.normalize("NFKC").toLowerCase().replace(/[\s_-]+/g, "") === normalized,
+    );
+    if (!heading) return false;
+    virtuosoRef.current?.scrollToIndex({
+      index: heading.blockIndex,
+      align: "start",
+      behavior: "smooth",
+    });
+    return true;
+  }, [headings]);
   // The set of block indexes currently mounted by Virtuoso. We need it to
   // know when a scrolled-to block is actually in the DOM so we can highlight
   // the match inside it — chasing it via setTimeout would race with item
@@ -531,15 +544,7 @@ export const VirtualizedMarkdownRenderer = forwardRef<
           behavior: "smooth",
         });
       },
-      scrollToHeadingId: (id: string) => {
-        const heading = headings.find((h) => h.id === id);
-        if (!heading) return;
-        virtuosoRef.current?.scrollToIndex({
-          index: heading.blockIndex,
-          align: "start",
-          behavior: "smooth",
-        });
-      },
+      scrollToHeadingId,
       setSearchQuery: (q: string) => {
         setQuery(q);
       },
@@ -559,7 +564,7 @@ export const VirtualizedMarkdownRenderer = forwardRef<
         );
       },
     }),
-    [headings, matches.length],
+    [matches.length, scrollToHeadingId],
   );
 
   // Map block index → heading id so the wrapper <div> can carry an `id`
@@ -610,6 +615,7 @@ export const VirtualizedMarkdownRenderer = forwardRef<
             sketchRenderMode={sketchRenderMode}
             location={location}
             renderMode={renderMode}
+            onHeadingLinkClick={scrollToHeadingId}
             // Heading IDs are owned by the virtualized wrapper above (via
             // `id={headingId}` derived from a single global slugger), not by
             // per-block render. Leaving this off avoids the per-block
@@ -634,6 +640,7 @@ export const VirtualizedMarkdownRenderer = forwardRef<
       sketchRenderMode,
       location,
       renderMode,
+      scrollToHeadingId,
     ],
   );
 

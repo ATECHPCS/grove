@@ -19,7 +19,7 @@ import { PreviewCommentHost } from './PreviewCommentHost';
 import { PreviewSearchBar } from './PreviewSearchBar';
 import { useDomSearch } from './useDomSearch';
 import { ImageLightbox } from '../ui/ImageLightbox';
-import { previewCommentTaskLabel, usePreviewComments, type PreviewCommentLocator } from '../../context';
+import { previewCommentLocatorInParentViewport, previewCommentTaskLabel, usePreviewComments, type PreviewCommentLocator } from '../../context';
 import { useCommand, useContextKey, useDefineCommand, useKeyboardScope } from '../../keyboard';
 
 // ============================================================================
@@ -730,7 +730,7 @@ export function DiffFileView({
       const data = event.data as { type?: string; previewId?: string; payload?: PreviewCommentLocator; markerId?: string; ids?: string[] };
       if (!data || data.previewId !== previewCommentId) return;
       if (data.type === 'grove-preview-comment:selected' && data.payload) {
-        setPendingPreviewLocator(data.payload);
+        setPendingPreviewLocator(previewCommentLocatorInParentViewport(data.payload, event.source, bodyRef.current));
         setPreviewCommentText('');
         setEditingPreviewDraftId(null);
         setPreviewCommentMode(false);
@@ -1909,6 +1909,7 @@ export function DiffFileView({
             }}
           >
               <textarea
+                autoFocus
                 value={previewCommentText}
                 onChange={(e) => setPreviewCommentText(e.target.value)}
                 rows={3}

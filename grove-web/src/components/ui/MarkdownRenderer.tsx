@@ -789,6 +789,10 @@ export interface MarkdownRendererProps {
    * heading ids would collide across messages. Opt in only on surfaces that
    * own their preview pane (file preview drawer, code review preview). */
   enableHeadingIds?: boolean;
+  /** Route an internal `#fragment` to an owner that controls navigation.
+   * Virtualized documents use this because the target heading may not be
+   * mounted in the DOM yet. Return true when the owner handled the jump. */
+  onHeadingLinkClick?: (id: string) => boolean;
   /** Shared Markdown annotation capability used by chat, artifacts, and file previews. */
   /** Explicit annotation config. Omit to auto-enable for task-scoped files;
    * pass false only when a parent annotation host owns the whole document. */
@@ -1047,7 +1051,7 @@ function EmbeddedHtmlIframe({ src, fitLocalHtml, className, height, ...props }: 
   );
 }
 
-export const MarkdownRenderer = memo(function MarkdownRenderer({ content, renderMode = "compact", onFileClick, resolveImageUrl, location, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode = "chip", enableHeadingIds, comments }: MarkdownRendererProps) {
+export const MarkdownRenderer = memo(function MarkdownRenderer({ content, renderMode = "compact", onFileClick, resolveImageUrl, location, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode = "chip", enableHeadingIds, onHeadingLinkClick, comments }: MarkdownRendererProps) {
   const markdownRootRef = useRef<HTMLDivElement>(null);
   const previewComments = useOptionalPreviewComments();
   const automaticCommentId = useId().replace(/:/g, "");
@@ -1180,6 +1184,34 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, render
                 />
               );
             }
+          }
+          if (href?.startsWith("#")) {
+            return (
+              <a
+                href={href}
+                onClick={(event) => {
+                  let targetId = href.slice(1);
+                  try {
+                    targetId = decodeURIComponent(targetId);
+                  } catch {
+                    // Keep the literal fragment when it is not valid URI encoding.
+                  }
+                  if (onHeadingLinkClick?.(targetId)) {
+                    event.preventDefault();
+                    return;
+                  }
+                  const target = Array.from(
+                    markdownRootRef.current?.querySelectorAll<HTMLElement>("[id]") ?? [],
+                  ).find((element) => element.id === targetId);
+                  if (!target) return;
+                  event.preventDefault();
+                  target.scrollIntoView({ behavior: "smooth", block: "start" });
+                }}
+                className="text-[var(--color-highlight)] hover:underline break-words"
+              >
+                {children}
+              </a>
+            );
           }
           // Check if the link href looks like a file path (not an external URL)
           if (onFileClick && href) {
@@ -1386,7 +1418,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, render
           return <input {...props} />;
         },
     });
-  }, [onFileClick, resolveImageUrl, location, resourceSrcResolver, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode, enableHeadingIds, isDocument]);
+  }, [onFileClick, resolveImageUrl, location, resourceSrcResolver, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode, enableHeadingIds, onHeadingLinkClick, isDocument]);
 
   const rendered = (
     <div

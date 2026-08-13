@@ -147,6 +147,11 @@ fn ensure_storage_version() {
             let _ = storage::database::connection();
             storage::database::migrate_audio_to_config_toml();
         }
+        Some("2.7") => {
+            // v2.7 → v2.8: Standard-cron weekday semantics are adapted to
+            // the backend cron crate; refresh persisted future fire times.
+            let _ = storage::database::connection();
+        }
         Some(v) => {
             eprintln!(
                 "Unknown storage version: {}. Expected {}.",
@@ -189,6 +194,21 @@ fn ensure_storage_version() {
     // it's a silent no-op.
     if version != Some(CURRENT_STORAGE_VERSION) {
         storage::database::migrate_config_agent_command_ids();
+    }
+
+    // v2.8: `schedule_cron` remains standard 5-field cron. Recompute the
+    // derived timestamps after fixing the backend library's weekday mapping.
+    if version != Some(CURRENT_STORAGE_VERSION) {
+        match storage::automations::recompute_all_next_runs() {
+            Ok(count) if count > 0 => {
+                eprintln!("[migrate] refreshed {} automation schedule(s)", count)
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "[migrate] failed to refresh automation schedules: {}",
+                error
+            ),
+        }
     }
 
     // Update version

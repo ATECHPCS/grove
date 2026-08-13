@@ -392,6 +392,10 @@ export function PreviewCommentHost({ previewComment, children, fill = false }: P
     const onMouseDown = (e: MouseEvent) => {
       const el = pickBlock(e.target as Element, content);
       if (!el) return;
+      // Comment mode owns this gesture; do not paint a native text selection
+      // underneath the block picker.
+      e.preventDefault();
+      window.getSelection()?.removeAllRanges();
       drag.startBlock = el;
       drag.lastBlocks = [el];
       setHoverRects([el.getBoundingClientRect()]);
@@ -434,6 +438,7 @@ export function PreviewCommentHost({ previewComment, children, fill = false }: P
       resetDrag();
       e.preventDefault();
       e.stopPropagation();
+      window.getSelection()?.removeAllRanges();
       const payload = blocks.length === 1
         ? describe(blocks[0], content)
         : describeBlocks(blocks, content);

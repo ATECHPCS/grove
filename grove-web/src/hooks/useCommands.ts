@@ -116,7 +116,7 @@ export function buildCommands(options: UseCommandsOptions): Command[] {
         );
       }
       commands.push(
-        withRanking({ id: "nav-skills", name: "Go to Skills", category: "Navigation", icon: Blocks, handler: () => onNavigate("skills"), keywords: ["agent", "plugin"] }, { contexts: { default: 12, tasks: -8, workspace: -12 } }),
+        withRanking({ id: "nav-skills", name: "Go to Extensions", category: "Navigation", icon: Blocks, handler: () => onNavigate("skills"), keywords: ["skill", "agent", "plugin", "mcp"] }, { contexts: { default: 12, tasks: -8, workspace: -12 } }),
         withRanking({ id: "nav-ai", name: "Go to AI", category: "Navigation", icon: Sparkles, handler: () => onNavigate("ai"), keywords: ["audio", "voice", "provider"] }, { contexts: { default: 14, tasks: -4, workspace: -8 } }),
         withRanking({ id: "nav-statistics", name: "Go to Statistics", category: "Navigation", icon: BarChart2, handler: () => onNavigate("statistics"), keywords: ["stats", "analytics"] }, { contexts: { default: 10, tasks: -6, workspace: -10 } }),
         withRanking({ id: "nav-settings", name: "Go to Settings", category: "Navigation", icon: Settings, handler: () => onNavigate("settings"), keywords: ["config", "preferences"] }, { contexts: { default: 8, tasks: -4, workspace: -8 } }),

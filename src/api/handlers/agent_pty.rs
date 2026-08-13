@@ -131,6 +131,7 @@ pub async fn agent_pty_handler(
         &task,
         Some(&chat_id),
     );
+    grove_env.insert("GROVE_AGENT_ID".to_string(), canonical_agent.clone());
 
     // Terminal mode launches the bare CLI under a PTY using the contract
     // declared in registry.terminal_launch:
@@ -316,6 +317,40 @@ fn build_mcp_config_file(
                 "args": ["mcp-bridge"],
             }),
         );
+    }
+    for server in crate::storage::extensions::resolve_effective_mcp_configs(
+        grove_env
+            .get("GROVE_AGENT_ID")
+            .map(String::as_str)
+            .unwrap_or(""),
+        grove_env.get("GROVE_PROJECT").map(String::as_str),
+    )
+    .unwrap_or_default()
+    {
+        let key = server
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        if server.transport == "stdio" {
+            if let Some(command) = server.command {
+                servers.insert(
+                    key,
+                    json!({ "command": command, "args": server.args, "env": server.env }),
+                );
+            }
+        } else if let Some(url) = server.url {
+            servers.insert(
+                key,
+                json!({ "type": "http", "url": url, "headers": server.headers }),
+            );
+        }
     }
     let config = json!({ "mcpServers": servers });
 

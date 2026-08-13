@@ -2144,8 +2144,44 @@ pub async fn chat_ws_handler(
         &task,
         Some(&chat_id),
     );
-    let working_dir = std::path::PathBuf::from(&task.worktree_path);
+    let mut working_dir = std::path::PathBuf::from(&task.worktree_path);
     let session_key = format!("{}:{}:{}", project_key, task_id, chat_id);
+    let mut additional_mcp_servers = Vec::new();
+    let mut mcp_server_policy = crate::acp::McpServerPolicy::WorkingSession;
+
+    // A recoverable project Automation Run uses an ordinary TaskChat, but a
+    // newly attached Agent process must regain the Run-specific MCP bindings.
+    // Existing live handles already own their original bindings and token.
+    if !acp::session_exists(&session_key) {
+        if let Ok(Some(run_id)) = crate::storage::automations::nonterminal_run_id_for_chat(
+            &project_key,
+            &task_id,
+            &chat_id,
+        ) {
+            if let Ok(Some(run)) = crate::storage::automations::get_run(&run_id) {
+                if run.execution_scope == "project_run" {
+                    if let Ok(Some(automation)) =
+                        crate::storage::automations::get(&run.automation_id)
+                    {
+                        if let Some(handler) =
+                            crate::automation::consumer::get(&automation.handler_key)
+                        {
+                            let bindings = handler
+                                .runtime_bindings(crate::automation::consumer::RuntimeContext {
+                                    automation: &automation,
+                                    run: &run,
+                                })
+                                .map_err(|error| AcpError::Internal(error.to_string()))?;
+                            working_dir = bindings.working_dir;
+                            env_vars.extend(bindings.env_vars);
+                            additional_mcp_servers = bindings.additional_mcp_servers;
+                            mcp_server_policy = bindings.mcp_server_policy;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Per-agent overrides from the marketplace settings sheet. Look up by
     // canonical id so legacy chat.agent values (claude → claude-acp) hit
@@ -2155,6 +2191,7 @@ pub async fn chat_ws_handler(
     // been deleted off disk).
     // Post-v2.6, `effective_agent` is canonical. Direct lookup.
     let canonical_id = effective_agent.clone();
+    env_vars.insert("GROVE_AGENT_ID".to_string(), canonical_id.clone());
     let installed_record = crate::storage::installed_agents::get(&canonical_id)
         .ok()
         .flatten();
@@ -2193,8 +2230,8 @@ pub async fn chat_ws_handler(
         task_id,
         chat_id: Some(chat_id),
         artifact_dir: None,
-        additional_mcp_servers: Vec::new(),
-        mcp_server_policy: crate::acp::McpServerPolicy::WorkingSession,
+        additional_mcp_servers,
+        mcp_server_policy,
         agent_type: resolved.agent_type,
         remote_url: resolved.url,
         remote_auth: resolved.auth_header,

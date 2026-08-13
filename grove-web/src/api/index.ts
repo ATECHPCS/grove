@@ -187,6 +187,9 @@ export {
   installSkill,
   checkSourceUpdates,
 } from './skills';
+
+export { exploreExtensions, createManagedMcp, installMcp, installCatalogPlugin } from './extensions';
+export type { ExtensionArtifact, ExtensionKind } from './extensions';
 export type {
   AgentDef,
   SkillSource,

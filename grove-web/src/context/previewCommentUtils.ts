@@ -1,4 +1,28 @@
-import type { PreviewCommentDraft } from "./PreviewCommentContext";
+import type { PreviewCommentDraft, PreviewCommentLocator } from "./PreviewCommentContext";
+
+/** Translate a sandboxed iframe's viewport rect for parent-document portals. */
+export function previewCommentLocatorInParentViewport(
+  locator: PreviewCommentLocator,
+  source: MessageEventSource | null,
+  root: ParentNode | null,
+): PreviewCommentLocator {
+  if (!locator.rect || !source || source === window || !root) return locator;
+
+  const frame = Array.from(root.querySelectorAll("iframe")).find(
+    (candidate) => candidate.contentWindow === source,
+  );
+  if (!frame) return locator;
+
+  const frameRect = frame.getBoundingClientRect();
+  return {
+    ...locator,
+    rect: {
+      ...locator.rect,
+      x: frameRect.left + locator.rect.x,
+      y: frameRect.top + locator.rect.y,
+    },
+  };
+}
 
 /**
  * Stable marker label shared by every preview surface. The composer drawer is

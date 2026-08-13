@@ -132,6 +132,45 @@
   }
 }
 
+/* Keep the composer header on one line as the chat pane narrows. Auxiliary
+   panels retain their icon/count affordance first; identity text compresses
+   only at smaller widths so status never overlaps adjacent controls. */
+@container chatbox (max-width: 700px) {
+  .chatbox-header-pill-label {
+    display: none;
+  }
+
+  .chatbox-header-actions {
+    gap: 4px;
+  }
+
+  .chatbox-header-actions > button {
+    padding-left: 6px;
+    padding-right: 6px;
+  }
+}
+
+@container chatbox (max-width: 520px) {
+  .chatbox-agent-static-label {
+    display: none;
+  }
+
+  .chatbox-header {
+    gap: 4px;
+  }
+}
+
+@container chatbox (max-width: 420px) {
+  .chatbox-agent-name {
+    display: none;
+  }
+
+  .chatbox-agent-pill {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+}
+
 /* Very narrow (< 300px): hide left footer (status text + attach), keep only dropdowns + send */
 @container chatbox (max-width: 300px) {
   .chatbox-cq-root {

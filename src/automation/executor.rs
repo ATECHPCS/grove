@@ -15,15 +15,12 @@
 //! 7. Stamp `queued_at` on the run row.
 //! 8. Fire-and-forget background task: wait for the matching `UserMessage`
 //!    (that's when the agent picked up our prompt), accumulate `MessageChunk`
-//!    text, then close out on the next `Complete` / `Error` / `SessionEnded`
-//!    — or a 30-minute timeout. Truncate the accumulated text to 16 KB and
-//!    persist as the final `agent_response`.
+//!    text, and close out only on `Complete`. Errors and disconnects stay in
+//!    the Chat lifecycle so the user can continue the same Session.
 //!
 //! Registered project handlers use the same Automation-owned dedicated ACP
 //! driver. Handlers contribute only concurrency, business pre/post actions and
 //! runtime bindings.
-
-use std::time::Duration;
 
 use chrono::Utc;
 use tokio::sync::broadcast::error::RecvError;
@@ -37,43 +34,9 @@ use crate::storage::{
 
 use super::{awarn, consumer, cron_util};
 
-/// Cap on how long a single automation run waits for the agent's `Complete`
-/// notification. The cron scheduler won't re-fire the same automation
-/// before its next scheduled tick, so picking 30 min keeps long agent turns
-/// (research, multi-tool workflows) alive without unbounded resource use.
-const AGENT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-// `AcpUpdate::Complete` is emitted immediately before TaskChat drains its next
-// queued prompt. Give that synchronous drain one scheduler window to surface a
-// `QueueUpdate`/`UserMessage` before treating a project Run as truly settled.
-// The biased receive below still observes an already-buffered follow-up even
-// when the runtime is busy and this wall-clock deadline has elapsed.
-const PROJECT_RUN_FOLLOWUP_GRACE: Duration = Duration::from_millis(100);
-
-/// Grace window between "our entry vanished from the pending queue" and
-/// "treat that as a user cancellation".
-///
-/// cmd_loop's normal end-of-turn drain emits `QueueUpdate { messages: [] }`
-/// (with us already popped) *before* sending the Prompt command that
-/// becomes a `UserMessage`. So "queue without us" can mean two things:
-/// (a) cmd_loop is about to pump our prompt — a `UserMessage` is coming;
-/// (b) the user clicked the trash icon on our queued prompt — no
-/// `UserMessage` will ever arrive. We can't distinguish at the event
-/// level, so we wait this long after seeing the disappearance. If a
-/// matching `UserMessage` arrives within the window, it's case (a) and we
-/// proceed; otherwise it's case (b) and we cancel.
-///
-/// 30s budget: between `pop_queue_front` and the agent's `UserMessage`,
-/// cmd_loop performs up to three ACP roundtrips (SetSessionMode /
-/// SetSessionModel / SetSessionConfigOption — see `acp/mod.rs:2620-2696`),
-/// each of which can take several seconds against a slow agent backend.
-/// Under-budgeting this kills legitimate runs as false cancels; over-
-/// budgeting only matters for the true trash-click path (user waits up to
-/// 30s for the cancelled badge), which is acceptable.
-const DRAIN_GRACE: Duration = Duration::from_secs(30);
-
 pub struct RunOutcome {
     pub run_id: String,
-    pub status: String, // "queued" (will complete asynchronously) | "failed"
+    pub status: String, // persisted Runs remain active until completion or cancellation
     pub error: Option<String>,
     pub resolved_task_id: Option<String>,
     pub resolved_chat_id: Option<String>,
@@ -120,11 +83,10 @@ fn now() -> i64 {
 
 /// Run one automation. Inserts the run row, resolves task + chat, queues the
 /// prompt, and spawns a background task that updates the row to its terminal
-/// state once the agent reports completion.
+/// state once the agent reports completion or the user explicitly cancels.
 ///
 /// Returns once the prompt is queued (or once a pre-queue failure happens).
-/// The eventual success/failure of the agent's actual work lands in the
-/// `automation_runs` row asynchronously.
+/// The eventual completion lands in the `automation_runs` row asynchronously.
 pub async fn run(automation: &Automation, trigger_kind: &str) -> RunOutcome {
     run_with_payload(automation, trigger_kind, None).await
 }
@@ -221,7 +183,7 @@ pub async fn run_with_payload(
     // 4. Subscribe BEFORE handing the prompt to ACP. The agent could emit
     //    UserMessage + Complete within microseconds for a short prompt; if
     //    we subscribed after, those events go to no listener and the run
-    //    sits on `queued` until the 30-min timeout.
+    //    remains invisible to the completion watcher.
     let rx = handle.subscribe();
 
     // 4b. Final pre-send cancel check. Narrows the post-`mark_run_resolved`
@@ -264,42 +226,32 @@ pub async fn run_with_payload(
         )
         .is_ok();
     if claimed {
-        let send_res = tokio::time::timeout(
-            Duration::from_secs(10),
-            handle.send_prompt(
+        match handle
+            .send_prompt(
                 automation.prompt.clone(),
                 Vec::new(),
                 Some(sender.clone()),
                 false,
                 Some(snapshot),
-            ),
-        )
-        .await;
-        match send_res {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(error) => {
                 handle
                     .is_busy
                     .store(false, std::sync::atomic::Ordering::Release);
-                return fail(
-                    &run_id,
-                    "queue",
-                    &format!("send_prompt: {e}"),
-                    Some(&task_id),
-                    Some(&chat_id),
-                );
-            }
-            Err(_) => {
-                handle
-                    .is_busy
-                    .store(false, std::sync::atomic::Ordering::Release);
-                return fail(
-                    &run_id,
-                    "queue",
-                    "send_prompt timeout (10s)",
-                    Some(&task_id),
-                    Some(&chat_id),
-                );
+                let message = format!("send_prompt: {error}");
+                if let Err(mark_error) = automations::mark_run_failed(&run_id, "queue", &message) {
+                    awarn!("mark_run_failed for {run_id}: {mark_error}");
+                }
+                return RunOutcome {
+                    run_id,
+                    status: "failed".to_string(),
+                    error: Some(message),
+                    resolved_task_id: Some(task_id),
+                    resolved_chat_id: Some(chat_id),
+                };
             }
         }
     } else {
@@ -575,39 +527,27 @@ async fn run_handler(automation: &Automation, trigger: consumer::TriggerContext)
             .ok();
         return RunOutcome::queued(run_id, None, None);
     }
-    let send_result = tokio::time::timeout(
-        Duration::from_secs(10),
-        handle.send_prompt(
+    if let Err(error) = handle
+        .send_prompt(
             run.prompt_snapshot.clone(),
             Vec::new(),
             Some(format!("automation:{run_id}")),
             false,
             run.agent_config_snapshot.queued_config(),
-        ),
-    )
-    .await;
-    match send_result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            let _ = handle.kill().await;
-            return fail_handler(
-                automation,
-                handler.as_ref(),
-                &run_id,
-                "queue",
-                &format!("send Automation prompt: {error}"),
-            );
+        )
+        .await
+    {
+        let message = format!("send Automation prompt: {error}");
+        if let Err(mark_error) = automations::mark_run_failed(&run_id, "queue", &message) {
+            awarn!("mark_run_failed for {run_id}: {mark_error}");
         }
-        Err(_) => {
-            let _ = handle.kill().await;
-            return fail_handler(
-                automation,
-                handler.as_ref(),
-                &run_id,
-                "queue",
-                "send Automation prompt timeout (10s)",
-            );
-        }
+        return RunOutcome {
+            run_id,
+            status: "failed".to_string(),
+            error: Some(message),
+            resolved_task_id: run.resolved_task_id,
+            resolved_chat_id: run.resolved_chat_id,
+        };
     }
     if let Err(error) = automations::mark_run_queued(&run_id, now()) {
         awarn!("mark_run_queued for {run_id}: {error}");
@@ -616,14 +556,7 @@ async fn run_handler(automation: &Automation, trigger: consumer::TriggerContext)
     let task_run = run;
     let task_handler = handler;
     tokio::spawn(async move {
-        wait_for_handler_completion(
-            task_handler,
-            task_automation,
-            task_run,
-            bindings.timeout,
-            rx,
-        )
-        .await;
+        wait_for_handler_completion(task_handler, task_automation, task_run, rx).await;
     });
     RunOutcome::queued(run_id, None, None)
 }
@@ -644,185 +577,183 @@ fn fail_handler(
             awarn!("abort handler for {run_id}: {abort_error}");
         }
     }
-    if let Err(mark_error) = automations::mark_run_failed(run_id, now(), phase, error) {
+    if let Err(mark_error) = automations::mark_run_failed(run_id, phase, error) {
         awarn!("mark_run_failed for {run_id}: {mark_error}");
     }
-    RunOutcome::failed_run(run_id, error, None, None)
+    let status = automations::get_run(run_id)
+        .ok()
+        .flatten()
+        .map(|run| run.status)
+        .unwrap_or_else(|| "queued".to_string());
+    RunOutcome {
+        run_id: run_id.to_string(),
+        status,
+        error: Some(error.to_string()),
+        resolved_task_id: None,
+        resolved_chat_id: None,
+    }
 }
 
 async fn wait_for_handler_completion(
     handler: std::sync::Arc<dyn consumer::AutomationHandler>,
     automation: Automation,
     initial_run: AutomationRun,
-    timeout: Duration,
     mut rx: tokio::sync::broadcast::Receiver<AcpUpdate>,
 ) {
     let mut response = String::new();
-    let mut settle_after_complete: Option<tokio::time::Instant> = None;
-    let terminal = tokio::time::timeout(timeout, async {
-        loop {
-            let received = match settle_after_complete {
-                Some(deadline) => {
-                    tokio::select! {
-                        biased;
-                        update = rx.recv() => Some(update),
-                        _ = tokio::time::sleep_until(deadline) => None,
-                    }
+    let mut turn_failed = false;
+    loop {
+        let update = match rx.recv().await {
+            Ok(update) => update,
+            Err(RecvError::Lagged(skipped)) => {
+                awarn!(
+                    "broadcast lagged for run {}: skipped {skipped} events",
+                    initial_run.id
+                );
+                continue;
+            }
+            Err(RecvError::Closed) => {
+                let _ = automations::mark_run_failed(
+                    &initial_run.id,
+                    "agent_run",
+                    "Agent Session closed before the Run completed",
+                );
+                return;
+            }
+        };
+        automations::publish_run_event(
+            &automation.project,
+            &automation.id,
+            &initial_run.id,
+            &update,
+        );
+        let Some(latest) = automations::get_run(&initial_run.id).ok().flatten() else {
+            return;
+        };
+        if matches!(
+            latest.status.as_str(),
+            "success" | "cancelled" | "cancelling"
+        ) {
+            return;
+        }
+        match update {
+            AcpUpdate::UserMessage { .. }
+            | AcpUpdate::PermissionResponse { .. }
+            | AcpUpdate::ElicitationResolved { .. }
+            | AcpUpdate::AuthSucceeded => {
+                turn_failed = false;
+                response.clear();
+                if let Err(error) = automations::mark_run_running(&latest.id) {
+                    awarn!("mark_run_running for {}: {error}", latest.id);
                 }
-                None => Some(rx.recv().await),
-            };
-            let Some(received) = received else {
-                break Ok(());
-            };
-            match received {
-                Ok(update) => {
-                    automations::publish_run_event(
-                        &automation.project,
-                        &automation.id,
-                        &initial_run.id,
-                        &update,
-                    );
-                    // A product-level completion action (for example
-                    // memory_mark_organization_finished) can finish the Run
-                    // independently of the ordinary Chat Session. Stop only
-                    // this Run watcher; never terminate the Session.
-                    if matches!(
-                        automations::get_run(&initial_run.id),
-                        Ok(Some(ref run)) if run.status != "running"
-                    ) {
-                        break Ok(());
-                    }
-                    match update {
-                        AcpUpdate::MessageChunk { text } => {
-                            settle_after_complete = None;
-                            response.push_str(&text);
-                        }
-                        AcpUpdate::Complete { .. } => {
-                            let latest = automations::get_run(&initial_run.id)
-                                .ok()
-                                .flatten()
-                                .unwrap_or_else(|| initial_run.clone());
-                            match handler.completion_requested(consumer::RuntimeContext {
-                                automation: &automation,
-                                run: &latest,
-                            }) {
-                                Ok(true) => {
-                                    settle_after_complete = Some(
-                                        tokio::time::Instant::now() + PROJECT_RUN_FOLLOWUP_GRACE,
-                                    );
-                                }
-                                Ok(false) => {
-                                    // The Agent only finished one ordinary
-                                    // Chat turn. Keep the Run watcher and the
-                                    // Session alive for the user's next turn.
-                                    settle_after_complete = None;
-                                }
-                                Err(error) => break Err(error.to_string()),
+            }
+            AcpUpdate::PermissionRequest { .. }
+            | AcpUpdate::ElicitationRequest { .. }
+            | AcpUpdate::AskForm { .. }
+            | AcpUpdate::AuthRequired { .. }
+            | AcpUpdate::AuthFailed { .. } => {
+                if let Err(error) = automations::mark_run_waiting(&latest.id) {
+                    awarn!("mark_run_waiting for {}: {error}", latest.id);
+                }
+            }
+            AcpUpdate::MessageChunk { text } => response.push_str(&text),
+            AcpUpdate::Complete { .. } => {
+                match handler.completion_requested(consumer::RuntimeContext {
+                    automation: &automation,
+                    run: &latest,
+                }) {
+                    Ok(false) => {
+                        if !turn_failed {
+                            if let Err(error) = automations::mark_run_waiting(&latest.id) {
+                                awarn!("mark_run_waiting for {}: {error}", latest.id);
                             }
                         }
-                        // A successful TaskChat auto-drain emits QueueUpdate
-                        // directly after Complete, before the next UserMessage.
-                        // Keep the Run alive so queued human guidance is not
-                        // discarded when the first Agent turn finishes.
-                        AcpUpdate::QueueUpdate { .. }
-                        | AcpUpdate::UserMessage { .. }
-                        | AcpUpdate::Busy { value: true } => {
-                            settle_after_complete = None;
+                        continue;
+                    }
+                    Err(error) => {
+                        automations::publish_run_event(
+                            &automation.project,
+                            &automation.id,
+                            &latest.id,
+                            &AcpUpdate::Error {
+                                message: error.to_string(),
+                            },
+                        );
+                        if let Err(mark_error) = automations::mark_run_failed(
+                            &latest.id,
+                            "completion_check",
+                            &error.to_string(),
+                        ) {
+                            awarn!("mark_run_failed for {}: {mark_error}", latest.id);
                         }
-                        AcpUpdate::Error { message } => break Err(message),
-                        AcpUpdate::SessionEnded => {
-                            break Err(
-                                "Automation Agent Session ended before completion".to_string()
-                            )
+                        turn_failed = true;
+                        continue;
+                    }
+                    Ok(true) => {}
+                }
+                let truncated =
+                    (!response.is_empty()).then(|| automations::truncate_agent_response(&response));
+                match automations::complete_consumer_run(&latest.id, now(), |tx| {
+                    let result = handler.post_action(
+                        consumer::PostActionContext {
+                            automation: &automation,
+                            run: &latest,
+                            agent_response: truncated.as_deref(),
+                        },
+                        tx,
+                    )?;
+                    tx.execute(
+                        "UPDATE automation_runs SET agent_response = ?1 WHERE id = ?2",
+                        rusqlite::params![truncated, latest.id],
+                    )?;
+                    Ok(((), result))
+                }) {
+                    Ok(Some(())) => {
+                        if let Err(error) = handler.after_commit(consumer::AfterCommitContext {
+                            automation: &automation,
+                            run: &latest,
+                        }) {
+                            awarn!("after_commit for run {}: {error}", latest.id);
                         }
-                        _ => continue,
+                        return;
+                    }
+                    Ok(None) => return,
+                    Err(error) => {
+                        automations::publish_run_event(
+                            &automation.project,
+                            &automation.id,
+                            &latest.id,
+                            &AcpUpdate::Error {
+                                message: error.to_string(),
+                            },
+                        );
+                        if let Err(mark_error) = automations::mark_run_failed(
+                            &latest.id,
+                            "complete_run",
+                            &error.to_string(),
+                        ) {
+                            awarn!("mark_run_failed for {}: {mark_error}", latest.id);
+                        }
+                        turn_failed = true;
                     }
                 }
-                Err(RecvError::Lagged(skipped)) => {
-                    awarn!(
-                        "broadcast lagged for run {}: skipped {skipped} events",
-                        initial_run.id
-                    );
-                }
-                Err(RecvError::Closed) => {
-                    break Err("Automation Agent Session closed before completion".to_string())
-                }
             }
-        }
-    })
-    .await;
-
-    let latest = automations::get_run(&initial_run.id)
-        .ok()
-        .flatten()
-        .unwrap_or(initial_run);
-    match terminal {
-        Ok(Ok(())) if latest.status == "running" => {
-            let truncated =
-                (!response.is_empty()).then(|| automations::truncate_agent_response(&response));
-            let committed = automations::complete_consumer_run(&latest.id, now(), |tx| {
-                let result = handler.post_action(
-                    consumer::PostActionContext {
-                        automation: &automation,
-                        run: &latest,
-                        agent_response: truncated.as_deref(),
-                    },
-                    tx,
-                )?;
-                tx.execute(
-                    "UPDATE automation_runs SET agent_response = ?1 WHERE id = ?2",
-                    rusqlite::params![truncated, latest.id],
-                )?;
-                Ok(((), result))
-            });
-            match committed {
-                Ok(Some(())) => {
-                    if let Err(error) = handler.after_commit(consumer::AfterCommitContext {
-                        automation: &automation,
-                        run: &latest,
-                    }) {
-                        awarn!("after_commit for run {}: {error}", latest.id);
-                    }
+            AcpUpdate::Error { message } => {
+                if let Err(error) = automations::mark_run_failed(&latest.id, "agent_run", &message)
+                {
+                    awarn!("mark_run_failed for {}: {error}", latest.id);
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    let _ = handler.abort(consumer::AbortContext {
-                        automation: &automation,
-                        run: &latest,
-                        reason: &error.to_string(),
-                    });
-                    let _ = automations::mark_run_failed(
-                        &latest.id,
-                        now(),
-                        "post_action",
-                        &error.to_string(),
-                    );
-                }
+                turn_failed = true;
             }
-        }
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            let _ = handler.abort(consumer::AbortContext {
-                automation: &automation,
-                run: &latest,
-                reason: &error,
-            });
-            let phase = if error.starts_with("Prompt not sent") {
-                "apply_agent_config"
-            } else {
-                "agent_run"
-            };
-            let _ = automations::mark_run_failed(&latest.id, now(), phase, &error);
-        }
-        Err(_) => {
-            let _ = handler.abort(consumer::AbortContext {
-                automation: &automation,
-                run: &latest,
-                reason: "Agent completion timeout",
-            });
-            let truncated =
-                (!response.is_empty()).then(|| automations::truncate_agent_response(&response));
-            let _ = automations::mark_run_timeout(&latest.id, now(), truncated.as_deref());
+            AcpUpdate::SessionEnded => {
+                let _ = automations::mark_run_failed(
+                    &latest.id,
+                    "agent_run",
+                    "Agent Session ended before the Run completed",
+                );
+                return;
+            }
+            _ => {}
         }
     }
 }
@@ -834,12 +765,16 @@ fn fail(
     task_id: Option<&str>,
     chat_id: Option<&str>,
 ) -> RunOutcome {
-    if let Err(e) = automations::mark_run_failed(run_id, now(), phase, error) {
+    if let Err(e) = automations::mark_run_failed(run_id, phase, error) {
         awarn!("mark_run_failed for {run_id}: {e}");
     }
     RunOutcome {
         run_id: run_id.to_string(),
-        status: "failed".to_string(),
+        status: automations::get_run(run_id)
+            .ok()
+            .flatten()
+            .map(|run| run.status)
+            .unwrap_or_else(|| "queued".to_string()),
         error: Some(error.to_string()),
         resolved_task_id: task_id.map(String::from),
         resolved_chat_id: chat_id.map(String::from),
@@ -871,7 +806,7 @@ fn agent_snapshot(a: &Automation) -> String {
 
 /// Background task: watch the ACP broadcast for events tagged with our
 /// `automation:<run_id>` sender, accumulate the agent's response text, and
-/// land the run in its terminal state.
+/// mark the Run completed only when ACP reports `Complete`.
 ///
 /// State machine inside:
 ///   waiting_for_pickup → streaming → done
@@ -879,7 +814,7 @@ fn agent_snapshot(a: &Automation) -> String {
 /// In `waiting_for_pickup` we discard everything except our matching
 /// `UserMessage` — that's the signal the agent dequeued our prompt and
 /// started this turn. From then on we accumulate `MessageChunk.text` and
-/// wait for `Complete` / `Error` / `SessionEnded`.
+/// wait for `Complete`. Errors remain part of the live conversation.
 async fn wait_for_completion(
     run_id: String,
     sender: String,
@@ -887,177 +822,102 @@ async fn wait_for_completion(
 ) {
     let mut started = false;
     let mut response = String::new();
-    // True once we've observed our own sender in a `QueueUpdate`. Until
-    // then, a `QueueUpdate` that doesn't include us is just "queue update
-    // happening before we landed" (rare timing) — not a cancellation.
-    let mut saw_self_in_queue = false;
-    // When set, we've seen the queue *lose* our entry. If a matching
-    // `UserMessage` arrives before this deadline we treat the drop as a
-    // cmd_loop drain (case 1 in DRAIN_GRACE's doc). Otherwise we treat it
-    // as a user cancellation.
-    let mut drain_grace_until: Option<tokio::time::Instant> = None;
-
-    let outcome = loop {
-        let wait_for = match drain_grace_until {
-            Some(deadline) => {
-                let now = tokio::time::Instant::now();
-                if now >= deadline {
-                    break WatchOutcome::Cancelled("removed from pending queue".to_string());
-                }
-                deadline - now
+    let mut turn_failed = false;
+    loop {
+        match rx.recv().await {
+            Err(RecvError::Closed) => {
+                let _ = automations::mark_run_failed(
+                    &run_id,
+                    "agent_run",
+                    "Agent Session closed before the Run completed",
+                );
+                return;
             }
-            None => AGENT_COMPLETION_TIMEOUT,
-        };
-        let recv = tokio::time::timeout(wait_for, rx.recv()).await;
-        match recv {
-            Err(_) => {
-                // Either the long-poll timeout (no event in 30 min) or the
-                // short drain-grace window expired. The branch above
-                // already converts an expired grace into Cancelled, so
-                // anything reaching here is the long timeout.
-                if drain_grace_until.is_some() {
-                    break WatchOutcome::Cancelled("removed from pending queue".to_string());
-                }
-                break WatchOutcome::Timeout(response);
-            }
-            Ok(Err(RecvError::Closed)) => {
-                break WatchOutcome::Failed {
-                    phase: "agent_run",
-                    error: "ACP broadcast closed before completion".to_string(),
-                    response,
-                };
-            }
-            Ok(Err(RecvError::Lagged(n))) => {
-                // Broadcast buffer (256 events) overran. We may have missed
-                // the matching UserMessage or Complete. Log and keep trying
-                // — the 30-min timeout is the ultimate floor.
+            Err(RecvError::Lagged(n)) => {
                 awarn!("broadcast lagged for run {run_id}: skipped {n} events");
                 continue;
             }
-            Ok(Ok(update)) => match update {
-                AcpUpdate::UserMessage {
-                    sender: Some(s), ..
-                } if s == sender => {
-                    started = true;
-                    response.clear();
-                    drain_grace_until = None;
-                    // Promote queued → running so the UI shows "agent is
-                    // actually working". Conditional UPDATE, so a cancel
-                    // that beat us to the row stays cancelled.
-                    if let Err(e) = automations::mark_run_running(&run_id) {
-                        awarn!("mark_run_running for {run_id}: {e}");
+            Ok(update) => {
+                if !matches!(
+                    automations::get_run(&run_id),
+                    Ok(Some(ref run)) if !matches!(run.status.as_str(), "success" | "cancelled" | "cancelling")
+                ) {
+                    return;
+                }
+                match update {
+                    AcpUpdate::UserMessage {
+                        sender: Some(s), ..
+                    } if s == sender => {
+                        started = true;
+                        turn_failed = false;
+                        response.clear();
+                        // Promote queued → running so the UI shows "agent is
+                        // actually working". Conditional UPDATE, so a cancel
+                        // that beat us to the row stays cancelled.
+                        if let Err(e) = automations::mark_run_running(&run_id) {
+                            awarn!("mark_run_running for {run_id}: {e}");
+                        }
                     }
-                }
-                // A *different* UserMessage after we started means the
-                // cmd_loop has already moved on to the next prompt (manual
-                // human message, or another automation queued behind us).
-                // Our turn's `Complete` event was dropped on the floor —
-                // most likely a broadcast lag we already logged above.
-                // Close out with whatever we've accumulated so the chunks
-                // belonging to the *next* turn don't pollute our snapshot.
-                AcpUpdate::UserMessage { .. } if started => {
-                    break WatchOutcome::Completed(std::mem::take(&mut response));
-                }
-                AcpUpdate::MessageChunk { text } if started => {
-                    response.push_str(&text);
-                }
-                AcpUpdate::Complete { .. } if started => {
-                    break WatchOutcome::Completed(response);
-                }
-                AcpUpdate::Error { message } if started => {
-                    break WatchOutcome::Failed {
-                        phase: "agent_run",
-                        error: message,
-                        response,
-                    };
-                }
-                AcpUpdate::Error { message } if message.starts_with("Prompt not sent") => {
-                    break WatchOutcome::Failed {
-                        phase: "apply_agent_config",
-                        error: message,
-                        response,
-                    };
-                }
-                AcpUpdate::SessionEnded if started => {
-                    break WatchOutcome::Failed {
-                        phase: "agent_run",
-                        error: "ACP session ended before completion".to_string(),
-                        response,
-                    };
-                }
-                // SessionEnded before we ever picked up means the agent
-                // died while a prior prompt was running. Surface that.
-                AcpUpdate::SessionEnded => {
-                    break WatchOutcome::Failed {
-                        phase: "agent_run",
-                        error: "ACP session ended before agent picked up the prompt".to_string(),
-                        response,
-                    };
-                }
-                // State sync with the chat UI: the user may trash-click
-                // our queued message. But cmd_loop's normal end-of-turn
-                // drain *also* removes us from the queue (and emits this
-                // event) before sending the Prompt command that becomes
-                // our UserMessage. The original implementation conflated
-                // the two — every queue drain falsely cancelled the run.
-                //
-                // Now: we only act on a "queue lost us" event after we've
-                // seen ourselves *in* a previous QueueUpdate (rules out the
-                // first-event-before-we're-added race), and we wait
-                // `DRAIN_GRACE` for the matching UserMessage before
-                // declaring it a real cancellation.
-                AcpUpdate::QueueUpdate { messages } if !started => {
-                    let still_queued = messages
-                        .iter()
-                        .any(|m| m.sender.as_deref() == Some(&sender));
-                    if still_queued {
-                        saw_self_in_queue = true;
-                        drain_grace_until = None;
-                    } else if saw_self_in_queue && drain_grace_until.is_none() {
-                        drain_grace_until = Some(tokio::time::Instant::now() + DRAIN_GRACE);
+                    AcpUpdate::UserMessage { .. } if started => {
+                        turn_failed = false;
+                        response.clear();
+                        if let Err(e) = automations::mark_run_running(&run_id) {
+                            awarn!("mark_run_running for {run_id}: {e}");
+                        }
                     }
+                    AcpUpdate::PermissionResponse { .. }
+                    | AcpUpdate::ElicitationResolved { .. }
+                    | AcpUpdate::AuthSucceeded
+                        if started =>
+                    {
+                        if let Err(e) = automations::mark_run_running(&run_id) {
+                            awarn!("mark_run_running for {run_id}: {e}");
+                        }
+                    }
+                    AcpUpdate::PermissionRequest { .. }
+                    | AcpUpdate::ElicitationRequest { .. }
+                    | AcpUpdate::AskForm { .. }
+                    | AcpUpdate::AuthRequired { .. }
+                    | AcpUpdate::AuthFailed { .. }
+                        if started =>
+                    {
+                        if let Err(e) = automations::mark_run_waiting(&run_id) {
+                            awarn!("mark_run_waiting for {run_id}: {e}");
+                        }
+                    }
+                    AcpUpdate::MessageChunk { text } if started => {
+                        response.push_str(&text);
+                    }
+                    AcpUpdate::Complete { .. } if started && !turn_failed => {
+                        let truncated = (!response.is_empty())
+                            .then(|| automations::truncate_agent_response(&response));
+                        if let Err(error) =
+                            automations::mark_run_completed(&run_id, now(), truncated.as_deref())
+                        {
+                            awarn!("mark_run_completed for {run_id}: {error}");
+                        }
+                        return;
+                    }
+                    AcpUpdate::Complete { .. } if started => continue,
+                    AcpUpdate::Error { message } if started => {
+                        if let Err(e) = automations::mark_run_failed(&run_id, "agent_run", &message)
+                        {
+                            awarn!("mark_run_failed for {run_id}: {e}");
+                        }
+                        turn_failed = true;
+                    }
+                    AcpUpdate::SessionEnded => {
+                        let _ = automations::mark_run_failed(
+                            &run_id,
+                            "agent_run",
+                            "Agent Session ended before the Run completed",
+                        );
+                        return;
+                    }
+                    _ => continue,
                 }
-                _ => continue,
-            },
+            }
         }
-    };
-
-    persist(&run_id, outcome).await;
-}
-
-enum WatchOutcome {
-    Completed(String),
-    Failed {
-        phase: &'static str,
-        error: String,
-        response: String,
-    },
-    Timeout(String),
-    Cancelled(String),
-}
-
-async fn persist(run_id: &str, outcome: WatchOutcome) {
-    let finished_at = now();
-    let result = match outcome {
-        WatchOutcome::Completed(text) => {
-            let truncated = (!text.is_empty()).then(|| automations::truncate_agent_response(&text));
-            automations::mark_run_completed(run_id, finished_at, truncated.as_deref())
-        }
-        WatchOutcome::Failed {
-            phase,
-            error,
-            response: _response,
-        } => automations::mark_run_failed(run_id, finished_at, phase, &error),
-        WatchOutcome::Timeout(text) => {
-            let truncated = (!text.is_empty()).then(|| automations::truncate_agent_response(&text));
-            automations::mark_run_timeout(run_id, finished_at, truncated.as_deref())
-        }
-        WatchOutcome::Cancelled(reason) => {
-            automations::mark_run_cancelled(run_id, finished_at, &reason)
-        }
-    };
-    if let Err(e) = result {
-        awarn!("persist outcome for {run_id}: {e}");
     }
 }
 

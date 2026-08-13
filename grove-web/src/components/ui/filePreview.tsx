@@ -16,7 +16,11 @@ import {
 } from "./VirtualizedMarkdownRenderer";
 import { FullFilePreview } from "./FullFilePreview";
 import { isVirtualizedMarkdownPreview } from "./filePreviewPolicy";
-import type { PreviewCommentLocator, PreviewCommentDraft } from "../../context";
+import {
+  previewCommentLocatorInParentViewport,
+  type PreviewCommentLocator,
+  type PreviewCommentDraft,
+} from "../../context";
 import { useKeyboardScope, useCommand, useContextKey } from "../../keyboard";
 import type { FileLocation } from "./fileLocation";
 
@@ -415,7 +419,7 @@ export function FilePreviewDrawer({
         // letting users add multiple comments in one session. The `enabled`
         // prop below gates the overlay on `!pendingLocator` so the picker UI
         // hides while the modal is up.
-        setPendingLocator(data.payload);
+        setPendingLocator(previewCommentLocatorInParentViewport(data.payload, event.source, drawerRef.current));
         setCommentText("");
         setEditingDraftId(null);
       } else if (data.type === "grove-preview-comment:cancel") {
@@ -760,6 +764,7 @@ export function FilePreviewDrawer({
             }}
           >
               <textarea
+                autoFocus
                 value={commentText}
                 onChange={(e) => setCommentText(e.target.value)}
                 rows={3}

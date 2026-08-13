@@ -19,7 +19,7 @@ export const CHAT_COMMANDS: CommandDef[] = [
     description: "Send the current message",
     defaultBindings: [{ key: "Enter" }],
     scope: "workspace",
-    defaultWhen: "chatFocus && messageNotEmpty && !chatInputExpanded",
+    passThroughTextInput: true,
   },
   {
     id: "chat.send.alt",
@@ -28,7 +28,7 @@ export const CHAT_COMMANDS: CommandDef[] = [
     description: "Send the current message via Cmd+Enter",
     defaultBindings: [{ key: "Mod+Enter" }],
     scope: "workspace",
-    defaultWhen: "chatFocus",
+    passThroughTextInput: true,
   },
   {
     id: "chat.search.toggle",

@@ -11,6 +11,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { createRoot } from "react-dom/client";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   MessageSquare,
@@ -105,18 +106,17 @@ import type { MentionItem, FilteredMentionItem } from "../../../utils/fileMentio
 import { getMentionCandidates } from "../../../api";
 import type {
   SessionConfigOption,
-  SessionConfigSelectGroup,
   SessionConfigSelectValue,
 } from "../../../api/tasks";
 import {
   configCategoryMatches,
   configDropdownValues,
-  isConfigGroup,
   quickConfigOptions,
 } from "./sessionConfigOptions";
 import { listExtensionTabs, getExtensionStatus } from "../../../api/extension";
 import { useProject } from "../../../context/ProjectContext";
 import { useConfig } from "../../../context/ConfigContext";
+import { useTheme } from "../../../context/ThemeContext";
 import { previewCommentTaskLabel, usePreviewComments, type PreviewCommentDraft, type PreviewCommentLocator } from "../../../context";
 import { PreviewSearchBar } from "../../Review/PreviewSearchBar";
 import {
@@ -186,6 +186,7 @@ import { sendInputToTerminal } from "../TaskDetail/terminalCache";
 import { perfMark } from "../../../perf/marks";
 import { useReportDebugId } from "../../../perf/debugIdsStore";
 import { getApiHost, appendHmacToUrl } from "../../../api/client";
+import { getProjectStyle } from "../../../utils/projectStyle";
 import { useAgentQuota, useRadioEvents } from "../../../hooks";
 import { AgentQuotaPopover } from "./AgentQuotaPopover";
 import { ContextUsagePill } from "./ContextUsagePill";
@@ -1695,6 +1696,8 @@ function createFileChip(
   displayLabel?: string,
   category?: string,
   favIconUrl?: string,
+  projectId?: string,
+  accentPalette?: string[],
 ): HTMLSpanElement {
   const chip = document.createElement("span");
   chip.contentEditable = "false";
@@ -1714,7 +1717,17 @@ function createFileChip(
   const isLink = filePath.toLowerCase().endsWith(".link.json");
   const baseName = filePath.split("/").filter(Boolean).pop() || "";
 
-  if (category === "Sketch") {
+  if (category === "Project Root" && projectId) {
+    chip.dataset.projectId = projectId;
+    const projectStyle = getProjectStyle(projectId, accentPalette);
+    const ProjectIcon = projectStyle.Icon;
+    const iconHost = document.createElement("span");
+    iconHost.style.cssText =
+      `display:inline-flex;width:18px;height:18px;align-items:center;justify-content:center;` +
+      `border-radius:4px;flex-shrink:0;background:${projectStyle.color.bg};color:${projectStyle.color.fg};`;
+    chip.appendChild(iconHost);
+    createRoot(iconHost).render(<ProjectIcon width={11} height={11} />);
+  } else if (category === "Sketch") {
     // Render Lucide Palette icon in SVG for visual consistency and premium look!
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("width", "13");
@@ -2836,6 +2849,7 @@ export function TaskChat({
   const taskFilesLoadingRef = useRef(false);
   const { selectedProject, projects } = useProject();
   const { config: appConfig } = useConfig();
+  const { theme } = useTheme();
   const {
     drafts: previewCommentDrafts,
     addDraft: addPreviewCommentDraft,
@@ -2998,15 +3012,40 @@ export function TaskChat({
   const chatboxContainerRef = useRef<HTMLDivElement>(null);
   const taskChatRootRef = useRef<HTMLDivElement>(null);
   // Composer width budget — when the chat panel is squeezed (e.g. opened
-  // alongside a Graph / Editor split), drop the Model / Mode / Thinking
-  // dropdowns so the Send button doesn't get clipped. Two tiers: below
-  // HIDE_ALL we drop everything; between HIDE_ALL and HIDE_THINKING we
-  // keep Model + Mode but drop the Thinking pill (which was added later
-  // and tips the row over the edge in mid-width panels).
-  const COMPOSER_HIDE_ALL_WIDTH = 420;
-  const COMPOSER_HIDE_THINKING_WIDTH = 560;
+  // alongside a Graph / Editor split), move the quick settings into the
+  // settings menu so the Send button doesn't get clipped. Collapse one item
+  // at a time so a narrower composer still keeps as much context visible as
+  // possible: Thinking first, then Mode, and Model only at the smallest size.
+  const COMPOSER_HIDE_ALL_WIDTH = 480;
+  const COMPOSER_HIDE_MODE_WIDTH = 680;
+  const COMPOSER_HIDE_THINKING_WIDTH = 820;
   const [composerNarrow, setComposerNarrow] = useState(false);
+  const [composerHideMode, setComposerHideMode] = useState(false);
   const [composerHideThinking, setComposerHideThinking] = useState(false);
+  const settingsSessionConfigOptions = useMemo(() => {
+    const compactQuickOptions = composerNarrow
+      ? [
+          matchedSessionConfig.model,
+          matchedSessionConfig.mode,
+          matchedSessionConfig.thinking,
+        ]
+      : [
+          composerHideMode ? matchedSessionConfig.mode : undefined,
+          composerHideThinking ? matchedSessionConfig.thinking : undefined,
+        ];
+    return [
+      ...compactQuickOptions.filter(
+        (option): option is SessionConfigOption => !!option,
+      ),
+      ...additionalSessionConfigOptions,
+    ];
+  }, [
+    additionalSessionConfigOptions,
+    composerHideMode,
+    composerHideThinking,
+    composerNarrow,
+    matchedSessionConfig,
+  ]);
 
   // ─── Read-only observation mode state ──────────────────────────────────
   const [isRemoteSession, setIsRemoteSession] = useState(false);
@@ -3240,16 +3279,14 @@ export function TaskChat({
   // Routed through the Scoped Command Registry — catalog entry lives in
   // src/keyboard/catalog/chat.ts (chat.search.toggle, Mod+f, workspace
   // scope, defaultWhen "chatPanelActive"). `chatPanelActive` is set true
-  // while TaskChat is mounted. `chatFocus` exists so the catalog's
-  // chat.send binding (Enter when chatFocus && messageNotEmpty) keeps
-  // working — TaskChat owns the chatbox composer.
+  // while TaskChat is mounted. Composer context remains available to other
+  // chat commands and user-authored when clauses; chat.send additionally
+  // uses a per-instance focus gate at registration time so keep-alive
+  // TaskChats cannot route Enter to a hidden composer.
   useContextKey("chatPanelActive", true);
   useContextKey("chatFocus", isInputFocused);
-  // `messageNotEmpty` gates chat.send (Enter when chatFocus && messageNotEmpty).
-  // Reuse `hasContent` — the same flag the send button uses (line ~7788 and
-  // friends). It's true when the composer contenteditable has trimmed text,
-  // a chip ([data-command]/[data-file]), or any attachment — i.e. anything
-  // that would form a non-empty outgoing message.
+  // Expose the same content state used by the send button. It is true when
+  // the composer has trimmed text, a chip, or an attachment.
   useContextKey("messageNotEmpty", hasContent);
   useContextKey("chatInputExpanded", isInputExpanded);
   // `messageSelected` gates chat.fork. TaskChat has no per-history-message
@@ -3738,6 +3775,7 @@ export function TaskChat({
     const ro = new ResizeObserver(() => {
       const w = el.getBoundingClientRect().width;
       setComposerNarrow(w > 0 && w < COMPOSER_HIDE_ALL_WIDTH);
+      setComposerHideMode(w > 0 && w < COMPOSER_HIDE_MODE_WIDTH);
       setComposerHideThinking(w > 0 && w < COMPOSER_HIDE_THINKING_WIDTH);
     });
     ro.observe(el);
@@ -4317,7 +4355,31 @@ export function TaskChat({
           return;
         }
         setArchivedChats(freshArchived);
-        const freshIds = new Set(fresh.map((chat) => chat.id));
+        const current = getActiveChatId();
+        const currentChat = current
+          ? chatsRef.current.find((chat) => chat.id === current)
+          : undefined;
+        const currentWs = current ? wsMapRef.current.get(current) : undefined;
+        const currentWasArchived = current
+          ? freshArchived.some((chat) => chat.id === current)
+          : false;
+        // UserMessage/Complete activity emits ChatListChanged. A transiently
+        // incomplete list response must not tear down the live active chat:
+        // doing so restores default per-chat state while the same Agent keeps
+        // streaming, which makes every composer capability disappear until a
+        // later navigation hydrates session.json again. Explicit archive and
+        // delete flows close their socket separately, so preserving an open,
+        // non-archived active session here is safe.
+        const preserveLiveCurrent =
+          !!current &&
+          !!currentChat &&
+          !fresh.some((chat) => chat.id === current) &&
+          !currentWasArchived &&
+          currentWs?.readyState === WebSocket.OPEN;
+        const visibleFresh = preserveLiveCurrent
+          ? [currentChat, ...fresh]
+          : fresh;
+        const freshIds = new Set(visibleFresh.map((chat) => chat.id));
         wsMapRef.current.forEach((ws, chatId) => {
           if (freshIds.has(chatId)) return;
           intentionalCloseRef.current.add(chatId);
@@ -4327,7 +4389,7 @@ export function TaskChat({
           cancelPendingReconnectRef.current(chatId);
         });
 
-        setChats(fresh);
+        setChats(visibleFresh);
 
         // If a tray/notification deep-link was waiting on this chat to
         // appear (race: Open clicked before grove_agent_graph_spawn's chat is in
@@ -4352,10 +4414,9 @@ export function TaskChat({
           return;
         }
 
-        const current = getActiveChatId();
         if (current && freshIds.has(current)) return;
 
-        const next = fresh[0];
+        const next = visibleFresh[0];
         if (next) {
           setActiveChatId(next.id);
           writeLastActiveTab("chat", projectId, taskId, next.id);
@@ -4717,6 +4778,42 @@ export function TaskChat({
                 const state =
                   perChatStateRef.current.get(chatId) ?? defaultPerChatState();
                 state.isConnected = true;
+                if (evt.uses_config_options || (Array.isArray(evt.config_options) && evt.config_options.length > 0)) {
+                  applyConfigOptionsToCachedState(state, evt.config_options ?? []);
+                } else {
+                  state.sessionConfigOptions = [];
+                  state.modeOptions = (evt.available_modes ?? []).map(
+                    (mode: { id: string; name: string; description?: string }) => ({
+                      label: mode.name,
+                      value: mode.id,
+                      description: mode.description,
+                    }),
+                  );
+                  state.permissionLevel = evt.current_mode_id ?? "";
+                  state.modelOptions = (evt.available_models ?? []).map(
+                    (model: { id: string; name: string }) => ({
+                      label: model.name,
+                      value: model.id,
+                    }),
+                  );
+                  state.selectedModel = evt.current_model_id ?? "";
+                  state.thoughtLevelOptions = (evt.available_thought_levels ?? []).map(
+                    (level: { id: string; name: string }) => ({
+                      label: level.name,
+                      value: level.id,
+                    }),
+                  );
+                  state.thoughtLevel = evt.current_thought_level_id ?? "";
+                  state.thoughtLevelConfigId = evt.thought_level_config_id ?? "";
+                }
+                if (evt.prompt_capabilities) {
+                  state.promptCaps = {
+                    image: evt.prompt_capabilities.image ?? false,
+                    audio: evt.prompt_capabilities.audio ?? false,
+                    embeddedContext:
+                      evt.prompt_capabilities.embedded_context ?? false,
+                  };
+                }
                 state.forkCapable = !!evt.fork_capable;
                 state.importCapable = !!evt.import_capable;
                 state.deleteCapable = !!evt.delete_capable;
@@ -5055,6 +5152,14 @@ export function TaskChat({
                 );
                 state.thoughtLevel = msg.current_thought_level_id ?? "";
                 state.thoughtLevelConfigId = msg.thought_level_config_id ?? "";
+              }
+              if (msg.prompt_capabilities) {
+                state.promptCaps = {
+                  image: msg.prompt_capabilities.image ?? false,
+                  audio: msg.prompt_capabilities.audio ?? false,
+                  embeddedContext:
+                    msg.prompt_capabilities.embedded_context ?? false,
+                };
               }
               state.forkCapable = !!msg.fork_capable;
               state.importCapable = !!msg.import_capable;
@@ -6855,21 +6960,35 @@ export function TaskChat({
 
   // ── Chat command registrations (catalog: workspace scope) ─────────────
   // These mirror existing UI handlers so the same actions are reachable
-  // via shortcuts / the Cmd+K palette / Settings rebinding. Local DOM
-  // keybindings in onKeyDown still own composer-local semantics (Enter vs
-  // Shift+Enter inside contenteditable) — these registry entries only
-  // surface for catalog binding overrides + palette discovery.
+  // via shortcuts / the Cmd+K palette / Settings rebinding. Multiple
+  // keep-alive TaskChats may register these commands simultaneously, so send
+  // is enabled only for the instance whose composer actually owns focus.
   useCommand(
     "chat.send",
     () => { void handleSend(); },
-    { enabled: () => !!activeChatId && !showFileMenu && !showSlashMenu && !isInputExpanded },
-    [activeChatId, showFileMenu, showSlashMenu, isInputExpanded, handleSend],
+    {
+      enabled: () =>
+        !!activeChatId &&
+        editableRef.current === document.activeElement &&
+        hasContent &&
+        !showFileMenu &&
+        !showSlashMenu &&
+        !isInputExpanded,
+    },
+    [activeChatId, hasContent, showFileMenu, showSlashMenu, isInputExpanded, handleSend],
   );
   useCommand(
     "chat.send.alt",
     () => { void handleSend(); },
-    { enabled: () => !!activeChatId && !showFileMenu && !showSlashMenu },
-    [activeChatId, showFileMenu, showSlashMenu, handleSend],
+    {
+      enabled: () =>
+        !!activeChatId &&
+        editableRef.current === document.activeElement &&
+        hasContent &&
+        !showFileMenu &&
+        !showSlashMenu,
+    },
+    [activeChatId, hasContent, showFileMenu, showSlashMenu, handleSend],
   );
   useCommand(
     "chat.permission.cycle",
@@ -7560,7 +7679,9 @@ export function TaskChat({
               isDir,
               displayLabel || (matched?.displayName ?? ""),
               category,
-              matched?.favIconUrl
+              matched?.favIconUrl,
+              matched?.category === "Project Root" ? matched.sessionId : undefined,
+              theme.accentPalette,
             );
 
       const frag = document.createDocumentFragment();
@@ -7578,7 +7699,7 @@ export function TaskChat({
       setActiveCategory(null);
       checkContent();
     },
-    [checkContent, filteredFiles, triggerProjectFilesLoad, isStudioProject],
+    [checkContent, filteredFiles, triggerProjectFilesLoad, isStudioProject, theme.accentPalette],
   );
 
   const autocompleteFileAtCursor = useCallback(
@@ -7853,7 +7974,9 @@ export function TaskChat({
         false,
         matched?.displayName,
         matched?.category,
-        matched?.favIconUrl
+        matched?.favIconUrl,
+        matched?.category === "Project Root" ? matched.sessionId : undefined,
+        theme.accentPalette,
       );
 
       // Resolve a Range at the drop point. caretRangeFromPoint is WebKit/Blink;
@@ -7898,7 +8021,7 @@ export function TaskChat({
 
       checkContent();
     },
-    [checkContent, filteredFiles],
+    [checkContent, filteredFiles, theme.accentPalette],
   );
 
   /** Drag & drop handlers */
@@ -8856,7 +8979,7 @@ export function TaskChat({
       tabIndex={-1}
       initial={{ opacity: 0, y: -10 }}
       animate={{ opacity: 1, y: 0 }}
-      className={`flex-1 flex flex-col overflow-hidden relative outline-none ${fullscreen ? "" : "rounded-lg border border-[var(--color-border)]"}`}
+      className={`relative flex min-w-0 max-w-full flex-1 flex-col overflow-hidden outline-none ${fullscreen ? "" : "rounded-lg border border-[var(--color-border)]"}`}
       onPointerDown={(e) => {
         // Anchor keyboard focus to the chat panel on any click, so that
         // global Cmd/Ctrl+F handlers (which gate on activeElement) recognize
@@ -9169,7 +9292,7 @@ export function TaskChat({
         </div>
       )}
 
-      <div className="flex min-h-0 flex-1">
+      <div className="flex min-h-0 min-w-0 max-w-full flex-1 overflow-hidden">
         {canManageSessions && <div
           className={`taskchat-session-rail shrink-0 border-r border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_20%,transparent)] transition-all duration-200 ${sessionRailCollapsed ? "w-0 overflow-hidden border-r-transparent" : "overflow-hidden"}`}
           style={{ width: sessionRailCollapsed ? 0 : sessionRailWidth }}
@@ -10245,9 +10368,9 @@ export function TaskChat({
                     </div>
                   </div>
                 )}
-                <div className="mb-2 flex items-center justify-between gap-2 pr-10 select-none">
+                <div className="chatbox-header mb-2 flex items-center justify-between gap-2 pr-10 select-none">
                   <div className="flex min-w-0 items-center gap-2 select-none">
-                    <div className="inline-flex items-center gap-1.5 rounded-full bg-[var(--color-bg)] px-2.5 py-1 text-[11px] text-[var(--color-text)] min-w-0 max-w-full">
+                    <div className="chatbox-agent-pill inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full bg-[var(--color-bg)] px-2.5 py-1 text-[11px] text-[var(--color-text)]">
                       {AgentIcon ? (
                         <AgentIcon
                           size={12}
@@ -10256,10 +10379,10 @@ export function TaskChat({
                       ) : (
                         <Bot className="w-3 h-3 shrink-0 text-[var(--color-highlight)]" />
                       )}
-                      <span className="text-[var(--color-text-muted)] shrink-0">
+                      <span className="chatbox-agent-static-label shrink-0 text-[var(--color-text-muted)]">
                         Agent
                       </span>
-                      <span className="truncate font-medium">{agentLabel}</span>
+                      <span className="chatbox-agent-name truncate font-medium">{agentLabel}</span>
                       {agentQuota && (
                         <AgentQuotaPopover
                           usage={agentQuota}
@@ -10319,7 +10442,7 @@ export function TaskChat({
                       </div>
                     )}
                   </div>
-                  <div className="flex items-center gap-1.5 shrink-0 select-none">
+                  <div className="chatbox-header-actions flex shrink-0 items-center gap-1.5 select-none">
                     {hasMemoryPanel && (
                       <button
                         onClick={() => {
@@ -10343,7 +10466,7 @@ export function TaskChat({
                         title="Memory read by the agent in this turn"
                       >
                         <Database className="h-3 w-3" />
-                        <span>Memory</span>
+                        <span className="chatbox-header-pill-label">Memory</span>
                         <span className="opacity-70">{readMemories.length}</span>
                       </button>
                     )}
@@ -10368,7 +10491,7 @@ export function TaskChat({
                         }`}
                       >
                         <ListTodo className="h-3 w-3" />
-                        <span>Todo</span>
+                        <span className="chatbox-header-pill-label">Todo</span>
                         <span className="opacity-70">
                           {
                             planEntries.filter((e) => e.status === "completed")
@@ -10399,7 +10522,7 @@ export function TaskChat({
                         }`}
                       >
                         <BookOpen className="h-3 w-3" />
-                        <span>Plan</span>
+                        <span className="chatbox-header-pill-label">Plan</span>
                       </button>
                     )}
                     {hasPendingPanel && (
@@ -10423,7 +10546,7 @@ export function TaskChat({
                         }`}
                       >
                         <ListPlus className="h-3 w-3" />
-                        <span>Pending</span>
+                        <span className="chatbox-header-pill-label">Pending</span>
                       </button>
                     )}
                     {activePermissionMessage && (
@@ -10446,7 +10569,7 @@ export function TaskChat({
                         }`}
                       >
                         <ShieldCheck className="h-3 w-3" />
-                        <span>Permission Request</span>
+                        <span className="chatbox-header-pill-label">Permission Request</span>
                       </button>
                     )}
                     {activeSurveyMessage && (
@@ -10479,7 +10602,7 @@ export function TaskChat({
                           && activeSurveyMessage.snapshot.request.mode === "url"
                           ? <ExternalLink className="h-3 w-3" />
                           : <ListChecks className="h-3 w-3" />}
-                        <span>
+                        <span className="chatbox-header-pill-label">
                           {activeSurveyMessage.type === "elicitation"
                             && activeSurveyMessage.snapshot.request.mode === "url"
                             ? "External Request"
@@ -10508,7 +10631,7 @@ export function TaskChat({
                         }`}
                       >
                         <MessageSquarePlus className="h-3 w-3" />
-                        <span>Comments</span>
+                        <span className="chatbox-header-pill-label">Comments</span>
                         <span className="opacity-70">{taskPreviewCommentDrafts.length}</span>
                       </button>
                     )}
@@ -10700,7 +10823,7 @@ export function TaskChat({
                         }}
                       />
                     )}
-                    {!isTerminalLaunchMode && !composerNarrow && modeOptions.length > 0 && (
+                    {!isTerminalLaunchMode && !composerHideMode && modeOptions.length > 0 && (
                       <DropdownSelect
                         ref={permMenuRef}
                         label={matchedSessionConfig.mode?.name ?? "Mode"}
@@ -10757,10 +10880,10 @@ export function TaskChat({
                         }}
                       />
                     )}
-                    {!isTerminalLaunchMode && additionalSessionConfigOptions.length > 0 && (
+                    {!isTerminalLaunchMode && settingsSessionConfigOptions.length > 0 && (
                       <SessionSettingsMenu
                         ref={sessionSettingsRef}
-                        options={additionalSessionConfigOptions}
+                        options={settingsSessionConfigOptions}
                         open={showSessionSettings}
                         disabled={!isConnected}
                         pendingConfigIds={pendingConfigIds}
@@ -10968,6 +11091,30 @@ const SessionSettingsMenu = ({
     bottom: number;
     maxHeight: number;
   } | null>(null);
+  const [activeOptionId, setActiveOptionId] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  const activeOption = useMemo(
+    () =>
+      options.find(
+        (option) => option.id === activeOptionId && option.type === "select",
+      ),
+    [activeOptionId, options],
+  );
+  const activeValues = activeOption ? configDropdownValues(activeOption) : [];
+  const enableSearch = activeValues.length > 5;
+  const normalizedSearchQuery = searchQuery.toLowerCase();
+  const filteredValues = normalizedSearchQuery
+    ? activeValues.filter((value) =>
+        value.name.toLowerCase().includes(normalizedSearchQuery),
+      )
+    : activeValues;
+
+  useEffect(() => {
+    if (!activeOption || !enableSearch) return;
+    requestAnimationFrame(() => searchInputRef.current?.focus());
+  }, [activeOption, enableSearch]);
 
   const positionMenu = useCallback((trigger: HTMLElement) => {
     const rect = trigger.getBoundingClientRect();
@@ -11003,7 +11150,11 @@ const SessionSettingsMenu = ({
       type="button"
       disabled={pendingConfigIds.has(option.id)}
       onMouseDown={(event) => event.preventDefault()}
-      onClick={() => onSelect(option, value.value)}
+      onClick={() => {
+        onSelect(option, value.value);
+        setActiveOptionId(null);
+        setSearchQuery("");
+      }}
       className="grid w-full grid-cols-[14px_minmax(0,1fr)_auto] items-start gap-x-2 rounded-md px-1 py-1.5 text-left hover:bg-[var(--color-bg-tertiary)] disabled:opacity-50"
     >
       <span aria-hidden="true" />
@@ -11026,7 +11177,11 @@ const SessionSettingsMenu = ({
       <button
         type="button"
         onClick={(event) => {
-          if (!open) positionMenu(event.currentTarget);
+          if (!open) {
+            positionMenu(event.currentTarget);
+            setActiveOptionId(null);
+            setSearchQuery("");
+          }
           onToggle();
         }}
         disabled={disabled}
@@ -11040,7 +11195,7 @@ const SessionSettingsMenu = ({
         createPortal(
         <div
           data-session-settings-menu
-          className="fixed z-[1000] flex w-80 flex-col overflow-y-auto rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-1.5 shadow-lg"
+          className="fixed z-[1000] flex w-80 flex-col overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg"
           style={{
             left: menuAnchor.left,
             bottom: menuAnchor.bottom,
@@ -11048,23 +11203,72 @@ const SessionSettingsMenu = ({
             overflowAnchor: "none",
           }}
         >
-          {options.map((option) => (
-            <div key={option.id} className="border-b border-[var(--color-border)] px-1 py-2 last:border-b-0">
-              <div className="mb-1 grid grid-cols-[14px_minmax(0,1fr)_auto] items-start gap-x-2 px-1">
-                <span className="mt-0.5 text-[var(--color-text-muted)]">
-                  {iconForOption(option)}
+          {activeOption ? (
+            <>
+              <div className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-2 py-2">
+                <button
+                  type="button"
+                  aria-label="Back to session settings"
+                  onClick={() => {
+                    setActiveOptionId(null);
+                    setSearchQuery("");
+                  }}
+                  className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </button>
+                <span className="text-[var(--color-text-muted)]">
+                  {iconForOption(activeOption)}
                 </span>
-                <span className="min-w-0">
-                  <span className="block text-xs font-medium text-[var(--color-text)]">
-                    {option.name}
-                  </span>
-                  {option.description && (
-                    <span className="mt-0.5 block text-[10px] leading-4 text-[var(--color-text-muted)]">
-                      {option.description}
-                    </span>
-                  )}
+                <span className="min-w-0 truncate text-xs font-medium text-[var(--color-text)]">
+                  {activeOption.name}
                 </span>
               </div>
+              {enableSearch && (
+                <div className="shrink-0 border-b border-[var(--color-border)] p-2">
+                  <div className="flex items-center gap-1.5 rounded-md bg-[var(--color-bg-secondary)] px-2 py-1.5">
+                    <Search className="h-3 w-3 shrink-0 text-[var(--color-text-muted)]" />
+                    <input
+                      ref={searchInputRef}
+                      type="text"
+                      value={searchQuery}
+                      onChange={(event) => setSearchQuery(event.target.value)}
+                      placeholder={`Search ${activeOption.name.toLowerCase()}...`}
+                      className="min-w-0 flex-1 bg-transparent text-xs text-[var(--color-text)] outline-none placeholder:text-[var(--color-text-muted)]"
+                    />
+                  </div>
+                </div>
+              )}
+              <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
+                {filteredValues.map((value, index) => (
+                  <Fragment key={value.value}>
+                    {value.group &&
+                      filteredValues[index - 1]?.group !== value.group && (
+                        <div className="px-2 pb-1 pt-2 text-[10px] font-medium uppercase tracking-wide text-[var(--color-text-muted)]">
+                          {value.group}
+                        </div>
+                      )}
+                    {renderValue(activeOption, value)}
+                  </Fragment>
+                ))}
+                {filteredValues.length === 0 && (
+                  <div className="px-3 py-4 text-center text-xs text-[var(--color-text-muted)]">
+                    No matches
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
+            {options.map((option) => {
+              const currentValue =
+                option.type === "select"
+                  ? configDropdownValues(option).find(
+                      (value) => value.value === option.currentValue,
+                    )?.name ?? String(option.currentValue)
+                  : null;
+              return (
+            <div key={option.id} className="border-b border-[var(--color-border)] px-1 py-1 last:border-b-0">
               {option.type === "boolean" ? (
                 <button
                   type="button"
@@ -11073,10 +11277,19 @@ const SessionSettingsMenu = ({
                   disabled={pendingConfigIds.has(option.id)}
                   onMouseDown={(event) => event.preventDefault()}
                   onClick={() => onSelect(option, !option.currentValue)}
-                  className="mt-1 grid w-full grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-x-2 rounded-md px-1 py-1.5 text-left text-xs text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] disabled:opacity-50"
+                  className="grid w-full grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-x-2 rounded-md px-2 py-2 text-left text-xs text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] disabled:opacity-50"
                 >
-                  <span aria-hidden="true" />
-                  <span>{option.currentValue ? "On" : "Off"}</span>
+                  <span className="text-[var(--color-text-muted)]">
+                    {iconForOption(option)}
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block font-medium">{option.name}</span>
+                    {option.description && (
+                      <span className="mt-0.5 block truncate text-[10px] text-[var(--color-text-muted)]">
+                        {option.description}
+                      </span>
+                    )}
+                  </span>
                   <span
                     className={`relative inline-block h-4 w-7 justify-self-end rounded-full transition-colors ${
                       option.currentValue
@@ -11091,25 +11304,42 @@ const SessionSettingsMenu = ({
                     />
                   </span>
                 </button>
-              ) : option.options.some(isConfigGroup) ? (
-                (option.options as SessionConfigSelectGroup[]).map((group) => (
-                  <div key={group.group} className="mt-1">
-                    <div className="grid grid-cols-[14px_minmax(0,1fr)_auto] gap-x-2 px-1 py-1">
-                      <span aria-hidden="true" />
-                      <span className="text-[10px] font-medium uppercase tracking-wide text-[var(--color-text-muted)]">
-                        {group.name}
-                      </span>
-                    </div>
-                    {group.options.map((value) => renderValue(option, value))}
-                  </div>
-                ))
               ) : (
-                (option.options as SessionConfigSelectValue[]).map((value) =>
-                  renderValue(option, value),
-                )
+                <>
+                  <button
+                    type="button"
+                    disabled={pendingConfigIds.has(option.id)}
+                    onClick={() => {
+                      setActiveOptionId(option.id);
+                      setSearchQuery("");
+                    }}
+                    className="grid w-full grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-x-2 rounded-md px-2 py-2 text-left hover:bg-[var(--color-bg-tertiary)] disabled:opacity-50"
+                  >
+                    <span className="text-[var(--color-text-muted)]">
+                      {iconForOption(option)}
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block text-xs font-medium text-[var(--color-text)]">
+                        {option.name}
+                      </span>
+                      {option.description && (
+                        <span className="mt-0.5 block truncate text-[10px] text-[var(--color-text-muted)]">
+                          {option.description}
+                        </span>
+                      )}
+                    </span>
+                    <span className="flex max-w-32 items-center gap-1 text-[11px] text-[var(--color-text-muted)]">
+                      <span className="truncate">{currentValue}</span>
+                      <ChevronRight className="h-3 w-3 shrink-0" />
+                    </span>
+                  </button>
+                </>
               )}
             </div>
-          ))}
+              );
+            })}
+            </div>
+          )}
         </div>,
         document.body,
       )}

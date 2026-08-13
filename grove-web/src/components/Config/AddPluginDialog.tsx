@@ -1,35 +1,37 @@
 import { useRef, useState, type DragEvent } from "react";
-import { createPortal } from "react-dom";
-import { Code, FileArchive, FolderOpen, GitBranch, Terminal, X } from "lucide-react";
-import { Button } from "../ui";
+import { Code, FileArchive, FolderOpen, GitBranch, Sparkles, Terminal, X } from "lucide-react";
+import { Button, DialogShell } from "../ui";
 import {
   browsePluginFolder,
   installLocalPlugin,
   installGitPlugin,
   installZipPlugin,
   registerDevPlugin,
+  scaffoldPlugin,
 } from "../../api/plugins";
 import { parseGitInput } from "../../utils/gitUrl";
 
-type Mode = "local" | "git" | "dev";
+type Mode = "local" | "git" | "dev" | "create";
 
 const MODE_META: Record<Mode, { label: string; icon: typeof Terminal }> = {
-  local: { label: "From Local", icon: Terminal },
-  git: { label: "From Git", icon: GitBranch },
-  dev: { label: "Dev folder", icon: Code },
+  local: { label: "Local package", icon: Terminal },
+  git: { label: "Git repository", icon: GitBranch },
+  dev: { label: "Development folder", icon: Code },
+  create: { label: "Create new", icon: Sparkles },
 };
 
 /**
- * "Add Plugin" dialog with three sources:
+ * Unified Plugin entry point:
  *   - local: drop a .zip (auto-extracted) or pick a folder — copied into Grove
  *   - git:   clone any git repo (optional subpath) into Grove's storage
  *   - dev:   register an existing folder in place (referenced, hot-reload)
- * Starting a brand-new plugin from scratch is the separate Develop flow.
+ *   - create: scaffold a new plugin and register it as development source
  */
 export function AddPluginDialog({ onClose }: { onClose: () => void }) {
   const [mode, setMode] = useState<Mode>("local");
   const [gitUrl, setGitUrl] = useState("");
   const [subpath, setSubpath] = useState("");
+  const [newPluginName, setNewPluginName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
@@ -58,6 +60,26 @@ export function AddPluginDialog({ onClose }: { onClose: () => void }) {
 
   const handleLocal = () => pickFolderThen(installLocalPlugin);
   const handleDev = () => pickFolderThen(registerDevPlugin);
+
+  const handleCreate = async () => {
+    const trimmed = newPluginName.trim();
+    if (!trimmed) {
+      setError("Enter a plugin name.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const picked = await browsePluginFolder();
+      if (!picked.path) return;
+      const result = await scaffoldPlugin(picked.path, trimmed);
+      setDone({ name: result.name, warning: result.next ? `Created at ${result.path}. Next: ${result.next}` : `Created at ${result.path}.` });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const handleZipFile = async (file: File) => {
     if (!/\.zip$/i.test(file.name)) {
@@ -114,14 +136,10 @@ export function AddPluginDialog({ onClose }: { onClose: () => void }) {
     }
   };
 
-  return createPortal(
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
-      onClick={onClose}
-    >
+  return (
+    <DialogShell isOpen onClose={onClose}>
       <div
         className="w-full max-w-md rounded-2xl border border-[var(--color-border)] bg-[var(--color-bg)] p-5 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-sm font-semibold text-[var(--color-text)]">Add Plugin</h2>
@@ -153,7 +171,7 @@ export function AddPluginDialog({ onClose }: { onClose: () => void }) {
         ) : (
           <div className="space-y-4">
             {/* Mode toggle */}
-            <div className="flex gap-2">
+            <div className="grid grid-cols-2 gap-2">
               {(Object.keys(MODE_META) as Mode[]).map((m) => {
                 const active = mode === m;
                 const Icon = MODE_META[m].icon;
@@ -278,6 +296,19 @@ export function AddPluginDialog({ onClose }: { onClose: () => void }) {
                 </div>
               </div>
             )}
+            {mode === "create" && (
+              <div className="space-y-2">
+                <label className="block text-xs text-[var(--color-text-muted)]">Plugin name</label>
+                <input
+                  autoFocus
+                  value={newPluginName}
+                  onChange={(event) => setNewPluginName(event.target.value)}
+                  placeholder="my-grove-plugin"
+                  className="w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-3 py-2 text-sm text-[var(--color-text)] outline-none focus:border-[var(--color-highlight)]"
+                />
+                <p className="text-[10px] text-[var(--color-text-muted)]">Choose a parent folder next. Grove creates a TypeScript plugin starter and registers it as a development plugin.</p>
+              </div>
+            )}
 
             {error && (
               <div className="break-all rounded-lg border border-[var(--color-error)]/30 bg-[var(--color-error)]/5 px-3 py-2 text-xs text-[var(--color-error)]">
@@ -301,11 +332,16 @@ export function AddPluginDialog({ onClose }: { onClose: () => void }) {
                   {busy ? "Registering…" : "Choose folder & register"}
                 </Button>
               )}
+              {mode === "create" && (
+                <Button variant="primary" size="sm" onClick={handleCreate} disabled={busy}>
+                  <Sparkles className="mr-1.5 h-4 w-4" />
+                  {busy ? "Creating…" : "Choose folder & create"}
+                </Button>
+              )}
             </div>
           </div>
         )}
       </div>
-    </div>,
-    document.body,
+    </DialogShell>
   );
 }

@@ -89,6 +89,8 @@ export interface MemoryOverview {
   run_count: number;
   successful_run_count: number;
   failed_run_count: number;
+  in_progress_run_count: number;
+  waiting_run_count: number;
   active_run_count: number;
   last_organized_at?: number;
   usage: {

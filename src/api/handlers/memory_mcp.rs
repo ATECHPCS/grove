@@ -858,7 +858,7 @@ fn running_run(project_id: &str, run_id: &str) -> Result<automations::Automation
         || automation.handler_key != automations::MEMORY_ORGANIZATION_HANDLER
         || config.organization_automation_id != automation.id
         || !config.enabled
-        || run.status != "running"
+        || matches!(run.status.as_str(), "success" | "cancelled" | "cancelling")
     {
         return Err(McpError::invalid_request(
             "Memory Run is not running for this Project".to_string(),

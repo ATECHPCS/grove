@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::time::Duration;
 
 use crate::acp::{LoopbackMcpServer, McpServerPolicy};
 use crate::api::handlers::memory_mcp;
@@ -109,7 +108,6 @@ impl AutomationHandler for MemoryOrganizationHandler {
                 session_instruction: Some(organization_session_instruction(deep_organization)),
             }],
             mcp_server_policy: McpServerPolicy::ExplicitOnly,
-            timeout: Duration::from_secs(30 * 60),
         })
     }
 

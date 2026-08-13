@@ -495,6 +495,30 @@ describe("KeyboardManager — text input suppression", () => {
     expect(handler).toHaveBeenCalledOnce();
   });
 
+  it("dispatches to the enabled owner when keep-alive components share a command", () => {
+    const visible = vi.fn();
+    const hidden = vi.fn();
+    commandRegistry.setStaticCatalog([
+      {
+        id: "chat.send",
+        name: "send",
+        category: "t",
+        defaultBindings: [{ key: "Enter" }],
+        scope: "workspace",
+        passThroughTextInput: true,
+      },
+    ]);
+    commandRegistry.registerHandler("chat.send", visible, () => true);
+    commandRegistry.registerHandler("chat.send", hidden, () => false);
+    mgr.pushScope("workspace");
+
+    textarea.focus();
+    dispatchKey("Enter");
+
+    expect(visible).toHaveBeenCalledOnce();
+    expect(hidden).not.toHaveBeenCalled();
+  });
+
   it("modifier combos always pass through in textarea", () => {
     // Modifier combos (Cmd+F, Ctrl+S, …) are never plain text input,
     // so they should reach the command catalog regardless of focus.

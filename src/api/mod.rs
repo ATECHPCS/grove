@@ -868,6 +868,17 @@ pub fn create_api_router() -> Router {
             "/skills/installed/{repo_key}/{*repo_path}",
             delete(handlers::skills::uninstall_skill),
         )
+        // Unified Extensions catalog + standalone MCP configuration.
+        .route("/extensions/explore", get(handlers::extensions::explore))
+        .route("/extensions/mcp", post(handlers::extensions::create_mcp))
+        .route(
+            "/extensions/mcp/install",
+            get(handlers::extensions::list_mcp_installed).post(handlers::extensions::install_mcp),
+        )
+        .route(
+            "/extensions/plugin/install",
+            post(handlers::extensions::install_plugin),
+        )
         .route(
             "/skills/local/{source}/{*repo_path}",
             delete(handlers::skills::delete_local_skill),
@@ -1600,16 +1611,6 @@ fn display_host_for(bind_host: &str, lan_ip: Option<&str>) -> String {
 pub fn start_automation_runtime() {
     crate::memory::register_automation_handlers();
 
-    let sweep_now = chrono::Utc::now().timestamp();
-    match crate::storage::automations::sweep_interrupted_runs(sweep_now) {
-        Ok(n) if n > 0 => {
-            crate::automation::awarn!("swept {n} stale queued run(s) → interrupted");
-        }
-        Ok(_) => {}
-        Err(e) => {
-            crate::automation::awarn!("startup sweep failed: {e}");
-        }
-    }
     crate::automation::scheduler::spawn();
 }
 
@@ -1679,7 +1680,7 @@ pub async fn initialize_local_server_runtime(port: u16) -> std::io::Result<()> {
 
     // Automation cron scheduler — fires while Grove is running. Missed runs
     // during downtime are not back-filled; the next fire window is the next
-    // scheduled tick. Sweep interrupted runs before starting the scheduler.
+    // scheduled tick.
     start_automation_runtime();
 
     // Start the in-process agent_graph MCP listener (loopback-only). Failure to

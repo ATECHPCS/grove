@@ -1,310 +1,168 @@
 import { useState } from "react";
-import { createPortal } from "react-dom";
-import { RefreshCw, X } from "lucide-react";
-import { Button } from "../ui";
+import {
+  Blocks,
+  CheckCircle2,
+  Clock3,
+  FolderOpen,
+  PanelRight,
+  RefreshCw,
+  Server,
+  ShieldAlert,
+  Terminal,
+  X,
+} from "lucide-react";
+import { Button, DrawerShell } from "../ui";
 import { updatePluginSdk, type Plugin } from "../../api/plugins";
-import { PluginIcon } from "../Plugins/PluginIcon";
+import { ExtensionIdentityIcon } from "../Skills/ExtensionIdentityIcon";
 
-/** Permissions that let a plugin modify files, run commands, or drive the agent
- *  — warning treatment, mirroring PluginsSection's HIGH_RISK handling. */
 const HIGH_RISK_PERMISSIONS = new Set(["exec", "project:write", "chat:read", "chat:write", "inject"]);
 
-/** Human labels for declared permission strings; unknown perms fall back to the
- *  raw string so new backend permissions still render legibly. */
 const PERMISSION_LABELS: Record<string, string> = {
   "chat:read": "Read chat & AI events",
   "chat:write": "Send prompts to the AI",
 };
 
-const permLabel = (perm: string): string => PERMISSION_LABELS[perm] ?? perm;
+const permissionLabel = (permission: string) => PERMISSION_LABELS[permission] ?? permission;
 
-/** Format an ISO-ish timestamp for display, falling back to the raw string. */
-function formatTime(value: string): string {
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return value;
-  return d.toLocaleString();
+function formatTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
 }
 
-/** One labelled row inside an info block. */
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="flex flex-col gap-0.5">
-      <span className="text-[10px] uppercase tracking-wide text-[var(--color-text-muted)]">
-        {label}
-      </span>
-      <span className="break-all text-xs text-[var(--color-text)]">{children}</span>
-    </div>
-  );
-}
-
-/** A titled section card. */
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div className="space-y-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-3 py-2.5">
-      <h3 className="text-xs font-semibold text-[var(--color-text)]">{title}</h3>
-      {children}
-    </div>
-  );
-}
-
-/** A small status pill. `tone` picks the color treatment. */
-function Pill({
-  children,
-  tone = "muted",
-}: {
-  children: React.ReactNode;
-  tone?: "muted" | "highlight" | "warning" | "error" | "success";
-}) {
-  const cls =
-    tone === "highlight"
-      ? "bg-[var(--color-highlight)]/10 text-[var(--color-highlight)]"
-      : tone === "warning"
-        ? "bg-[var(--color-warning)]/10 text-[var(--color-warning)]"
-        : tone === "error"
-          ? "bg-[var(--color-error)]/10 text-[var(--color-error)]"
-          : tone === "success"
-            ? "bg-[var(--color-success)]/10 text-[var(--color-success)]"
-            : "bg-[var(--color-bg)] text-[var(--color-text-muted)]";
-  return (
-    <span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${cls}`}>
-      {children}
-    </span>
-  );
-}
-
-/**
- * Read-only detail view for a single plugin, opened by clicking a plugin row's
- * name/icon in PluginsSection. Shows basics, contribution points, declared
- * permissions, and runtime/build status. Skills + MCP tool enumeration needs
- * backend support and isn't shown yet — only a placeholder note for now.
- */
 export function PluginDetailDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) {
-  const c = plugin.contributes;
   const [sdkState, setSdkState] = useState<"idle" | "running" | "done" | "error">("idle");
-  const [sdkMsg, setSdkMsg] = useState<string | null>(null);
+  const [sdkMessage, setSdkMessage] = useState<string | null>(null);
+  const [sdkStatus, setSdkStatus] = useState(plugin.sdk_status);
 
-  // Dev-only: rewrite src/grove-sdk/* to this Grove's SDK version (the SDK is
-  // vendored per-plugin, so this is how a dev pulls in host-side changes).
-  const onUpdateSdk = async () => {
+  const updateSdk = async () => {
     setSdkState("running");
-    setSdkMsg(null);
+    setSdkMessage(null);
     try {
       await updatePluginSdk(plugin.id);
       setSdkState("done");
-      setSdkMsg("SDK updated — run `npm run build` to rebuild.");
-    } catch (e) {
+      setSdkStatus("current");
+      setSdkMessage("SDK updated. Rebuild the plugin to apply it.");
+    } catch (cause) {
       setSdkState("error");
-      setSdkMsg(e instanceof Error ? e.message : "Update failed");
+      setSdkMessage(cause instanceof Error ? cause.message : "Update failed");
     }
   };
 
-  return createPortal(
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-2xl border border-[var(--color-border)] bg-[var(--color-bg)] p-5 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="mb-4 flex items-start justify-between gap-3">
-          <div className="flex min-w-0 items-center gap-3">
-            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-[var(--color-highlight)]/10">
-              <PluginIcon plugin={plugin} className="h-5 w-5 text-[var(--color-highlight)]" size={20} />
-            </div>
+  const capabilities = [
+    plugin.contributes?.panel && {
+      id: "panel",
+      icon: PanelRight,
+      title: plugin.contributes.panel.title || "Workspace panel",
+      detail: plugin.contributes.panel.side ? `${plugin.contributes.panel.side} side` : "Panel contribution",
+    },
+    plugin.contributes?.sidebar && {
+      id: "sidebar",
+      icon: Blocks,
+      title: plugin.contributes.sidebar.title || "Top-level page",
+      detail: "Sidebar contribution",
+    },
+    plugin.contributes?.mcp && {
+      id: "mcp",
+      icon: Server,
+      title: "MCP server",
+      detail: "Provides tools to Grove",
+    },
+    plugin.contributes?.backend && {
+      id: "backend",
+      icon: Terminal,
+      title: "Node backend",
+      detail: "Runs a local backend process",
+    },
+  ].filter(Boolean) as Array<{ id: string; icon: typeof PanelRight; title: string; detail: string }>;
+
+  const runtimeIssue = plugin.exists === false
+    ? "Plugin folder is missing"
+    : plugin.unbuilt && plugin.unbuilt.length > 0
+      ? `Build required: ${plugin.unbuilt.join(", ")}`
+      : plugin.runtime && !plugin.runtime.available
+        ? `${plugin.runtime.command} is not available on PATH`
+        : null;
+
+  return (
+    <DrawerShell isOpen onClose={onClose} width="w-[620px]">
+      <div className="flex h-full flex-col bg-[var(--color-bg)]">
+        <header className="flex shrink-0 items-start justify-between gap-4 border-b border-[var(--color-border)] px-6 py-5">
+          <div className="flex min-w-0 items-center gap-3.5">
+            <ExtensionIdentityIcon kind="plugin" name={plugin.name} plugin={plugin} />
             <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <h2 className="truncate text-sm font-semibold text-[var(--color-text)]">
-                  {plugin.name}
-                </h2>
-                <Pill>v{plugin.version}</Pill>
-                {plugin.source === "dev" && <Pill tone="highlight">dev</Pill>}
+              <div className="flex min-w-0 items-center gap-2">
+                <h2 className="truncate text-lg font-semibold text-[var(--color-text)]">{plugin.name}</h2>
+                <span className="shrink-0 text-xs text-[var(--color-text-muted)]">v{plugin.version}</span>
+                {plugin.source === "dev" && <span className="shrink-0 rounded-md bg-[var(--color-info)]/10 px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-info)]">Development</span>}
               </div>
-              <div className="truncate text-[10px] text-[var(--color-text-muted)]">{plugin.id}</div>
+              <p className="mt-1 truncate font-mono text-xs text-[var(--color-text-muted)]">{plugin.id}</p>
             </div>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="shrink-0 text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
-          >
-            <X className="h-4 w-4" />
-          </button>
-        </div>
+          <button type="button" aria-label="Close" onClick={onClose} className="rounded-lg p-1.5 text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-secondary)] hover:text-[var(--color-text)]"><X className="h-4 w-4" /></button>
+        </header>
 
-        {/* Placeholder note for the not-yet-built capabilities. */}
-        <div className="mb-4 rounded-lg border border-[var(--color-highlight)]/30 bg-[var(--color-highlight)]/5 px-3 py-2 text-[11px] text-[var(--color-text-muted)]">
-          Skill &amp; MCP tool listing, with per-tool visibility control, is coming soon.
-        </div>
-
-        <div className="space-y-3">
-          {/* Basics */}
-          <Section title="Basics">
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Name">{plugin.name}</Field>
-              <Field label="Version">v{plugin.version}</Field>
-              <Field label="Source">
-                <span className="inline-flex items-center gap-1">
-                  {plugin.source === "dev" ? (
-                    <Pill tone="highlight">dev</Pill>
-                  ) : plugin.source === "git" ? (
-                    <Pill>git</Pill>
-                  ) : (
-                    <Pill>local</Pill>
-                  )}
-                </span>
-              </Field>
-              <Field label="Created">{formatTime(plugin.created_at)}</Field>
-              <Field label="Updated">{formatTime(plugin.updated_at)}</Field>
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
+          <section>
+            <h3 className="text-sm font-semibold text-[var(--color-text)]">Overview</h3>
+            <div className="mt-3 overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)]/40">
+              <OverviewRow icon={FolderOpen} label="Location" value={plugin.local_path} mono />
+              <OverviewRow icon={Blocks} label="Source" value={plugin.source === "dev" ? "Development folder" : plugin.source === "git" ? "Git repository" : "Local package"} />
+              <OverviewRow icon={Clock3} label="Updated" value={formatTime(plugin.updated_at)} />
             </div>
-            <Field label="Local path">{plugin.local_path}</Field>
-            {plugin.git_url && <Field label="Git URL">{plugin.git_url}</Field>}
-            {plugin.subpath && <Field label="Subpath">{plugin.subpath}</Field>}
-          </Section>
+          </section>
 
-          {/* Capabilities / contribution points */}
-          <Section title="Capabilities">
-            {c?.panel || c?.sidebar || c?.mcp || c?.backend ? (
-              <div className="space-y-2">
-                {c?.panel && (
-                  <div className="flex items-center gap-2">
-                    <Pill tone="highlight">panel</Pill>
-                    <span className="text-xs text-[var(--color-text-muted)]">
-                      {c.panel.title ? `“${c.panel.title}”` : "Workspace panel"}
-                      {c.panel.side ? ` · ${c.panel.side}` : ""}
-                    </span>
-                  </div>
-                )}
-                {c?.sidebar && (
-                  <div className="flex items-center gap-2">
-                    <Pill tone="highlight">sidebar</Pill>
-                    <span className="text-xs text-[var(--color-text-muted)]">
-                      {c.sidebar.title ? `“${c.sidebar.title}”` : "Top-level page"}
-                    </span>
-                  </div>
-                )}
-                {c?.mcp && (
-                  <div className="flex items-center gap-2">
-                    <Pill tone="highlight">mcp</Pill>
-                    <span className="text-xs text-[var(--color-text-muted)]">
-                      Ships an MCP server
-                    </span>
-                  </div>
-                )}
-                {c?.backend && (
-                  <div className="flex items-center gap-2">
-                    <Pill tone="highlight">backend</Pill>
-                    <span className="text-xs text-[var(--color-text-muted)]">
-                      Ships a node backend
-                    </span>
-                  </div>
-                )}
-              </div>
+          <section className="mt-6">
+            <h3 className="text-sm font-semibold text-[var(--color-text)]">Capabilities</h3>
+            {capabilities.length === 0 ? (
+              <p className="mt-2 text-sm text-[var(--color-text-muted)]">This plugin does not declare any UI or runtime capabilities.</p>
             ) : (
-              <p className="text-xs text-[var(--color-text-muted)]">
-                No contribution points declared.
-              </p>
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                {capabilities.map(({ id, icon: Icon, title, detail }) => (
+                  <div key={id} className="flex min-w-0 items-center gap-3 rounded-xl border border-[var(--color-border)] px-3 py-3">
+                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[var(--color-highlight)]/8 text-[var(--color-highlight)]"><Icon className="h-4 w-4" /></span>
+                    <div className="min-w-0"><div className="truncate text-sm font-medium text-[var(--color-text)]">{title}</div><div className="mt-0.5 truncate text-xs text-[var(--color-text-muted)]">{detail}</div></div>
+                  </div>
+                ))}
+              </div>
             )}
-          </Section>
+          </section>
 
-          {/* Permissions */}
-          <Section title="Permissions">
+          <section className="mt-6">
+            <div className="flex items-center gap-2"><h3 className="text-sm font-semibold text-[var(--color-text)]">Permissions</h3>{plugin.permissions && plugin.permissions.length > 0 && <span className="text-xs tabular-nums text-[var(--color-text-muted)]">{plugin.permissions.length}</span>}</div>
             {plugin.permissions && plugin.permissions.length > 0 ? (
-              <div className="flex flex-wrap gap-1.5">
-                {plugin.permissions.map((perm) => {
-                  const highRisk = HIGH_RISK_PERMISSIONS.has(perm);
-                  return (
-                    <span
-                      key={perm}
-                      className={
-                        highRisk
-                          ? "rounded-full bg-[var(--color-warning)]/10 px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-warning)]"
-                          : "rounded-full bg-[var(--color-bg)] px-1.5 py-0.5 text-[10px] text-[var(--color-text-muted)]"
-                      }
-                      title={
-                        highRisk
-                          ? "High-risk permission — this plugin can modify your files, run commands, or drive the agent"
-                          : "Declared permission"
-                      }
-                    >
-                      {highRisk ? `⚠ ${permLabel(perm)}` : permLabel(perm)}
-                    </span>
-                  );
+              <div className="mt-3 flex flex-wrap gap-2">
+                {plugin.permissions.map((permission) => {
+                  const highRisk = HIGH_RISK_PERMISSIONS.has(permission);
+                  return <span key={permission} className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs ${highRisk ? "border-[var(--color-warning)]/25 bg-[var(--color-warning)]/8 text-[var(--color-warning)]" : "border-[var(--color-border)] text-[var(--color-text-secondary)]"}`}>{highRisk && <ShieldAlert className="h-3.5 w-3.5" />}{permissionLabel(permission)}</span>;
                 })}
               </div>
-            ) : (
-              <p className="text-xs text-[var(--color-text-muted)]">No permissions declared.</p>
-            )}
-          </Section>
+            ) : <p className="mt-2 text-sm text-[var(--color-text-muted)]">No permissions requested.</p>}
+          </section>
 
-          {/* Status — one dense line: readiness + (if it has a server) the
-              runtime command and whether it's on PATH. */}
-          <Section title="Status">
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-[var(--color-text-muted)]">
-              {plugin.exists === false ? (
-                <Pill tone="error">⚠ folder missing</Pill>
-              ) : plugin.unbuilt && plugin.unbuilt.length > 0 ? (
-                <Pill tone="warning">⚠ not built: {plugin.unbuilt.join(", ")}</Pill>
-              ) : (
-                <Pill tone="success">ready</Pill>
-              )}
-              {plugin.runtime && (
-                <span>
-                  runs <code className="text-[var(--color-text)]">{plugin.runtime.command}</code>
-                  {plugin.runtime.available ? (
-                    <span className="text-[var(--color-success)]"> · available</span>
-                  ) : (
-                    <span className="text-[var(--color-warning)]"> · not on PATH</span>
-                  )}
-                </span>
-              )}
+          <section className="mt-6">
+            <h3 className="text-sm font-semibold text-[var(--color-text)]">Runtime</h3>
+            <div className={`mt-3 flex items-start gap-3 rounded-xl border px-3.5 py-3 ${runtimeIssue ? "border-[var(--color-warning)]/30 bg-[var(--color-warning)]/6" : "border-[var(--color-success)]/25 bg-[var(--color-success)]/6"}`}>
+              {runtimeIssue ? <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-[var(--color-warning)]" /> : <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-[var(--color-success)]" />}
+              <div><div className="text-sm font-medium text-[var(--color-text)]">{runtimeIssue || "Ready"}</div>{plugin.runtime && <div className="mt-1 text-xs text-[var(--color-text-muted)]">Command: <code className="text-[var(--color-text-secondary)]">{plugin.runtime.command}</code></div>}</div>
             </div>
-            {plugin.exists === false && (
-              <p className="text-xs text-[var(--color-error)]">
-                The plugin's folder no longer exists on disk — delete this entry to clean it up.
-              </p>
-            )}
-          </Section>
+          </section>
 
-          {/* Developer tools — dev plugins only (their SDK is vendored in-folder). */}
           {plugin.source === "dev" && (
-            <Section title="Developer">
-              <p className="text-xs text-[var(--color-text-muted)]">
-                Refresh the vendored SDK in <code>src/grove-sdk/</code> to this Grove's
-                version, then rebuild. Only the SDK files change — never your code.
-              </p>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={onUpdateSdk}
-                  disabled={sdkState === "running"}
-                >
-                  <RefreshCw
-                    className={`mr-1.5 h-3.5 w-3.5 ${sdkState === "running" ? "animate-spin" : ""}`}
-                  />
-                  {sdkState === "running" ? "Updating…" : "Update SDK"}
-                </Button>
-                {sdkMsg && (
-                  <span
-                    className={`text-xs ${sdkState === "error" ? "text-[var(--color-error)]" : "text-[var(--color-success)]"}`}
-                  >
-                    {sdkMsg}
-                  </span>
-                )}
+            <section className="mt-6 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)]/40 p-4">
+              <div className="flex items-start justify-between gap-5">
+                <div><h3 className="text-sm font-semibold text-[var(--color-text)]">Plugin SDK</h3><p className="mt-1 max-w-sm text-xs leading-5 text-[var(--color-text-muted)]">{sdkStatus === "current" ? "Matches the SDK bundled with this Grove build." : sdkStatus === "missing" ? "No Grove SDK was detected in this development plugin." : "The vendored SDK differs from the SDK bundled with this Grove build."}</p></div>
+                {sdkStatus === "current" ? <span className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--color-success)]/10 px-2.5 py-1.5 text-xs font-medium text-[var(--color-success)]"><CheckCircle2 className="h-3.5 w-3.5" />Up to date</span> : <Button variant="secondary" size="sm" onClick={() => void updateSdk()} disabled={sdkState === "running"}><RefreshCw className={`mr-1.5 h-3.5 w-3.5 ${sdkState === "running" ? "animate-spin" : ""}`} />{sdkState === "running" ? "Updating…" : sdkStatus === "missing" ? "Install SDK" : "Update SDK"}</Button>}
               </div>
-            </Section>
+              {sdkMessage && <p className={`mt-3 text-xs ${sdkState === "error" ? "text-[var(--color-error)]" : "text-[var(--color-success)]"}`}>{sdkMessage}</p>}
+            </section>
           )}
         </div>
-
-        <div className="mt-4 flex justify-end">
-          <Button variant="secondary" size="sm" onClick={onClose}>
-            Close
-          </Button>
-        </div>
       </div>
-    </div>,
-    document.body,
+    </DrawerShell>
   );
+}
+
+function OverviewRow({ icon: Icon, label, value, mono = false }: { icon: typeof FolderOpen; label: string; value: string; mono?: boolean }) {
+  return <div className="grid grid-cols-[20px_90px_minmax(0,1fr)] items-center gap-2 border-b border-[var(--color-border)] px-3.5 py-2.5 last:border-0"><Icon className="h-4 w-4 text-[var(--color-text-muted)]" /><span className="text-xs text-[var(--color-text-muted)]">{label}</span><span className={`truncate text-sm text-[var(--color-text-secondary)] ${mono ? "font-mono text-xs" : ""}`} title={value}>{value}</span></div>;
 }

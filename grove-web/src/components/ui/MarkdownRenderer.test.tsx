@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
@@ -84,6 +84,53 @@ describe("MarkdownRenderer lists", () => {
     expect(html).toContain("[li&gt;&amp;:first-child]:inline");
     expect(html).toContain("<li");
     expect(html).toContain("<p");
+  });
+});
+
+describe("MarkdownRenderer heading links", () => {
+  it("keeps fragment links inside the current markdown preview", () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => root.render(
+      <MarkdownRenderer
+        content={'[皇帝 喜多川祐介](#皇帝-喜多川祐介)\n\n## 皇帝 喜多川祐介'}
+        enableHeadingIds
+      />,
+    ));
+
+    const link = container.querySelector<HTMLAnchorElement>("a");
+    const heading = container.querySelector<HTMLElement>('#皇帝-喜多川祐介');
+    expect(decodeURIComponent(link?.getAttribute("href") ?? "")).toBe("#皇帝-喜多川祐介");
+    expect(link?.getAttribute("target")).toBeNull();
+    expect(heading).not.toBeNull();
+
+    const scrollIntoView = vi.fn();
+    if (heading) heading.scrollIntoView = scrollIntoView;
+    act(() => link?.click());
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "start" });
+
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  it("delegates fragment navigation when a virtualized owner handles it", () => {
+    const onHeadingLinkClick = vi.fn(() => true);
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    act(() => root.render(
+      <MarkdownRenderer
+        content={'[喜多川祐介](#喜多川祐介)'}
+        onHeadingLinkClick={onHeadingLinkClick}
+      />,
+    ));
+
+    act(() => container.querySelector<HTMLAnchorElement>("a")?.click());
+    expect(onHeadingLinkClick).toHaveBeenCalledWith("喜多川祐介");
+
+    act(() => root.unmount());
+    container.remove();
   });
 });
 

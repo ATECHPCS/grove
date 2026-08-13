@@ -29,10 +29,13 @@ interface AddAgentRequest {
 export interface SkillSource {
   name: string;
   source_type: 'git' | 'local';
+  management_mode: 'referenced' | 'managed' | 'development';
   url: string;
   subpath: string | null;
   repo_key: string;
   skill_count: number;
+  plugin_count: number;
+  mcp_count: number;
   last_synced: string | null;
   /** Git sources only: true when remote has new commits not yet pulled */
   has_remote_updates: boolean;
@@ -95,6 +98,7 @@ export interface InstalledSkill {
 interface AddSourceRequest {
   name: string;
   source_type: 'git' | 'local';
+  management_mode?: 'referenced' | 'managed' | 'development';
   url: string;
   subpath?: string;
 }

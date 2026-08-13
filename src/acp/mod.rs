@@ -1427,8 +1427,68 @@ fn build_mcp_servers(
         // task/project context env (so a plugin's MCP server has the same "current
         // context" the panel gets from host.getInfo).
         servers.extend(load_plugin_mcp_servers(env_vars));
+        servers.extend(load_standalone_mcp_servers(env_vars));
     }
     Ok(servers)
+}
+
+fn load_standalone_mcp_servers(base_env: &HashMap<String, String>) -> Vec<acp::McpServer> {
+    let Some(agent_id) = base_env.get("GROVE_AGENT_ID") else {
+        return Vec::new();
+    };
+    let configs = crate::storage::extensions::resolve_effective_mcp_configs(
+        agent_id,
+        base_env.get("GROVE_PROJECT").map(String::as_str),
+    )
+    .unwrap_or_default();
+    configs
+        .into_iter()
+        .filter_map(|config| {
+            let name = sanitize_mcp_server_name(&config.name);
+            if config.transport == "stdio" {
+                let command = config.command?;
+                let env = config
+                    .env
+                    .into_iter()
+                    .map(|(key, value)| acp::EnvVariable::new(key, value))
+                    .collect();
+                Some(acp::McpServer::Stdio(
+                    acp::McpServerStdio::new(name, std::path::PathBuf::from(command))
+                        .args(config.args)
+                        .env(env),
+                ))
+            } else {
+                let url = config.url?;
+                let headers = config
+                    .headers
+                    .into_iter()
+                    .map(|(key, value)| acp::HttpHeader::new(key, value))
+                    .collect();
+                Some(acp::McpServer::Http(
+                    acp::McpServerHttp::new(name, url).headers(headers),
+                ))
+            }
+        })
+        .collect()
+}
+
+fn sanitize_mcp_server_name(raw: &str) -> String {
+    let value = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let value = value.trim_matches('-');
+    if value.is_empty() {
+        "mcp".into()
+    } else {
+        value.into()
+    }
 }
 
 /// Resolve Task-level linked Grove Project IDs to the absolute directories
@@ -7551,6 +7611,15 @@ impl AcpSessionHandle {
             if let Ok(mut slot) = self.last_plan.lock() {
                 *slot = None;
             }
+        }
+
+        if let Some(ref chat_id) = self.chat_id {
+            crate::storage::automations::sync_run_state_for_chat_event(
+                &self.project_key,
+                &self.task_id,
+                chat_id,
+                &update,
+            );
         }
 
         // broadcast

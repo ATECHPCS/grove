@@ -25,7 +25,12 @@ interface HandlerEntry {
 export class CommandRegistryImpl {
   private staticCatalog: Map<string, CommandDef> = new Map();
   private contributed: Map<string, CommandDef> = new Map();
-  private handlers: Map<string, HandlerEntry> = new Map();
+  // A command may be owned by more than one mounted component. This is
+  // common for keep-alive workspaces: every TaskChat registers chat.send,
+  // while only the focused composer should handle it. Keep registrations as
+  // a stack and invoke the newest enabled owner instead of letting the last
+  // registration permanently overwrite every other instance.
+  private handlers: Map<string, HandlerEntry[]> = new Map();
   private listeners: Set<() => void> = new Set();
 
   setStaticCatalog(defs: ReadonlyArray<CommandDef>): void {
@@ -65,18 +70,18 @@ export class CommandRegistryImpl {
       console.warn(`[CommandRegistry] handler registered for unknown command "${id}" — declare it in catalog or use useDefineCommand`);
     }
     const entry: HandlerEntry = { handler, enabled };
-    const prev = this.handlers.get(id);
-    if (prev) {
-      console.warn(`[CommandRegistry] handler for "${id}" already registered — replacing`);
-    }
-    this.handlers.set(id, entry);
+    const entries = this.handlers.get(id) ?? [];
+    entries.push(entry);
+    this.handlers.set(id, entries);
     this.notify();
     return () => {
       const current = this.handlers.get(id);
-      if (current === entry) {
-        this.handlers.delete(id);
-        this.notify();
-      }
+      if (!current) return;
+      const index = current.indexOf(entry);
+      if (index < 0) return;
+      current.splice(index, 1);
+      if (current.length === 0) this.handlers.delete(id);
+      this.notify();
     };
   }
 
@@ -85,9 +90,17 @@ export class CommandRegistryImpl {
    * handler was registered or the enabled gate said no.
    */
   invoke(id: string, args?: unknown): boolean {
-    const entry = this.handlers.get(id);
+    const entries = this.handlers.get(id);
+    if (!entries) return false;
+    let entry: HandlerEntry | undefined;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const candidate = entries[i];
+      if (!candidate.enabled || candidate.enabled()) {
+        entry = candidate;
+        break;
+      }
+    }
     if (!entry) return false;
-    if (entry.enabled && !entry.enabled()) return false;
     try {
       const r = entry.handler(args);
       if (r instanceof Promise) {
@@ -120,7 +133,13 @@ export class CommandRegistryImpl {
 
   /** Get the enabled predicate for a command (if any). KeybindingResolver uses this. */
   getEnabled(id: string): (() => boolean) | undefined {
-    return this.handlers.get(id)?.enabled;
+    const entries = this.handlers.get(id);
+    if (!entries || entries.length === 0) return undefined;
+    // Preserve the existing single-owner identity contract. With multiple
+    // owners, the command is enabled when at least one registration can
+    // handle it; invoke() uses the same newest-enabled selection rule.
+    if (entries.length === 1) return entries[0].enabled;
+    return () => entries.some((entry) => !entry.enabled || entry.enabled());
   }
 
   subscribe(listener: () => void): () => void {

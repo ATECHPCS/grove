@@ -65,7 +65,7 @@ export interface AutomationRun {
   started_at?: number;
   completed_at?: number;
   // Result
-  status: string;                  // 'queued' | 'running' | 'success' | 'failed' | 'timeout' | 'interrupted' | 'cancelled'
+  status: string;                  // queued/running=In Progress | waiting | failed | success=Completed | cancelled
   phase?: string;                  // 'resolve_task' | 'resolve_session' | 'spawn_acp' | 'queue' | 'agent_run'
   error?: string;
   agent_response?: string;         // last_assistant_text truncated to 16KB; absent when agent ran tools only
@@ -89,7 +89,7 @@ export interface AutomationUpsert {
 
 export interface TriggerResult {
   run_id: string;
-  status: string; // 'queued' (running async — poll /runs) | 'failed' (pre-queue)
+  status: string; // Run status; 'failed' is only a request error before a Run exists
   error?: string;
   resolved_task_id?: string;
   resolved_chat_id?: string;

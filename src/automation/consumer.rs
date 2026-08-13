@@ -1,13 +1,12 @@
 //! Registry for project-level Automation handlers.
 //!
 //! Automations owns execution: Run creation, concurrency, ACP lifecycle,
-//! cancellation, timeout and terminal state. A handler contributes only the
+//! cancellation and completion state. A handler contributes only the
 //! business work around that execution.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use once_cell::sync::Lazy;
 
@@ -45,7 +44,6 @@ pub struct RuntimeBindings {
     pub env_vars: HashMap<String, String>,
     pub additional_mcp_servers: Vec<LoopbackMcpServer>,
     pub mcp_server_policy: McpServerPolicy,
-    pub timeout: Duration,
 }
 
 pub struct PostActionContext<'a> {
@@ -97,8 +95,8 @@ pub trait AutomationHandler: Send + Sync {
         tx: &rusqlite::Transaction<'_>,
     ) -> Result<serde_json::Value>;
 
-    /// Release handler-owned runtime resources after a failed, timed-out or
-    /// cancelled Agent execution. Durable Run artifacts are retained.
+    /// Release handler-owned runtime resources when a Run is explicitly
+    /// cancelled or cannot create its interactive Session.
     fn abort(&self, _context: AbortContext<'_>) -> Result<()> {
         Ok(())
     }
