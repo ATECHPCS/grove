@@ -277,7 +277,12 @@ function pluginDescriptor(plugin: Plugin): PanelDescriptor {
     category: side === "right" ? "info" : "aux",
     available: always,
     render: (ctx) => (
-      <PluginFrame plugin={plugin} projectId={ctx.projectId} taskId={ctx.task.id} />
+      <PluginFrame
+        plugin={plugin}
+        contribution="panel"
+        projectId={ctx.projectId}
+        taskId={ctx.task.id}
+      />
     ),
   };
 }

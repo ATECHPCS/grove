@@ -1280,7 +1280,13 @@ function AppContent() {
           const pluginId = activeItem.slice("plugin:".length);
           const plugin = sidebarPlugins.find((p) => p.id === pluginId);
           if (plugin) {
-            return <PluginFrame plugin={plugin} projectId={selectedProject?.id ?? null} />;
+            return (
+              <PluginFrame
+                plugin={plugin}
+                contribution="sidebar"
+                projectId={selectedProject?.id ?? null}
+              />
+            );
           }
         }
         return (

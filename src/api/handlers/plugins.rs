@@ -150,7 +150,7 @@ const SCAFFOLD_PKG_JSON: &str = r#"{
     "build": "npm run clean && vite build && node scripts/build-server.mjs",
     "publish": "npm run build && node scripts/publish.mjs"
   },
-  "//": "dev builds BOTH the panel and (if present) src/server.ts / src/backend.ts → dist/, and neither wipes the other. A node backend/MCP server runs under node's permission model; Grove requires node >= 24.",
+  "//": "dev builds BOTH the panel and (if present) src/server.ts / src/backend.ts → dist/, and neither wipes the other. A node backend/MCP server uses manifest-derived runtime permissions; Grove requires node >= 24.",
   "engines": { "node": ">=24" },
   "devDependencies": {
     "@types/node": "^24.0.0",
@@ -2148,9 +2148,8 @@ pub struct BackendInvokeRequest {
 /// `{ method, params, projectId?, taskId? }`. With both ids the backend is
 /// task-scoped (gets that task's project fs access); without, it's app-scoped.
 ///
-/// No per-call permission gate: the backend already runs under the Node
-/// Permission Model with grants derived from the manifest, so the manifest is
-/// the single enforced source of truth.
+/// No per-call permission gate: the backend already runs with runtime access
+/// derived from the manifest, so the manifest is the single source of truth.
 pub async fn backend_invoke(
     Path(id): Path<String>,
     Json(req): Json<BackendInvokeRequest>,

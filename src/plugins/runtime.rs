@@ -1,5 +1,5 @@
-//! Launching a plugin's node processes (MCP server, backend) under the **Node
-//! Permission Model** (`node --permission`).
+//! Launching a plugin's node processes (MCP server, backend), normally under
+//! the **Node Permission Model** (`node --permission`).
 //!
 //! Grove requires node >= 24 — where the model is stable — for any plugin that
 //! ships a node process. Older node is refused (the process is not launched) so
@@ -11,8 +11,11 @@
 //!   - `storage:write` → `--allow-fs-write` of the plugin's data dir
 //!   - `project:read`  → `--allow-fs-read`  of the current task worktree
 //!   - `project:write` → `--allow-fs-write` of the current task worktree
-//!   - `exec` → `--allow-child-process` (all-or-nothing; the spawned child is
-//!     itself unsandboxed → effectively full trust)
+//!   - `exec` → no Node Permission Model. Child-process access is already
+//!     effectively full trust, and Node 24.4+ propagates the parent's permission
+//!     flags to spawned Node/shebang CLIs via `NODE_OPTIONS`. Keeping the model
+//!     enabled would therefore break ordinary installed CLIs unless every
+//!     global package path were granted explicitly.
 //!
 //! Network is intentionally absent: Node's model has no `--allow-net`, so a
 //! `network` permission could not be enforced and Grove does not pretend it can.
@@ -73,6 +76,12 @@ fn grant(kind: &str, dir: &str, out: &mut Vec<String>) {
 /// Build the `--permission …` flags for a node process, granting fs/exec scopes
 /// exactly matching the plugin's declared permissions.
 ///
+/// Returns no flags when `exec` is declared. That permission already lets the
+/// plugin run an unrestricted OS process (and thus bypass any parent fs grant),
+/// so retaining Node's model would add no security boundary. Since Node 24.4 it
+/// would, however, propagate the parent's restrictions to Node-based external
+/// CLIs and prevent them from reading their own installation files.
+///
 /// - `install_dir` is always granted read (node must load the plugin's own
 ///   code / node_modules to start).
 /// - `storage_root` is the plugin's whole data dir (covers global/project/task
@@ -85,6 +94,9 @@ pub fn node_permission_flags(
     storage_root: &str,
     project_dir: Option<&str>,
 ) -> Vec<String> {
+    if perms.contains("exec") {
+        return Vec::new();
+    }
     let mut flags = vec!["--permission".to_string()];
     // Node must read its own code; worker threads inherit the same perms.
     grant("read", install_dir, &mut flags);
@@ -102,9 +114,6 @@ pub fn node_permission_flags(
         if perms.contains("project:write") {
             grant("write", proj, &mut flags);
         }
-    }
-    if perms.contains("exec") {
-        flags.push("--allow-child-process".to_string());
     }
     flags
 }
@@ -138,9 +147,9 @@ mod tests {
     }
 
     #[test]
-    fn flags_map_each_permission() {
+    fn flags_map_each_scoped_permission() {
         let f = node_permission_flags(
-            &perms(&["storage:read", "storage:write", "project:read", "exec"]),
+            &perms(&["storage:read", "storage:write", "project:read"]),
             "/plug",
             "/data",
             Some("/work"),
@@ -149,6 +158,16 @@ mod tests {
         assert!(f.iter().any(|x| x.contains("--allow-fs-write=/data")));
         assert!(f.iter().any(|x| x.contains("--allow-fs-read=/work")));
         assert!(!f.iter().any(|x| x.contains("--allow-fs-write=/work")));
-        assert!(f.iter().any(|x| x == "--allow-child-process"));
+    }
+
+    #[test]
+    fn exec_disables_the_permission_model() {
+        let f = node_permission_flags(
+            &perms(&["storage:read", "project:read", "exec"]),
+            "/plug",
+            "/data",
+            Some("/work"),
+        );
+        assert!(f.is_empty());
     }
 }

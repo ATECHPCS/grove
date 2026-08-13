@@ -23,10 +23,10 @@ drop that into Grove → Settings → Plugins → Add → From Local. For a git 
 just commit `dist/`. The panel entry is `dist/index.html`.
 
 > **Node 24+ required for backends.** A plugin that ships an MCP server or a
-> node backend runs that process under Node's Permission Model (stable in node
-> 24). Grove **refuses to launch** such a process on older node, so a declared
-> permission is never silently unenforced. Pure-panel plugins have no node
-> requirement (they run in the browser).
+> node backend runs with manifest-derived runtime access. Scoped permissions use
+> Node's Permission Model (stable in node 24); `exec` grants full machine trust.
+> Grove **refuses to launch** such a process on older node. Pure-panel plugins
+> have no node requirement (they run in the browser).
 
 ## Anatomy
 
@@ -236,7 +236,7 @@ in the MCP server or backend, and have the panel read results via the SDK.)
 Prefer Node's built-in **`node:sqlite`** over native addons like
 `better-sqlite3`: the permission model blocks native addons by default, and the
 built-in needs no `--allow-addons`. Running external tools (ripgrep, git) needs
-the `exec` permission (`--allow-child-process`); plain fs does not.
+the `exec` permission; plain fs does not.
 
 ### Testing a server offline
 
@@ -356,8 +356,11 @@ to `dist/server.js` automatically (via `scripts/build-server.mjs`), in both
 ## Permissions
 
 Permissions are **enforced**, not advisory. The panel iframe is isolated
-(opaque origin) so the SDK is its only channel; node processes (mcp / backend)
-run under Node's Permission Model with grants matching exactly what you declare.
+(opaque origin) so the SDK is its only channel. Node processes (mcp / backend)
+use Node's Permission Model for scoped permissions. Declaring `exec` disables
+that model for the process because an arbitrary child process can already access
+the full machine; this also prevents Node from propagating parent filesystem
+restrictions into external Node/shebang CLIs.
 
 | Permission | Grants | Risk |
 |---|---|---|

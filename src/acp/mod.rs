@@ -1707,11 +1707,10 @@ fn load_plugin_mcp_servers(base_env: &HashMap<String, String>) -> Vec<acp::McpSe
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|x| x.as_str()).map(resolve).collect())
             .unwrap_or_default();
-        // Declared permissions → Node Permission Model flags. A node-based MCP
-        // server runs under `node --permission` with fs/exec grants matching
-        // exactly what the manifest declares; Grove requires node >= 24 and
-        // refuses (skips) the server otherwise, so a permission is never left
-        // silently unenforced.
+        // Declared permissions → Node runtime flags. Scoped permissions use
+        // `node --permission`; `exec` intentionally disables that model because
+        // it already grants full machine trust and Node otherwise propagates
+        // the parent's fs restrictions to external Node/shebang CLIs.
         let perms: std::collections::HashSet<String> = manifest
             .get("permissions")
             .and_then(|p| p.as_array())

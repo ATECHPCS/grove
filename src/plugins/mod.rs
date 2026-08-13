@@ -1,5 +1,5 @@
-//! Plugin runtime support — launching a plugin's node processes (MCP server,
-//! backend) under the Node Permission Model. See [`runtime`].
+//! Plugin runtime support — launching plugin node processes with manifest-
+//! derived runtime permissions. See [`runtime`].
 
 pub mod backend;
 pub mod events;

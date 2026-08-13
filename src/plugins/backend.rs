@@ -16,9 +16,9 @@
 //! panel keys on `"global"` (no project access). Processes are spawned lazily
 //! on first invoke, reused, and reaped on idle or plugin uninstall.
 //!
-//! The node process runs under the same Node Permission Model as the MCP
-//! server (see [`super::runtime`]) — fs/exec grants match the manifest, and
-//! node < 24 is refused.
+//! The node process follows the same runtime policy as the MCP server (see
+//! [`super::runtime`]): scoped permissions use Node's Permission Model, while
+//! `exec` runs unrestricted because it already grants full machine trust.
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -229,7 +229,7 @@ async fn spawn(
     let storage_root = crate::storage::plugin_data::data_dir(plugin_id);
     let _ = std::fs::create_dir_all(&storage_root);
 
-    // Node Permission Model gating + flags (same policy as the MCP server).
+    // Node runtime gating + permission flags (same policy as the MCP server).
     let mut args: Vec<String> = Vec::new();
     if super::runtime::is_node_command(&command) {
         if !super::runtime::node_supports_permissions(&command) {
