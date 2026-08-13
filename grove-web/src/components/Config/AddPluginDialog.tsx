@@ -1,5 +1,5 @@
 import { useRef, useState, type DragEvent } from "react";
-import { Code, FileArchive, FolderOpen, GitBranch, Sparkles, Terminal, X } from "lucide-react";
+import { CheckCircle2, Code, FileArchive, FolderOpen, GitBranch, Sparkles, Terminal, X } from "lucide-react";
 import { Button, DialogShell } from "../ui";
 import {
   browsePluginFolder,
@@ -35,7 +35,12 @@ export function AddPluginDialog({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
-  const [done, setDone] = useState<{ name: string; warning?: string | null } | null>(null);
+  const [done, setDone] = useState<{
+    name: string;
+    warning?: string | null;
+    path?: string;
+    next?: string;
+  } | null>(null);
   const zipInputRef = useRef<HTMLInputElement>(null);
 
   const pickFolderThen = async (
@@ -73,7 +78,7 @@ export function AddPluginDialog({ onClose }: { onClose: () => void }) {
       const picked = await browsePluginFolder();
       if (!picked.path) return;
       const result = await scaffoldPlugin(picked.path, trimmed);
-      setDone({ name: result.name, warning: result.next ? `Created at ${result.path}. Next: ${result.next}` : `Created at ${result.path}.` });
+      setDone({ name: result.name, path: result.path, next: result.next });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -139,7 +144,7 @@ export function AddPluginDialog({ onClose }: { onClose: () => void }) {
   return (
     <DialogShell isOpen onClose={onClose}>
       <div
-        className="w-full max-w-md rounded-2xl border border-[var(--color-border)] bg-[var(--color-bg)] p-5 shadow-xl"
+        className="w-full max-w-lg rounded-2xl border border-[var(--color-border)] bg-[var(--color-bg)] p-5 shadow-xl"
       >
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-sm font-semibold text-[var(--color-text)]">Add Plugin</h2>
@@ -153,12 +158,46 @@ export function AddPluginDialog({ onClose }: { onClose: () => void }) {
         </div>
 
         {done ? (
-          <div className="space-y-3">
-            <div className="rounded-lg border border-[var(--color-success)]/30 bg-[var(--color-success)]/5 px-3 py-2 text-xs text-[var(--color-text)]">
-              Installed “{done.name}”.
+          <div className="space-y-5">
+            <div className="flex flex-col items-center px-4 pb-1 pt-2 text-center">
+              <div className="mb-3 flex h-11 w-11 items-center justify-center rounded-full bg-[var(--color-success)]/10">
+                <CheckCircle2 className="h-6 w-6 text-[var(--color-success)]" />
+              </div>
+              <h3 className="text-base font-semibold text-[var(--color-text)]">
+                Plugin added
+              </h3>
+              <p className="mt-1 text-xs text-[var(--color-text-muted)]">
+                “{done.name}” was installed successfully.
+              </p>
             </div>
+
+            {(done.path || done.next) && (
+              <div className="space-y-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] p-3.5">
+                {done.path && (
+                  <div>
+                    <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-[var(--color-text-muted)]">
+                      Created at
+                    </div>
+                    <code className="block break-all text-xs text-[var(--color-text)]">
+                      {done.path}
+                    </code>
+                  </div>
+                )}
+                {done.next && (
+                  <div>
+                    <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-[var(--color-text-muted)]">
+                      Next step
+                    </div>
+                    <code className="block overflow-x-auto whitespace-nowrap rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-2.5 py-2 text-xs text-[var(--color-text)]">
+                      {done.next}
+                    </code>
+                  </div>
+                )}
+              </div>
+            )}
+
             {done.warning && (
-              <div className="rounded-lg border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/5 px-3 py-2 text-xs text-[var(--color-warning)]">
+              <div className="rounded-lg border border-[var(--color-warning)]/30 bg-[var(--color-warning)]/5 px-3 py-2 text-xs text-[var(--color-text)]">
                 {done.warning}
               </div>
             )}
