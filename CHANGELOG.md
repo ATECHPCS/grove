@@ -5,20 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.12.2] - 2026-08-10
+## [0.12.2] - 2026-08-13
 
 ### Added
 
+- **Unified extension catalog** — Skills, plugins, and MCP servers can be discovered, filtered, inspected, and installed from one Extensions workspace, with source, installation, and agent-aware views.
 - **Interactive memory organization** — Memory organization runs can ask for guidance while preserving clearer graph, documentation, and read-visibility context.
 - **Archived session restore** — Archived chat history can be restored directly from its history actions.
 
 ### Improved
 
+- **Recoverable automation runs and standard cron schedules** — Runs remain actionable while waiting or after an agent error, and five-field schedules now use standard Sunday `0`/`7` through Saturday `6` semantics when calculating their next execution.
+- **Task chat and preview workflows** — Live chats keep their session controls through transient list refreshes, narrow composers retain settings in the overflow menu, virtualized conversations preserve their scroll position, and preview comments stay anchored to the exact selected text.
+- **Extension and plugin management** — Extension sources expose clearer install state and agent bindings, while plugin installation finishes with a focused success handoff.
 - **Session activity and lifecycle** — Meaningful chat activity updates recency consistently, while session cleanup and archived-history actions remain available across lifecycle states.
 - **Working agent memory retrieval** — Agent instructions more reliably retrieve durable project context before substantive work.
 
 ### Fixed
 
+- **Plugin and companion startup** — Companion installs require a valid manifest, plugin sidebars load their own declared entry, and plugins with `exec` permission can launch installed Node-based command-line tools.
 - **Blitz task discovery and ordering** — Projects preserve workspace membership, repair missing task-group placement, and keep task ordering stable across views.
 - **ACP lifecycle diagnostics** — Routine shutdown noise is suppressed without hiding actionable session and plugin failures.
 
