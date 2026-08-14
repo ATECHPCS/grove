@@ -2,6 +2,14 @@
 // git clone), register dev folders, list, delete, and per-plugin file storage.
 import { apiClient } from './client';
 
+export const PLUGINS_CHANGED_EVENT = 'grove:plugins-changed';
+
+export function notifyPluginsChanged(): void {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(PLUGINS_CHANGED_EVENT));
+  }
+}
+
 /**
  * Pop a native OS folder picker for choosing where to create/develop a plugin.
  * Resolves with `path: null` when the user cancels.
@@ -93,7 +101,9 @@ export async function listPlugins(): Promise<Plugin[]> {
  * files; for dev plugins it only drops the registry entry (your folder stays).
  */
 export async function deletePlugin(id: string): Promise<{ ok: boolean }> {
-  return apiClient.delete<{ ok: boolean }>(`/api/v1/plugins/${id}`);
+  const result = await apiClient.delete<{ ok: boolean }>(`/api/v1/plugins/${id}`);
+  notifyPluginsChanged();
+  return result;
 }
 
 /** Reveal a plugin's folder in the OS file manager (Finder / Explorer). */
@@ -113,10 +123,12 @@ export async function updatePluginSdk(id: string): Promise<{ ok: boolean; files:
 export async function installLocalPlugin(
   path: string,
 ): Promise<{ ok: boolean; plugin: Plugin; warning?: string | null }> {
-  return apiClient.post<{ path: string }, { ok: boolean; plugin: Plugin; warning?: string | null }>(
+  const result = await apiClient.post<{ path: string }, { ok: boolean; plugin: Plugin; warning?: string | null }>(
     '/api/v1/plugins/install-local',
     { path },
   );
+  notifyPluginsChanged();
+  return result;
 }
 
 /** Install a plugin from a git repo (cloned into Grove's storage). */
@@ -124,10 +136,12 @@ export async function installGitPlugin(
   url: string,
   subpath?: string,
 ): Promise<{ ok: boolean; plugin: Plugin; warning?: string | null }> {
-  return apiClient.post<{ url: string; subpath?: string }, { ok: boolean; plugin: Plugin; warning?: string | null }>(
+  const result = await apiClient.post<{ url: string; subpath?: string }, { ok: boolean; plugin: Plugin; warning?: string | null }>(
     '/api/v1/plugins/install-git',
     { url, subpath },
   );
+  notifyPluginsChanged();
+  return result;
 }
 
 /**
@@ -141,10 +155,12 @@ export async function installZipPlugin(
 ): Promise<{ ok: boolean; plugin: Plugin; warning?: string | null }> {
   const form = new FormData();
   form.append('file', file);
-  return apiClient.postFormData<{ ok: boolean; plugin: Plugin; warning?: string | null }>(
+  const result = await apiClient.postFormData<{ ok: boolean; plugin: Plugin; warning?: string | null }>(
     '/api/v1/plugins/install-zip',
     form,
   );
+  notifyPluginsChanged();
+  return result;
 }
 
 /**
@@ -192,8 +208,10 @@ export async function sendPluginChat(
 export async function registerDevPlugin(
   path: string,
 ): Promise<{ ok: boolean; plugin: Plugin }> {
-  return apiClient.post<{ path: string }, { ok: boolean; plugin: Plugin }>(
+  const result = await apiClient.post<{ path: string }, { ok: boolean; plugin: Plugin }>(
     '/api/v1/plugins',
     { path },
   );
+  notifyPluginsChanged();
+  return result;
 }

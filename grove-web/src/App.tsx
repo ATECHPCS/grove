@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ShortcutHandler } from "@tauri-apps/plugin-global-shortcut";
 import { Sidebar } from "./components/Layout/Sidebar";
 import { PluginFrame } from "./components/Plugins/PluginFrame";
-import { listPlugins, type Plugin } from "./api/plugins";
+import { listPlugins, PLUGINS_CHANGED_EVENT, type Plugin } from "./api/plugins";
 import { MobileHeader } from "./components/Layout/MobileHeader";
 import { MobileDrawer } from "./components/Layout/MobileDrawer";
 import { NotificationPopover } from "./components/Layout/NotificationPopover";
@@ -274,21 +274,33 @@ function AppContent() {
   const [hasExitedWelcome, setHasExitedWelcome] = useState(false);
   const [navigationData, setNavigationData] = useState<Record<string, unknown> | null>(null);
 
-  // Installed plugins that contribute a top-level sidebar page. Loaded once;
+  // Installed plugins that contribute a top-level sidebar page.
   // the sidebar renders a nav entry per plugin (id `plugin:<id>`) and
   // renderContent renders the plugin full-page when one is active.
   const [sidebarPlugins, setSidebarPlugins] = useState<Plugin[]>([]);
   useEffect(() => {
     let cancelled = false;
-    listPlugins()
-      .then((ps) => {
-        if (!cancelled) setSidebarPlugins(ps.filter((p) => p.contributes?.sidebar));
-      })
-      .catch(() => {
-        if (!cancelled) setSidebarPlugins([]);
-      });
+    const load = () => {
+      listPlugins()
+        .then((ps) => {
+          if (cancelled) return;
+          const nextSidebarPlugins = ps.filter((p) => p.contributes?.sidebar);
+          setSidebarPlugins(nextSidebarPlugins);
+          setActiveItem((current) => {
+            if (!current.startsWith("plugin:")) return current;
+            const pluginId = current.slice("plugin:".length);
+            return nextSidebarPlugins.some((plugin) => plugin.id === pluginId) ? current : "skills";
+          });
+        })
+        .catch(() => {
+          if (!cancelled) setSidebarPlugins([]);
+        });
+    };
+    load();
+    window.addEventListener(PLUGINS_CHANGED_EVENT, load);
     return () => {
       cancelled = true;
+      window.removeEventListener(PLUGINS_CHANGED_EVENT, load);
     };
   }, []);
   const { selectedProject, currentProjectId, isLoading, selectProject, projects, addProject, createNewProject, cloneProject, refreshProjects, refreshSelectedProject } = useProject();

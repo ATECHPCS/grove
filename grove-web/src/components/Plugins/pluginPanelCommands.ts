@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { commandRegistry } from "../../keyboard";
-import { listPlugins } from "../../api/plugins";
+import { listPlugins, PLUGINS_CHANGED_EVENT } from "../../api/plugins";
 
 /** Fired (with the current task context) when a plugin's keybinding is pressed;
  *  the active layout opens that plugin's panel. */
@@ -13,7 +13,7 @@ export interface OpenPluginPanelDetail {
 
 /** Fired after a plugin is installed/uninstalled so open workspaces re-sync
  *  their plugin lists + keybindings live (no remount needed). */
-export const PLUGINS_CHANGED_EVENT = "grove:plugins-changed";
+export { PLUGINS_CHANGED_EVENT } from "../../api/plugins";
 
 /** The keymap command id for opening a plugin's panel — matches the
  *  `panel.<key>.open` convention the toolbar's shortcut hints resolve. */

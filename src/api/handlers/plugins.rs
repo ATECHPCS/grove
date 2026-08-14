@@ -1228,6 +1228,20 @@ pub async fn list_plugins() -> Result<Json<serde_json::Value>, (StatusCode, Json
         .iter()
         .map(|p| {
             let mut v = serde_json::to_value(p).unwrap_or_else(|_| json!({}));
+            if let Ok(raw) =
+                std::fs::read_to_string(std::path::Path::new(&p.local_path).join("plugin.json"))
+            {
+                if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(name) = manifest.get("name").and_then(serde_json::Value::as_str) {
+                        v["name"] = json!(name);
+                    }
+                    if let Some(version) =
+                        manifest.get("version").and_then(serde_json::Value::as_str)
+                    {
+                        v["version"] = json!(version);
+                    }
+                }
+            }
             v["permissions"] = json!(read_permissions_at(&p.local_path));
             v["contributes"] = read_contributes_at(&p.local_path);
             // Folder still on disk? A user may delete the source folder without
