@@ -699,9 +699,9 @@ export function DashboardPage({ onNavigate }: DashboardPageProps) {
   allTips.push({
     id: "skills",
     icon: Lightbulb,
-    title: "Explore Skills",
-    description: "Skills extend agent capabilities with specialized knowledge and workflows.",
-    action: { label: "View Skills", onClick: () => onNavigate("skills") },
+    title: "Explore Extensions",
+    description: "Discover Skills, Plugins, and MCP Servers for your Agents.",
+    action: { label: "View Extensions", onClick: () => onNavigate("skills") },
     tone: "tip",
   });
 
@@ -1305,4 +1305,3 @@ function formatRelativeTime(date: Date): string {
   const days = Math.floor(hours / 24);
   return `${days}d`;
 }
-

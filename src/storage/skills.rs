@@ -33,10 +33,17 @@ fn default_true() -> bool {
     true
 }
 
+fn default_management_mode() -> String {
+    "referenced".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillSourceDef {
     pub name: String,
     pub source_type: String,
+    /// `referenced` | `managed` | `development`.
+    #[serde(default = "default_management_mode")]
+    pub management_mode: String,
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subpath: Option<String>,
@@ -592,13 +599,13 @@ pub fn load_sources() -> SourcesFile {
     let sources: Vec<SkillSourceDef> = (|| {
         let mut stmt = conn
             .prepare(
-                "SELECT name, source_type, url, subpath, repo_key, last_synced, local_head \
+                "SELECT name, source_type, management_mode, url, subpath, repo_key, last_synced, local_head \
              FROM skill_sources",
             )
             .ok()?;
         let rows = stmt
             .query_map([], |row| {
-                let last_synced_str: Option<String> = row.get(5)?;
+                let last_synced_str: Option<String> = row.get(6)?;
                 let last_synced = last_synced_str.and_then(|s| {
                     DateTime::parse_from_rfc3339(&s)
                         .ok()
@@ -607,11 +614,12 @@ pub fn load_sources() -> SourcesFile {
                 Ok(SkillSourceDef {
                     name: row.get(0)?,
                     source_type: row.get(1)?,
-                    url: row.get(2)?,
-                    subpath: row.get(3)?,
-                    repo_key: row.get(4)?,
+                    management_mode: row.get(2)?,
+                    url: row.get(3)?,
+                    subpath: row.get(4)?,
+                    repo_key: row.get(5)?,
                     last_synced,
-                    local_head: row.get(6)?,
+                    local_head: row.get(7)?,
                 })
             })
             .ok()?;
@@ -630,11 +638,12 @@ pub fn save_sources(data: &SourcesFile) -> Result<()> {
     for src in &data.sources {
         let last_synced_str = src.last_synced.map(|d| d.to_rfc3339());
         tx.execute(
-            "INSERT INTO skill_sources (name, source_type, url, subpath, repo_key, last_synced, local_head) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO skill_sources (name, source_type, management_mode, url, subpath, repo_key, last_synced, local_head) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 src.name,
                 src.source_type,
+                src.management_mode,
                 src.url,
                 src.subpath,
                 src.repo_key,

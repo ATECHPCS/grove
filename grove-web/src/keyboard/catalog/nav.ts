@@ -61,7 +61,7 @@ export const NAV_COMMANDS: CommandDef[] = [
   },
   {
     id: "nav.skills",
-    name: "Go to Skills",
+    name: "Go to Extensions",
     category: "Navigation",
     defaultBindings: [{ key: "Mod+6" }],
     passThroughTextInput: true,

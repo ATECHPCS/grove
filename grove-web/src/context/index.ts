@@ -19,4 +19,8 @@ export {
   type PreviewCommentLocator,
   type NewPreviewCommentDraft,
 } from "./PreviewCommentContext";
-export { previewCommentTaskLabel } from "./previewCommentUtils";
+export {
+  previewCommentLocatorInParentViewport,
+  previewCommentMarkerData,
+  previewCommentTaskLabel,
+} from "./previewCommentUtils";

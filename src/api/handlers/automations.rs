@@ -455,6 +455,69 @@ pub struct CancelRunResponse {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct FinishRunResponse {
+    pub status: String,
+}
+
+/// Ask the existing ordinary Chat Session to finish the Memory organization.
+/// The Agent remains responsible for calling memory_mark_organization_finished;
+/// that MCP call completes the business Run without ending the Chat Session.
+pub async fn finish_run(
+    Path((project_id, automation_id, run_id)): Path<(String, String, String)>,
+) -> Result<Json<FinishRunResponse>, (StatusCode, String)> {
+    let (_, project_key) =
+        find_project_by_id(&project_id).map_err(|s| (s, "project not found".to_string()))?;
+    let run = automations::get_run(&run_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .filter(|run| run.automation_id == automation_id)
+        .ok_or((StatusCode::NOT_FOUND, "run not found".into()))?;
+    let parent = automations::get(&automation_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .filter(|automation| automation.project == project_key)
+        .ok_or((StatusCode::NOT_FOUND, "run not found".into()))?;
+    if parent.handler_key != automations::MEMORY_ORGANIZATION_HANDLER {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "run does not support Finish".into(),
+        ));
+    }
+    if matches!(run.status.as_str(), "success" | "cancelled" | "cancelling") {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("run is already {}", run.status),
+        ));
+    }
+    let (Some(task_id), Some(chat_id)) = (
+        run.resolved_task_id.as_deref(),
+        run.resolved_chat_id.as_deref(),
+    ) else {
+        return Err((StatusCode::CONFLICT, "run session is not ready".into()));
+    };
+    let session_key = format!("{}:{}:{}", project_key, task_id, chat_id);
+    let handle = crate::acp::get_session_handle(&session_key)
+        .ok_or((StatusCode::CONFLICT, "run session is offline".into()))?;
+    automations::mark_run_running(&run_id)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if let Err(error) = handle
+        .send_prompt(
+            "Finish this Memory organization now. Complete any remaining checks, then call memory_mark_organization_finished exactly once with the final summary and Entity base scores.".to_string(),
+            Vec::new(),
+            None,
+            false,
+            None,
+        )
+        .await
+    {
+        let message = error.to_string();
+        let _ = automations::mark_run_failed(&run_id, "queue", &message);
+        return Err((StatusCode::CONFLICT, message));
+    }
+    Ok(Json(FinishRunResponse {
+        status: "finishing".to_string(),
+    }))
+}
+
 /// POST /api/v1/projects/{id}/automations/{aid}/runs/{run_id}/cancel
 ///
 /// User-initiated cancel of an in-flight or queued automation run.
@@ -518,9 +581,18 @@ pub async fn cancel_run(
     // Best-effort ACP side-effect. The DB remains in `cancelling` until both
     // this and the handler abort hook have had a chance to clean up.
     if run.execution_scope == "project_run" {
-        // Consumer Runs own a dedicated ACP Session, so cancellation can
-        // terminate it outright without risking an unrelated user turn.
-        let _ = crate::acp::kill_session(&format!("automation-run:{run_id}"));
+        // Cancelling the business Run does not end its ordinary Chat Session.
+        // Abort only the current Agent turn, if one is active; the Chat remains
+        // available through the same TaskChat lifecycle afterwards.
+        if let (Some(task_id), Some(chat_id)) = (
+            run.resolved_task_id.as_deref(),
+            run.resolved_chat_id.as_deref(),
+        ) {
+            let session_key = format!("{}:{}:{}", project_key, task_id, chat_id);
+            if let Some(handle) = crate::acp::get_session_handle(&session_key) {
+                let _ = handle.cancel().await;
+            }
+        }
     } else if let (Some(task_id), Some(chat_id)) = (
         run.resolved_task_id.as_deref(),
         run.resolved_chat_id.as_deref(),

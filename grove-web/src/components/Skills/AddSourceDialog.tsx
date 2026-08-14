@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { X, GitBranch, FolderOpen } from "lucide-react";
-import { Button } from "../ui";
-import { DialogShell } from "../ui/DialogShell";
+import { Button, DialogShell } from "../ui";
 import { useIsMobile } from "../../hooks";
 import { apiClient } from "../../api/client";
 import { addSource, updateSource } from "../../api";
@@ -14,9 +13,10 @@ interface AddSourceDialogProps {
   editingSource: SkillSource | null;
   onClose: () => void;
   onSaved: () => void;
+  initialSourceType?: "git" | "local";
 }
 
-export function AddSourceDialog({ isOpen, editingSource, onClose, onSaved }: AddSourceDialogProps) {
+export function AddSourceDialog({ isOpen, editingSource, onClose, onSaved, initialSourceType = "git" }: AddSourceDialogProps) {
   const [name, setName] = useState("");
   const [sourceType, setSourceType] = useState<"git" | "local">("git");
   const [url, setUrl] = useState("");
@@ -42,7 +42,7 @@ export function AddSourceDialog({ isOpen, editingSource, onClose, onSaved }: Add
       setIsNameAutoFilled(false);
     } else {
       setName("");
-      setSourceType("git");
+      setSourceType(initialSourceType);
       setUrl("");
       setSubpath("");
       setIsNameAutoFilled(false);
@@ -230,7 +230,7 @@ export function AddSourceDialog({ isOpen, editingSource, onClose, onSaved }: Add
                       placeholder={
                         sourceType === "git"
                           ? "URL · owner/repo · npx skills add ..."
-                          : "/home/user/my-skills"
+                          : "/home/user/extensions"
                       }
                       className="flex-1 px-3 py-2 text-sm font-mono bg-[var(--color-bg)] border border-[var(--color-border)] rounded-lg text-[var(--color-text)] placeholder:text-[var(--color-text-muted)]/50 focus:outline-none focus:ring-1 focus:ring-[var(--color-highlight)]"
                     />
@@ -255,7 +255,7 @@ export function AddSourceDialog({ isOpen, editingSource, onClose, onSaved }: Add
                     className="w-full px-3 py-2 text-sm font-mono bg-[var(--color-bg)] border border-[var(--color-border)] rounded-lg text-[var(--color-text)] placeholder:text-[var(--color-text-muted)]/50 focus:outline-none focus:ring-1 focus:ring-[var(--color-highlight)]"
                   />
                   <p className="text-[10px] text-[var(--color-text-muted)] mt-1">
-                    Only scan skills from this subdirectory within the repository.
+                    Only scan extensions from this subdirectory within the repository.
                   </p>
                 </div>
 

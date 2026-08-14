@@ -11,6 +11,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { createRoot } from "react-dom/client";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   MessageSquare,
@@ -63,6 +64,8 @@ import {
   SlidersHorizontal,
   Box,
   Database,
+  Archive,
+  ArchiveRestore,
 } from "lucide-react";
 import { iconUrlForFile } from "../../ui/iconUrl";
 import {
@@ -103,18 +106,17 @@ import type { MentionItem, FilteredMentionItem } from "../../../utils/fileMentio
 import { getMentionCandidates } from "../../../api";
 import type {
   SessionConfigOption,
-  SessionConfigSelectGroup,
   SessionConfigSelectValue,
 } from "../../../api/tasks";
 import {
   configCategoryMatches,
   configDropdownValues,
-  isConfigGroup,
   quickConfigOptions,
 } from "./sessionConfigOptions";
 import { listExtensionTabs, getExtensionStatus } from "../../../api/extension";
 import { useProject } from "../../../context/ProjectContext";
 import { useConfig } from "../../../context/ConfigContext";
+import { useTheme } from "../../../context/ThemeContext";
 import { previewCommentTaskLabel, usePreviewComments, type PreviewCommentDraft, type PreviewCommentLocator } from "../../../context";
 import { PreviewSearchBar } from "../../Review/PreviewSearchBar";
 import {
@@ -135,6 +137,7 @@ import { extractThoughtStatus } from "./thoughtStatus";
 import {
   firstVisibleTaskChatRow,
   scrollVirtuosoToBottom,
+  shouldDisengageTaskChatAutoStick,
   shouldVirtualizeTaskChat,
   taskChatHeightEstimates,
   taskChatLayoutTransitionTarget,
@@ -145,6 +148,12 @@ import { useACPAvailability } from "./useACPAvailability";
 import { useInitialChatLoad } from "./useInitialChatLoad";
 import { useActiveChatId } from "./useActiveChatId";
 import { useTypewriter } from "./useTypewriter";
+import {
+  markSessionRead,
+  removeSessionActivity,
+  updateSessionRunning,
+  type SessionActivityMap,
+} from "./sessionActivity";
 import {
   appendStructuredContentBlock,
   appendTextContentBlock,
@@ -171,18 +180,19 @@ import {
   type PlanEntry,
 } from "./planEntries";
 import { listSketches, type SketchMeta } from "../../../api/sketches";
+import { resolveMemoryEntities, type MemoryEntityMetadata } from "../../../api/memory";
 import { writeLastActiveTab } from "../../../utils/lastActiveTab";
 import { XTerminal } from "../TaskDetail/XTerminal";
 import { sendInputToTerminal } from "../TaskDetail/terminalCache";
-import type { Task } from "../../../data/types";
 import { perfMark } from "../../../perf/marks";
 import { useReportDebugId } from "../../../perf/debugIdsStore";
 import { getApiHost, appendHmacToUrl } from "../../../api/client";
+import { getProjectStyle } from "../../../utils/projectStyle";
 import { useAgentQuota, useRadioEvents } from "../../../hooks";
 import { AgentQuotaPopover } from "./AgentQuotaPopover";
 import { ContextUsagePill } from "./ContextUsagePill";
 import { TurnUsageMeta } from "./TurnUsageMeta";
-import { collectCurrentTurnRecalledMemories } from "./memoryRecall";
+import { collectReadMemoryIds } from "./memoryRead";
 import {
   quotaBadgePercent,
   quotaBatteryIcon,
@@ -191,7 +201,10 @@ import {
 import {
   getConfig,
   listChats,
+  listArchivedChats,
   createChat,
+  archiveChat,
+  restoreChat,
   updateChatTitle,
   deleteChat,
   forkChat,
@@ -345,13 +358,17 @@ function gcChatDraftsOnce(): void {
 
 interface TaskChatProps {
   projectId: string;
-  task: Task;
+  taskId: string;
+  fixedChatId?: string;
   /** If provided, the chat with this id is pinned as the active chat
    *  and the chat-switcher tab UI is hidden. Used by the Blitz grid
    *  workspace to scope each slot to a single chat. Omitted in Zen
    *  mode and the single-task Blitz workspace (preserves existing
    *  multi-chat tab behavior). */
   pinnedChatId?: string;
+  sessionManagement?: boolean;
+  /** Render persisted history without attaching to the live Agent session. */
+  finished?: boolean;
   collapsed?: boolean;
   onExpand?: () => void;
   onCollapse?: () => void;
@@ -534,6 +551,7 @@ interface SessionActionsMenuProps {
   reconnectDisabled: boolean;
   actionsDisabled: boolean;
   deleteDisabled: boolean;
+  archiveDisabled: boolean;
   onFork: (chatId: string) => void;
   onOpenImport: () => void;
   onLoadMoreImport: () => void;
@@ -542,6 +560,7 @@ interface SessionActionsMenuProps {
   onLogout: () => void;
   onReconnect: () => void;
   onDelete: (chatId: string) => void;
+  onArchive: (chatId: string) => void;
 }
 
 function SessionActionsMenu({
@@ -557,6 +576,7 @@ function SessionActionsMenu({
   reconnectDisabled,
   actionsDisabled,
   deleteDisabled,
+  archiveDisabled,
   onFork,
   onOpenImport,
   onLoadMoreImport,
@@ -565,6 +585,7 @@ function SessionActionsMenu({
   onLogout,
   onReconnect,
   onDelete,
+  onArchive,
 }: SessionActionsMenuProps) {
   const items: Parameters<typeof DropdownMenu>[0]["items"] = [];
 
@@ -630,6 +651,13 @@ function SessionActionsMenu({
     });
   }
   items.push({
+    id: "archive",
+    label: "Archive",
+    icon: Archive,
+    onClick: () => onArchive(chatId),
+    disabled: archiveDisabled,
+  });
+  items.push({
     id: "delete",
     label: "Delete",
     icon: Trash2,
@@ -676,6 +704,8 @@ type ChatDropdownOption = {
 /** Per-chat cached state (preserved across chat switches) */
 interface PerChatState {
   messages: ChatMessage[];
+  /** Completed memory_read Entity IDs across the full persisted chat history. */
+  readMemoryIds: string[];
   hiddenMessageCount: number;
   attachmentCounters: AttachmentCounters;
   isBusy: boolean;
@@ -757,6 +787,7 @@ const applyConfigOptionsToCachedState = (
 function defaultPerChatState(): PerChatState {
   return {
     messages: [],
+    readMemoryIds: [],
     hiddenMessageCount: 0,
     attachmentCounters: { image: 0, audio: 0, resource: 0 },
     isBusy: false,
@@ -1666,6 +1697,8 @@ function createFileChip(
   displayLabel?: string,
   category?: string,
   favIconUrl?: string,
+  projectId?: string,
+  accentPalette?: string[],
 ): HTMLSpanElement {
   const chip = document.createElement("span");
   chip.contentEditable = "false";
@@ -1685,7 +1718,17 @@ function createFileChip(
   const isLink = filePath.toLowerCase().endsWith(".link.json");
   const baseName = filePath.split("/").filter(Boolean).pop() || "";
 
-  if (category === "Sketch") {
+  if (category === "Project Root" && projectId) {
+    chip.dataset.projectId = projectId;
+    const projectStyle = getProjectStyle(projectId, accentPalette);
+    const ProjectIcon = projectStyle.Icon;
+    const iconHost = document.createElement("span");
+    iconHost.style.cssText =
+      `display:inline-flex;width:18px;height:18px;align-items:center;justify-content:center;` +
+      `border-radius:4px;flex-shrink:0;background:${projectStyle.color.bg};color:${projectStyle.color.fg};`;
+    chip.appendChild(iconHost);
+    createRoot(iconHost).render(<ProjectIcon width={11} height={11} />);
+  } else if (category === "Sketch") {
     // Render Lucide Palette icon in SVG for visual consistency and premium look!
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("width", "13");
@@ -2369,8 +2412,11 @@ function DownloadingLabel({ startedAt, compact }: { startedAt: number; compact?:
 
 export function TaskChat({
   projectId,
-  task,
+  taskId,
+  fixedChatId,
   pinnedChatId,
+  sessionManagement = true,
+  finished = false,
   collapsed = false,
   onExpand,
   onCollapse,
@@ -2384,6 +2430,7 @@ export function TaskChat({
   onUserMessageSent,
   onBusyStateChange,
 }: TaskChatProps) {
+  const canManageSessions = sessionManagement;
   // Three sub-concerns have been extracted into their own hooks
   // (useChatPositioning, useACPAvailability, useInitialChatLoad) — those
   // hooks ARE Compiler-optimized. The remaining TaskChat body still has
@@ -2396,6 +2443,8 @@ export function TaskChat({
   const sessionModeStorageKey = `taskchat:session-mode:${projectId}`;
   // ─── Multi-chat state ───────────────────────────────────────────────────
   const [chats, setChats] = useState<ChatSessionResponse[]>([]);
+  const [archivedChats, setArchivedChats] = useState<ChatSessionResponse[]>([]);
+  const [showArchivedSessions, setShowArchivedSessions] = useState(false);
   // Mirror of `chats` for stable callbacks/event handlers that shouldn't
   // re-register every time the chat list changes.
   const chatsRef = useRef<ChatSessionResponse[]>([]);
@@ -2447,6 +2496,7 @@ export function TaskChat({
   const showAgentPickerRef = useRef(false);
   const [sessionRailCollapsed, setSessionRailCollapsed] = useState<boolean>(
     () => {
+      if (!canManageSessions) return true;
       if (typeof window === "undefined") return true;
       return window.localStorage.getItem(sessionModeStorageKey) !== "sidebar";
     },
@@ -2473,13 +2523,14 @@ export function TaskChat({
   });
 
   useEffect(() => {
+    if (!canManageSessions) return;
     if (typeof window === "undefined") return;
     try {
       window.localStorage.setItem(`taskchat:session-rail-width:${projectId}`, sessionRailWidth.toString());
     } catch {
       // ignore
     }
-  }, [sessionRailWidth, projectId]);
+  }, [canManageSessions, sessionRailWidth, projectId]);
 
   const startSessionRailResize = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -2517,6 +2568,8 @@ export function TaskChat({
   const seededChatsRef = useRef<Set<string>>(new Set());
   // Per-chat WebSocket connections
   const wsMapRef = useRef<Map<string, WebSocket>>(new Map());
+  const finishedRef = useRef(finished);
+  finishedRef.current = finished;
   // Track intentionally closed WebSockets (don't auto-reconnect these)
   const intentionalCloseRef = useRef<Set<string>>(new Set());
   // Per-chat reconnect attempt count for exponential backoff. Reset on
@@ -2563,6 +2616,7 @@ export function TaskChat({
   const [hasContent, setHasContent] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
   const busyRef = useRef(false);
+  const [sessionActivity, setSessionActivity] = useState<SessionActivityMap>({});
   // True from the moment the user clicks a cancel-emitting button (Send Now /
   // Stop) until the server acks by transitioning busy → false. Prevents the
   // "click 11 times spams 11 CancelNotifications" pattern that previously
@@ -2571,9 +2625,15 @@ export function TaskChat({
   const updateBusy = useCallback((value: boolean) => {
     busyRef.current = value;
     setIsBusy(value);
+    const chatId = getActiveChatId();
+    if (chatId) {
+      setSessionActivity((previous) =>
+        updateSessionRunning(previous, chatId, value, chatId),
+      );
+    }
     if (!value) setIsCancelling(false);
     onBusyStateChange?.(value);
-  }, [onBusyStateChange]);
+  }, [getActiveChatId, onBusyStateChange]);
   const terminalRunningRef = useRef(false);
   const composingRef = useRef(false);
   const [selectedModel, setSelectedModel] = useState("");
@@ -2804,6 +2864,7 @@ export function TaskChat({
   const taskFilesLoadingRef = useRef(false);
   const { selectedProject, projects } = useProject();
   const { config: appConfig } = useConfig();
+  const { theme } = useTheme();
   const {
     drafts: previewCommentDrafts,
     addDraft: addPreviewCommentDraft,
@@ -2957,6 +3018,11 @@ export function TaskChat({
   const planFilePathRef = useRef("");
   const planFileToolIdsRef = useRef<Set<string>>(new Set());
   const autoStickToBottomRef = useRef(true);
+  // Capture the reader's intent before a completion commit replaces the live
+  // sequential rows with a much shorter WorkSummary. Virtuoso emits transient
+  // off-bottom measurements during that height collapse; those measurements
+  // must not erase the fact that the reader was following the tail.
+  const preserveBottomOnBusyEndRef = useRef(false);
   const suppressNextSmoothScrollRef = useRef(false);
   const messagesCountRef = useRef(messages.length);
   useEffect(() => {
@@ -2966,15 +3032,40 @@ export function TaskChat({
   const chatboxContainerRef = useRef<HTMLDivElement>(null);
   const taskChatRootRef = useRef<HTMLDivElement>(null);
   // Composer width budget — when the chat panel is squeezed (e.g. opened
-  // alongside a Graph / Editor split), drop the Model / Mode / Thinking
-  // dropdowns so the Send button doesn't get clipped. Two tiers: below
-  // HIDE_ALL we drop everything; between HIDE_ALL and HIDE_THINKING we
-  // keep Model + Mode but drop the Thinking pill (which was added later
-  // and tips the row over the edge in mid-width panels).
-  const COMPOSER_HIDE_ALL_WIDTH = 420;
-  const COMPOSER_HIDE_THINKING_WIDTH = 560;
+  // alongside a Graph / Editor split), move the quick settings into the
+  // settings menu so the Send button doesn't get clipped. Collapse one item
+  // at a time so a narrower composer still keeps as much context visible as
+  // possible: Thinking first, then Mode, and Model only at the smallest size.
+  const COMPOSER_HIDE_ALL_WIDTH = 480;
+  const COMPOSER_HIDE_MODE_WIDTH = 680;
+  const COMPOSER_HIDE_THINKING_WIDTH = 820;
   const [composerNarrow, setComposerNarrow] = useState(false);
+  const [composerHideMode, setComposerHideMode] = useState(false);
   const [composerHideThinking, setComposerHideThinking] = useState(false);
+  const settingsSessionConfigOptions = useMemo(() => {
+    const compactQuickOptions = composerNarrow
+      ? [
+          matchedSessionConfig.model,
+          matchedSessionConfig.mode,
+          matchedSessionConfig.thinking,
+        ]
+      : [
+          composerHideMode ? matchedSessionConfig.mode : undefined,
+          composerHideThinking ? matchedSessionConfig.thinking : undefined,
+        ];
+    return [
+      ...compactQuickOptions.filter(
+        (option): option is SessionConfigOption => !!option,
+      ),
+      ...additionalSessionConfigOptions,
+    ];
+  }, [
+    additionalSessionConfigOptions,
+    composerHideMode,
+    composerHideThinking,
+    composerNarrow,
+    matchedSessionConfig,
+  ]);
 
   // ─── Read-only observation mode state ──────────────────────────────────
   const [isRemoteSession, setIsRemoteSession] = useState(false);
@@ -2990,15 +3081,19 @@ export function TaskChat({
   const wsEventBufferRef = useRef<any[]>([]);
   const historyLoadingRef = useRef(false);
 
-  const activeChat = chats.find((c) => c.id === activeChatId);
+  const activeChat =
+    chats.find((c) => c.id === activeChatId) ??
+    archivedChats.find((c) => c.id === activeChatId);
+  const isViewingArchived = archivedChats.some((chat) => chat.id === activeChatId);
+  const isReadOnlyHistory = finished || isViewingArchived;
   // Terminal-mode chat: agent CLI runs under a PTY (no ACP). Messages area
   // becomes xterm.js; chatbox input writes to PTY stdin instead of session/prompt.
   const isTerminalLaunchMode = activeChat?.launch_mode === "terminal";
   const agentPtyWsUrl = useMemo(() => {
     if (!isTerminalLaunchMode || !activeChatId) return null;
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    return `${protocol}//${window.location.host}/api/v1/projects/${projectId}/tasks/${task.id}/chats/${activeChatId}/agent-pty`;
-  }, [isTerminalLaunchMode, activeChatId, projectId, task.id]);
+    return `${protocol}//${window.location.host}/api/v1/projects/${projectId}/tasks/${taskId}/chats/${activeChatId}/agent-pty`;
+  }, [isTerminalLaunchMode, activeChatId, projectId, taskId]);
   // Quota for built-in AI coding agents (Claude Code / Codex / Gemini).
   // Unsupported agents return null, which hides the quota badge entirely.
   const {
@@ -3009,7 +3104,7 @@ export function TaskChat({
   const quotaBadgePercentRemaining = agentQuota
     ? quotaBadgePercent(agentQuota)
     : null;
-  const orderedChats = useMemo(() => [...chats].reverse(), [chats]);
+  const orderedChats = chats;
   const displayedPlanEntries = useMemo(
     () => sortPlanEntries(planEntries),
     [planEntries],
@@ -3017,11 +3112,57 @@ export function TaskChat({
   const hasTodoPanel = planEntries.length > 0;
   const hasPlanPanel = !!planFileContent;
   const hasPendingPanel = pendingMessages.length > 0;
-  const recalledMemories = useMemo(
-    () => collectCurrentTurnRecalledMemories(messages),
-    [messages],
+  // Memory evidence is chat-scoped, not render-window-scoped. History load
+  // seeds this from the full transcript before old messages are pruned; live
+  // ToolCalls then accumulate into it without removing earlier reads.
+  const [readMemoryIds, setReadMemoryIds] = useState<string[]>([]);
+  useEffect(() => {
+    const observed = collectReadMemoryIds(messages);
+    if (observed.length === 0) return;
+    setReadMemoryIds((previous) => {
+      const merged = new Set(previous);
+      observed.forEach((entityId) => merged.add(entityId));
+      return merged.size === previous.length ? previous : [...merged];
+    });
+  }, [messages]);
+  const readMemoryIdsKey = readMemoryIds.join("\u0000");
+  const readMemoryMetadataKey = `${projectId}\u0000${readMemoryIdsKey}`;
+  const [readMemoryMetadata, setReadMemoryMetadata] = useState<{
+    key: string;
+    items: Map<string, MemoryEntityMetadata>;
+  }>({ key: "", items: new Map() });
+  useEffect(() => {
+    let cancelled = false;
+    const entityIds = readMemoryIdsKey ? readMemoryIdsKey.split("\u0000") : [];
+    if (entityIds.length === 0) return () => { cancelled = true; };
+    resolveMemoryEntities(projectId, entityIds)
+      .then(({ items }) => {
+        if (!cancelled) {
+          setReadMemoryMetadata({
+            key: readMemoryMetadataKey,
+            items: new Map(items.map((item) => [item.entity_id, item])),
+          });
+        }
+      })
+      .catch(() => {
+        // The completed ToolCall remains the source of truth. If metadata
+        // hydration fails, keep the ID fallback instead of hiding the pill.
+      });
+    return () => { cancelled = true; };
+  }, [projectId, readMemoryIdsKey, readMemoryMetadataKey]);
+  const readMemories = useMemo(
+    () => readMemoryIds.map((entityId) => (
+      readMemoryMetadata.key === readMemoryMetadataKey
+        ? readMemoryMetadata.items.get(entityId)
+        : undefined
+    ) ?? {
+      entity_id: entityId,
+      title: entityId,
+      tags: [],
+    }),
+    [readMemoryIds, readMemoryMetadata, readMemoryMetadataKey],
   );
-  const hasMemoryPanel = recalledMemories.length > 0;
+  const hasMemoryPanel = readMemoryIds.length > 0;
   const activePermissionMessage = useMemo(
     () =>
       [...messages]
@@ -3065,8 +3206,8 @@ export function TaskChat({
     return -1;
   }, [activeAuthMessage, messages]);
   const taskPreviewCommentDrafts = useMemo(
-    () => previewCommentDrafts.filter((draft) => draft.projectId === projectId && draft.taskId === task.id),
-    [previewCommentDrafts, projectId, task.id],
+    () => previewCommentDrafts.filter((draft) => draft.projectId === projectId && draft.taskId === taskId),
+    [previewCommentDrafts, projectId, taskId],
   );
   const hasPreviewCommentsPanel = taskPreviewCommentDrafts.length > 0;
   const activeComposerPanel =
@@ -3158,16 +3299,14 @@ export function TaskChat({
   // Routed through the Scoped Command Registry — catalog entry lives in
   // src/keyboard/catalog/chat.ts (chat.search.toggle, Mod+f, workspace
   // scope, defaultWhen "chatPanelActive"). `chatPanelActive` is set true
-  // while TaskChat is mounted. `chatFocus` exists so the catalog's
-  // chat.send binding (Enter when chatFocus && messageNotEmpty) keeps
-  // working — TaskChat owns the chatbox composer.
+  // while TaskChat is mounted. Composer context remains available to other
+  // chat commands and user-authored when clauses; chat.send additionally
+  // uses a per-instance focus gate at registration time so keep-alive
+  // TaskChats cannot route Enter to a hidden composer.
   useContextKey("chatPanelActive", true);
   useContextKey("chatFocus", isInputFocused);
-  // `messageNotEmpty` gates chat.send (Enter when chatFocus && messageNotEmpty).
-  // Reuse `hasContent` — the same flag the send button uses (line ~7788 and
-  // friends). It's true when the composer contenteditable has trimmed text,
-  // a chip ([data-command]/[data-file]), or any attachment — i.e. anything
-  // that would form a non-empty outgoing message.
+  // Expose the same content state used by the send button. It is true when
+  // the composer has trimmed text, a chip, or an attachment.
   useContextKey("messageNotEmpty", hasContent);
   useContextKey("chatInputExpanded", isInputExpanded);
   // `messageSelected` gates chat.fork. TaskChat has no per-history-message
@@ -3517,7 +3656,7 @@ export function TaskChat({
     taskFilesLoadingRef.current = true;
     taskFilesFetchTimeRef.current = now;
 
-    getTaskFiles(projectId, task.id)
+    getTaskFiles(projectId, taskId)
       .then((res) => {
         setTaskFiles(res.files);
         setTaskFilesMeta(res.metadata || []);
@@ -3528,9 +3667,9 @@ export function TaskChat({
       });
 
     if (isStudioProject) {
-      listSketches(projectId, task.id).catch(() => {});
+      listSketches(projectId, taskId).catch(() => {});
     }
-  }, [projectId, task.id, isStudioProject]);
+  }, [projectId, taskId, isStudioProject]);
 
   const refreshProjectsIfNeeded = useCallback(() => {
     if (allProjects.length > 0) return;
@@ -3542,14 +3681,14 @@ export function TaskChat({
   }, [allProjects.length]);
 
   // Initial load on mount / task switch. refreshTaskFilesIfNeeded is a
-  // useCallback whose deps are [projectId, task.id, isStudioProject], so
+  // useCallback whose deps are [projectId, taskId, isStudioProject], so
   // including it here only adds isStudioProject as a transitive dep.
   // Workspace-level isStudioProject changes already imply a task switch,
   // so the extra refire is harmless.
   useEffect(() => {
     taskFilesFetchTimeRef.current = 0; // force stale on task switch
     refreshTaskFilesIfNeeded();
-  }, [projectId, task.id, refreshTaskFilesIfNeeded]);
+  }, [projectId, taskId, refreshTaskFilesIfNeeded]);
 
   // Refresh agent-graph @-mention candidates whenever the active chat changes
   // or the user opens the popover. Spawn candidates come from `acpAgentOptions`
@@ -3581,7 +3720,7 @@ export function TaskChat({
         agent: c.agent,
         history_path: c.history_path,
       }));
-    getMentionCandidates(projectId, task.id, activeChatId)
+    getMentionCandidates(projectId, taskId, activeChatId)
       .then((resp) => {
         setAgentMentionItems(
           buildAgentMentionItems({
@@ -3604,7 +3743,7 @@ export function TaskChat({
           }),
         );
       });
-  }, [projectId, task.id, activeChatId, acpAgentOptions, customAgentPersonas, chats]);
+  }, [projectId, taskId, activeChatId, acpAgentOptions, customAgentPersonas, chats]);
 
   // Defer to a microtask so the synchronous setAgentMentionItems([]) path
   // for !activeChatId doesn't trip the set-state-in-effect rule. We still
@@ -3632,7 +3771,7 @@ export function TaskChat({
         setSketchMeta([]);
         return;
       }
-      listSketches(projectId, task.id)
+      listSketches(projectId, taskId)
         .then((meta) => {
           if (!cancelled) setSketchMeta(meta);
         })
@@ -3643,7 +3782,7 @@ export function TaskChat({
     return () => {
       cancelled = true;
     };
-  }, [isStudioProject, projectId, task.id]);
+  }, [isStudioProject, projectId, taskId]);
 
   // Dynamically measure the input area height. With Virtuoso, we feed this
   // into the Footer component's height so the last message is never
@@ -3671,6 +3810,7 @@ export function TaskChat({
     const ro = new ResizeObserver(() => {
       const w = el.getBoundingClientRect().width;
       setComposerNarrow(w > 0 && w < COMPOSER_HIDE_ALL_WIDTH);
+      setComposerHideMode(w > 0 && w < COMPOSER_HIDE_MODE_WIDTH);
       setComposerHideThinking(w > 0 && w < COMPOSER_HIDE_THINKING_WIDTH);
     });
     ro.observe(el);
@@ -3756,7 +3896,6 @@ export function TaskChat({
   // disable auto-stick when atBottom flips while isScrolling is true —
   // i.e. there's a live user-driven scroll in progress. Re-enabling
   // happens unconditionally when atBottom becomes true.
-  const isUserScrollingRef = useRef(false);
   // `isScrolling` alone cannot identify the source: Virtuoso sets it for
   // both a wheel/drag from the user and our own scrollToIndex calls. Record
   // a short-lived user gesture before the scroll begins so an upward scroll
@@ -3785,7 +3924,6 @@ export function TaskChat({
     userScrollGestureUntilRef.current = Date.now() + 1_000;
   }, []);
   const handleIsScrolling = useCallback((scrolling: boolean) => {
-    isUserScrollingRef.current = scrolling;
     if (scrolling && Date.now() < userScrollGestureUntilRef.current) {
       disengageAutoStick();
     }
@@ -3839,10 +3977,11 @@ export function TaskChat({
       // Chat-switch reveal: as soon as Virtuoso confirms we're at bottom,
       // fade the list in (vs waiting the hard fallback timeout).
       notifyPositionedAtBottom();
-    } else if (
-      isUserScrollingRef.current &&
-      !programmaticScrollRef.current
-    ) {
+    } else if (shouldDisengageTaskChatAutoStick({
+      atBottom,
+      userGestureActive: Date.now() < userScrollGestureUntilRef.current,
+      programmaticScroll: programmaticScrollRef.current,
+    })) {
       autoStickToBottomRef.current = false;
     }
     setShowScrollToBottom(!atBottom && messagesCountRef.current > 0);
@@ -3857,12 +3996,13 @@ export function TaskChat({
 
   // Close dropdown menus when clicking outside
   useEffect(() => {
+    if (!canManageSessions) return;
     if (typeof window === "undefined") return;
     window.localStorage.setItem(
       sessionModeStorageKey,
       sessionRailCollapsed ? "header" : "sidebar",
     );
-  }, [sessionModeStorageKey, sessionRailCollapsed]);
+  }, [canManageSessions, sessionModeStorageKey, sessionRailCollapsed]);
 
   // Reload session-rail preference from localStorage when the storage key
   // changes (project switch). Set-state-during-render with a prev-key guard
@@ -3991,6 +4131,7 @@ export function TaskChat({
     if (!activeChatId) return;
     perChatStateRef.current.set(activeChatId, {
       messages,
+      readMemoryIds,
       hiddenMessageCount,
       attachmentCounters: { ...attachCountersRef.current },
       isBusy,
@@ -4026,6 +4167,7 @@ export function TaskChat({
   }, [
     activeChatId,
     messages,
+    readMemoryIds,
     hiddenMessageCount,
     isBusy,
     selectedModel,
@@ -4062,6 +4204,7 @@ export function TaskChat({
     const cached = perChatStateRef.current.get(chatId);
     if (cached) {
       setMessages(cached.messages);
+      setReadMemoryIds(cached.readMemoryIds ?? collectReadMemoryIds(cached.messages));
       updateHiddenMessageCount(cached.hiddenMessageCount);
       updateBusy(cached.isBusy);
       setSelectedModel(cached.selectedModel);
@@ -4097,6 +4240,7 @@ export function TaskChat({
       setContextUsage(cached.contextUsage);
     } else {
       setMessages([]);
+      setReadMemoryIds([]);
       updateHiddenMessageCount(0);
       updateBusy(false);
       setSelectedModel("");
@@ -4167,11 +4311,25 @@ export function TaskChat({
   // Initial chat list load is encapsulated in useInitialChatLoad.
   useInitialChatLoad({
     projectId,
-    taskId: task.id,
+    taskId,
+    fixedChatId,
     setChats,
     setActiveChatId,
     pinnedChatId,
   });
+
+  useEffect(() => {
+    if (!canManageSessions) return;
+    let cancelled = false;
+    void listArchivedChats(projectId, taskId)
+      .then((archived) => {
+        if (!cancelled) setArchivedChats(archived);
+      })
+      .catch((error) => console.error("Failed to load archived sessions:", error));
+    return () => {
+      cancelled = true;
+    };
+  }, [canManageSessions, projectId, taskId]);
 
   // Restore the composer draft on initial mount.
   //
@@ -4217,16 +4375,46 @@ export function TaskChat({
   // the UI until the user manually refreshed.
   useRadioEvents({
     onChatListChanged: (evtProjectId, evtTaskId) => {
-      if (evtProjectId !== projectId || evtTaskId !== task.id) return;
+      if (!canManageSessions) return;
+      if (evtProjectId !== projectId || evtTaskId !== taskId) return;
       void (async () => {
         let fresh: ChatSessionResponse[];
+        let freshArchived: ChatSessionResponse[];
         try {
-          fresh = await listChats(projectId, task.id);
+          [fresh, freshArchived] = await Promise.all([
+            listChats(projectId, taskId),
+            listArchivedChats(projectId, taskId),
+          ]);
         } catch (err) {
           console.error("Failed to refetch chats after ChatListChanged:", err);
           return;
         }
-        const freshIds = new Set(fresh.map((chat) => chat.id));
+        setArchivedChats(freshArchived);
+        const current = getActiveChatId();
+        const currentChat = current
+          ? chatsRef.current.find((chat) => chat.id === current)
+          : undefined;
+        const currentWs = current ? wsMapRef.current.get(current) : undefined;
+        const currentWasArchived = current
+          ? freshArchived.some((chat) => chat.id === current)
+          : false;
+        // UserMessage/Complete activity emits ChatListChanged. A transiently
+        // incomplete list response must not tear down the live active chat:
+        // doing so restores default per-chat state while the same Agent keeps
+        // streaming, which makes every composer capability disappear until a
+        // later navigation hydrates session.json again. Explicit archive and
+        // delete flows close their socket separately, so preserving an open,
+        // non-archived active session here is safe.
+        const preserveLiveCurrent =
+          !!current &&
+          !!currentChat &&
+          !fresh.some((chat) => chat.id === current) &&
+          !currentWasArchived &&
+          currentWs?.readyState === WebSocket.OPEN;
+        const visibleFresh = preserveLiveCurrent
+          ? [currentChat, ...fresh]
+          : fresh;
+        const freshIds = new Set(visibleFresh.map((chat) => chat.id));
         wsMapRef.current.forEach((ws, chatId) => {
           if (freshIds.has(chatId)) return;
           intentionalCloseRef.current.add(chatId);
@@ -4236,7 +4424,7 @@ export function TaskChat({
           cancelPendingReconnectRef.current(chatId);
         });
 
-        setChats(fresh);
+        setChats(visibleFresh);
 
         // If a tray/notification deep-link was waiting on this chat to
         // appear (race: Open clicked before grove_agent_graph_spawn's chat is in
@@ -4248,7 +4436,7 @@ export function TaskChat({
         const pendingMatches =
           pending !== undefined &&
           pending.projectId === projectId &&
-          pending.taskId === task.id &&
+          pending.taskId === taskId &&
           freshIds.has(pending.chatId);
         if (pendingMatches && pending) {
           const targetId = pending.chatId;
@@ -4256,22 +4444,21 @@ export function TaskChat({
           if (!pinnedChatId) {
             setActiveChatId(targetId);
           }
-          writeLastActiveTab("chat", projectId, task.id, targetId);
+          writeLastActiveTab("chat", projectId, taskId, targetId);
           restoreChatState(targetId);
           await connectChatWsRef.current(targetId);
           wsRef.current = wsMapRef.current.get(targetId) ?? null;
           return;
         }
 
-        const current = getActiveChatId();
         if (current && freshIds.has(current)) return;
 
-        const next = fresh[fresh.length - 1];
+        const next = visibleFresh[0];
         if (next) {
           if (!pinnedChatId) {
             setActiveChatId(next.id);
           }
-          writeLastActiveTab("chat", projectId, task.id, next.id);
+          writeLastActiveTab("chat", projectId, taskId, next.id);
           restoreChatState(next.id);
           await connectChatWsRef.current(next.id);
           wsRef.current = wsMapRef.current.get(next.id) ?? null;
@@ -4291,9 +4478,10 @@ export function TaskChat({
   const switchChatRef = useRef<(chatId: string) => void>(() => {});
   useEffect(() => {
     const handler = (e: Event) => {
+      if (!canManageSessions) return;
       const detail = (e as CustomEvent).detail;
       if (!detail?.chatId) return;
-      if (detail.projectId !== projectId || detail.taskId !== task.id) return;
+      if (detail.projectId !== projectId || detail.taskId !== taskId) return;
       // If the target chat isn't in our list yet (just spawned, MCP write
       // hasn't propagated to listChats), park it as pending so the
       // ChatListChanged handler picks it up. Otherwise switch immediately.
@@ -4310,7 +4498,7 @@ export function TaskChat({
     };
     window.addEventListener("grove:switch-chat", handler);
     return () => window.removeEventListener("grove:switch-chat", handler);
-  }, [projectId, task.id]);
+  }, [canManageSessions, projectId, taskId]);
 
   // ─── Per-chat WebSocket management ─────────────────────────────────────
 
@@ -4331,6 +4519,7 @@ export function TaskChat({
   /** Connect a WebSocket for a given chat ID (idempotent) */
   const connectChatWs = useCallback(
     async (chatId: string, importing = false) => {
+      if (finishedRef.current) return;
       if (wsMapRef.current.has(chatId)) return; // Already connected
       if (connectingRef.current.has(chatId)) return; // Connection already in-flight
       // Terminal-mode chats have no ACP WebSocket — they speak PTY only.
@@ -4353,10 +4542,13 @@ export function TaskChat({
       const host = getApiHost();
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const url = await appendHmacToUrl(
-        `${protocol}//${host}/api/v1/projects/${projectId}/tasks/${task.id}/chats/${chatId}/ws${importing ? "?import=true" : ""}`,
+        `${protocol}//${host}/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/ws${importing ? "?import=true" : ""}`,
       );
 
       connectingRef.current.delete(chatId);
+      // The Run may have reached its terminal state while URL signing was in
+      // flight. A finished view must never create a late live attachment.
+      if (finishedRef.current) return;
       // Re-check after async gap: another call may have connected while we awaited
       if (wsMapRef.current.has(chatId)) return;
 
@@ -4460,7 +4652,7 @@ export function TaskChat({
           reconnectAttemptRef.current.set(chatId, attempt + 1);
           const timer = setTimeout(() => {
             reconnectTimerRef.current.delete(chatId);
-            if (!wsMapRef.current.has(chatId)) {
+            if (!finishedRef.current && !wsMapRef.current.has(chatId)) {
               connectChatWsRef.current(chatId).then(() => {
                 if (chatId === getActiveChatId()) {
                   wsRef.current = wsMapRef.current.get(chatId) ?? null;
@@ -4479,13 +4671,34 @@ export function TaskChat({
         }
       };
     },
-    [projectId, task.id, getActiveChatId],
+    [projectId, taskId, getActiveChatId],
   );
 
 
   useEffect(() => {
     connectChatWsRef.current = connectChatWs;
   }, [connectChatWs]);
+
+  // A finished Run is a persisted, read-only transcript. Detach this view
+  // from every live transport without killing the Agent-owned session.
+  useEffect(() => {
+    if (!finished) return;
+
+    reconnectTimerRef.current.forEach((timer) => clearTimeout(timer));
+    reconnectTimerRef.current.clear();
+    reconnectAttemptRef.current.clear();
+    connectingRef.current.clear();
+    wsMapRef.current.forEach((_, chatId) => intentionalCloseRef.current.add(chatId));
+    wsMapRef.current.forEach((ws) => ws.close());
+    wsMapRef.current.clear();
+    intentionalCloseRef.current.clear();
+    wsRef.current = null;
+    wsEventBufferRef.current = [];
+    setIsConnected(false);
+    setConnectPhase(null);
+    setConnectPhaseStartedAt(null);
+    updateBusy(false);
+  }, [finished, updateBusy]);
 
   // activeChatIdRef is owned by useActiveChatId — no separate declaration here.
 
@@ -4555,7 +4768,7 @@ export function TaskChat({
     if (!isInitialImport) wsEventBufferRef.current = [];
     (async () => {
       // Step 1: Connect WS for real-time events
-      await connectChatWs(chatId);
+      if (!isReadOnlyHistory) await connectChatWs(chatId);
       wsRef.current = wsMapRef.current.get(chatId) ?? null;
       // A newly imported chat has no Grove history yet. Its first render is
       // the live session/load replay; later opens use the normal HTTP history
@@ -4568,7 +4781,7 @@ export function TaskChat({
       if (chatId !== getActiveChatId()) return;
       let res: Awaited<ReturnType<typeof getChatHistory>>;
       try {
-        res = await getChatHistory(projectId, task.id, chatId);
+        res = await getChatHistory(projectId, taskId, chatId);
       } catch {
         historyLoadingRef.current = false;
         wsEventBufferRef.current = [];
@@ -4585,13 +4798,16 @@ export function TaskChat({
           }
         }
         // Drain buffered WS events that arrived during HTTP load
-        const buffered = wsEventBufferRef.current;
+        const buffered = isReadOnlyHistory ? [] : wsEventBufferRef.current;
         wsEventBufferRef.current = [];
         historyLoadingRef.current = false;
         // Reduce buffered message events into msgs locally (avoids React batching concerns)
         for (const evt of buffered) {
           msgs = reduceHistoryMessages(msgs, evt);
         }
+        // Capture the complete History evidence before applying the optional
+        // render window. A visual optimization must not erase Memory usage.
+        setReadMemoryIds(collectReadMemoryIds(msgs));
         const attachmentCounters = buildAttachmentCounters(msgs);
         const prunedHistory = pruneChatViewMessages(
           msgs,
@@ -4674,6 +4890,42 @@ export function TaskChat({
                 const state =
                   perChatStateRef.current.get(chatId) ?? defaultPerChatState();
                 state.isConnected = true;
+                if (evt.uses_config_options || (Array.isArray(evt.config_options) && evt.config_options.length > 0)) {
+                  applyConfigOptionsToCachedState(state, evt.config_options ?? []);
+                } else {
+                  state.sessionConfigOptions = [];
+                  state.modeOptions = (evt.available_modes ?? []).map(
+                    (mode: { id: string; name: string; description?: string }) => ({
+                      label: mode.name,
+                      value: mode.id,
+                      description: mode.description,
+                    }),
+                  );
+                  state.permissionLevel = evt.current_mode_id ?? "";
+                  state.modelOptions = (evt.available_models ?? []).map(
+                    (model: { id: string; name: string }) => ({
+                      label: model.name,
+                      value: model.id,
+                    }),
+                  );
+                  state.selectedModel = evt.current_model_id ?? "";
+                  state.thoughtLevelOptions = (evt.available_thought_levels ?? []).map(
+                    (level: { id: string; name: string }) => ({
+                      label: level.name,
+                      value: level.id,
+                    }),
+                  );
+                  state.thoughtLevel = evt.current_thought_level_id ?? "";
+                  state.thoughtLevelConfigId = evt.thought_level_config_id ?? "";
+                }
+                if (evt.prompt_capabilities) {
+                  state.promptCaps = {
+                    image: evt.prompt_capabilities.image ?? false,
+                    audio: evt.prompt_capabilities.audio ?? false,
+                    embeddedContext:
+                      evt.prompt_capabilities.embedded_context ?? false,
+                  };
+                }
                 state.forkCapable = !!evt.fork_capable;
                 state.importCapable = !!evt.import_capable;
                 state.deleteCapable = !!evt.delete_capable;
@@ -4839,7 +5091,7 @@ export function TaskChat({
     // loading after this effect's first run (when launch_mode was still
     // undefined → connectChatWs bailed), the effect re-fires with the
     // resolved mode and routes the chat correctly (ACP WS vs PTY-only).
-  }, [activeChatId, activeChat?.launch_mode, connectChatWs, projectId, task.id, updateBusy, chatRenderWindowSettings, updateHiddenMessageCount, getActiveChatId, seedChatDefaults, applyConfigOptionsSnapshot]);
+  }, [activeChatId, activeChat?.launch_mode, connectChatWs, isReadOnlyHistory, projectId, taskId, updateBusy, chatRenderWindowSettings, updateHiddenMessageCount, getActiveChatId, seedChatDefaults, applyConfigOptionsSnapshot]);
 
   // Cleanup all WebSockets on unmount, plus any pending reconnect timers —
   // otherwise an in-flight backoff timer fires after unmount and creates a
@@ -5081,6 +5333,14 @@ export function TaskChat({
                 state.thoughtLevel = msg.current_thought_level_id ?? "";
                 state.thoughtLevelConfigId = msg.thought_level_config_id ?? "";
               }
+              if (msg.prompt_capabilities) {
+                state.promptCaps = {
+                  image: msg.prompt_capabilities.image ?? false,
+                  audio: msg.prompt_capabilities.audio ?? false,
+                  embeddedContext:
+                    msg.prompt_capabilities.embedded_context ?? false,
+                };
+              }
               state.forkCapable = !!msg.fork_capable;
               state.importCapable = !!msg.import_capable;
               state.deleteCapable = !!msg.delete_capable;
@@ -5199,6 +5459,9 @@ export function TaskChat({
           setMessages((prev) => reduceHistoryMessages(prev, msg));
           break;
         case "complete":
+          // Snapshot this before the WorkSummary compaction changes the list
+          // height and Virtuoso emits transient atBottom=false callbacks.
+          preserveBottomOnBusyEndRef.current = autoStickToBottomRef.current;
           setAutoExpandSectionId((prev) => {
             if (prev) {
               setExpandedSections((s) => {
@@ -5222,6 +5485,9 @@ export function TaskChat({
           onChatBecameIdle?.();
           break;
         case "busy":
+          if (!msg.value) {
+            preserveBottomOnBusyEndRef.current = autoStickToBottomRef.current;
+          }
           updateBusy(msg.value);
           if (!msg.value) {
             setMessages((prev) => pruneActiveChatMessages(prev));
@@ -5589,6 +5855,18 @@ export function TaskChat({
         case "terminal_chunk":
         case "terminal_complete":
           state.messages = reduceHistoryMessages(state.messages, msg);
+          state.readMemoryIds = [
+            ...new Set([
+              ...(state.readMemoryIds ?? []),
+              ...collectReadMemoryIds(state.messages),
+            ]),
+          ];
+          if (msg.type === "terminal_execute") {
+            state.isBusy = true;
+            setSessionActivity((previous) =>
+              updateSessionRunning(previous, chatId, true, getActiveChatId()),
+            );
+          }
           if (msg.type === "complete" || msg.type === "terminal_complete") {
             const pruned = pruneChatViewMessages(
               state.messages,
@@ -5598,6 +5876,9 @@ export function TaskChat({
             state.messages = pruned.messages;
             state.hiddenMessageCount = pruned.hiddenMessageCount;
             state.isBusy = false;
+            setSessionActivity((previous) =>
+              updateSessionRunning(previous, chatId, false, getActiveChatId()),
+            );
           }
           break;
         case "queue_update":
@@ -5617,6 +5898,9 @@ export function TaskChat({
           break;
         case "busy":
           state.isBusy = msg.value;
+          setSessionActivity((previous) =>
+            updateSessionRunning(previous, chatId, msg.value, getActiveChatId()),
+          );
           if (!msg.value) {
             const pruned = pruneChatViewMessages(
               state.messages,
@@ -5654,7 +5938,7 @@ export function TaskChat({
       }
       perChatStateRef.current.set(chatId, state);
     },
-    [chatRenderWindowSettings],
+    [chatRenderWindowSettings, getActiveChatId],
   );
 
   // Keep refs in sync so connectChatWs WS handlers always call latest versions
@@ -5675,7 +5959,7 @@ export function TaskChat({
 
     // Load initial history
     const chatId = activeChatId;
-    getChatHistory(projectId, task.id, chatId, 0)
+    getChatHistory(projectId, taskId, chatId, 0)
       .then((res) => {
         if (res.events.length > 0) {
           for (const evt of res.events) {
@@ -5692,7 +5976,7 @@ export function TaskChat({
       try {
         res = await getChatHistory(
           projectId,
-          task.id,
+          taskId,
           chatId,
           pollingOffsetRef.current,
         );
@@ -5718,7 +6002,7 @@ export function TaskChat({
       clearInterval(timer);
       pollingTimerRef.current = null;
     };
-  }, [isRemoteSession, activeChatId, projectId, task.id]);
+  }, [isRemoteSession, activeChatId, projectId, taskId]);
 
   // ─── Chat switching ────────────────────────────────────────────────────
 
@@ -5729,18 +6013,26 @@ export function TaskChat({
       // automatic callers (post-new-chat, grove:switch-chat event,
       // grove:select-chat event) become no-ops here so the pin holds.
       if (pinnedChatId) return;
+      if (!canManageSessions && chatId !== fixedChatId) return;
+      setSessionActivity((previous) => markSessionRead(previous, chatId));
       if (chatId === activeChatId) return;
       perfMark("TaskChat:switchChat", { from: activeChatId, to: chatId });
       saveCurrentChatState();
       setActiveChatId(chatId);
-      writeLastActiveTab("chat", projectId, task.id, chatId);
+      writeLastActiveTab("chat", projectId, taskId, chatId);
       restoreChatState(chatId);
       setShowChatMenu(false);
-      // Connect WS if needed
-      await connectChatWs(chatId);
-      wsRef.current = wsMapRef.current.get(chatId) ?? null;
+      const archived = archivedChats.some((chat) => chat.id === chatId);
+      if (!archived) {
+        await connectChatWs(chatId);
+        wsRef.current = wsMapRef.current.get(chatId) ?? null;
+      } else {
+        wsRef.current = null;
+        setIsConnected(false);
+        updateBusy(false);
+      }
     },
-    [pinnedChatId, activeChatId, projectId, task.id, saveCurrentChatState, restoreChatState, connectChatWs, setActiveChatId],
+    [pinnedChatId, activeChatId, archivedChats, canManageSessions, fixedChatId, projectId, taskId, saveCurrentChatState, restoreChatState, connectChatWs, setActiveChatId, updateBusy],
   );
   useEffect(() => {
     switchChatRef.current = switchChat;
@@ -5761,6 +6053,7 @@ export function TaskChat({
 
   const handleNewChatWithAgent = useCallback(
     async (agent: string, launchMode?: string) => {
+      if (!canManageSessions) return;
       setShowAgentPicker(false);
       try {
         // Omit the title so the backend names the session after the chosen
@@ -5768,18 +6061,18 @@ export function TaskChat({
         // tell sessions apart in the Blitz grid than "New Session <date>".
         const newChat = await createChat(
           projectId,
-          task.id,
+          taskId,
           undefined,
           agent,
           launchMode,
         );
-        setChats((prev) => [...prev, newChat]);
+        setChats((prev) => [newChat, ...prev]);
         switchChat(newChat.id);
       } catch (err) {
         console.error("Failed to create chat:", err);
       }
     },
-    [projectId, task.id, switchChat],
+    [canManageSessions, projectId, taskId, switchChat],
   );
 
   // Listen for the two agent-related catalog dispatches:
@@ -5790,18 +6083,22 @@ export function TaskChat({
   //   agent.picker.show    → just open the picker, user chooses.
   useEffect(() => {
     const onDefault = () => {
-      void (async () => {
-        // Prefer the configured default agent (acp.agent_command); fall back
-        // to the last-used agent, then "claude".
-        const cfg = await getConfig().catch(() => null);
-        const agent =
-          cfg?.acp?.agent_command ||
-          chats[chats.length - 1]?.agent ||
-          "claude";
-        await handleNewChatWithAgent(agent);
-      })();
+      if (!canManageSessions) return;
+      // Prefer the agent used by the most recent chat. If no chats exist,
+      // open the picker rather than guessing — agent identity is the
+      // user's choice, not a hardcoded fallback.
+      const fallback = chats[0]?.agent;
+      if (fallback) {
+        void handleNewChatWithAgent(fallback);
+      } else {
+        const anchor =
+          headerAgentPickerRef.current ?? sidebarAgentPickerRef.current;
+        if (anchor) toggleAgentPicker(anchor);
+        else setShowAgentPicker(true);
+      }
     };
     const onPicker = () => {
+      if (!canManageSessions) return;
       // Prefer the header button as anchor; fall back to the sidebar
       // rail (Studio task) or just open without an anchor.
       const anchor =
@@ -5815,7 +6112,7 @@ export function TaskChat({
       window.removeEventListener("grove:new-session-default-agent", onDefault);
       window.removeEventListener("grove:show-agent-picker", onPicker);
     };
-  }, [handleNewChatWithAgent, chats, toggleAgentPicker]);
+  }, [canManageSessions, handleNewChatWithAgent, chats, toggleAgentPicker]);
 
   // ─── Chat title editing ─────────────────────────────────────────────────
 
@@ -5827,7 +6124,7 @@ export function TaskChat({
     try {
       await updateChatTitle(
         projectId,
-        task.id,
+        taskId,
         editingTitle.chatId,
         editTitleValue.trim(),
       );
@@ -5842,28 +6139,93 @@ export function TaskChat({
       console.error("Failed to update chat title:", err);
     }
     setEditingTitle(null);
-  }, [editingTitle, editTitleValue, projectId, task.id]);
+  }, [editingTitle, editTitleValue, projectId, taskId]);
+
+  const handleArchiveChat = useCallback(
+    async (chatId: string) => {
+      if (chats.length <= 1 || sessionActivity[chatId]?.running) return;
+      try {
+        const archived = await archiveChat(projectId, taskId, chatId);
+        const ws = wsMapRef.current.get(chatId);
+        if (ws) {
+          intentionalCloseRef.current.add(chatId);
+          ws.close();
+          wsMapRef.current.delete(chatId);
+        }
+        cancelPendingReconnectRef.current(chatId);
+        setArchivedChats((previous) =>
+          previous.some((chat) => chat.id === archived.id)
+            ? previous
+            : [archived, ...previous],
+        );
+        const remaining = chats.filter((chat) => chat.id !== chatId);
+        setChats(remaining);
+        setSessionActivity((previous) => removeSessionActivity(previous, chatId));
+        if (chatId === activeChatId) {
+          const next = remaining[0];
+          if (next) {
+            setActiveChatId(next.id);
+            writeLastActiveTab("chat", projectId, taskId, next.id);
+            restoreChatState(next.id);
+            await connectChatWs(next.id);
+            wsRef.current = wsMapRef.current.get(next.id) ?? null;
+          }
+        }
+      } catch (error) {
+        console.error("Failed to archive session:", error);
+      }
+      setShowChatMenu(false);
+    },
+    [activeChatId, chats, connectChatWs, projectId, restoreChatState, sessionActivity, setActiveChatId, taskId],
+  );
+
+  const handleRestoreChat = useCallback(
+    async (chatId: string) => {
+      try {
+        await restoreChat(projectId, taskId, chatId);
+        const [fresh, freshArchived] = await Promise.all([
+          listChats(projectId, taskId),
+          listArchivedChats(projectId, taskId),
+        ]);
+        setArchivedChats(freshArchived);
+        setChats(fresh);
+        if (chatId === activeChatId) {
+          await connectChatWs(chatId);
+          wsRef.current = wsMapRef.current.get(chatId) ?? null;
+        }
+      } catch (error) {
+        console.error("Failed to restore session:", error);
+      }
+    },
+    [activeChatId, connectChatWs, projectId, taskId],
+  );
 
   // ─── Chat deletion ─────────────────────────────────────────────────────
 
   const requestDeleteChat = useCallback(
     (chatId: string) => {
+      const isArchived = archivedChats.some((chat) => chat.id === chatId);
       setShowChatMenu(false);
       setDeleteError(null);
       setDeleteConfirmTargetCapable(
-        chatId === activeChatId && isConnected && !isRemoteSession && deleteCapable,
+        !isArchived &&
+          chatId === activeChatId &&
+          isConnected &&
+          !isRemoteSession &&
+          deleteCapable,
       );
       setDeleteConfirmChatId(chatId);
     },
-    [activeChatId, deleteCapable, isConnected, isRemoteSession],
+    [activeChatId, archivedChats, deleteCapable, isConnected, isRemoteSession],
   );
 
   const handleDeleteChat = useCallback(
     async (chatId: string, scope: "grove" | "agent") => {
-      if (chats.length <= 1) return; // Don't delete the last chat
+      const deletingArchived = archivedChats.some((chat) => chat.id === chatId);
+      if (!deletingArchived && chats.length <= 1) return; // Keep one active chat
       setIsDeletingChat(true);
       try {
-        await deleteChat(projectId, task.id, chatId, scope);
+        await deleteChat(projectId, taskId, chatId, scope);
         // Close WebSocket if connected; cancel any pending reconnect timer so
         // it doesn't fire later trying to reconnect a deleted chat.
         const ws = wsMapRef.current.get(chatId);
@@ -5874,18 +6236,27 @@ export function TaskChat({
         }
         cancelPendingReconnectRef.current(chatId);
         perChatStateRef.current.delete(chatId);
-        setChats((prev) => {
-          const updated = prev.filter((c) => c.id !== chatId);
-          if (chatId === activeChatId && updated.length > 0) {
-            const next = updated[updated.length - 1];
+        setSessionActivity((previous) => removeSessionActivity(previous, chatId));
+        const remaining = chats.filter((chat) => chat.id !== chatId);
+        if (deletingArchived) {
+          setArchivedChats((previous) =>
+            previous.filter((chat) => chat.id !== chatId),
+          );
+        } else {
+          setChats(remaining);
+        }
+        if (chatId === activeChatId) {
+          const next = remaining[0];
+          if (next) {
             if (!pinnedChatId) {
               setActiveChatId(next.id);
             }
-            writeLastActiveTab("chat", projectId, task.id, next.id);
+            writeLastActiveTab("chat", projectId, taskId, next.id);
             restoreChatState(next.id);
+            await connectChatWs(next.id);
+            wsRef.current = wsMapRef.current.get(next.id) ?? null;
           }
-          return updated;
-        });
+        }
         setDeleteConfirmChatId(null);
         setDeleteConfirmTargetCapable(false);
         setDeleteError(null);
@@ -5897,7 +6268,7 @@ export function TaskChat({
       }
       setShowChatMenu(false);
     },
-    [chats.length, projectId, task.id, activeChatId, pinnedChatId, restoreChatState, setActiveChatId],
+    [activeChatId, archivedChats, chats, connectChatWs, pinnedChatId, projectId, restoreChatState, setActiveChatId, taskId],
   );
 
   // ─── Chat fork ─────────────────────────────────────────────────────────
@@ -5907,12 +6278,12 @@ export function TaskChat({
   const handleForkChat = useCallback(
     async (chatId: string) => {
       try {
-        const created = await forkChat(projectId, task.id, chatId);
-        setChats((prev) => [...prev, created]);
+        const created = await forkChat(projectId, taskId, chatId);
+        setChats((prev) => [created, ...prev]);
         if (!pinnedChatId) {
           setActiveChatId(created.id);
         }
-        writeLastActiveTab("chat", projectId, task.id, created.id);
+        writeLastActiveTab("chat", projectId, taskId, created.id);
         restoreChatState(created.id);
       } catch (err) {
         // Fork 通常因 source agent 进程已退出 / agent busy / agent 拒绝
@@ -5927,7 +6298,7 @@ export function TaskChat({
       }
       setShowChatMenu(false);
     },
-    [projectId, task.id, pinnedChatId, restoreChatState, setActiveChatId],
+    [projectId, taskId, pinnedChatId, restoreChatState, setActiveChatId],
   );
 
   const loadImportSessions = useCallback(async (cursor?: string) => {
@@ -5936,7 +6307,7 @@ export function TaskChat({
     const requestId = ++importRequestRef.current;
     setImportLoading(true);
     try {
-      const page = await listImportSessions(projectId, task.id, requestedChatId, cursor);
+      const page = await listImportSessions(projectId, taskId, requestedChatId, cursor);
       if (importRequestRef.current !== requestId || getActiveChatId() !== requestedChatId) return;
       setImportSessions((previous) => cursor ? [...previous, ...page.sessions] : page.sessions);
       setImportNextCursor(page.next_cursor);
@@ -5948,13 +6319,13 @@ export function TaskChat({
         setImportLoading(false);
       }
     }
-  }, [activeChatId, getActiveChatId, importLoading, projectId, task.id]);
+  }, [activeChatId, getActiveChatId, importLoading, projectId, taskId]);
 
   const handleImportSession = useCallback(async (session: ImportableSession) => {
     if (!activeChatId || importLoading) return;
     setImportLoading(true);
     try {
-      const created = await importSession(projectId, task.id, activeChatId, session);
+      const created = await importSession(projectId, taskId, activeChatId, session);
       if (!chatsRef.current.some((chat) => chat.id === created.id)) {
         chatsRef.current = [...chatsRef.current, created];
       }
@@ -5969,7 +6340,7 @@ export function TaskChat({
       initialImportChatIdRef.current = created.id;
       const connecting = connectChatWs(created.id, true);
       setActiveChatId(created.id);
-      writeLastActiveTab("chat", projectId, task.id, created.id);
+      writeLastActiveTab("chat", projectId, taskId, created.id);
       restoreChatState(created.id);
       await connecting;
       wsRef.current = wsMapRef.current.get(created.id) ?? null;
@@ -5979,7 +6350,7 @@ export function TaskChat({
     } finally {
       setImportLoading(false);
     }
-  }, [activeChatId, connectChatWs, importLoading, projectId, restoreChatState, saveCurrentChatState, setActiveChatId, task.id]);
+  }, [activeChatId, connectChatWs, importLoading, projectId, restoreChatState, saveCurrentChatState, setActiveChatId, taskId]);
 
   // ─── User actions ────────────────────────────────────────────────────────
 
@@ -6220,7 +6591,7 @@ export function TaskChat({
     setIsTakingControl(true);
     let ok = true;
     try {
-      await takeControl(projectId, task.id, activeChatId);
+      await takeControl(projectId, taskId, activeChatId);
     } catch {
       ok = false;
     }
@@ -6262,14 +6633,14 @@ export function TaskChat({
     await connectChatWs(activeChatId);
     wsRef.current = wsMapRef.current.get(activeChatId) ?? null;
     setIsTakingControl(false);
-  }, [activeChatId, isTakingControl, projectId, task.id, connectChatWs]);
+  }, [activeChatId, isTakingControl, projectId, taskId, connectChatWs]);
 
   const handleSavePlanToNote = useCallback(async () => {
     if (!planFileContent || isSavingToNote) return;
     setIsSavingToNote(true);
     setSaveToNoteDone(false);
     try {
-      await updateNotes(projectId, task.id, planFileContent);
+      await updateNotes(projectId, taskId, planFileContent);
       setSaveToNoteDone(true);
       setTimeout(() => setSaveToNoteDone(false), 2000);
     } catch {
@@ -6279,7 +6650,7 @@ export function TaskChat({
       ]);
     }
     setIsSavingToNote(false);
-  }, [planFileContent, isSavingToNote, projectId, task.id]);
+  }, [planFileContent, isSavingToNote, projectId, taskId]);
 
   // Legacy compatibility for queued messages created before full ACP
   // configOptions support. New sessions change settings immediately and do
@@ -6397,7 +6768,7 @@ export function TaskChat({
               const data = att.pendingFile
                 ? await fileToBase64(att.pendingFile)
                 : att.data;
-              return uploadChatAttachment(projectId, task.id, activeChatId, {
+              return uploadChatAttachment(projectId, taskId, activeChatId, {
                 name: att.pendingFile?.name ?? att.name,
                 mime_type: att.mimeType || undefined,
                 data,
@@ -6504,7 +6875,7 @@ export function TaskChat({
         const uploadResults = await Promise.all(
           pendingOnes.map(async (att) => {
             const data = await fileToBase64(att.pendingFile!);
-            return uploadChatAttachment(projectId, task.id, activeChatId, {
+            return uploadChatAttachment(projectId, taskId, activeChatId, {
               name: att.pendingFile!.name,
               mime_type: att.pendingFile!.type || undefined,
               data,
@@ -6617,7 +6988,7 @@ export function TaskChat({
       onUserMessageSent?.();
       el.focus();
     }
-  }, [isTerminalMode, isBusy, attachments, activeChatId, isConnected, projectId, task.id, enableAutoStickToBottom, onUserMessageSent, buildPromptConfig, isTerminalLaunchMode, agentPtyWsUrl]);
+  }, [isTerminalMode, isBusy, attachments, activeChatId, isConnected, projectId, taskId, enableAutoStickToBottom, onUserMessageSent, buildPromptConfig, isTerminalLaunchMode, agentPtyWsUrl]);
 
   const sendPreviewComments = useCallback((comments: PreviewCommentDraft[]) => {
     if (
@@ -6799,32 +7170,35 @@ export function TaskChat({
 
   // ── Chat command registrations (catalog: workspace scope) ─────────────
   // These mirror existing UI handlers so the same actions are reachable
-  // via shortcuts / the Cmd+K palette / Settings rebinding. Local DOM
-  // keybindings in onKeyDown still own composer-local semantics (Enter vs
-  // Shift+Enter inside contenteditable) — these registry entries only
-  // surface for catalog binding overrides + palette discovery.
-  // Multiple TaskChats coexist in the Blitz grid, and each registers
-  // `chat.send`. The command registry now keeps every handler and dispatches
-  // to the first whose `enabled()` passes, so we gate on "is focus inside THIS
-  // panel?" (same guard as chat.search.toggle) to route Enter to the focused
-  // pane. Without it, Enter sent to whichever chat mounted last. In single-pane
-  // Zen the only instance is the focused one, so behaviour is unchanged.
-  const sendFocusInPanel = () => {
-    const root = taskChatRootRef.current;
-    const active = document.activeElement;
-    return !!(root && active && root.contains(active));
-  };
+  // via shortcuts / the Cmd+K palette / Settings rebinding. Multiple
+  // keep-alive TaskChats may register these commands simultaneously, so send
+  // is enabled only for the instance whose composer actually owns focus.
   useCommand(
     "chat.send",
     () => { void handleSend(); },
-    { enabled: () => sendFocusInPanel() && !!activeChatId && !showFileMenu && !showSlashMenu && !isInputExpanded },
-    [activeChatId, showFileMenu, showSlashMenu, isInputExpanded, handleSend],
+    {
+      enabled: () =>
+        !!activeChatId &&
+        editableRef.current === document.activeElement &&
+        hasContent &&
+        !showFileMenu &&
+        !showSlashMenu &&
+        !isInputExpanded,
+    },
+    [activeChatId, hasContent, showFileMenu, showSlashMenu, isInputExpanded, handleSend],
   );
   useCommand(
     "chat.send.alt",
     () => { void handleSend(); },
-    { enabled: () => sendFocusInPanel() && !!activeChatId && !showFileMenu && !showSlashMenu },
-    [activeChatId, showFileMenu, showSlashMenu, handleSend],
+    {
+      enabled: () =>
+        !!activeChatId &&
+        editableRef.current === document.activeElement &&
+        hasContent &&
+        !showFileMenu &&
+        !showSlashMenu,
+    },
+    [activeChatId, hasContent, showFileMenu, showSlashMenu, handleSend],
   );
   useCommand(
     "chat.permission.cycle",
@@ -6851,8 +7225,8 @@ export function TaskChat({
   useCommand(
     "chat.fork",
     () => { if (activeChatId && forkCapable) void handleForkChat(activeChatId); },
-    { enabled: () => !!activeChatId && forkCapable },
-    [activeChatId, forkCapable, handleForkChat],
+    { enabled: () => canManageSessions && !!activeChatId && forkCapable },
+    [activeChatId, canManageSessions, forkCapable, handleForkChat],
   );
   useCommand(
     "chat.clear",
@@ -6896,6 +7270,7 @@ export function TaskChat({
   // Cycle through chats — switch active chat to the next/previous in the
   // chats list, wrapping at the ends. No-op when there's 0 or 1 chat.
   const cycleChat = useCallback((delta: 1 | -1) => {
+    if (!canManageSessions) return;
     const list = chatsRef.current;
     if (list.length < 2) return;
     const cur = list.findIndex((c) => c.id === activeChatId);
@@ -6905,12 +7280,13 @@ export function TaskChat({
     }
     const next = (cur + delta + list.length) % list.length;
     void switchChat(list[next].id);
-  }, [activeChatId, switchChat]);
+  }, [activeChatId, canManageSessions, switchChat]);
   useCommand("agent.switch.next", () => cycleChat(1), [cycleChat]);
   useCommand("agent.switch.previous", () => cycleChat(-1), [cycleChat]);
   useCommand(
     "chat.switchSession",
     (args?: unknown) => {
+      if (!canManageSessions) return;
       const typedArgs = args as { sessionId?: string; sessionTitle?: string; sessionIndex?: number } | undefined;
       if (typedArgs?.sessionId) {
         void switchChat(typedArgs.sessionId);
@@ -6930,7 +7306,7 @@ export function TaskChat({
         }
       }
     },
-    [switchChat],
+    [canManageSessions, switchChat],
   );
 
   /** Submit an ask_form response as a regular user prompt. Mirrors the queue /
@@ -7091,7 +7467,7 @@ export function TaskChat({
     intentionalCloseRef.current.add(chatId);
 
     try {
-      await reconnectChat(projectId, task.id, chatId);
+      await reconnectChat(projectId, taskId, chatId);
 
       // The backend normally closes this socket through SessionEnded. Keep a
       // local fallback for broken links where that close frame never arrives.
@@ -7133,7 +7509,7 @@ export function TaskChat({
     } finally {
       setIsReconnecting(false);
     }
-  }, [activeChatId, connectChatWs, getActiveChatId, isReconnecting, projectId, task.id, updateBusy]);
+  }, [activeChatId, connectChatWs, getActiveChatId, isReconnecting, projectId, taskId, updateBusy]);
 
   const handleReconnect = useCallback(() => {
     if (isReconnecting) return;
@@ -7513,7 +7889,9 @@ export function TaskChat({
               isDir,
               displayLabel || (matched?.displayName ?? ""),
               category,
-              matched?.favIconUrl
+              matched?.favIconUrl,
+              matched?.category === "Project Root" ? matched.sessionId : undefined,
+              theme.accentPalette,
             );
 
       const frag = document.createDocumentFragment();
@@ -7531,7 +7909,7 @@ export function TaskChat({
       setActiveCategory(null);
       checkContent();
     },
-    [checkContent, filteredFiles, triggerProjectFilesLoad, isStudioProject],
+    [checkContent, filteredFiles, triggerProjectFilesLoad, isStudioProject, theme.accentPalette],
   );
 
   const autocompleteFileAtCursor = useCallback(
@@ -7806,7 +8184,9 @@ export function TaskChat({
         false,
         matched?.displayName,
         matched?.category,
-        matched?.favIconUrl
+        matched?.favIconUrl,
+        matched?.category === "Project Root" ? matched.sessionId : undefined,
+        theme.accentPalette,
       );
 
       // Resolve a Range at the drop point. caretRangeFromPoint is WebKit/Blink;
@@ -7851,7 +8231,7 @@ export function TaskChat({
 
       checkContent();
     },
-    [checkContent, filteredFiles],
+    [checkContent, filteredFiles, theme.accentPalette],
   );
 
   /** Drag & drop handlers */
@@ -8275,16 +8655,15 @@ export function TaskChat({
     measuredRowHeights,
     TASK_CHAT_DEFAULT_ITEM_HEIGHT,
   );
-  // Virtuoso only consumes heightEstimates while constructing an empty size
-  // tree. Remount whenever the cold/hot boundary advances, or after the pane
-  // settles at a new width, so a turn leaving the hot zone enters the cold
-  // zone with the real height already measured for this generation.
+  // Keep the scroller mounted while the pane width and cold/hot boundary
+  // settle. Virtuoso remeasures mounted rows through ResizeObserver, while our
+  // height cache remains width-scoped. Including either transient value in
+  // the React key remounts the scroller after initial bottom positioning (and
+  // on every long-chat send), which can strand a streaming reader mid-chat.
   const virtualizationLayoutKey = taskChatVirtualizationLayoutKey({
     chatId: activeChatId ?? "none",
     hiddenMessageCount,
-    measurementWidth,
     virtualized: shouldVirtualizeChat,
-    coldBoundaryIndex: recentTurnStartRenderIndex,
   });
   const resolveActiveConversationTurnMessageIndex = useCallback((range: { startIndex: number }) => {
     let active = conversationTurns[0];
@@ -8545,11 +8924,14 @@ export function TaskChat({
     let secondFrame: number | null = null;
     const turnJustCompleted = !isBusy && wasBusyRef.current;
     wasBusyRef.current = isBusy;
+    const preserveCompletedTail = preserveBottomOnBusyEndRef.current;
+    if (turnJustCompleted) preserveBottomOnBusyEndRef.current = false;
     // Completing a turn automatically replaces its live sequential rows with
     // a compact WorkSummary. That can remove a large amount of height in one
     // commit. Preserve the tail only for readers who were already following
     // it; someone who intentionally scrolled into history remains detached.
-    if (turnJustCompleted && autoStickToBottomRef.current) {
+    if (turnJustCompleted && preserveCompletedTail) {
+      autoStickToBottomRef.current = true;
       firstFrame = requestAnimationFrame(() => {
         secondFrame = requestAnimationFrame(() => {
           if (autoStickToBottomRef.current) {
@@ -8564,10 +8946,9 @@ export function TaskChat({
     };
   }, [isBusy, scrollMessagesToBottom]);
 
-  // A layout generation changes when the direct/virtual renderer swaps, when
-  // the 50-turn boundary advances, or when the pane settles at a new width.
-  // All three rebuild Virtuoso's size tree. Preserve either the complete tail
-  // or an exact row + pixel-offset anchor across that rebuild.
+  // A layout generation changes when the direct/virtual renderer swaps.
+  // Preserve either the complete tail or an exact row + pixel-offset anchor
+  // across that rebuild.
   const previousVirtualizationLayoutRef = useRef({
     chatId: activeChatId,
     key: virtualizationLayoutKey,
@@ -8683,7 +9064,7 @@ export function TaskChat({
             isBusy={isBusy}
             agentLabel={agentLabel}
             projectId={projectId}
-            taskId={task.id}
+            taskId={taskId}
             activeChatId={activeChatId ?? undefined}
             previewCommentDrafts={taskPreviewCommentDrafts}
             onAddPreviewComment={addPreviewCommentDraft}
@@ -8829,7 +9210,7 @@ export function TaskChat({
       tabIndex={-1}
       initial={{ opacity: 0, y: -10 }}
       animate={{ opacity: 1, y: 0 }}
-      className={`flex-1 flex flex-col overflow-hidden relative outline-none ${fullscreen ? "" : "rounded-lg border border-[var(--color-border)]"}`}
+      className={`relative flex min-w-0 max-w-full flex-1 flex-col overflow-hidden outline-none ${fullscreen ? "" : "rounded-lg border border-[var(--color-border)]"}`}
       onPointerDown={(e) => {
         // Anchor keyboard focus to the chat panel on any click, so that
         // global Cmd/Ctrl+F handlers (which gate on activeElement) recognize
@@ -8893,6 +9274,7 @@ export function TaskChat({
                     <button
                       onClick={() => setShowChatMenu((prev) => !prev)}
                       onDoubleClick={() => {
+                        if (isViewingArchived) return;
                         setEditTitleValue(activeChat.title);
                         setEditingTitle({
                           chatId: activeChat.id,
@@ -8901,7 +9283,7 @@ export function TaskChat({
                         setShowChatMenu(false);
                       }}
                       className="flex max-w-full min-w-0 items-center gap-2 text-left"
-                      title="Double-click to rename"
+                      title={isViewingArchived ? "Archived session" : "Double-click to rename"}
                     >
                       {AgentIcon ? (
                         <AgentIcon
@@ -8936,6 +9318,9 @@ export function TaskChat({
                       <div className="max-h-64 overflow-y-auto py-1">
                         {orderedChats.map((chat) => {
                           const ChatIcon = getChatIcon(chat.agent);
+                          const activity = sessionActivity[chat.id];
+                          const isRunning = activity?.running ?? false;
+                          const hasUnreadCompletion = !isRunning && (activity?.unread ?? false);
                           return (
                             <div
                               key={chat.id}
@@ -8946,10 +9331,34 @@ export function TaskChat({
                               }`}
                               onClick={() => switchChat(chat.id)}
                             >
-                              <ChatIcon className="h-3.5 w-3.5 shrink-0" />
+                              <div
+                                className={`relative flex h-6 w-6 shrink-0 items-center justify-center rounded-md ${isRunning ? "taskchat-session-running" : ""}`}
+                                aria-label={isRunning ? "Session running" : undefined}
+                              >
+                                <ChatIcon className="h-3.5 w-3.5" />
+                              </div>
                               <div className="min-w-0 flex-1">
                                 <div className="truncate">{chat.title}</div>
                               </div>
+                              {hasUnreadCompletion && (
+                                <span
+                                  className="taskchat-session-unread-dot"
+                                  title="New completed activity"
+                                  aria-label="New completed activity"
+                                />
+                              )}
+                              {chats.length > 1 && !isRunning && (
+                                <button
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    void handleArchiveChat(chat.id);
+                                  }}
+                                  className="shrink-0 p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-highlight)] group-hover:opacity-100"
+                                  title="Archive session"
+                                >
+                                  <Archive className="h-3 w-3" />
+                                </button>
+                              )}
                               {chats.length > 1 && (
                                 <button
                                   onClick={(e) => {
@@ -8965,6 +9374,57 @@ export function TaskChat({
                             </div>
                           );
                         })}
+                        {archivedChats.length > 0 && (
+                          <div className="mt-1 border-t border-[color-mix(in_srgb,var(--color-border)_64%,transparent)] pt-1">
+                            <button
+                              type="button"
+                              onClick={() => setShowArchivedSessions((value) => !value)}
+                              className="flex w-full items-center gap-2 px-3 py-1.5 text-[11px] text-[var(--color-text-muted)] transition-colors hover:text-[var(--color-text)]"
+                            >
+                              <ChevronRight className={`h-3 w-3 transition-transform ${showArchivedSessions ? "rotate-90" : ""}`} />
+                              <Archive className="h-3 w-3" />
+                              <span className="flex-1 text-left">Archived</span>
+                              <span>{archivedChats.length}</span>
+                            </button>
+                            {showArchivedSessions && archivedChats.map((chat) => {
+                              const ChatIcon = getChatIcon(chat.agent);
+                              return (
+                                <div
+                                  key={chat.id}
+                                  className={`group flex cursor-pointer items-center gap-2 px-3 py-2 text-sm transition-colors ${chat.id === activeChatId ? "bg-[var(--color-bg-tertiary)] text-[var(--color-text)]" : "text-[var(--color-text-muted)] hover:bg-[var(--color-bg-secondary)] hover:text-[var(--color-text)]"}`}
+                                  onClick={() => switchChat(chat.id)}
+                                >
+                                  <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md opacity-65">
+                                    <ChatIcon className="h-3.5 w-3.5" />
+                                  </div>
+                                  <div className="min-w-0 flex-1 truncate">{chat.title}</div>
+                                  <button
+                                    type="button"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      void handleRestoreChat(chat.id);
+                                    }}
+                                    className="shrink-0 rounded p-0.5 opacity-0 transition-all hover:text-[var(--color-highlight)] group-hover:opacity-100"
+                                    title="Restore session"
+                                  >
+                                    <ArchiveRestore className="h-3 w-3" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      requestDeleteChat(chat.id);
+                                    }}
+                                    className="shrink-0 rounded p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-error)] group-hover:opacity-100"
+                                    title="Delete archived session"
+                                  >
+                                    <Trash2 className="h-3 w-3" />
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}
@@ -8985,7 +9445,17 @@ export function TaskChat({
                   <span>New</span>
                 </button>
               </div>
-              {activeChat && (
+              {activeChat && isViewingArchived ? (
+                <button
+                  type="button"
+                  onClick={() => void handleRestoreChat(activeChat.id)}
+                  className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-highlight)]"
+                  title="Restore session"
+                >
+                  <ArchiveRestore className="h-3.5 w-3.5" />
+                  <span>Restore</span>
+                </button>
+              ) : activeChat ? (
                 <SessionActionsMenu
                   surface="header"
                   chatId={activeChat.id}
@@ -8999,6 +9469,7 @@ export function TaskChat({
                   reconnectDisabled={isReconnecting || activeChat.launch_mode === "terminal"}
                   actionsDisabled={!isConnected || isBusy || !!activeAuthMessage}
                   deleteDisabled={chats.length <= 1}
+                  archiveDisabled={chats.length <= 1 || isBusy}
                   onFork={handleForkChat}
                   onOpenImport={() => { if (importSessions.length === 0) void loadImportSessions(); }}
                   onLoadMoreImport={() => { if (importNextCursor) void loadImportSessions(importNextCursor); }}
@@ -9007,16 +9478,19 @@ export function TaskChat({
                   onLogout={handleLogout}
                   onReconnect={handleReconnect}
                   onDelete={requestDeleteChat}
+                  onArchive={(chatId) => void handleArchiveChat(chatId)}
                 />
-              )}
+              ) : null}
             </div>
 
             <div className="flex shrink-0 items-center gap-1.5 select-none">
               <div
-                className={`w-2.5 h-2.5 rounded-full ${isConnected ? "bg-[var(--color-success)] animate-pulse" : "bg-[var(--color-warning)]"}`}
+                className={`w-2.5 h-2.5 rounded-full ${isViewingArchived ? "bg-[var(--color-text-muted)]" : isConnected ? "bg-[var(--color-success)] animate-pulse" : "bg-[var(--color-warning)]"}`}
               />
               <span className="text-xs text-[var(--color-text-muted)]">
-                {isConnected
+                {isViewingArchived
+                  ? "Archived"
+                  : isConnected
                   ? "Connected"
                   : connectPhase === "downloading" && connectPhaseStartedAt
                     ? <DownloadingLabel startedAt={connectPhaseStartedAt} />
@@ -9049,8 +9523,8 @@ export function TaskChat({
         </div>
       )}
 
-      <div className="flex min-h-0 flex-1">
-        <div
+      <div className="flex min-h-0 min-w-0 max-w-full flex-1 overflow-hidden">
+        {canManageSessions && <div
           className={`taskchat-session-rail shrink-0 border-r border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[color-mix(in_srgb,var(--color-bg-secondary)_20%,transparent)] transition-all duration-200 ${sessionRailCollapsed ? "w-0 overflow-hidden border-r-transparent" : "overflow-hidden"}`}
           style={{ width: sessionRailCollapsed ? 0 : sessionRailWidth }}
         >
@@ -9067,14 +9541,14 @@ export function TaskChat({
                 <div
                   className="min-w-0 flex items-center gap-2"
                   onDoubleClick={() => {
-                    if (!activeChat) return;
+                    if (!activeChat || isViewingArchived) return;
                     setEditTitleValue(activeChat.title);
                     setEditingTitle({
                       chatId: activeChat.id,
                       surface: "sidebar-header",
                     });
                   }}
-                  title="Double-click to rename"
+                  title={isViewingArchived ? "Archived session" : "Double-click to rename"}
                 >
                   {AgentIcon ? (
                     <AgentIcon
@@ -9108,10 +9582,12 @@ export function TaskChat({
                 </div>
                 <div className="flex items-center gap-1.5 text-[11px] text-[var(--color-text-muted)]">
                   <span
-                    className={`h-1.5 w-1.5 rounded-full ${isConnected ? "bg-[var(--color-success)]" : "bg-[var(--color-warning)]"}`}
+                    className={`h-1.5 w-1.5 rounded-full ${isViewingArchived ? "bg-[var(--color-text-muted)]" : isConnected ? "bg-[var(--color-success)]" : "bg-[var(--color-warning)]"}`}
                   />
                   <span>
-                    {isConnected
+                    {isViewingArchived
+                      ? "Archived"
+                      : isConnected
                       ? "Connected"
                       : connectPhase === "downloading" && connectPhaseStartedAt
                         ? <DownloadingLabel startedAt={connectPhaseStartedAt} compact />
@@ -9136,7 +9612,17 @@ export function TaskChat({
                       <span className="font-medium">New Session</span>
                     </button>
                   </div>
-                  {activeChat && (
+                  {activeChat && isViewingArchived ? (
+                    <button
+                      type="button"
+                      onClick={() => void handleRestoreChat(activeChat.id)}
+                      className="flex h-full shrink-0 items-center gap-1.5 rounded-md border border-dashed border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] px-2 text-[12px] text-[var(--color-text-muted)] transition-colors hover:border-[color-mix(in_srgb,var(--color-highlight)_34%,transparent)] hover:text-[var(--color-highlight)]"
+                      title="Restore session"
+                    >
+                      <ArchiveRestore className="h-3 w-3" />
+                      <span>Restore</span>
+                    </button>
+                  ) : activeChat ? (
                     <SessionActionsMenu
                       surface="sidebar"
                       chatId={activeChat.id}
@@ -9150,6 +9636,7 @@ export function TaskChat({
                       reconnectDisabled={isReconnecting || activeChat.launch_mode === "terminal"}
                       actionsDisabled={!isConnected || isBusy || !!activeAuthMessage}
                       deleteDisabled={chats.length <= 1}
+                      archiveDisabled={chats.length <= 1 || isBusy}
                       onFork={handleForkChat}
                       onOpenImport={() => { if (importSessions.length === 0) void loadImportSessions(); }}
                       onLoadMoreImport={() => { if (importNextCursor) void loadImportSessions(importNextCursor); }}
@@ -9158,12 +9645,16 @@ export function TaskChat({
                       onLogout={handleLogout}
                       onReconnect={handleReconnect}
                       onDelete={requestDeleteChat}
+                      onArchive={(chatId) => void handleArchiveChat(chatId)}
                     />
-                  )}
+                  ) : null}
                 </div>
                 {!pinnedChatId && orderedChats.map((chat) => {
                   const ChatIcon = getChatIcon(chat.agent);
                   const isActive = chat.id === activeChatId;
+                  const activity = sessionActivity[chat.id];
+                  const isRunning = activity?.running ?? false;
+                  const hasUnreadCompletion = !isRunning && (activity?.unread ?? false);
                   return (
                     <div
                       key={chat.id}
@@ -9187,7 +9678,7 @@ export function TaskChat({
                         title={chat.title}
                       >
                         <div
-                          className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-sm border ${
+                          className={`relative flex h-6 w-6 shrink-0 items-center justify-center rounded-sm border ${isRunning ? "taskchat-session-running" : ""} ${
                             isActive
                               ? "border-[color-mix(in_srgb,var(--color-highlight)_26%,transparent)] bg-[color-mix(in_srgb,var(--color-highlight)_10%,transparent)] text-[var(--color-highlight)]"
                               : "border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-transparent text-[var(--color-text-muted)]"
@@ -9213,6 +9704,27 @@ export function TaskChat({
                           )}
                         </div>
                       </button>
+                      {hasUnreadCompletion && (
+                        <span
+                          className="taskchat-session-unread-dot"
+                          title="New completed activity"
+                          aria-label="New completed activity"
+                        />
+                      )}
+                      {chats.length > 1 && !isRunning &&
+                        !(
+                          editingTitle?.chatId === chat.id &&
+                          editingTitle.surface === "sidebar-list"
+                        ) && (
+                          <button
+                            type="button"
+                            onClick={() => void handleArchiveChat(chat.id)}
+                            className="shrink-0 rounded p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-highlight)] group-hover:opacity-100"
+                            title="Archive session"
+                          >
+                            <Archive className="h-3 w-3" />
+                          </button>
+                        )}
                       {chats.length > 1 &&
                         !(
                           editingTitle?.chatId === chat.id &&
@@ -9229,13 +9741,68 @@ export function TaskChat({
                     </div>
                   );
                 })}
+                {archivedChats.length > 0 && (
+                  <div className="mt-1 border-t border-[color-mix(in_srgb,var(--color-border)_64%,transparent)] pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setShowArchivedSessions((value) => !value)}
+                      className="flex w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-[11px] text-[var(--color-text-muted)] transition-colors hover:bg-[color-mix(in_srgb,var(--color-bg-secondary)_72%,transparent)] hover:text-[var(--color-text)]"
+                    >
+                      <ChevronRight className={`h-3 w-3 transition-transform ${showArchivedSessions ? "rotate-90" : ""}`} />
+                      <Archive className="h-3 w-3" />
+                      <span className="flex-1 text-left">Archived</span>
+                      <span>{archivedChats.length}</span>
+                    </button>
+                    {showArchivedSessions && archivedChats.map((chat) => {
+                      const ChatIcon = getChatIcon(chat.agent);
+                      const isActive = chat.id === activeChatId;
+                      return (
+                        <div
+                          key={chat.id}
+                          className={`group mt-0.5 flex items-center gap-1.5 rounded-md border border-transparent px-1.5 py-1 transition-colors ${isActive ? "bg-[color-mix(in_srgb,var(--color-highlight)_7%,transparent)]" : "text-[var(--color-text-muted)] hover:bg-[color-mix(in_srgb,var(--color-bg-secondary)_72%,transparent)] hover:text-[var(--color-text)]"}`}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => switchChat(chat.id)}
+                            className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                            title={`${chat.title} · Archived`}
+                          >
+                            <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-sm border border-[color-mix(in_srgb,var(--color-border)_60%,transparent)] opacity-65">
+                              <ChatIcon className="h-3 w-3" />
+                            </div>
+                            <OverflowTitle
+                              text={chat.title}
+                              className={`text-[12px] leading-5 ${isActive ? "font-medium text-[var(--color-text)]" : ""}`}
+                            />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleRestoreChat(chat.id)}
+                            className="shrink-0 rounded p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-highlight)] group-hover:opacity-100"
+                            title="Restore session"
+                          >
+                            <ArchiveRestore className="h-3 w-3" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => requestDeleteChat(chat.id)}
+                            className="shrink-0 rounded p-0.5 text-[var(--color-text-muted)] opacity-0 transition-all hover:text-[var(--color-error)] group-hover:opacity-100"
+                            title="Delete archived session"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             </div>
           </div>
-        </div>
+        </div>}
 
         {/* Drag handle */}
-        {!sessionRailCollapsed && (
+        {canManageSessions && !sessionRailCollapsed && (
           <div
             className="diff-resizer"
             onPointerDown={startSessionRailResize}
@@ -9259,7 +9826,7 @@ export function TaskChat({
           />
           {/* Terminal launch mode: agent CLI runs in xterm.js (PTY).
               Chatbox input still writes lines to PTY stdin via handleSend. */}
-          {isTerminalLaunchMode && agentPtyWsUrl ? (
+          {!isReadOnlyHistory && isTerminalLaunchMode && agentPtyWsUrl ? (
             // Constrain xterm's height so the floating chatbox doesn't cover
             // the agent's bottom prompt. inputAreaHeight is the live-measured
             // chatbox height (ResizeObserver on inputAreaRef); +16 matches
@@ -9286,7 +9853,7 @@ export function TaskChat({
           <ChatListErrorBoundary
             resetKey={activeChatId}
             projectId={projectId}
-            taskId={task.id}
+            taskId={taskId}
           >
           {shouldVirtualizeChat ? (
           <Virtuoso
@@ -9366,7 +9933,35 @@ export function TaskChat({
           </ChatListErrorBoundary>
           )}
 
-          {/* Input */}
+          {/* Input / finished state */}
+          {isReadOnlyHistory ? (
+            <div
+              ref={inputAreaRef}
+              className="pointer-events-none absolute inset-x-0 z-10 px-3 pb-4 pt-2"
+              style={{ bottom: "max(var(--grove-kb-inset, 0px), env(safe-area-inset-bottom))" }}
+            >
+              <div className="pointer-events-none absolute inset-x-0 bottom-0 h-20 bg-[linear-gradient(to_top,color-mix(in_srgb,var(--color-bg)_96%,transparent),transparent)]" />
+              <div className="pointer-events-auto relative mx-auto flex w-fit max-w-full items-center gap-2 rounded-full border border-[color-mix(in_srgb,var(--color-success)_28%,var(--color-border))] bg-[color-mix(in_srgb,var(--color-bg)_94%,var(--color-success))] px-3.5 py-2 text-xs text-[var(--color-text-secondary)] shadow-sm backdrop-blur-md">
+                {isViewingArchived ? (
+                  <Archive className="h-4 w-4 shrink-0 text-[var(--color-text-muted)]" />
+                ) : (
+                  <CheckCircle2 className="h-4 w-4 shrink-0 text-[var(--color-success)]" />
+                )}
+                <span>{isViewingArchived ? "Archived session · Read-only history" : "Run finished · Read-only history"}</span>
+                {isViewingArchived && activeChat && (
+                  <button
+                    type="button"
+                    onClick={() => void handleRestoreChat(activeChat.id)}
+                    className="ml-1 flex shrink-0 items-center gap-1 rounded-full border border-[color-mix(in_srgb,var(--color-highlight)_30%,var(--color-border))] bg-[color-mix(in_srgb,var(--color-highlight)_9%,transparent)] px-2 py-0.5 font-medium text-[var(--color-highlight)] transition-colors hover:bg-[color-mix(in_srgb,var(--color-highlight)_16%,transparent)]"
+                    title="Restore session"
+                  >
+                    <ArchiveRestore className="h-3 w-3" />
+                    <span>Restore</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          ) : (
           <div ref={inputAreaRef} className="pointer-events-none absolute inset-x-0 z-10 px-3 pb-4 pt-2" style={{ bottom: "max(var(--grove-kb-inset, 0px), env(safe-area-inset-bottom))" }}>
             <div className="pointer-events-none absolute inset-x-0 bottom-0 h-24 bg-[linear-gradient(to_top,color-mix(in_srgb,var(--color-bg)_96%,transparent),transparent)]" />
             <div className="chatbox-cq-root pointer-events-auto relative mx-auto w-full max-w-[920px]">
@@ -9444,41 +10039,35 @@ export function TaskChat({
                           <div className="flex items-center gap-2 px-0.5">
                             <Database className="h-3.5 w-3.5 text-[var(--color-highlight)]" />
                             <div className="text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--color-text-muted)]">
-                              Recalled Memory · {recalledMemories.length}
+                              Read Memory · {readMemories.length}
                             </div>
                           </div>
                           <div className="space-y-1.5">
-                            {recalledMemories.map((memory) => (
+                            {readMemories.map((memory) => (
                               <div
-                                key={memory.entityId || memory.title}
+                                key={memory.entity_id}
                                 className="rounded-xl border border-[color-mix(in_srgb,var(--color-border)_65%,transparent)] bg-[color-mix(in_srgb,var(--color-bg)_72%,transparent)] px-3 py-2.5"
                               >
                                 <div className="flex min-w-0 items-start justify-between gap-3">
                                   <div className="min-w-0 text-sm font-medium leading-5 text-[var(--color-text)]">
                                     {memory.title}
                                   </div>
-                                  {memory.entityId && (
-                                    <span
-                                      className="max-w-28 shrink-0 truncate font-mono text-[9px] text-[var(--color-text-muted)] opacity-60"
-                                      title={memory.entityId}
-                                    >
-                                      {memory.entityId}
-                                    </span>
-                                  )}
+                                  <span
+                                    className="max-w-28 shrink-0 truncate font-mono text-[9px] text-[var(--color-text-muted)] opacity-60"
+                                    title={memory.entity_id}
+                                  >
+                                    {memory.entity_id}
+                                  </span>
                                 </div>
-                                {memory.description && (
-                                  <div className="mt-1 line-clamp-2 text-[11px] leading-4 text-[var(--color-text-muted)]">
-                                    {memory.description}
-                                  </div>
-                                )}
                                 {memory.tags.length > 0 && (
                                   <div className="mt-2 flex flex-wrap gap-1">
-                                    {memory.tags.slice(0, 6).map((tag) => (
+                                    {memory.tags.map((tag) => (
                                       <span
-                                        key={tag}
+                                        key={`${tag.key}:${tag.value}`}
+                                        title={`${tag.key}: ${tag.value}`}
                                         className="rounded-full bg-[color-mix(in_srgb,var(--color-highlight)_10%,transparent)] px-1.5 py-0.5 text-[9px] text-[var(--color-highlight)]"
                                       >
-                                        {tag}
+                                        {tag.value}
                                       </span>
                                     ))}
                                   </div>
@@ -9517,7 +10106,7 @@ export function TaskChat({
                             onMermaidClick={setLightboxSvg}
                             onD2Click={setLightboxSvg}
                             onImageClick={setLightboxUrl}
-                            sketchContext={isStudioProject ? { projectId, taskId: task.id } : undefined}
+                            sketchContext={isStudioProject ? { projectId, taskId: taskId } : undefined}
                           />
                         </div>
                       )}
@@ -10010,9 +10599,9 @@ export function TaskChat({
                     </div>
                   </div>
                 )}
-                <div className="mb-2 flex items-center justify-between gap-2 pr-10 select-none">
+                <div className="chatbox-header mb-2 flex items-center justify-between gap-2 pr-10 select-none">
                   <div className="flex min-w-0 items-center gap-2 select-none">
-                    <div className="inline-flex items-center gap-1.5 rounded-full bg-[var(--color-bg)] px-2.5 py-1 text-[11px] text-[var(--color-text)] min-w-0 max-w-full">
+                    <div className="chatbox-agent-pill inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-full bg-[var(--color-bg)] px-2.5 py-1 text-[11px] text-[var(--color-text)]">
                       {AgentIcon ? (
                         <AgentIcon
                           size={12}
@@ -10021,10 +10610,10 @@ export function TaskChat({
                       ) : (
                         <Bot className="w-3 h-3 shrink-0 text-[var(--color-highlight)]" />
                       )}
-                      <span className="text-[var(--color-text-muted)] shrink-0">
+                      <span className="chatbox-agent-static-label shrink-0 text-[var(--color-text-muted)]">
                         Agent
                       </span>
-                      <span className="truncate font-medium">{agentLabel}</span>
+                      <span className="chatbox-agent-name truncate font-medium">{agentLabel}</span>
                       {agentQuota && (
                         <AgentQuotaPopover
                           usage={agentQuota}
@@ -10084,7 +10673,7 @@ export function TaskChat({
                       </div>
                     )}
                   </div>
-                  <div className="flex items-center gap-1.5 shrink-0 select-none">
+                  <div className="chatbox-header-actions flex shrink-0 items-center gap-1.5 select-none">
                     {hasMemoryPanel && (
                       <button
                         onClick={() => {
@@ -10105,11 +10694,11 @@ export function TaskChat({
                             ? "bg-[color-mix(in_srgb,var(--color-highlight)_14%,transparent)] text-[var(--color-highlight)]"
                             : "bg-[var(--color-bg)] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
                         }`}
-                        title="Memory recalled by the agent in this turn"
+                        title="Memory read by the agent in this turn"
                       >
                         <Database className="h-3 w-3" />
-                        <span>Memory</span>
-                        <span className="opacity-70">{recalledMemories.length}</span>
+                        <span className="chatbox-header-pill-label">Memory</span>
+                        <span className="opacity-70">{readMemories.length}</span>
                       </button>
                     )}
                     {hasTodoPanel && (
@@ -10133,7 +10722,7 @@ export function TaskChat({
                         }`}
                       >
                         <ListTodo className="h-3 w-3" />
-                        <span>Todo</span>
+                        <span className="chatbox-header-pill-label">Todo</span>
                         <span className="opacity-70">
                           {
                             planEntries.filter((e) => e.status === "completed")
@@ -10164,7 +10753,7 @@ export function TaskChat({
                         }`}
                       >
                         <BookOpen className="h-3 w-3" />
-                        <span>Plan</span>
+                        <span className="chatbox-header-pill-label">Plan</span>
                       </button>
                     )}
                     {hasPendingPanel && (
@@ -10188,7 +10777,7 @@ export function TaskChat({
                         }`}
                       >
                         <ListPlus className="h-3 w-3" />
-                        <span>Pending</span>
+                        <span className="chatbox-header-pill-label">Pending</span>
                       </button>
                     )}
                     {activePermissionMessage && (
@@ -10211,7 +10800,7 @@ export function TaskChat({
                         }`}
                       >
                         <ShieldCheck className="h-3 w-3" />
-                        <span>Permission Request</span>
+                        <span className="chatbox-header-pill-label">Permission Request</span>
                       </button>
                     )}
                     {activeSurveyMessage && (
@@ -10244,7 +10833,7 @@ export function TaskChat({
                           && activeSurveyMessage.snapshot.request.mode === "url"
                           ? <ExternalLink className="h-3 w-3" />
                           : <ListChecks className="h-3 w-3" />}
-                        <span>
+                        <span className="chatbox-header-pill-label">
                           {activeSurveyMessage.type === "elicitation"
                             && activeSurveyMessage.snapshot.request.mode === "url"
                             ? "External Request"
@@ -10273,7 +10862,7 @@ export function TaskChat({
                         }`}
                       >
                         <MessageSquarePlus className="h-3 w-3" />
-                        <span>Comments</span>
+                        <span className="chatbox-header-pill-label">Comments</span>
                         <span className="opacity-70">{taskPreviewCommentDrafts.length}</span>
                       </button>
                     )}
@@ -10465,7 +11054,7 @@ export function TaskChat({
                         }}
                       />
                     )}
-                    {!isTerminalLaunchMode && !composerNarrow && modeOptions.length > 0 && (
+                    {!isTerminalLaunchMode && !composerHideMode && modeOptions.length > 0 && (
                       <DropdownSelect
                         ref={permMenuRef}
                         label={matchedSessionConfig.mode?.name ?? "Mode"}
@@ -10522,10 +11111,10 @@ export function TaskChat({
                         }}
                       />
                     )}
-                    {!isTerminalLaunchMode && additionalSessionConfigOptions.length > 0 && (
+                    {!isTerminalLaunchMode && settingsSessionConfigOptions.length > 0 && (
                       <SessionSettingsMenu
                         ref={sessionSettingsRef}
-                        options={additionalSessionConfigOptions}
+                        options={settingsSessionConfigOptions}
                         open={showSessionSettings}
                         disabled={!isConnected}
                         pendingConfigIds={pendingConfigIds}
@@ -10604,6 +11193,7 @@ export function TaskChat({
               </div>
             </div>
           </div>
+          )}
         </div>
       </div>
       {/* Image / SVG Lightbox */}
@@ -10754,6 +11344,30 @@ const SessionSettingsMenu = ({
     bottom: number;
     maxHeight: number;
   } | null>(null);
+  const [activeOptionId, setActiveOptionId] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  const activeOption = useMemo(
+    () =>
+      options.find(
+        (option) => option.id === activeOptionId && option.type === "select",
+      ),
+    [activeOptionId, options],
+  );
+  const activeValues = activeOption ? configDropdownValues(activeOption) : [];
+  const enableSearch = activeValues.length > 5;
+  const normalizedSearchQuery = searchQuery.toLowerCase();
+  const filteredValues = normalizedSearchQuery
+    ? activeValues.filter((value) =>
+        value.name.toLowerCase().includes(normalizedSearchQuery),
+      )
+    : activeValues;
+
+  useEffect(() => {
+    if (!activeOption || !enableSearch) return;
+    requestAnimationFrame(() => searchInputRef.current?.focus());
+  }, [activeOption, enableSearch]);
 
   const positionMenu = useCallback((trigger: HTMLElement) => {
     const rect = trigger.getBoundingClientRect();
@@ -10789,7 +11403,11 @@ const SessionSettingsMenu = ({
       type="button"
       disabled={pendingConfigIds.has(option.id)}
       onMouseDown={(event) => event.preventDefault()}
-      onClick={() => onSelect(option, value.value)}
+      onClick={() => {
+        onSelect(option, value.value);
+        setActiveOptionId(null);
+        setSearchQuery("");
+      }}
       className="grid w-full grid-cols-[14px_minmax(0,1fr)_auto] items-start gap-x-2 rounded-md px-1 py-1.5 text-left hover:bg-[var(--color-bg-tertiary)] disabled:opacity-50"
     >
       <span aria-hidden="true" />
@@ -10812,7 +11430,11 @@ const SessionSettingsMenu = ({
       <button
         type="button"
         onClick={(event) => {
-          if (!open) positionMenu(event.currentTarget);
+          if (!open) {
+            positionMenu(event.currentTarget);
+            setActiveOptionId(null);
+            setSearchQuery("");
+          }
           onToggle();
         }}
         disabled={disabled}
@@ -10826,7 +11448,7 @@ const SessionSettingsMenu = ({
         createPortal(
         <div
           data-session-settings-menu
-          className="fixed z-[1000] flex w-80 flex-col overflow-y-auto rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-1.5 shadow-lg"
+          className="fixed z-[1000] flex w-80 flex-col overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] shadow-lg"
           style={{
             left: menuAnchor.left,
             bottom: menuAnchor.bottom,
@@ -10834,23 +11456,72 @@ const SessionSettingsMenu = ({
             overflowAnchor: "none",
           }}
         >
-          {options.map((option) => (
-            <div key={option.id} className="border-b border-[var(--color-border)] px-1 py-2 last:border-b-0">
-              <div className="mb-1 grid grid-cols-[14px_minmax(0,1fr)_auto] items-start gap-x-2 px-1">
-                <span className="mt-0.5 text-[var(--color-text-muted)]">
-                  {iconForOption(option)}
+          {activeOption ? (
+            <>
+              <div className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-2 py-2">
+                <button
+                  type="button"
+                  aria-label="Back to session settings"
+                  onClick={() => {
+                    setActiveOptionId(null);
+                    setSearchQuery("");
+                  }}
+                  className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)]"
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </button>
+                <span className="text-[var(--color-text-muted)]">
+                  {iconForOption(activeOption)}
                 </span>
-                <span className="min-w-0">
-                  <span className="block text-xs font-medium text-[var(--color-text)]">
-                    {option.name}
-                  </span>
-                  {option.description && (
-                    <span className="mt-0.5 block text-[10px] leading-4 text-[var(--color-text-muted)]">
-                      {option.description}
-                    </span>
-                  )}
+                <span className="min-w-0 truncate text-xs font-medium text-[var(--color-text)]">
+                  {activeOption.name}
                 </span>
               </div>
+              {enableSearch && (
+                <div className="shrink-0 border-b border-[var(--color-border)] p-2">
+                  <div className="flex items-center gap-1.5 rounded-md bg-[var(--color-bg-secondary)] px-2 py-1.5">
+                    <Search className="h-3 w-3 shrink-0 text-[var(--color-text-muted)]" />
+                    <input
+                      ref={searchInputRef}
+                      type="text"
+                      value={searchQuery}
+                      onChange={(event) => setSearchQuery(event.target.value)}
+                      placeholder={`Search ${activeOption.name.toLowerCase()}...`}
+                      className="min-w-0 flex-1 bg-transparent text-xs text-[var(--color-text)] outline-none placeholder:text-[var(--color-text-muted)]"
+                    />
+                  </div>
+                </div>
+              )}
+              <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
+                {filteredValues.map((value, index) => (
+                  <Fragment key={value.value}>
+                    {value.group &&
+                      filteredValues[index - 1]?.group !== value.group && (
+                        <div className="px-2 pb-1 pt-2 text-[10px] font-medium uppercase tracking-wide text-[var(--color-text-muted)]">
+                          {value.group}
+                        </div>
+                      )}
+                    {renderValue(activeOption, value)}
+                  </Fragment>
+                ))}
+                {filteredValues.length === 0 && (
+                  <div className="px-3 py-4 text-center text-xs text-[var(--color-text-muted)]">
+                    No matches
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
+            {options.map((option) => {
+              const currentValue =
+                option.type === "select"
+                  ? configDropdownValues(option).find(
+                      (value) => value.value === option.currentValue,
+                    )?.name ?? String(option.currentValue)
+                  : null;
+              return (
+            <div key={option.id} className="border-b border-[var(--color-border)] px-1 py-1 last:border-b-0">
               {option.type === "boolean" ? (
                 <button
                   type="button"
@@ -10859,10 +11530,19 @@ const SessionSettingsMenu = ({
                   disabled={pendingConfigIds.has(option.id)}
                   onMouseDown={(event) => event.preventDefault()}
                   onClick={() => onSelect(option, !option.currentValue)}
-                  className="mt-1 grid w-full grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-x-2 rounded-md px-1 py-1.5 text-left text-xs text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] disabled:opacity-50"
+                  className="grid w-full grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-x-2 rounded-md px-2 py-2 text-left text-xs text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] disabled:opacity-50"
                 >
-                  <span aria-hidden="true" />
-                  <span>{option.currentValue ? "On" : "Off"}</span>
+                  <span className="text-[var(--color-text-muted)]">
+                    {iconForOption(option)}
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block font-medium">{option.name}</span>
+                    {option.description && (
+                      <span className="mt-0.5 block truncate text-[10px] text-[var(--color-text-muted)]">
+                        {option.description}
+                      </span>
+                    )}
+                  </span>
                   <span
                     className={`relative inline-block h-4 w-7 justify-self-end rounded-full transition-colors ${
                       option.currentValue
@@ -10877,25 +11557,42 @@ const SessionSettingsMenu = ({
                     />
                   </span>
                 </button>
-              ) : option.options.some(isConfigGroup) ? (
-                (option.options as SessionConfigSelectGroup[]).map((group) => (
-                  <div key={group.group} className="mt-1">
-                    <div className="grid grid-cols-[14px_minmax(0,1fr)_auto] gap-x-2 px-1 py-1">
-                      <span aria-hidden="true" />
-                      <span className="text-[10px] font-medium uppercase tracking-wide text-[var(--color-text-muted)]">
-                        {group.name}
-                      </span>
-                    </div>
-                    {group.options.map((value) => renderValue(option, value))}
-                  </div>
-                ))
               ) : (
-                (option.options as SessionConfigSelectValue[]).map((value) =>
-                  renderValue(option, value),
-                )
+                <>
+                  <button
+                    type="button"
+                    disabled={pendingConfigIds.has(option.id)}
+                    onClick={() => {
+                      setActiveOptionId(option.id);
+                      setSearchQuery("");
+                    }}
+                    className="grid w-full grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-x-2 rounded-md px-2 py-2 text-left hover:bg-[var(--color-bg-tertiary)] disabled:opacity-50"
+                  >
+                    <span className="text-[var(--color-text-muted)]">
+                      {iconForOption(option)}
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block text-xs font-medium text-[var(--color-text)]">
+                        {option.name}
+                      </span>
+                      {option.description && (
+                        <span className="mt-0.5 block truncate text-[10px] text-[var(--color-text-muted)]">
+                          {option.description}
+                        </span>
+                      )}
+                    </span>
+                    <span className="flex max-w-32 items-center gap-1 text-[11px] text-[var(--color-text-muted)]">
+                      <span className="truncate">{currentValue}</span>
+                      <ChevronRight className="h-3 w-3 shrink-0" />
+                    </span>
+                  </button>
+                </>
               )}
             </div>
-          ))}
+              );
+            })}
+            </div>
+          )}
         </div>,
         document.body,
       )}

@@ -1,4 +1,5 @@
-import { Archive, ChevronUp, ChevronDown, Laptop, Zap, Code, GitBranch, Sparkles } from "lucide-react";
+import { useLayoutEffect, useRef, useState } from "react";
+import { ChevronUp, ChevronDown } from "lucide-react";
 import type { BlitzTask } from "../../data/types";
 import { useIsMobile } from "../../hooks";
 import { GROVE_TASK_MIME } from "./blitzFlexModel";
@@ -18,23 +19,11 @@ interface BlitzTaskListItemProps {
   onDragLeave?: () => void;
   isDragging?: boolean;
   isDragOver?: boolean;
+  dragPlacement?: "before" | "after" | null;
   onMoveUp?: () => void;
   onMoveDown?: () => void;
   isFirst?: boolean;
   isLast?: boolean;
-}
-
-function formatTimeAgo(date: Date): string {
-  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-  if (seconds < 60) return "just now";
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days === 1) return "1d ago";
-  if (days < 14) return `${days}d ago`;
-  return `${Math.floor(days / 7)}w ago`;
 }
 
 function getNotificationColor(level: string): string {
@@ -46,6 +35,90 @@ function getNotificationColor(level: string): string {
     default:
       return "var(--color-info)";
   }
+}
+
+interface MiddleEllipsisProps {
+  text: string;
+  className?: string;
+}
+
+let sharedTextMeasureContext: CanvasRenderingContext2D | null = null;
+
+function getTextMeasureContext(): CanvasRenderingContext2D | null {
+  if (sharedTextMeasureContext) return sharedTextMeasureContext;
+  sharedTextMeasureContext = document.createElement("canvas").getContext("2d");
+  return sharedTextMeasureContext;
+}
+
+/**
+ * Preserve both ends of identifiers instead of dropping the distinguishing
+ * suffix. The visible string is recalculated from the actual rendered width,
+ * font, and letter spacing whenever the sidebar is resized.
+ */
+function MiddleEllipsis({ text, className }: MiddleEllipsisProps) {
+  const elementRef = useRef<HTMLSpanElement | null>(null);
+  const [visibleText, setVisibleText] = useState(text);
+
+  useLayoutEffect(() => {
+    const element = elementRef.current;
+    if (!element) return;
+
+    const context = getTextMeasureContext();
+    if (!context) return;
+
+    const update = () => {
+      const availableWidth = element.clientWidth;
+      if (availableWidth <= 0) return;
+
+      const style = window.getComputedStyle(element);
+      context.font = style.font || `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+      const parsedLetterSpacing = Number.parseFloat(style.letterSpacing);
+      const letterSpacing = Number.isFinite(parsedLetterSpacing) ? parsedLetterSpacing : 0;
+      const measure = (value: string) => (
+        context.measureText(value).width + Math.max(0, [...value].length - 1) * letterSpacing
+      );
+
+      if (measure(text) <= availableWidth) {
+        setVisibleText(text);
+        return;
+      }
+
+      const chars = [...text];
+      const separator = "...";
+      let best = separator;
+      let low = 2;
+      let high = chars.length - 1;
+
+      while (low <= high) {
+        const kept = Math.floor((low + high) / 2);
+        const prefixLength = Math.ceil(kept / 2);
+        const suffixLength = Math.floor(kept / 2);
+        const candidate = `${chars.slice(0, prefixLength).join("")}${separator}${
+          suffixLength > 0 ? chars.slice(-suffixLength).join("") : ""
+        }`;
+
+        if (measure(candidate) <= availableWidth) {
+          best = candidate;
+          low = kept + 1;
+        } else {
+          high = kept - 1;
+        }
+      }
+
+      setVisibleText(best);
+    };
+
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    void document.fonts?.ready.then(update);
+    return () => observer.disconnect();
+  }, [text]);
+
+  return (
+    <span ref={elementRef} className={className} aria-label={text}>
+      {visibleText}
+    </span>
+  );
 }
 
 export function BlitzTaskListItem({
@@ -62,6 +135,7 @@ export function BlitzTaskListItem({
   onDragLeave,
   isDragging,
   isDragOver,
+  dragPlacement,
   onMoveUp,
   onMoveDown,
   isFirst,
@@ -73,206 +147,119 @@ export function BlitzTaskListItem({
 
   return (
     <div className="flex items-stretch gap-0">
-    <button
-      data-project-id={blitzTask.projectId}
-      data-task-id={task.id}
-      onClick={onClick}
-      onDoubleClick={task.status !== "archived" ? onDoubleClick : undefined}
-      onContextMenu={onContextMenu}
-      draggable={!isTouchDevice}
-      onDragStart={isTouchDevice ? undefined : (e) => {
-        e.dataTransfer.effectAllowed = 'move';
-        // Also advertise the task to the Blitz grid canvas (onExternalDrag) so
-        // it can be dropped in as a panel. Reorder-within-the-list still works
-        // off the parent's dragInfoRef, independent of this payload.
-        try {
-          e.dataTransfer.setData(
-            GROVE_TASK_MIME,
-            JSON.stringify({
-              projectId: blitzTask.projectId,
-              projectName: blitzTask.projectName,
-              taskId: task.id,
-              taskName: task.name,
-            }),
-          );
-        } catch {
-          /* setData can throw in odd DnD states — non-fatal */
-        }
-        onDragStart?.();
-      }}
-      onDragOver={isTouchDevice ? undefined : (e) => {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = 'move';
-        onDragOver?.(e);
-      }}
-      onDragEnd={isTouchDevice ? undefined : onDragEnd}
-      onDragLeave={isTouchDevice ? undefined : onDragLeave}
-      className={`relative flex-1 min-w-0 text-left rounded-lg transition-all duration-150 overflow-hidden ${
-        isSelected
-          ? "px-4 py-3 bg-[var(--color-highlight)]/5"
-          : task.isLocal
-            ? "px-3 py-2.5 bg-[var(--color-bg-secondary)] hover:bg-[var(--color-bg-tertiary)] border-l-2 border-l-[var(--color-accent)]/40"
-            : "px-3 py-2.5 bg-[var(--color-bg-secondary)] hover:bg-[var(--color-bg-tertiary)]"
-      } ${!isTouchDevice && isDragging ? "opacity-40 cursor-grabbing" : !isTouchDevice ? "cursor-grab" : ""} ${
-        isDragOver ? "border-t-2 border-t-[var(--color-highlight)]" : ""
-      }`}
-      style={isSelected ? {
-        border: "2px solid transparent",
-        backgroundImage: task.isLocal
-          ? `linear-gradient(var(--color-bg-secondary), var(--color-bg-secondary)), linear-gradient(135deg, var(--color-accent), color-mix(in srgb, var(--color-accent) 40%, white), var(--color-accent))`
-          : `linear-gradient(var(--color-bg-secondary), var(--color-bg-secondary)), linear-gradient(135deg, var(--color-highlight), color-mix(in srgb, var(--color-highlight) 40%, white), var(--color-highlight))`,
-        backgroundOrigin: "border-box",
-        backgroundClip: "padding-box, border-box",
-        boxShadow: task.isLocal
-          ? `0 0 8px -2px var(--color-accent)`
-          : `0 0 8px -2px var(--color-highlight)`,
-      } : undefined}
-    >
-      {/* Selection sweep effect — single gentle left-to-right pass */}
-      {isSelected && (
-        <div
-          key={`${task.id}-sweep`}
-          className="absolute inset-0 pointer-events-none animate-[card-sweep_4s_ease-out_infinite]"
-          style={{
-            background: "linear-gradient(90deg, transparent 0%, var(--color-highlight) 45%, var(--color-highlight) 55%, transparent 100%)",
-            opacity: 0.06,
-          }}
-        />
+      <button
+        data-project-id={blitzTask.projectId}
+        data-task-id={task.id}
+        onClick={onClick}
+        onDoubleClick={task.status !== "archived" ? onDoubleClick : undefined}
+        onContextMenu={onContextMenu}
+        draggable={!isTouchDevice}
+        onDragStart={isTouchDevice ? undefined : (e) => {
+          e.dataTransfer.effectAllowed = "move";
+          // Also advertise the task to the Blitz grid canvas (onExternalDrag) so
+          // it can be dropped in as a panel. Reorder-within-the-list still works
+          // off the parent's dragInfoRef, independent of this payload.
+          try {
+            e.dataTransfer.setData(
+              GROVE_TASK_MIME,
+              JSON.stringify({
+                projectId: blitzTask.projectId,
+                projectName: blitzTask.projectName,
+                taskId: task.id,
+                taskName: task.name,
+              }),
+            );
+          } catch {
+            /* setData can throw in odd DnD states — non-fatal */
+          }
+          onDragStart?.();
+        }}
+        onDragOver={isTouchDevice ? undefined : (e) => {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
+          onDragOver?.(e);
+        }}
+        onDragEnd={isTouchDevice ? undefined : onDragEnd}
+        onDragLeave={isTouchDevice ? undefined : onDragLeave}
+        className={`relative flex-1 min-w-0 px-3 py-2.5 text-left rounded-lg overflow-hidden bg-[var(--color-bg-secondary)] transition-colors duration-150 hover:bg-[var(--color-bg-tertiary)] ${
+          isSelected
+            ? "bg-[var(--color-highlight)]/5 ring-2 ring-inset ring-[var(--color-highlight)]"
+            : ""
+        } ${!isTouchDevice && isDragging ? "opacity-40 cursor-grabbing" : !isTouchDevice ? "cursor-grab" : ""} ${
+          isDragOver && dragPlacement === "before" ? "border-t-2 border-t-[var(--color-highlight)]" : ""
+        } ${
+          isDragOver && dragPlacement === "after" ? "border-b-2 border-b-[var(--color-highlight)]" : ""
+        }`}
+      >
+        {notification && (
+          <span
+            className="absolute inset-y-2 right-0 w-0.5 rounded-l"
+            style={{ backgroundColor: getNotificationColor(notification.level) }}
+            aria-label={`${notification.level} notification`}
+          />
+        )}
+
+        {shortcutNumber !== undefined && (
+          <span
+            className="blitz-shortcut absolute right-2 top-2 z-10 min-w-5 rounded px-1.5 py-0.5 text-center text-xs font-bold opacity-0"
+            style={{
+              backgroundColor: "var(--color-highlight)",
+              color: "var(--color-bg)",
+            }}
+          >
+            {shortcutNumber}
+          </span>
+        )}
+
+        <Tooltip content={task.name} position="right" className="block w-full min-w-0 max-w-full">
+          <MiddleEllipsis
+            text={task.name}
+            className={`block w-full min-w-0 max-w-full overflow-hidden whitespace-nowrap text-sm font-medium ${
+              isSelected ? "text-[var(--color-highlight)]" : "text-[var(--color-text)]"
+            }`}
+          />
+        </Tooltip>
+
+        <div className="mt-1 flex min-w-0 items-center gap-1.5">
+          <span
+            className={`flex-shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${
+              isStudio
+                ? "bg-[var(--color-warning)]/15 text-[var(--color-warning)]"
+                : "bg-[var(--color-highlight)]/15 text-[var(--color-highlight)]"
+            }`}
+          >
+            {isStudio ? "Studio" : "Code"}
+          </span>
+          <span
+            className="min-w-0 truncate rounded border border-[var(--color-highlight)]/20 bg-[var(--color-bg-tertiary)]/60 px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-text-muted)]"
+            title={task.isLocal ? "Local" : projectName}
+          >
+            {task.isLocal ? "Local" : projectName}
+          </span>
+        </div>
+      </button>
+
+      {/* Mobile: up/down move buttons instead of drag */}
+      {isTouchDevice && (
+        <div className="ml-1 flex flex-col justify-center gap-0.5">
+          <button
+            onClick={(e) => { e.stopPropagation(); onMoveUp?.(); }}
+            disabled={isFirst}
+            className="p-1 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:opacity-30 disabled:pointer-events-none"
+            aria-label="Move up"
+          >
+            <ChevronUp className="w-4 h-4" />
+          </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); onMoveDown?.(); }}
+            disabled={isLast}
+            className="p-1 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:opacity-30 disabled:pointer-events-none"
+            aria-label="Move down"
+          >
+            <ChevronDown className="w-4 h-4" />
+          </button>
+        </div>
       )}
-      <div className="relative flex items-start gap-2.5">
-        {/* Task type icon: Local=Laptop, Agent=Bot, Regular=Code */}
-        <div className="flex-shrink-0 mt-0.5">
-          {task.isLocal ? (
-            <Laptop
-              className="w-3.5 h-3.5"
-              style={{ color: "var(--color-accent)" }}
-            />
-          ) : task.createdBy === "agent" ? (
-            <Zap
-              className="w-3.5 h-3.5"
-              style={{ color: "var(--color-info)" }}
-            />
-          ) : (
-            <Code
-              className="w-3.5 h-3.5"
-              style={{ color: "var(--color-highlight)" }}
-            />
-          )}
-        </div>
-
-        {/* Task Info */}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center justify-between gap-2">
-            <div className="flex items-center gap-1.5 min-w-0">
-              {shortcutNumber !== undefined && (
-                <span
-                  className="blitz-shortcut flex-shrink-0 text-xs font-bold px-1.5 py-0.5 rounded opacity-0"
-                  style={{
-                    backgroundColor: 'var(--color-highlight)',
-                    color: 'var(--color-bg)',
-                    minWidth: '20px',
-                    textAlign: 'center',
-                  }}
-                >
-                  {shortcutNumber}
-                </span>
-              )}
-              <Tooltip content={task.name} position="right" className="flex-1 min-w-0">
-                <span
-                  className={`text-sm font-medium truncate block ${isSelected ? "text-[var(--color-highlight)]" : "text-[var(--color-text)]"}`}
-                >
-                  {task.name}
-                </span>
-              </Tooltip>
-              {task.isLocal && (
-                <span className="flex-shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded bg-[var(--color-accent)]/15 text-[var(--color-accent)]">
-                  Local
-                </span>
-              )}
-              {task.createdBy === "agent" && (
-                <span className="flex-shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded bg-[var(--color-info)]/15 text-[var(--color-info)]">
-                  Agent
-                </span>
-              )}
-              {notification && (
-                <span
-                  className="w-2 h-2 rounded-full flex-shrink-0"
-                  style={{ backgroundColor: getNotificationColor(notification.level) }}
-                />
-              )}
-            </div>
-            <span className="text-xs text-[var(--color-text-muted)] whitespace-nowrap flex-shrink-0">
-              {formatTimeAgo(task.updatedAt)}
-            </span>
-          </div>
-
-          <div className="flex items-center gap-2 mt-1">
-            {/* Project name badge */}
-            <span
-              className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-[var(--color-bg-tertiary)]/60 text-[var(--color-text-muted)] border border-[var(--color-highlight)]/20 truncate max-w-[120px]"
-              title={projectName}
-            >
-              {projectName}
-            </span>
-
-            {/* Project type badge (Coding / Studio) */}
-            {isStudio ? (
-              <span
-                className="flex items-center gap-1 flex-shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded bg-[var(--color-warning)]/15 text-[var(--color-warning)]"
-                title="Studio project"
-              >
-                <Sparkles className="w-2.5 h-2.5" />
-                Studio
-              </span>
-            ) : (
-              <span
-                className="flex items-center gap-1 flex-shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded bg-[var(--color-highlight)]/15 text-[var(--color-highlight)]"
-                title="Coding project"
-              >
-                <GitBranch className="w-2.5 h-2.5" />
-                Coding
-              </span>
-            )}
-
-            {/* Target branch label (non-local tasks only) */}
-            {!task.isLocal && task.target && (
-              <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-[var(--color-text-muted)]/10 text-[var(--color-text-muted)] truncate max-w-[200px]">
-                {task.target}
-              </span>
-            )}
-
-            {/* Archived badge */}
-            {task.status === "archived" && (
-              <span className="flex items-center gap-1 text-xs font-medium" style={{ color: "var(--color-text-muted)" }}>
-                <Archive className="w-3 h-3" />
-                Archived
-              </span>
-            )}
-          </div>
-        </div>
-      </div>
-    </button>
-    {/* Mobile: up/down move buttons instead of drag */}
-    {isTouchDevice && (
-      <div className="flex flex-col justify-center gap-0.5 ml-1">
-        <button
-          onClick={(e) => { e.stopPropagation(); onMoveUp?.(); }}
-          disabled={isFirst}
-          className="p-1 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:opacity-30 disabled:pointer-events-none"
-          aria-label="Move up"
-        >
-          <ChevronUp className="w-4 h-4" />
-        </button>
-        <button
-          onClick={(e) => { e.stopPropagation(); onMoveDown?.(); }}
-          disabled={isLast}
-          className="p-1 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors disabled:opacity-30 disabled:pointer-events-none"
-          aria-label="Move down"
-        >
-          <ChevronDown className="w-4 h-4" />
-        </button>
-      </div>
-    )}
     </div>
   );
 }

@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use chrono::Utc;
 
 use crate::error::{GroveError, Result};
+use crate::storage::extensions::ExtensionArtifact;
 use crate::storage::skills::{
     self, compute_repo_path, load_installed, load_manifest, load_sources, parse_skill_md,
     repos_dir, save_installed, save_manifest, save_sources, InstalledSkillDef, ProjectInstall,
@@ -113,6 +114,14 @@ fn discover_skills(
             continue;
         }
 
+        // Skills shipped inside a Plugin are contributions owned by that
+        // Plugin, not standalone catalog entries. Legacy plugin:* sources point
+        // directly at the skills/ directory, so their parent plugin.json is
+        // intentionally outside this scan boundary and remains compatible.
+        if has_plugin_ancestor(entry.path(), base_dir) {
+            continue;
+        }
+
         let Ok(content) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
@@ -142,6 +151,104 @@ fn discover_skills(
     }
 
     entries
+}
+
+fn has_plugin_ancestor(path: &Path, base_dir: &Path) -> bool {
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        if dir.join("plugin.json").is_file() {
+            return true;
+        }
+        if dir == base_dir {
+            break;
+        }
+        current = dir.parent();
+    }
+    false
+}
+
+/// Discover Grove Plugins and official MCP Registry `server.json` manifests.
+fn discover_extension_artifacts(
+    base_dir: &Path,
+    source_name: &str,
+    repo_key: &str,
+    subpath: Option<&str>,
+) -> Vec<ExtensionArtifact> {
+    let mut artifacts = Vec::new();
+    if !base_dir.is_dir() {
+        return artifacts;
+    }
+    for entry in walkdir::WalkDir::new(base_dir)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let filename = entry.file_name().to_string_lossy();
+        if filename != "plugin.json" && filename != "server.json" {
+            continue;
+        }
+        // A server.json inside a Plugin is a Plugin contribution, not a
+        // separately installable standalone server.
+        if filename == "server.json" && has_plugin_ancestor(entry.path(), base_dir) {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(name) = manifest
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+        else {
+            continue;
+        };
+        let kind = if filename == "plugin.json" {
+            "plugin"
+        } else {
+            "mcp"
+        };
+        if kind == "mcp"
+            && manifest
+                .get("packages")
+                .and_then(|v| v.as_array())
+                .is_none()
+            && manifest.get("remotes").and_then(|v| v.as_array()).is_none()
+        {
+            continue;
+        }
+        let dir = entry.path().parent().unwrap_or(base_dir);
+        let relative_path = dir
+            .strip_prefix(base_dir)
+            .unwrap_or(dir)
+            .to_string_lossy()
+            .to_string();
+        let repo_path = compute_repo_path(subpath, &relative_path);
+        artifacts.push(ExtensionArtifact {
+            repo_key: repo_key.to_string(),
+            repo_path,
+            source_name: source_name.to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            version: manifest
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            description: manifest
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            relative_path,
+            manifest,
+        });
+    }
+    artifacts
 }
 
 /// Resolve the actual scan directory for a source
@@ -346,6 +453,13 @@ fn rebuild_manifest_for_repo_key(
                 source.subpath.as_deref(),
             );
             manifest.skills.extend(entries);
+            let artifacts = discover_extension_artifacts(
+                &scan_dir,
+                &source.name,
+                &source.repo_key,
+                source.subpath.as_deref(),
+            );
+            crate::storage::extensions::replace_source_artifacts(&source.name, &artifacts)?;
         }
     }
 
@@ -367,6 +481,13 @@ fn rebuild_manifest_for_source(name: &str) -> Result<()> {
     if let Some(scan_dir) = resolve_source_scan_dir(source) {
         let entries = discover_skills(&scan_dir, name, &source.repo_key, source.subpath.as_deref());
         manifest.skills.extend(entries);
+        let artifacts = discover_extension_artifacts(
+            &scan_dir,
+            name,
+            &source.repo_key,
+            source.subpath.as_deref(),
+        );
+        crate::storage::extensions::replace_source_artifacts(name, &artifacts)?;
     }
 
     save_manifest(&manifest)
@@ -667,6 +788,7 @@ pub fn delete_source(name: &str) -> Result<()> {
     let mut manifest = load_manifest();
     manifest.skills.retain(|e| e.source != name);
     save_manifest(&manifest)?;
+    crate::storage::extensions::remove_source_artifacts(name)?;
 
     // Remove from sources.toml
     let mut sources_file = load_sources();
@@ -686,6 +808,17 @@ pub fn delete_source(name: &str) -> Result<()> {
         }
     }
 
+    // Managed Local sources are Grove-owned generated/imported artifacts.
+    // Referenced and Development sources always remain user-owned and are
+    // never removed from disk when their catalog entry is deleted.
+    if source.source_type == "local" && source.management_mode == "managed" {
+        let managed_root = crate::storage::grove_dir().join("sources").join("managed");
+        let path = PathBuf::from(crate::storage::workspace::expand_tilde(&source.url));
+        if path.starts_with(&managed_root) && path != managed_root && path.is_dir() {
+            std::fs::remove_dir_all(path)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -698,6 +831,7 @@ pub fn add_local_source(name: &str, path: &str) -> Result<SkillSourceDef> {
     sources_file.sources.push(SkillSourceDef {
         name: name.to_string(),
         source_type: "local".to_string(),
+        management_mode: "development".to_string(),
         url: path.to_string(),
         subpath: None,
         repo_key: crate::storage::skills::compute_repo_key(path),
@@ -867,6 +1001,7 @@ pub fn create_local_skill(package: &str, name: &str, description: &str) -> Resul
             sources_file.sources.push(SkillSourceDef {
                 name: pkg.to_string(),
                 source_type: "local".to_string(),
+                management_mode: "managed".to_string(),
                 url: url.clone(),
                 subpath: None,
                 repo_key: skills::compute_repo_key(&url),
@@ -1097,4 +1232,58 @@ pub fn sync_stale_git(buffer_secs: i64) -> Result<usize> {
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod extension_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn source_scan_separates_standalone_and_plugin_owned_extensions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("standalone-skill")).unwrap();
+        std::fs::write(
+            root.join("standalone-skill/SKILL.md"),
+            "---\nname: Standalone Skill\ndescription: Standalone\n---\n",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(root.join("sample-plugin/skills/embedded")).unwrap();
+        std::fs::write(
+            root.join("sample-plugin/plugin.json"),
+            r#"{"name":"Sample Plugin","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("sample-plugin/skills/embedded/SKILL.md"),
+            "---\nname: Embedded Skill\ndescription: Plugin owned\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("sample-plugin/server.json"),
+            r#"{"name":"plugin-owned-mcp","remotes":[{"url":"https://example.com"}]}"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(root.join("standalone-mcp")).unwrap();
+        std::fs::write(
+            root.join("standalone-mcp/server.json"),
+            r#"{"name":"standalone-mcp","version":"1.0.0","remotes":[{"type":"streamable-http","url":"https://example.com/mcp"}]}"#,
+        )
+        .unwrap();
+
+        let skills = discover_skills(root, "test", "repo", None);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "Standalone Skill");
+
+        let artifacts = discover_extension_artifacts(root, "test", "repo", None);
+        assert_eq!(artifacts.len(), 2);
+        assert!(artifacts
+            .iter()
+            .any(|item| item.kind == "plugin" && item.name == "Sample Plugin"));
+        assert!(artifacts
+            .iter()
+            .any(|item| item.kind == "mcp" && item.name == "standalone-mcp"));
+    }
 }

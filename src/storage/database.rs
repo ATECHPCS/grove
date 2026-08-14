@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use super::grove_dir;
 use crate::error::Result;
 
-pub const CURRENT_STORAGE_VERSION: &str = "2.7";
+pub const CURRENT_STORAGE_VERSION: &str = "2.8";
 
 /// Database state: caches connection + its path so we can detect HOME changes.
 struct DbState {
@@ -97,6 +97,13 @@ fn open_at(db_path: &std::path::Path) -> Result<Connection> {
     )?;
 
     create_schema(&conn)?;
+    // `_memory` is a TaskChat storage namespace, not a Task entity. Remove
+    // rows created by the short-lived implementation that persisted it in
+    // `tasks`; Chat/session rows remain intact because they are independent.
+    conn.execute(
+        "DELETE FROM tasks WHERE id = ?1",
+        rusqlite::params![super::tasks::MEMORY_TASK_ID],
+    )?;
     Ok(conn)
 }
 
@@ -315,6 +322,7 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS skill_sources (
             name        TEXT PRIMARY KEY,
             source_type TEXT NOT NULL,
+            management_mode TEXT NOT NULL DEFAULT 'referenced',
             url         TEXT NOT NULL,
             subpath     TEXT,
             repo_key    TEXT NOT NULL,
@@ -374,7 +382,9 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             acp_session_id TEXT,
             duty           TEXT,
             created_at     TEXT NOT NULL,
-            launch_mode    TEXT NOT NULL DEFAULT 'acp'
+            updated_at     TEXT,
+            launch_mode    TEXT NOT NULL DEFAULT 'acp',
+            archived_at    TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_session_task ON session(project, task_id);
 
@@ -441,6 +451,40 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             subpath       TEXT,
             created_at    TEXT NOT NULL,
             updated_at    TEXT NOT NULL
+        );
+
+        -- Unified extension catalog discovered from Skill sources. Skills keep
+        -- their richer normalized manifest table; Plugin and MCP manifests are
+        -- stored verbatim so their type-specific detail/install flows can
+        -- evolve without flattening either format into a lowest-common-denominator.
+        CREATE TABLE IF NOT EXISTS extension_artifacts (
+            repo_key       TEXT NOT NULL,
+            repo_path      TEXT NOT NULL,
+            source_name    TEXT NOT NULL,
+            kind           TEXT NOT NULL,
+            name           TEXT NOT NULL,
+            version        TEXT,
+            description    TEXT NOT NULL DEFAULT '',
+            relative_path  TEXT NOT NULL,
+            manifest_json  TEXT NOT NULL,
+            PRIMARY KEY (repo_key, repo_path, kind)
+        );
+
+        -- A standalone MCP is installed for canonical ACP Agent ids. The
+        -- server definition remains in server.json; this table stores only the
+        -- user's runtime choice, scope, and supplied variable values.
+        CREATE TABLE IF NOT EXISTS mcp_installations (
+            repo_key        TEXT NOT NULL,
+            repo_path       TEXT NOT NULL,
+            source_name     TEXT NOT NULL,
+            agent_id        TEXT NOT NULL,
+            scope           TEXT NOT NULL,
+            project_path    TEXT NOT NULL DEFAULT '',
+            runtime_json    TEXT NOT NULL DEFAULT '{}',
+            values_json     TEXT NOT NULL DEFAULT '{}',
+            enabled         INTEGER NOT NULL DEFAULT 1,
+            installed_at    TEXT NOT NULL,
+            PRIMARY KEY (repo_key, repo_path, agent_id, scope, project_path)
         );
 
         -- The single source of truth for what agents grove can launch.
@@ -663,14 +707,13 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
         -- Automation run history. One row per trigger. Three-stage timeline:
         --   triggered_at  cron tick or manual click
         --   queued_at     prompt successfully entered the ACP pending queue
-        --   completed_at  agent reported Complete (or Error / timeout / cancel)
+        --   completed_at  agent reported Complete or the user cancelled
         -- Status state machine:
-        --   queued → running → success | failed | timeout | cancelled | interrupted
-        --                  └→ cancelling → cancelled
-        -- 'running' is skipped on pre-pickup terminal transitions (resolve_*
-        -- error, spawn_acp error, or a user cancel before the agent saw our
-        -- prompt). 'interrupted' is set on startup-sweep when Grove restarted
-        -- while runs were still active ('queued', 'running', or 'cancelling').
+        --   queued/running → waiting ↔ running
+        --                  → failed  ↔ running
+        --                  → success | cancelled
+        -- waiting and failed remain recoverable through TaskChat. Only success
+        -- and cancelled are terminal.
         -- agent_response captures up to 16KB of the agent's last_assistant_text
         -- at Complete time — NULL when the agent only ran tools (no text), or
         -- when the run never completed.
@@ -693,7 +736,7 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             queued_at          INTEGER,
             started_at         INTEGER,
             completed_at       INTEGER,
-            status             TEXT NOT NULL,           -- queued|running|cancelling|success|failed|timeout|cancelled|interrupted
+            status             TEXT NOT NULL,           -- queued|running|waiting|failed|cancelling|success|cancelled
             phase              TEXT,                    -- resolve_task|resolve_session|spawn_acp|queue|agent_run
             error              TEXT,
             agent_response     TEXT,                    -- last_assistant_text, max 16KB
@@ -719,6 +762,9 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute_batch("ALTER TABLE chat_token_usage ADD COLUMN cost_amount REAL;");
     let _ = conn.execute_batch("ALTER TABLE chat_token_usage ADD COLUMN cost_currency TEXT;");
     let _ = conn.execute_batch("ALTER TABLE chat_token_usage ADD COLUMN automation_run_id TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE session ADD COLUMN archived_at TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE session ADD COLUMN updated_at TEXT;");
+    conn.execute_batch("UPDATE session SET updated_at = created_at WHERE updated_at IS NULL;")?;
     let usage_task_not_null = {
         let mut stmt = conn.prepare("PRAGMA table_info(chat_token_usage)")?;
         let rows = stmt.query_map([], |row| {
@@ -786,6 +832,9 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
         .execute_batch("ALTER TABLE installed_agents ADD COLUMN capability_snapshot_json TEXT;");
     let _ =
         conn.execute_batch("ALTER TABLE installed_agents ADD COLUMN capability_updated_at TEXT;");
+    let _ = conn.execute_batch(
+        "ALTER TABLE skill_sources ADD COLUMN management_mode TEXT NOT NULL DEFAULT 'referenced';",
+    );
     let _ = conn.execute_batch(
         "ALTER TABLE automations ADD COLUMN handler_key TEXT NOT NULL DEFAULT 'builtin.task_prompt';",
     );

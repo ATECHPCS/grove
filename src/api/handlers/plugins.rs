@@ -150,7 +150,7 @@ const SCAFFOLD_PKG_JSON: &str = r#"{
     "build": "npm run clean && vite build && node scripts/build-server.mjs",
     "publish": "npm run build && node scripts/publish.mjs"
   },
-  "//": "dev builds BOTH the panel and (if present) src/server.ts / src/backend.ts → dist/, and neither wipes the other. A node backend/MCP server runs under node's permission model; Grove requires node >= 24.",
+  "//": "dev builds BOTH the panel and (if present) src/server.ts / src/backend.ts → dist/, and neither wipes the other. A node backend/MCP server uses manifest-derived runtime permissions; Grove requires node >= 24.",
   "engines": { "node": ">=24" },
   "devDependencies": {
     "@types/node": "^24.0.0",
@@ -957,6 +957,36 @@ fn write_sdk_files(dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Compare the vendored SDK with the exact SDK shipped by this Grove build.
+/// This intentionally compares contents instead of plugin/app version numbers:
+/// the SDK can change independently of a plugin's own semantic version.
+fn plugin_sdk_status(local_path: &str) -> &'static str {
+    let sdk = std::path::Path::new(local_path)
+        .join("src")
+        .join("grove-sdk");
+    let expected = [
+        ("index.ts", SCAFFOLD_GROVE_TS.as_bytes()),
+        ("mcp.ts", SCAFFOLD_GROVE_MCP_TS.as_bytes()),
+        ("backend.ts", SCAFFOLD_GROVE_BACKEND_TS.as_bytes()),
+    ];
+    let mut found = 0;
+    for (name, contents) in expected {
+        if let Ok(actual) = std::fs::read(sdk.join(name)) {
+            found += 1;
+            if actual != contents {
+                return "outdated";
+            }
+        }
+    }
+    if found == 0 {
+        "missing"
+    } else if found < 3 {
+        "outdated"
+    } else {
+        "current"
+    }
+}
+
 /// POST /api/v1/plugins/{id}/update-sdk — rewrite a **dev** plugin's vendored
 /// SDK (`src/grove-sdk/*`) to the version shipped with this Grove. Dev-only:
 /// local/git plugins are immutable copies, so refreshing their SDK wouldn't
@@ -1209,6 +1239,9 @@ pub async fn list_plugins() -> Result<Json<serde_json::Value>, (StatusCode, Json
             // of a misleading blanket "ready".
             v["unbuilt"] = json!(unbuilt_entries(&p.local_path));
             v["icon"] = json!(read_icon_at(&p.local_path));
+            if p.source == "dev" {
+                v["sdk_status"] = json!(plugin_sdk_status(&p.local_path));
+            }
             if let Some(cmd) = plugin_mcp_command(&p.local_path) {
                 let available = command_available(&cmd);
                 v["runtime"] = json!({ "command": cmd, "available": available });
@@ -1707,26 +1740,40 @@ pub async fn install_local(
     Json(req): Json<InstallLocalRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     let src = validate_plugin_path(&req.path).map_err(ApiError::bad_request)?;
-    let (name, version) = read_manifest(&src)?;
-    verify_entries_built(&src)?;
+    let plugin = install_plugin_from_source(&src, "local", None, None)?;
+    Ok(Json(json!({ "ok": true, "plugin": plugin })))
+}
+
+/// Install a discovered Plugin artifact from an already materialized Source.
+/// The Source remains the catalog authority; the Plugin runtime receives an
+/// owned snapshot under ~/.grove/plugins so source sync cannot execute changed
+/// code without an explicit reinstall/update action.
+pub(crate) fn install_plugin_from_source(
+    src: &std::path::Path,
+    source: &str,
+    git_url: Option<&str>,
+    subpath: Option<&str>,
+) -> Result<crate::storage::plugins::Plugin, (StatusCode, Json<ApiError>)> {
+    let (name, version) = read_manifest(src)?;
+    verify_entries_built(src)?;
 
     let id = crate::storage::plugins::new_id();
     let dest = plugins_dir().join(&id);
-    copy_dir_recursive(&src, &dest)
+    copy_dir_recursive(src, &dest)
         .map_err(|e| ApiError::internal(format!("failed to copy plugin: {}", e)))?;
 
     let plugin = crate::storage::plugins::upsert(
         &id,
         &name,
         &version,
-        "local",
+        source,
         &dest.display().to_string(),
-        None,
-        None,
+        git_url,
+        subpath,
     )
     .map_err(|e| ApiError::internal(format!("failed to register: {}", e)))?;
     sync_plugin_skills(&plugin.id, &plugin.name, &plugin.local_path);
-    Ok(Json(json!({ "ok": true, "plugin": plugin })))
+    Ok(plugin)
 }
 
 /// Find the directory inside `root` that actually holds the plugin (its
@@ -2101,9 +2148,8 @@ pub struct BackendInvokeRequest {
 /// `{ method, params, projectId?, taskId? }`. With both ids the backend is
 /// task-scoped (gets that task's project fs access); without, it's app-scoped.
 ///
-/// No per-call permission gate: the backend already runs under the Node
-/// Permission Model with grants derived from the manifest, so the manifest is
-/// the single enforced source of truth.
+/// No per-call permission gate: the backend already runs with runtime access
+/// derived from the manifest, so the manifest is the single source of truth.
 pub async fn backend_invoke(
     Path(id): Path<String>,
     Json(req): Json<BackendInvokeRequest>,

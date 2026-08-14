@@ -14,7 +14,7 @@ use once_cell::sync::Lazy;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{GroveError, Result};
 
 pub use crate::agent_config::AgentConfigSelection;
 
@@ -99,16 +99,16 @@ pub struct Automation {
 /// One automation execution. See `database.rs` for the column-level docs.
 ///
 /// `status` follows the state machine:
-///   queued → running → success | failed | timeout | cancelled | interrupted
-///                  └→ cancelling → cancelled
+///   queued/running → waiting ↔ running
+///                  → failed  ↔ running
+///                  → success | cancelled
 ///
-/// `running` is skipped for pre-pickup terminal transitions (cancel before
-/// the agent took our prompt, or a `resolve_*` / `spawn_acp` failure).
+/// Errors are recorded on the Run without changing its lifecycle state. Only
+/// completion or explicit user cancellation makes a persisted Run terminal.
 ///
 /// `queued_at` is NULL until the prompt successfully enters the ACP queue
 /// (failures before that point leave it NULL). `completed_at` is NULL until
-/// the ACP `Complete` notification arrives — never arrives in `interrupted`
-/// (Grove restarted) or `timeout` cases.
+/// the ACP `Complete` notification arrives or the user cancels the Run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutomationRun {
     pub id: String,
@@ -459,6 +459,49 @@ pub fn load_due(now: i64) -> Result<Vec<Automation>> {
     Ok(rows)
 }
 
+/// Recompute the derived next-fire timestamp for every persisted automation.
+///
+/// `schedule_cron` is intentionally left untouched: it stores standard
+/// 5-field cron, while `cron_util` adapts that public format to the backend
+/// parser. This is used by the v2.8 migration to correct timestamps that were
+/// previously calculated with the parser's different weekday numbering.
+pub fn recompute_all_next_runs() -> Result<usize> {
+    let conn = super::database::connection();
+    recompute_all_next_runs_on(&conn)
+}
+
+fn recompute_all_next_runs_on(conn: &rusqlite::Connection) -> Result<usize> {
+    let schedules = {
+        let mut stmt = conn.prepare("SELECT id, schedule_cron FROM automations")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+
+    let mut next_runs = Vec::with_capacity(schedules.len());
+    for (id, schedule) in schedules {
+        let next = crate::automation::cron_util::next_unix(&schedule).map_err(|error| {
+            GroveError::storage(format!(
+                "invalid persisted automation cron for {id}: {error}"
+            ))
+        })?;
+        next_runs.push((id, next));
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    for (id, next_run_at) in &next_runs {
+        tx.execute(
+            "UPDATE automations SET next_run_at = ?1 WHERE id = ?2",
+            params![next_run_at, id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(next_runs.len())
+}
+
 /// Maximum agent_response length stored per run. Anything longer is
 /// truncated with a `... [N more bytes]` marker so callers can still tell
 /// the response was clipped without pulling chat history.
@@ -474,6 +517,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRun> {
     let agent_config_json: String = row.get(6)?;
     let input_json: String = row.get(7)?;
     let result_json: Option<String> = row.get(19)?;
+    let status: String = row.get(15)?;
     Ok(AutomationRun {
         id: row.get(0)?,
         automation_id: row.get(1)?,
@@ -490,7 +534,10 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRun> {
         queued_at: row.get(12)?,
         started_at: row.get(13)?,
         completed_at: row.get(14)?,
-        status: row.get(15)?,
+        status: match status.as_str() {
+            "timeout" | "interrupted" => "failed".to_string(),
+            _ => status,
+        },
         phase: row.get(16)?,
         error: row.get(17)?,
         agent_response: row.get(18)?,
@@ -531,7 +578,7 @@ pub fn claim_run(
             .query_row(
                 &format!(
                     "SELECT {RUN_COLUMNS} FROM automation_runs
-                     WHERE automation_id = ?1 AND status IN ('queued','running','cancelling')
+                     WHERE automation_id = ?1 AND status NOT IN ('success','cancelled')
                      ORDER BY triggered_at DESC LIMIT 1"
                 ),
                 params![automation_id],
@@ -574,7 +621,7 @@ pub fn update_run_input(run_id: &str, input: &serde_json::Value) -> Result<bool>
     let conn = super::database::connection();
     let changed = conn.execute(
         "UPDATE automation_runs SET input_json = ?1
-         WHERE id = ?2 AND status IN ('queued','running')",
+         WHERE id = ?2 AND status NOT IN ('success','cancelled','cancelling')",
         params![serde_json::to_string(input)?, run_id],
     )? > 0;
     drop(conn);
@@ -662,7 +709,7 @@ pub fn mark_run_queued(run_id: &str, queued_at: i64) -> Result<()> {
     let conn = super::database::connection();
     conn.execute(
         "UPDATE automation_runs SET queued_at = ?1
-         WHERE id = ?2 AND status IN ('queued','running')",
+         WHERE id = ?2 AND status NOT IN ('success','cancelled','cancelling')",
         params![queued_at, run_id],
     )?;
     drop(conn);
@@ -676,9 +723,26 @@ pub fn mark_run_queued(run_id: &str, queued_at: i64) -> Result<()> {
 pub fn mark_run_running(run_id: &str) -> Result<()> {
     let conn = super::database::connection();
     conn.execute(
-        "UPDATE automation_runs SET status = 'running', started_at = COALESCE(started_at, ?2)
-         WHERE id = ?1 AND status = 'queued'",
+        "UPDATE automation_runs
+         SET status = 'running', started_at = COALESCE(started_at, ?2),
+             completed_at = NULL, phase = NULL, error = NULL
+         WHERE id = ?1 AND status NOT IN ('success','cancelled','cancelling')",
         params![run_id, chrono::Utc::now().timestamp()],
+    )?;
+    drop(conn);
+    publish_run_update(run_id);
+    Ok(())
+}
+
+/// The current Agent turn is no longer executing, but the Run remains open
+/// for user input and can return to `running` on the next message.
+pub fn mark_run_waiting(run_id: &str) -> Result<()> {
+    let conn = super::database::connection();
+    conn.execute(
+        "UPDATE automation_runs
+         SET status = 'waiting', completed_at = NULL, phase = NULL, error = NULL
+         WHERE id = ?1 AND status NOT IN ('success','cancelled','cancelling')",
+        params![run_id],
     )?;
     drop(conn);
     publish_run_update(run_id);
@@ -692,7 +756,8 @@ where
     let conn = super::database::connection();
     let tx = conn.unchecked_transaction()?;
     let active: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM automation_runs WHERE id = ?1 AND status = 'running')",
+        "SELECT EXISTS(SELECT 1 FROM automation_runs
+                       WHERE id = ?1 AND status NOT IN ('success','cancelled','cancelling'))",
         params![run_id],
         |row| row.get(0),
     )?;
@@ -704,7 +769,7 @@ where
     let changed = tx.execute(
         "UPDATE automation_runs
          SET completed_at = ?1, status = 'success', result_json = ?2
-         WHERE id = ?3 AND status = 'running'",
+         WHERE id = ?3 AND status NOT IN ('success','cancelled','cancelling')",
         params![completed_at, serde_json::to_string(&result)?, run_id],
     )?;
     let trimmed = if changed > 0 {
@@ -740,7 +805,7 @@ pub fn mark_run_completed(
     tx.execute(
         "UPDATE automation_runs
          SET completed_at = ?1, status = 'success', agent_response = ?2
-         WHERE id = ?3 AND status IN ('queued','running')",
+         WHERE id = ?3 AND status NOT IN ('success','cancelled','cancelling')",
         params![completed_at, agent_response, run_id],
     )?;
     refresh_last_run_from(&tx, run_id)?;
@@ -749,38 +814,6 @@ pub fn mark_run_completed(
     drop(conn);
     cleanup_run_artifacts(trimmed);
     publish_run_update(run_id);
-    Ok(())
-}
-
-/// User-initiated cancel. Stamps `completed_at` and `error` (so the UI can
-/// show a reason — "removed from queue" vs "in-flight cancelled") and
-/// flips status to `cancelled`. Idempotent against terminal states.
-///
-/// Same TOCTOU-safe pattern as the watcher's terminal writers, but the
-/// caller usually wants to know the *prior* status to decide which ACP
-/// side-effect to fire (dequeue vs cancel). Prefer [`claim_cancel`] in
-/// that case — it returns the prior status atomically.
-pub fn mark_run_cancelled(run_id: &str, completed_at: i64, reason: &str) -> Result<()> {
-    let conn = super::database::connection();
-    let tx = conn.unchecked_transaction()?;
-    let changed = tx.execute(
-        "UPDATE automation_runs
-         SET status = 'cancelled', completed_at = ?1, error = ?2
-         WHERE id = ?3 AND status IN ('queued','running')",
-        params![completed_at, reason, run_id],
-    )? > 0;
-    let trimmed = if changed {
-        refresh_last_run_from(&tx, run_id)?;
-        trim_history(&tx, run_id)?
-    } else {
-        Vec::new()
-    };
-    tx.commit()?;
-    drop(conn);
-    cleanup_run_artifacts(trimmed);
-    if changed {
-        publish_run_update(run_id);
-    }
     Ok(())
 }
 
@@ -794,7 +827,7 @@ pub fn claim_cancel(run_id: &str, reason: &str) -> Result<Option<String>> {
     let prior: Option<String> = tx
         .query_row(
             "SELECT status FROM automation_runs
-             WHERE id = ?1 AND status IN ('queued','running')",
+             WHERE id = ?1 AND status NOT IN ('success','cancelled','cancelling')",
             params![run_id],
             |row| row.get(0),
         )
@@ -803,7 +836,7 @@ pub fn claim_cancel(run_id: &str, reason: &str) -> Result<Option<String>> {
         tx.execute(
             "UPDATE automation_runs
              SET status = 'cancelling', error = ?1
-             WHERE id = ?2 AND status IN ('queued','running')",
+             WHERE id = ?2 AND status NOT IN ('success','cancelled','cancelling')",
             params![reason, run_id],
         )?;
     }
@@ -838,113 +871,19 @@ pub fn finish_cancel(run_id: &str, completed_at: i64, reason: &str) -> Result<bo
     Ok(changed)
 }
 
-/// Terminal failure — set status, phase, and error. `completed_at` is filled
-/// even if the run never reached the queue; downstream consumers use it to
-/// compute total duration. Use `phase` to surface where in the pipeline the
-/// failure occurred (resolve_task / resolve_session / spawn_acp / queue / agent_run).
-pub fn mark_run_failed(run_id: &str, completed_at: i64, phase: &str, error: &str) -> Result<()> {
+/// Mark the current Agent attempt failed without making the Run terminal. The
+/// user may retry in the same conversation, which moves it back to `running`.
+pub fn mark_run_failed(run_id: &str, phase: &str, error: &str) -> Result<()> {
     let conn = super::database::connection();
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
+    conn.execute(
         "UPDATE automation_runs
-         SET completed_at = ?1, status = 'failed', phase = ?2, error = ?3
-         WHERE id = ?4 AND status IN ('queued','running')",
-        params![completed_at, phase, error, run_id],
+         SET status = 'failed', completed_at = NULL, phase = ?1, error = ?2
+         WHERE id = ?3 AND status NOT IN ('success','cancelled')",
+        params![phase, error, run_id],
     )?;
-    refresh_last_run_from(&tx, run_id)?;
-    let trimmed = trim_history(&tx, run_id)?;
-    tx.commit()?;
     drop(conn);
-    cleanup_run_artifacts(trimmed);
     publish_run_update(run_id);
     Ok(())
-}
-
-/// Terminal timeout — subscriber gave up waiting for `Complete`. agent_response
-/// captures whatever `last_assistant_text` had accumulated so partial output
-/// isn't lost.
-pub fn mark_run_timeout(
-    run_id: &str,
-    completed_at: i64,
-    agent_response: Option<&str>,
-) -> Result<()> {
-    let conn = super::database::connection();
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "UPDATE automation_runs
-         SET completed_at = ?1, status = 'timeout', agent_response = ?2,
-             error = 'agent did not report completion within the timeout window'
-         WHERE id = ?3 AND status IN ('queued','running')",
-        params![completed_at, agent_response, run_id],
-    )?;
-    refresh_last_run_from(&tx, run_id)?;
-    let trimmed = trim_history(&tx, run_id)?;
-    tx.commit()?;
-    drop(conn);
-    cleanup_run_artifacts(trimmed);
-    publish_run_update(run_id);
-    Ok(())
-}
-
-/// Startup sweep: any row stuck in an active state belongs to a
-/// previous Grove process that died with the watcher subscriber still in
-/// flight. We can't recover that subscriber, so mark the row `interrupted`
-/// and propagate to the parent automation's `last_run_*` columns so the
-/// list view doesn't keep showing it as "queued" / "running" forever.
-/// Returns the number of swept rows for the log line.
-pub fn sweep_interrupted_runs(now: i64) -> Result<usize> {
-    let conn = super::database::connection();
-    let tx = conn.unchecked_transaction()?;
-
-    // Capture the affected run_ids first so we can refresh each parent's
-    // last_run snapshot after the bulk UPDATE. SQLite can't `RETURNING` in
-    // older versions and the rusqlite API we use here is simpler with a
-    // pre-scan.
-    let affected: Vec<(String, String)> = {
-        let mut stmt = tx.prepare(
-            "SELECT id, automation_id FROM automation_runs
-             WHERE status IN ('queued','running','cancelling')",
-        )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
-
-    if affected.is_empty() {
-        tx.commit()?;
-        return Ok(0);
-    }
-
-    tx.execute(
-        "UPDATE automation_runs
-         SET status = 'interrupted', completed_at = COALESCE(completed_at, ?1),
-             error = 'Grove process exited before agent reported completion'
-         WHERE status IN ('queued','running','cancelling')",
-        params![now],
-    )?;
-
-    // Propagate to each affected parent. Without this, an automation that
-    // died mid-run keeps its parent's `last_run_status` at the stale
-    // `queued` / `running` value until the next run completes.
-    for (id, _) in &affected {
-        refresh_last_run_from(&tx, id)?;
-    }
-
-    let automation_ids = affected
-        .iter()
-        .map(|(_, automation_id)| automation_id.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    let mut trimmed = Vec::new();
-    for automation_id in automation_ids {
-        trimmed.extend(trim_automation_history(&tx, automation_id)?);
-    }
-
-    tx.commit()?;
-    drop(conn);
-    cleanup_run_artifacts(trimmed);
-    for (id, _) in &affected {
-        publish_run_update(id);
-    }
-    Ok(affected.len())
 }
 
 /// Reflect the **latest** run's status / time onto the parent automation row
@@ -990,6 +929,8 @@ struct RunArtifact {
     run_id: String,
     project_id: String,
     handler_key: String,
+    resolved_task_id: Option<String>,
+    resolved_chat_id: Option<String>,
 }
 
 fn collect_run_artifacts(
@@ -997,17 +938,18 @@ fn collect_run_artifacts(
     automation_id: &str,
     only_trimmed: bool,
 ) -> Result<Vec<RunArtifact>> {
-    let mut sql = "SELECT r.id, a.project, a.handler_key
+    let mut sql = "SELECT r.id, a.project, a.handler_key,
+                          r.resolved_task_id, r.resolved_chat_id
                    FROM automation_runs r
                    JOIN automations a ON a.id = r.automation_id
                    WHERE r.automation_id = ?1"
         .to_string();
     if only_trimmed {
         sql.push_str(
-            " AND r.status NOT IN ('queued','running','cancelling')
+            " AND r.status IN ('success','cancelled')
               AND r.id NOT IN (
                 SELECT id FROM automation_runs
-                WHERE automation_id = ?1 AND status NOT IN ('queued','running','cancelling')
+                WHERE automation_id = ?1 AND status IN ('success','cancelled')
                 ORDER BY triggered_at DESC, rowid DESC LIMIT 100
               )",
         );
@@ -1018,6 +960,8 @@ fn collect_run_artifacts(
             run_id: row.get(0)?,
             project_id: row.get(1)?,
             handler_key: row.get(2)?,
+            resolved_task_id: row.get(3)?,
+            resolved_chat_id: row.get(4)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1029,6 +973,8 @@ fn cleanup_run_artifacts(artifacts: Vec<RunArtifact>) {
             &artifact.handler_key,
             &artifact.project_id,
             &artifact.run_id,
+            artifact.resolved_task_id.as_deref(),
+            artifact.resolved_chat_id.as_deref(),
         ) {
             crate::automation::awarn!(
                 "remove artifacts for Automation Run {}: {}",
@@ -1056,10 +1002,10 @@ fn trim_automation_history(
     tx.execute(
         "DELETE FROM automation_runs
          WHERE automation_id = ?1
-           AND status NOT IN ('queued','running','cancelling')
+           AND status IN ('success','cancelled')
            AND id NOT IN (
                SELECT id FROM automation_runs
-               WHERE automation_id = ?1 AND status NOT IN ('queued','running','cancelling')
+               WHERE automation_id = ?1 AND status IN ('success','cancelled')
                ORDER BY triggered_at DESC, rowid DESC LIMIT 100
            )",
         params![automation_id],
@@ -1077,6 +1023,92 @@ pub fn get_run(run_id: &str) -> Result<Option<AutomationRun>> {
         )
         .optional()?;
     Ok(row)
+}
+
+pub fn nonterminal_run_id_for_chat(
+    project_id: &str,
+    task_id: &str,
+    chat_id: &str,
+) -> Result<Option<String>> {
+    let conn = super::database::connection();
+    Ok(conn
+        .query_row(
+            "SELECT r.id
+             FROM automation_runs r
+             JOIN automations a ON a.id = r.automation_id
+             WHERE a.project = ?1 AND r.resolved_task_id = ?2
+               AND r.resolved_chat_id = ?3
+               AND r.status NOT IN ('success','cancelled')
+             ORDER BY r.triggered_at DESC, r.rowid DESC
+             LIMIT 1",
+            params![project_id, task_id, chat_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ChatRunTransition<'a> {
+    InProgress,
+    Waiting,
+    Failed(&'a str),
+    TurnComplete,
+    None,
+}
+
+fn chat_run_transition(update: &crate::acp::AcpUpdate) -> ChatRunTransition<'_> {
+    match update {
+        crate::acp::AcpUpdate::UserMessage { .. }
+        | crate::acp::AcpUpdate::PermissionResponse { .. }
+        | crate::acp::AcpUpdate::ElicitationResolved { .. }
+        | crate::acp::AcpUpdate::AuthSucceeded => ChatRunTransition::InProgress,
+        crate::acp::AcpUpdate::PermissionRequest { .. }
+        | crate::acp::AcpUpdate::ElicitationRequest { .. }
+        | crate::acp::AcpUpdate::AskForm { .. }
+        | crate::acp::AcpUpdate::AuthRequired { .. }
+        | crate::acp::AcpUpdate::AuthFailed { .. } => ChatRunTransition::Waiting,
+        crate::acp::AcpUpdate::Error { message } => ChatRunTransition::Failed(message),
+        crate::acp::AcpUpdate::SessionEnded => {
+            ChatRunTransition::Failed("Agent Session ended before the Run completed")
+        }
+        crate::acp::AcpUpdate::Complete { .. } => ChatRunTransition::TurnComplete,
+        _ => ChatRunTransition::None,
+    }
+}
+
+/// Keep a recoverable Run's user-facing state in sync with its ordinary
+/// TaskChat Session. This also covers Sessions reattached after the original
+/// executor watcher has gone away.
+pub fn sync_run_state_for_chat_event(
+    project_id: &str,
+    task_id: &str,
+    chat_id: &str,
+    update: &crate::acp::AcpUpdate,
+) {
+    let Ok(Some(run_id)) = nonterminal_run_id_for_chat(project_id, task_id, chat_id) else {
+        return;
+    };
+    match chat_run_transition(update) {
+        ChatRunTransition::InProgress => {
+            let _ = mark_run_running(&run_id);
+        }
+        ChatRunTransition::Waiting => {
+            let _ = mark_run_waiting(&run_id);
+        }
+        ChatRunTransition::Failed(message) => {
+            let _ = mark_run_failed(&run_id, "agent_run", message);
+        }
+        ChatRunTransition::TurnComplete => {
+            let is_project_run = get_run(&run_id)
+                .ok()
+                .flatten()
+                .is_some_and(|run| run.execution_scope == "project_run");
+            if is_project_run {
+                let _ = mark_run_waiting(&run_id);
+            }
+        }
+        ChatRunTransition::None => {}
+    }
 }
 
 pub fn list_runs(automation_id: &str, limit: usize) -> Result<Vec<AutomationRun>> {
@@ -1097,7 +1129,7 @@ pub fn has_active_run(automation_id: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM automation_runs
-            WHERE automation_id = ?1 AND status IN ('queued','running','cancelling')
+            WHERE automation_id = ?1 AND status NOT IN ('success','cancelled')
          )",
         params![automation_id],
         |row| row.get(0),
@@ -1112,7 +1144,8 @@ pub fn delete_finished_run(automation_id: &str, run_id: &str) -> Result<bool> {
     let tx = conn.unchecked_transaction()?;
     let artifact = tx
         .query_row(
-            "SELECT r.id, a.project, a.handler_key, r.status
+            "SELECT r.id, a.project, a.handler_key, r.resolved_task_id,
+                    r.resolved_chat_id, r.status
              FROM automation_runs r
              JOIN automations a ON a.id = r.automation_id
              WHERE r.automation_id = ?1 AND r.id = ?2",
@@ -1123,8 +1156,10 @@ pub fn delete_finished_run(automation_id: &str, run_id: &str) -> Result<bool> {
                         run_id: row.get(0)?,
                         project_id: row.get(1)?,
                         handler_key: row.get(2)?,
+                        resolved_task_id: row.get(3)?,
+                        resolved_chat_id: row.get(4)?,
                     },
-                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )
@@ -1132,7 +1167,7 @@ pub fn delete_finished_run(automation_id: &str, run_id: &str) -> Result<bool> {
     let Some((artifact, status)) = artifact else {
         return Ok(false);
     };
-    if matches!(status.as_str(), "queued" | "running" | "cancelling") {
+    if !matches!(status.as_str(), "success" | "cancelled") {
         return Err(crate::error::GroveError::invalid_data(
             "active Automation Runs must be cancelled before deletion",
         ));
@@ -1212,8 +1247,8 @@ pub fn delete_finished_run(automation_id: &str, run_id: &str) -> Result<bool> {
 }
 
 /// Input upper-bound from the latest successfully published project Run.
-/// Consumers use this as the next Run's exclusive lower-bound; failed or
-/// interrupted runs never advance the input window.
+/// Consumers use this as the next Run's exclusive lower-bound; Runs that did
+/// not complete successfully never advance the input window.
 pub fn latest_successful_input_through(automation_id: &str) -> Result<Option<String>> {
     let conn = super::database::connection();
     let raw: Option<String> = conn
@@ -1266,4 +1301,78 @@ pub fn truncate_agent_response(text: &str) -> String {
     }
     let remaining = bytes.len() - cutoff;
     format!("{}\n... [{} more bytes]", &text[..cutoff], remaining)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Datelike, Local, TimeZone, Timelike, Weekday};
+
+    #[test]
+    fn recompute_next_runs_corrects_persisted_standard_weekday() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::super::database::create_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO automations (
+                id, project, name, enabled, task_mode, session_mode, prompt,
+                schedule_cron, next_run_at, created_at, updated_at
+             ) VALUES ('test', 'project', 'Tuesday', 1, 'new', 'new', 'prompt',
+                       '10 10 * * 2', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(recompute_all_next_runs_on(&conn).unwrap(), 1);
+        let next_run_at: i64 = conn
+            .query_row(
+                "SELECT next_run_at FROM automations WHERE id = 'test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let next = Local.timestamp_opt(next_run_at, 0).single().unwrap();
+        assert_eq!(next.weekday(), Weekday::Tue);
+        assert_eq!((next.hour(), next.minute()), (10, 10));
+    }
+
+    #[test]
+    fn chat_events_map_to_the_five_state_machine() {
+        let user_message = crate::acp::AcpUpdate::UserMessage {
+            text: "continue".to_string(),
+            attachments: Vec::new(),
+            sender: None,
+            terminal: false,
+        };
+        assert_eq!(
+            chat_run_transition(&user_message),
+            ChatRunTransition::InProgress
+        );
+
+        let permission = crate::acp::AcpUpdate::PermissionRequest {
+            id: "permission-1".to_string(),
+            description: "Allow access?".to_string(),
+            options: Vec::new(),
+        };
+        assert_eq!(chat_run_transition(&permission), ChatRunTransition::Waiting);
+
+        let error = crate::acp::AcpUpdate::Error {
+            message: "agent failed".to_string(),
+        };
+        assert_eq!(
+            chat_run_transition(&error),
+            ChatRunTransition::Failed("agent failed")
+        );
+
+        let complete = crate::acp::AcpUpdate::Complete {
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+            start_ts: None,
+            end_ts: None,
+            cost: None,
+        };
+        assert_eq!(
+            chat_run_transition(&complete),
+            ChatRunTransition::TurnComplete
+        );
+    }
 }

@@ -1,9 +1,11 @@
 //! Cron expression parsing.
 //!
 //! Users (and the frontend cronstrue preview) speak 5-field standard cron
-//! (`minute hour day month weekday`). The `cron` crate speaks 6-field cron
-//! with leading seconds (and an optional 7th year field), so we prepend
-//! `"0 "` before parsing. Output `next_run_at` is unix seconds.
+//! (`minute hour day month weekday`), where Sunday is 0 or 7 and Monday is 1.
+//! The `cron` crate speaks 6-field cron with leading seconds (and an optional
+//! 7th year field), and numbers weekdays as Sunday=1 through Saturday=7. We
+//! translate the weekday field and prepend `"0 "` before parsing. Output
+//! `next_run_at` is unix seconds.
 //!
 //! Schedules are interpreted in the **system local timezone**: a user picking
 //! "Daily at 9am" expects 9am on their wall clock, not 9 UTC. The returned
@@ -15,21 +17,113 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Local};
 use cron::Schedule;
+use std::collections::BTreeSet;
 
-/// Promote a 5-field standard cron expression to the cron-crate's 6-field
-/// form. Returns the input unchanged if it already has 6 or 7 fields so a
-/// caller who knows what they're doing can pass through seconds-precision.
-fn to_six_field(expr: &str) -> String {
-    let field_count = expr.split_whitespace().count();
-    if field_count == 5 {
-        format!("0 {expr}")
-    } else {
-        expr.to_string()
+fn standard_weekday(value: &str) -> Result<u32, String> {
+    let ordinal = match value.to_ascii_lowercase().as_str() {
+        "sun" | "sunday" => 0,
+        "mon" | "monday" => 1,
+        "tue" | "tues" | "tuesday" => 2,
+        "wed" | "wednesday" => 3,
+        "thu" | "thurs" | "thursday" => 4,
+        "fri" | "friday" => 5,
+        "sat" | "saturday" => 6,
+        _ => value
+            .parse::<u32>()
+            .map_err(|_| format!("invalid day of week: {value}"))?,
+    };
+    if ordinal > 7 {
+        return Err(format!("day of week must be between 0 and 7: {value}"));
     }
+    Ok(if ordinal == 7 { 0 } else { ordinal })
+}
+
+fn standard_weekday_range(value: &str) -> Result<Vec<u32>, String> {
+    if matches!(value, "*" | "?") {
+        return Ok((0..=6).collect());
+    }
+
+    if let Some((start, end)) = value.split_once('-') {
+        let raw_numeric = start.parse::<u32>().ok().zip(end.parse::<u32>().ok());
+        if let Some((start, end)) = raw_numeric {
+            if start > 7 || end > 7 || start > end {
+                return Err(format!("invalid day-of-week range: {value}"));
+            }
+            return Ok((start..=end)
+                .map(|day| if day == 7 { 0 } else { day })
+                .collect());
+        }
+
+        let start = standard_weekday(start)?;
+        let end = standard_weekday(end)?;
+        if start > end {
+            return Err(format!("invalid day-of-week range: {value}"));
+        }
+        return Ok((start..=end).collect());
+    }
+
+    Ok(vec![standard_weekday(value)?])
+}
+
+/// Convert a standard cron weekday expression into the `cron` crate's
+/// Sunday=1 ordinal set. Expanding the seven-value field keeps ranges and
+/// steps correct across the Sunday boundary (for example `5-7` and `*/2`).
+fn translate_weekday_field(field: &str) -> Result<String, String> {
+    if matches!(field, "*" | "?") {
+        return Ok(field.to_string());
+    }
+
+    let mut weekdays = BTreeSet::new();
+    for item in field.split(',') {
+        let (base, step) = match item.split_once('/') {
+            Some((base, step)) => {
+                let step = step
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid day-of-week step: {item}"))?;
+                if step == 0 {
+                    return Err("day-of-week step cannot be zero".to_string());
+                }
+                (base, step)
+            }
+            None => (item, 1),
+        };
+
+        let mut values = standard_weekday_range(base)?;
+        // Like the backend cron parser, a point followed by `/N` means the
+        // range from that point through the maximum weekday.
+        if step > 1 && !matches!(base, "*" | "?") && !base.contains('-') {
+            let start = values[0];
+            values = (start..=6).collect();
+        }
+        for weekday in values.into_iter().step_by(step) {
+            weekdays.insert(weekday);
+        }
+    }
+
+    if weekdays.is_empty() {
+        return Err("day-of-week field cannot be empty".to_string());
+    }
+    Ok(weekdays
+        .into_iter()
+        .map(|weekday| (weekday + 1).to_string())
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+fn normalized_expression(expr: &str) -> Result<String, String> {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 5 {
+        return Ok(expr.to_string());
+    }
+    let weekday = translate_weekday_field(fields[4])?;
+    Ok(format!(
+        "0 {} {} {} {} {}",
+        fields[0], fields[1], fields[2], fields[3], weekday
+    ))
 }
 
 pub fn validate(expr: &str) -> Result<(), String> {
-    Schedule::from_str(&to_six_field(expr.trim()))
+    Schedule::from_str(&normalized_expression(expr.trim())?)
         .map(|_| ())
         .map_err(|e| format!("invalid cron expression: {e}"))
 }
@@ -39,7 +133,7 @@ pub fn validate(expr: &str) -> Result<(), String> {
 /// date). Tests call this with an explicit `after` so they're deterministic;
 /// production callers use [`next_unix`].
 pub fn next_after(expr: &str, after: DateTime<Local>) -> Result<Option<DateTime<Local>>, String> {
-    let schedule = Schedule::from_str(&to_six_field(expr.trim()))
+    let schedule = Schedule::from_str(&normalized_expression(expr.trim())?)
         .map_err(|e| format!("invalid cron expression: {e}"))?;
     Ok(schedule.after(&after).next())
 }
@@ -52,7 +146,7 @@ pub fn next_unix(expr: &str) -> Result<Option<i64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Timelike};
+    use chrono::{Datelike, TimeZone, Timelike, Weekday};
 
     #[test]
     fn validate_accepts_standard_5_field() {
@@ -77,5 +171,46 @@ mod tests {
         let next = next_after("0 9 * * *", now).unwrap().unwrap();
         assert_eq!(next.hour(), 9);
         assert_eq!(next.date_naive(), now.date_naive());
+    }
+
+    #[test]
+    fn standard_numeric_weekday_fires_on_tuesday() {
+        let tuesday_after_fire_time = Local
+            .with_ymd_and_hms(2026, 8, 11, 11, 0, 0)
+            .single()
+            .unwrap();
+        let next = next_after("10 10 * * 2", tuesday_after_fire_time)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.weekday(), Weekday::Tue);
+        assert_eq!(next.day(), 18);
+    }
+
+    #[test]
+    fn standard_sunday_zero_and_seven_are_equivalent() {
+        let saturday = Local
+            .with_ymd_and_hms(2026, 8, 15, 11, 0, 0)
+            .single()
+            .unwrap();
+        let zero = next_after("10 10 * * 0", saturday).unwrap().unwrap();
+        let seven = next_after("10 10 * * 7", saturday).unwrap().unwrap();
+        assert_eq!(zero, seven);
+        assert_eq!(zero.weekday(), Weekday::Sun);
+    }
+
+    #[test]
+    fn translates_standard_weekday_lists_ranges_and_steps() {
+        assert_eq!(translate_weekday_field("1,3,5").unwrap(), "2,4,6");
+        assert_eq!(translate_weekday_field("1-5").unwrap(), "2,3,4,5,6");
+        assert_eq!(translate_weekday_field("5-7").unwrap(), "1,6,7");
+        assert_eq!(translate_weekday_field("*/2").unwrap(), "1,3,5,7");
+        assert_eq!(translate_weekday_field("MON-FRI").unwrap(), "2,3,4,5,6");
+    }
+
+    #[test]
+    fn rejects_invalid_standard_weekdays() {
+        assert!(validate("0 9 * * 8").is_err());
+        assert!(validate("0 9 * * 5-1").is_err());
+        assert!(validate("0 9 * * */0").is_err());
     }
 }

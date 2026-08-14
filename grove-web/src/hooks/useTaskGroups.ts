@@ -7,6 +7,7 @@ import {
   upsertTaskSlot,
   removeTaskSlot,
   setSlots,
+  moveTaskSlot,
 } from "../api";
 import type { TaskGroup, TaskSlot } from "../data/types";
 import { MAIN_GROUP_ID, LOCAL_GROUP_ID } from "../data/types";
@@ -42,6 +43,9 @@ export interface UseTaskGroupsResult {
     toGroupId: string,
     projectId: string,
     taskId: string,
+    anchorProjectId?: string,
+    anchorTaskId?: string,
+    placement?: "before" | "after",
   ) => void;
   refresh: () => Promise<void>;
 }
@@ -147,10 +151,7 @@ export function useTaskGroups(): UseTaskGroupsResult {
       setGroups((prev) =>
         prev.map((g) => {
           if (g.id !== groupId) return g;
-          // Filter out deleted slot and renumber positions sequentially (matches backend behavior)
-          const remaining = g.slots
-            .filter((s) => s.position !== position)
-            .map((s, i) => ({ ...s, position: i + 1 }));
+          const remaining = g.slots.filter((s) => s.position !== position);
           return { ...g, slots: remaining };
         }),
       );
@@ -189,6 +190,9 @@ export function useTaskGroups(): UseTaskGroupsResult {
       toGroupId: string,
       projectId: string,
       taskId: string,
+      anchorProjectId?: string,
+      anchorTaskId?: string,
+      placement: "before" | "after" = "after",
     ) => {
       // Use ref to read latest groups (avoids stale closure in rapid operations)
       const latestGroups = groupsRef.current;
@@ -196,22 +200,43 @@ export function useTaskGroups(): UseTaskGroupsResult {
       const slot = sourceGroup?.slots.find(
         (s) => s.project_id === projectId && s.task_id === taskId,
       );
-      if (!slot) return;
+      if (!slot) {
+        console.warn("[TaskGroups] moveTask source slot not found; refreshing groups", {
+          fromGroupId,
+          projectId,
+          taskId,
+        });
+        void refresh();
+        return;
+      }
 
       const targetGroup = latestGroups.find((g) => g.id === toGroupId);
-      const existingPositions = targetGroup
-        ? targetGroup.slots.map((s) => s.position)
-        : [];
-      let candidatePos = 1;
-      while (existingPositions.includes(candidatePos)) candidatePos += 1;
-      const nextPos = candidatePos;
-
-      const movedSlot: TaskSlot = { ...slot, position: nextPos };
+      const targetSlots = (targetGroup?.slots ?? [])
+        .filter((candidate) => !(
+          candidate.project_id === projectId && candidate.task_id === taskId
+        ))
+        .sort((a, b) => a.position - b.position);
+      const anchorIndex = anchorProjectId && anchorTaskId
+        ? targetSlots.findIndex((candidate) => (
+            candidate.project_id === anchorProjectId && candidate.task_id === anchorTaskId
+          ))
+        : -1;
+      const insertionIndex = anchorIndex >= 0
+        ? anchorIndex + (placement === "after" ? 1 : 0)
+        : targetSlots.length;
+      const previous = targetSlots[insertionIndex - 1]?.position;
+      const next = targetSlots[insertionIndex]?.position;
+      // A fractional temporary rank keeps the optimistic order correct when
+      // the integer gap is exhausted; the backend response supplies rebased ranks.
+      const optimisticPosition = previous === undefined
+        ? (next === undefined ? 1000 : next / 2)
+        : (next === undefined ? previous + 1000 : previous + (next - previous) / 2);
+      const movedSlot: TaskSlot = { ...slot, position: optimisticPosition };
 
       // Optimistic update
       setGroups((prev) =>
         prev.map((g) => {
-          if (g.id === fromGroupId) {
+          if (g.id === fromGroupId && fromGroupId !== toGroupId) {
             return {
               ...g,
               slots: g.slots.filter(
@@ -220,22 +245,30 @@ export function useTaskGroups(): UseTaskGroupsResult {
             };
           }
           if (g.id === toGroupId) {
-            return { ...g, slots: [...g.slots, movedSlot] };
+            return { ...g, slots: [...targetSlots, movedSlot].sort((a, b) => a.position - b.position) };
           }
           return g;
         }),
       );
 
-      // Chain API calls sequentially to avoid TOCTOU race on the same TOML file
-      removeTaskSlot(fromGroupId, slot.position)
-        .then(() => upsertTaskSlot(toGroupId, {
-          position: nextPos,
-          project_id: projectId,
-          task_id: taskId,
-        }))
+      // One backend transaction owns the full cross-group invariant.
+      moveTaskSlot(
+        fromGroupId,
+        toGroupId,
+        projectId,
+        taskId,
+        anchorProjectId,
+        anchorTaskId,
+        placement,
+      )
+        .then((updatedTarget) => {
+          setGroups((prev) => prev.map((group) => (
+            group.id === toGroupId ? updatedTarget : group
+          )));
+        })
         .catch((err) => {
           console.error("[TaskGroups] moveTask failed:", err);
-          refresh();
+          void refresh();
         });
     },
     [refresh],

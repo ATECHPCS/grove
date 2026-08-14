@@ -4,6 +4,11 @@ import { apiClient, appendHmacToUrl } from "../../api/client";
 import { useProject, useTheme } from "../../context";
 import type { Plugin } from "../../api/plugins";
 import { listPluginChats, sendPluginChat } from "../../api/plugins";
+import {
+  resolvePluginEntry,
+  type PluginUiContribution,
+  type PluginUiManifest,
+} from "./pluginEntry";
 
 /** Encode each path segment but keep `/` separators (for the /data/{*path} route). */
 const encodePath = (p: string) => p.split("/").map(encodeURIComponent).join("/");
@@ -38,11 +43,14 @@ const encodePath = (p: string) => p.split("/").map(encodeURIComponent).join("/")
  */
 export function PluginFrame({
   plugin,
+  contribution,
   projectId = null,
   taskId = null,
   showReload = true,
 }: {
   plugin: Plugin;
+  /** Manifest contribution whose UI entry this frame is hosting. */
+  contribution: PluginUiContribution;
   /** Project the frame is scoped to. Defaults to the globally-selected project. */
   projectId?: string | null;
   /** Task the frame is scoped to (workspace panel); null for sidebar surfaces. */
@@ -59,16 +67,16 @@ export function PluginFrame({
   // sidebar selection — Blitz can open a task from a different project.
   const project = projectId ? (projects.find((p) => p.id === projectId) ?? selectedProject) : selectedProject;
 
-  // Read the panel entry from the plugin's manifest, fall back to index.html.
+  // Read the entry for the surface hosting this frame. A plugin may declare
+  // distinct panel and sidebar bundles, so this cannot be inferred globally.
   useEffect(() => {
     let cancelled = false;
     apiClient
-      .get<{ contributes?: { panel?: { entry?: string } } }>(
+      .get<PluginUiManifest>(
         `/api/v1/plugins/${plugin.id}/asset/plugin.json`,
       )
       .then((m) => {
-        const e = m?.contributes?.panel?.entry;
-        if (!cancelled) setEntry(typeof e === "string" && e ? e : "index.html");
+        if (!cancelled) setEntry(resolvePluginEntry(m, contribution));
       })
       .catch(() => {
         if (!cancelled) setEntry("index.html");
@@ -76,7 +84,7 @@ export function PluginFrame({
     return () => {
       cancelled = true;
     };
-  }, [plugin.id]);
+  }, [plugin.id, contribution]);
 
   // postMessage bridge.
   useEffect(() => {

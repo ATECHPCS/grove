@@ -118,7 +118,7 @@ export const BUILT_IN_PANELS: PanelDescriptor[] = [
         <TaskChat
           key={`${ctx.projectId}:${ctx.task.id}`}
           projectId={ctx.projectId}
-          task={ctx.task}
+          taskId={ctx.task.id}
           fullscreen
           onNavigateToFile={ctx.navigateToFile}
           onChatBecameIdle={ctx.onChatBecameIdle}
@@ -277,7 +277,12 @@ function pluginDescriptor(plugin: Plugin): PanelDescriptor {
     category: side === "right" ? "info" : "aux",
     available: always,
     render: (ctx) => (
-      <PluginFrame plugin={plugin} projectId={ctx.projectId} taskId={ctx.task.id} />
+      <PluginFrame
+        plugin={plugin}
+        contribution="panel"
+        projectId={ctx.projectId}
+        taskId={ctx.task.id}
+      />
     ),
   };
 }

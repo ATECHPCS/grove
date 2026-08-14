@@ -50,10 +50,13 @@ impl From<&AgentDef> for AgentResponse {
 pub struct SourceResponse {
     pub name: String,
     pub source_type: String,
+    pub management_mode: String,
     pub url: String,
     pub subpath: Option<String>,
     pub repo_key: String,
     pub skill_count: usize,
+    pub plugin_count: usize,
+    pub mcp_count: usize,
     pub last_synced: Option<String>,
     pub has_remote_updates: bool,
 }
@@ -141,6 +144,8 @@ pub struct AddAgentRequest {
 pub struct AddSourceRequest {
     pub name: String,
     pub source_type: String,
+    #[serde(default)]
+    pub management_mode: Option<String>,
     pub url: String,
     pub subpath: Option<String>,
 }
@@ -297,13 +302,25 @@ fn source_to_response(
     skill_count: usize,
     has_remote_updates: bool,
 ) -> SourceResponse {
+    let artifacts = crate::storage::extensions::list_artifacts().unwrap_or_default();
+    let plugin_count = artifacts
+        .iter()
+        .filter(|a| a.source_name == s.name && a.kind == "plugin")
+        .count();
+    let mcp_count = artifacts
+        .iter()
+        .filter(|a| a.source_name == s.name && a.kind == "mcp")
+        .count();
     SourceResponse {
         name: s.name.clone(),
         source_type: s.source_type.clone(),
+        management_mode: s.management_mode.clone(),
         url: s.url.clone(),
         subpath: s.subpath.clone(),
         repo_key: s.repo_key.clone(),
         skill_count,
+        plugin_count,
+        mcp_count,
         last_synced: s.last_synced.map(|dt| dt.to_rfc3339()),
         has_remote_updates,
     }
@@ -359,6 +376,9 @@ pub async fn add_source(Json(req): Json<AddSourceRequest>) -> impl IntoResponse 
     let source = SkillSourceDef {
         name: req.name.clone(),
         source_type: req.source_type,
+        management_mode: req
+            .management_mode
+            .unwrap_or_else(|| "referenced".to_string()),
         url: req.url,
         subpath: req.subpath,
         repo_key,
@@ -419,6 +439,9 @@ pub async fn update_source(
     };
 
     source.source_type = req.source_type.clone();
+    if let Some(mode) = req.management_mode {
+        source.management_mode = mode;
+    }
     source.url = req.url.clone();
     source.subpath = req.subpath;
     source.repo_key = compute_repo_key(&req.url);

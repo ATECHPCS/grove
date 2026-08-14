@@ -143,38 +143,58 @@
       <span class="title">MEMORY</span>
     </div>
     <div class="section-head" data-animate>
-      <h2>What the agent<br><span class="italic-soft">remembers</span>, you control.</h2>
+      <h2>Context that grows.<br><span class="italic-soft">Memory you can inspect.</span></h2>
       <p class="lede">
-        Project Memory and Workspace Instructions are the context your agents
-        read at every turn. In Studio they're first-class editable panels,
-        not hidden markdown files. No CLI required.
+        Chat history records a conversation. Project Memory preserves the
+        decisions, constraints, and working knowledge that should matter in
+        the next one — without loading the whole past into every prompt.
       </p>
     </div>
 
     <div class="feature reverse">
       <div class="feat-visual" data-animate>
         <figure class="asset-shot">
-          <img src="images/shared-memory.png" alt="Project Memory editor with Shared Assets and Workspace Instructions panels" loading="lazy" />
+          <img src="images/memory-graph.png" alt="Grove Project Memory graph with searchable Entities, structured Tag categories, and scored Relations" loading="lazy" />
           <figcaption>
             <span class="cap-num">FIG. 03</span>
-            <span class="cap-text">Edit once. Every agent, smarter.</span>
+            <span class="cap-text">Long-term knowledge, visible as a system — not buried in chat.</span>
           </figcaption>
         </figure>
       </div>
       <div class="feat-copy" data-animate>
-        <div class="eyebrow">Editors</div>
-        <h3>Markdown, made humane.</h3>
+        <div class="eyebrow">Project Memory</div>
+        <h3>Remember selectively.</h3>
         <p class="feat-lede">
-          Split view, preview mode, auto-save on navigation. The kind of
-          editor a product manager or a designer can open without googling
-          markdown syntax.
+          Agents recall concise candidates, read only the relevant full
+          Memory, and append new decisions or corrections as short-term Logs.
+          Grove keeps every step visible in the UI.
         </p>
         <ul>
-          <li>Project Memory — per-project context the agent reads every turn</li>
-          <li>Workspace Instructions — global preferences across all projects</li>
-          <li>Edit / preview toggle, auto-save, no "save button" ritual</li>
-          <li>Merges into Studio so memory, assets, and artifacts live together</li>
+          <li>Durable Markdown Entities with titles, structured Tags, and importance scores</li>
+          <li>Append-only Logs linked to the Task and Chat where knowledge emerged</li>
+          <li>Graph and List views for search, filtering, and relationship exploration</li>
+          <li>A TaskChat pill that shows the exact Memory read in the current turn</li>
         </ul>
+      </div>
+    </div>
+
+    <div class="rule"></div>
+
+    <div class="cards c-3" data-animate>
+      <div class="card">
+        <span class="card-label">Capture</span>
+        <h3>Logs stay close to the work.</h3>
+        <p>Agents append decisions, corrections, constraints, and reusable lessons without pretending every observation is already durable knowledge.</p>
+      </div>
+      <div class="card">
+        <span class="card-label">Organize</span>
+        <h3>Runs reconcile the evidence.</h3>
+        <p>Scheduled or event-driven Organization Runs review pending Logs, update the Entity structure, and preserve a visible Run history.</p>
+      </div>
+      <div class="card">
+        <span class="card-label">Control</span>
+        <h3>You can see what persists.</h3>
+        <p>Search, inspect, edit, or delete Memory. Relations remain lightweight, and full reads are explicit instead of hidden prompt injection.</p>
       </div>
     </div>
   </section>

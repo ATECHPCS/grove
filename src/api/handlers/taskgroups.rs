@@ -25,7 +25,7 @@ pub struct UpdateGroupRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct UpsertSlotRequest {
-    pub position: u16,
+    pub position: u32,
     pub project_id: String,
     pub task_id: String,
     pub target_chat_id: Option<String>,
@@ -36,14 +36,29 @@ pub struct SetSlotsRequest {
     pub slots: Vec<UpsertSlotRequest>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct MoveSlotRequest {
+    pub from_group_id: String,
+    pub to_group_id: String,
+    pub project_id: String,
+    pub task_id: String,
+    pub anchor_project_id: Option<String>,
+    pub anchor_task_id: Option<String>,
+    pub placement: Option<taskgroups::SlotPlacement>,
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
 
 /// GET /taskgroups — list all task groups
-/// Note: ensure_system_groups() is called at startup and after task create/archive/delete,
-/// so we don't need to call it on every list request.
 pub async fn list_groups() -> impl IntoResponse {
+    // Reconcile before every read instead of relying on one particular server
+    // startup path. Projects can also be registered by another long-lived Grove
+    // process, so a Blitz refresh must be able to repair a missing slot itself.
+    if let Err(e) = taskgroups::ensure_system_groups() {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    }
     match taskgroups::load_groups() {
         Ok(groups) => Ok(Json(serde_json::json!({ "groups": groups }))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
@@ -125,10 +140,10 @@ pub async fn delete_group(Path(id): Path<String>) -> impl IntoResponse {
 
         for slot in &slots_to_move {
             let (target_id, pos) = if slot.task_id == LOCAL_TASK_ID {
-                local_max += 1;
+                local_max = local_max.saturating_add(taskgroups::POSITION_STEP);
                 (taskgroups::LOCAL_GROUP_ID, local_max)
             } else {
-                main_max += 1;
+                main_max = main_max.saturating_add(taskgroups::POSITION_STEP);
                 (taskgroups::MAIN_GROUP_ID, main_max)
             };
             if let Some(target) = groups.iter_mut().find(|g| g.id == target_id) {
@@ -188,7 +203,7 @@ pub async fn upsert_slot(
 }
 
 /// DELETE /taskgroups/{id}/slots/{position} — remove a slot from a task group
-pub async fn remove_slot(Path((group_id, position)): Path<(String, u16)>) -> impl IntoResponse {
+pub async fn remove_slot(Path((group_id, position)): Path<(String, u32)>) -> impl IntoResponse {
     match taskgroups::remove_slot(&group_id, position) {
         Ok(Some(group)) => {
             broadcast_radio_event(RadioEvent::GroupChanged);
@@ -226,6 +241,35 @@ pub async fn set_slots(
         Ok(None) => Err((
             StatusCode::NOT_FOUND,
             format!("Group '{}' not found", group_id),
+        )),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+/// POST /taskgroups/move — atomically move a task between groups
+pub async fn move_slot(Json(body): Json<MoveSlotRequest>) -> impl IntoResponse {
+    if body.anchor_project_id.is_some() != body.anchor_task_id.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Anchor project and task must be provided together".to_string(),
+        ));
+    }
+    match taskgroups::move_slot(
+        &body.from_group_id,
+        &body.to_group_id,
+        &body.project_id,
+        &body.task_id,
+        body.anchor_project_id.as_deref(),
+        body.anchor_task_id.as_deref(),
+        body.placement.unwrap_or(taskgroups::SlotPlacement::After),
+    ) {
+        Ok(Some(group)) => {
+            broadcast_radio_event(RadioEvent::GroupChanged);
+            Ok(Json(serde_json::json!(group)))
+        }
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            "Source slot or target group not found".to_string(),
         )),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
@@ -321,6 +365,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_groups_repairs_missing_membership() {
+        let _lock = acquire_lock().await;
+        let home = sandbox_home();
+        let project_path = home.temp.join("self-healing-list-project");
+        std::fs::create_dir_all(&project_path).unwrap();
+        let project_path = project_path.to_string_lossy().to_string();
+        crate::storage::workspace::add_project("self-healing-list-project", &project_path).unwrap();
+        let registered = crate::storage::workspace::load_projects()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.name == "self-healing-list-project")
+            .unwrap();
+        let project_id = crate::storage::workspace::project_hash(&registered.path);
+        let local = taskgroups::load_groups()
+            .unwrap()
+            .into_iter()
+            .find(|group| group.id == taskgroups::LOCAL_GROUP_ID)
+            .unwrap();
+        let position = local
+            .slots
+            .iter()
+            .find(|slot| slot.project_id == project_id && slot.task_id == LOCAL_TASK_ID)
+            .unwrap()
+            .position;
+        taskgroups::remove_slot(taskgroups::LOCAL_GROUP_ID, position).unwrap();
+
+        let response = list_groups().await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(taskgroups::load_groups()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group.slots.iter())
+            .any(|slot| slot.project_id == project_id && slot.task_id == LOCAL_TASK_ID));
+    }
+
+    #[tokio::test]
     async fn test_handler_update_and_delete() {
         let _lock = acquire_lock().await;
         let _home = sandbox_home();
@@ -403,5 +483,54 @@ mod tests {
         .await;
         let resp = resp.into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_handler_moves_slot_in_one_request() {
+        let _lock = acquire_lock().await;
+        let _home = sandbox_home();
+        taskgroups::ensure_system_groups().unwrap();
+        let target = taskgroups::create_group("handler-move".to_string(), None).unwrap();
+        let _guard = TestGroup {
+            id: target.id.clone(),
+        };
+        taskgroups::upsert_slot(
+            taskgroups::LOCAL_GROUP_ID,
+            taskgroups::TaskSlot {
+                position: 1,
+                project_id: "project-a".to_string(),
+                task_id: "_local".to_string(),
+                target_chat_id: None,
+            },
+        )
+        .unwrap();
+
+        let response = move_slot(Json(MoveSlotRequest {
+            from_group_id: taskgroups::LOCAL_GROUP_ID.to_string(),
+            to_group_id: target.id.clone(),
+            project_id: "project-a".to_string(),
+            task_id: "_local".to_string(),
+            anchor_project_id: None,
+            anchor_task_id: None,
+            placement: None,
+        }))
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let groups = taskgroups::load_groups().unwrap();
+        assert!(groups
+            .iter()
+            .find(|group| group.id == taskgroups::LOCAL_GROUP_ID)
+            .unwrap()
+            .slots
+            .is_empty());
+        assert!(groups
+            .iter()
+            .find(|group| group.id == target.id)
+            .unwrap()
+            .slots
+            .iter()
+            .any(|slot| slot.project_id == "project-a" && slot.task_id == "_local"));
     }
 }

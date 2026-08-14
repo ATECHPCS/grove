@@ -200,7 +200,7 @@ async fn handle_shell_terminal(socket: WebSocket, cwd: String, cols: u16, rows: 
     cmd.cwd(&cwd);
     apply_terminal_env_defaults(&mut cmd);
 
-    handle_pty_terminal(socket, cmd, cols, rows).await;
+    handle_pty_terminal(socket, cmd, cols, rows, None).await;
 }
 
 /// Parameters for multiplexer terminal connection
@@ -232,7 +232,7 @@ async fn handle_mux_terminal(socket: WebSocket, params: MuxTerminalParams) {
             cmd.arg("-t");
             cmd.arg(&session_name);
             apply_terminal_env_defaults(&mut cmd);
-            handle_pty_terminal(socket, cmd, cols, rows).await;
+            handle_pty_terminal(socket, cmd, cols, rows, None).await;
         }
         SessionType::Zellij => {
             let mut cmd = CommandBuilder::new("zellij");
@@ -261,7 +261,7 @@ async fn handle_mux_terminal(socket: WebSocket, params: MuxTerminalParams) {
                 cmd.arg(&session_name);
             }
 
-            handle_pty_terminal(socket, cmd, cols, rows).await;
+            handle_pty_terminal(socket, cmd, cols, rows, None).await;
         }
         SessionType::Acp => {
             eprintln!("Warning: ACP task reached terminal handler — this should not happen");
@@ -330,6 +330,7 @@ pub(crate) async fn handle_pty_terminal(
     cmd: CommandBuilder,
     cols: u16,
     rows: u16,
+    activity_session: Option<(String, String, String)>,
 ) {
     // Create PTY in blocking context
     let pty_result = tokio::task::spawn_blocking(move || {
@@ -429,6 +430,25 @@ pub(crate) async fn handle_pty_terminal(
                         pixel_height: 0,
                     });
                     continue;
+                }
+            }
+
+            // A terminal-mode Session has no structured ACP UserMessage or
+            // Complete event. Treat submitting a line as its activity edge;
+            // ordinary task terminals pass no session identity here.
+            if data.iter().any(|byte| matches!(byte, b'\r' | b'\n')) {
+                if let Some((project_id, task_id, chat_id)) = &activity_session {
+                    if crate::storage::tasks::touch_chat_session(project_id, task_id, chat_id)
+                        .unwrap_or(false)
+                    {
+                        use crate::api::handlers::walkie_talkie::{
+                            broadcast_radio_event, RadioEvent,
+                        };
+                        broadcast_radio_event(RadioEvent::ChatListChanged {
+                            project_id: project_id.clone(),
+                            task_id: task_id.clone(),
+                        });
+                    }
                 }
             }
 

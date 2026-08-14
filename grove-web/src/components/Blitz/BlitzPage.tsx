@@ -50,6 +50,20 @@ const isMac = typeof navigator !== "undefined" && (
 );
 
 const shouldAvoidTrafficLights = isTauri && isMac;
+const EXPANDED_GROUPS_STORAGE_KEY = "grove-blitz-expanded-groups";
+
+function loadExpandedGroups(): Set<string> {
+  try {
+    const raw = localStorage.getItem(EXPANDED_GROUPS_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return new Set(parsed.filter((id): id is string => typeof id === "string"));
+    }
+  } catch {
+    // Corrupt or unavailable storage falls back to the familiar Main-first view.
+  }
+  return new Set([MAIN_GROUP_ID]);
+}
 
 interface BlitzPageProps {
   onSwitchToZen: () => void;
@@ -91,8 +105,9 @@ export function BlitzPage({
     createGroup: createTaskGroup,
     updateGroup: updateTaskGroup,
     deleteGroup: deleteTaskGroup,
+    refresh: refreshTaskGroups,
   } = taskGroupsHook;
-  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set());
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(loadExpandedGroups);
   const [showNewGroupInput, setShowNewGroupInput] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
   const newGroupInputRef = useRef<HTMLInputElement | null>(null);
@@ -117,35 +132,61 @@ export function BlitzPage({
   // ── Unified drag-and-drop state ──────────────────────────────────────────
   // Single ref tracks the drag source; render state tracks visual feedback
   const dragInfoRef = useRef<DragInfo | null>(null);
-  const dropTargetRef = useRef<{ zone: "main" | "group" | "local"; index?: number; groupId?: string } | null>(null);
+  const dropTargetRef = useRef<{
+    zone: "main" | "group" | "local";
+    index?: number;
+    groupId?: string;
+    taskKey?: string;
+    placement: "before" | "after";
+  } | null>(null);
   const [dragState, setDragState] = useState<{
     source: "main" | "group" | "local" | null;
     taskKey: string | null;
     overZone: "main" | "group" | "local" | null;
     overIndex: number | null;
     overGroupId: string | null;
-  }>({ source: null, taskKey: null, overZone: null, overIndex: null, overGroupId: null });
+    overPlacement: "before" | "after" | null;
+  }>({ source: null, taskKey: null, overZone: null, overIndex: null, overGroupId: null, overPlacement: null });
 
   const clearDrag = useCallback(() => {
     dragInfoRef.current = null;
     dropTargetRef.current = null;
-    setDragState({ source: null, taskKey: null, overZone: null, overIndex: null, overGroupId: null });
+    setDragState({ source: null, taskKey: null, overZone: null, overIndex: null, overGroupId: null, overPlacement: null });
   }, []);
 
-  const [localTasksExpanded, setLocalTasksExpanded] = useState(false);
   const mainListRef = useRef<HTMLDivElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
-  // Callback ref: only SET on mount, never clear on unmount.
-  // This prevents AnimatePresence exit animation from clearing the ref
-  // when the old TaskView unmounts after the new one has already mounted.
+  // Imperative handles for every keep-alive workspace. taskViewRef always
+  // points at the currently visible one; taskViewRefs owns the cached set.
   const taskViewRef = useRef<TaskViewHandle | null>(null);
-  const taskViewCallbackRef = useCallback((handle: TaskViewHandle | null) => {
-    if (handle) taskViewRef.current = handle;
-  }, []);
+  const taskViewRefs = useRef(new Map<string, TaskViewHandle>());
+  const [cachedWorkspaceTasks, setCachedWorkspaceTasks] = useState<Map<string, BlitzTask>>(
+    () => new Map(),
+  );
   const [isFullscreen, setIsFullscreen] = useState(false);
 
   // Archive confirmation state (shared between hooks)
   const [pendingArchiveConfirm, setPendingArchiveConfirm] = useState<PendingArchiveConfirm | null>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(EXPANDED_GROUPS_STORAGE_KEY, JSON.stringify([...expandedGroups]));
+    } catch {
+      // Expansion persistence is a convenience; the list remains functional.
+    }
+  }, [expandedGroups]);
+
+  const setGroupExpanded = useCallback((groupId: string, expanded: boolean) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (expanded) next.add(groupId);
+      else next.delete(groupId);
+      return next;
+    });
+  }, []);
+
+  const mainTasksExpanded = expandedGroups.has(MAIN_GROUP_ID);
+  const localTasksExpanded = expandedGroups.has(LOCAL_GROUP_ID);
 
   // `selectedBlitzTask` is a snapshot from the click moment; `blitzTasks`
   // refreshes underneath us. `liveSelected` is the same task with its latest
@@ -220,6 +261,9 @@ export function BlitzPage({
   }, []);
 
   const { radioClients } = useRadioEvents({
+    onGroupChanged: useCallback(() => {
+      void refreshTaskGroups();
+    }, [refreshTaskGroups]),
     onFocusTask: useCallback((projectId: string, taskId: string, target?: import("../../api/walkieTalkie").TargetMode) => {
       const taskKey = `${projectId}:${taskId}`;
       const bt = blitzTasksRef.current.find(
@@ -301,6 +345,7 @@ export function BlitzPage({
   }, [blitzTasks, pageState.searchQuery]);
 
   const filteredTasks = searchFilteredTasks;
+  const isFilteringTasks = pageState.searchQuery.trim().length > 0;
 
   // Pre-built map from task key to BlitzTask (shared across getGroupTasks calls)
   const taskMap = useMemo(
@@ -330,10 +375,38 @@ export function BlitzPage({
   // Derive studio status from current selection — kept in sync via React state
   const isStudioTask = currentSelected?.projectType === "studio";
 
-  // Clear stale taskViewRef when no task is selected
+  const activeWorkspaceKey = pageState.inWorkspace && currentSelected
+    ? `${currentSelected.projectId}:${currentSelected.task.id}`
+    : null;
+
+  // A Blitz session is a keep-alive boundary. Once a workspace has been
+  // opened, retain its full TaskView tree (including live transports and
+  // panel state) until BlitzPage itself unmounts.
   useEffect(() => {
-    if (!currentSelected) taskViewRef.current = null;
-  }, [currentSelected]);
+    if (!pageState.inWorkspace || !currentSelected) return;
+    const key = `${currentSelected.projectId}:${currentSelected.task.id}`;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- records a user navigation boundary for keep-alive rendering
+    setCachedWorkspaceTasks((prev) => {
+      if (prev.get(key) === currentSelected) return prev;
+      const next = new Map(prev);
+      next.set(key, currentSelected);
+      return next;
+    });
+  }, [pageState.inWorkspace, currentSelected]);
+
+  const workspaceTasks = useMemo(() => {
+    const tasks = new Map(cachedWorkspaceTasks);
+    if (pageState.inWorkspace && currentSelected) {
+      tasks.set(`${currentSelected.projectId}:${currentSelected.task.id}`, currentSelected);
+    }
+    return [...tasks.entries()].map(([key, cached]) => taskMap.get(key) ?? cached);
+  }, [cachedWorkspaceTasks, pageState.inWorkspace, currentSelected, taskMap]);
+
+  useEffect(() => {
+    taskViewRef.current = activeWorkspaceKey
+      ? taskViewRefs.current.get(activeWorkspaceKey) ?? null
+      : null;
+  }, [activeWorkspaceKey, workspaceTasks]);
 
   // Derive task lists from groups
   const mainGroup = useMemo(() => taskGroups.find(g => g.id === MAIN_GROUP_ID), [taskGroups]);
@@ -347,14 +420,21 @@ export function BlitzPage({
   const expandedGroupTasks = useMemo(() => {
     const tasks: BlitzTask[] = [];
     for (const group of customGroups) {
-      if (expandedGroups.has(group.id)) {
+      if (isFilteringTasks || expandedGroups.has(group.id)) {
         tasks.push(...getGroupTasks(group));
       }
     }
     return tasks;
-  }, [customGroups, expandedGroups, getGroupTasks]);
+  }, [customGroups, expandedGroups, getGroupTasks, isFilteringTasks]);
 
-  const displayTasks = useMemo(() => [...mainListTasks, ...expandedGroupTasks, ...folderLocalTasks], [mainListTasks, expandedGroupTasks, folderLocalTasks]);
+  const displayTasks = useMemo(
+    () => [
+      ...(mainTasksExpanded || isFilteringTasks ? mainListTasks : []),
+      ...expandedGroupTasks,
+      ...(localTasksExpanded || isFilteringTasks ? folderLocalTasks : []),
+    ],
+    [mainTasksExpanded, mainListTasks, expandedGroupTasks, localTasksExpanded, folderLocalTasks, isFilteringTasks],
+  );
 
   // Handle initial task selection from navigation (tray / notification).
   // Mirrors TasksPage's contract (see TasksPage.tsx useEffect on
@@ -410,8 +490,11 @@ export function BlitzPage({
       });
     }
 
-    // Local group is collapsed by default (`localTasksExpanded` starts
-    // false) and its row is only rendered when the user clicks the
+    if (!customGroup && !bt.task.isLocal && !mainTasksExpanded) {
+      setGroupExpanded(MAIN_GROUP_ID, true);
+    }
+
+    // Local group can be collapsed and its row is only rendered when the user clicks the
     // "Local" header. The tray / notification deep-link doesn't go
     // through the header, so without this branch the local task row
     // never enters the DOM and the scrollIntoView retry below times
@@ -419,7 +502,7 @@ export function BlitzPage({
     // Main group). Same state-push pattern as the custom-group branch.
     if (bt.task.isLocal) {
       if (!localTasksExpanded) {
-        setLocalTasksExpanded(true);
+        setGroupExpanded(LOCAL_GROUP_ID, true);
       }
     }
 
@@ -457,7 +540,7 @@ export function BlitzPage({
     // onNavigationConsumed / pageHandlers intentionally omitted from
     // deps: pageHandlers is recreated every render (re-firing would
     // re-enter workspace); onNavigationConsumed is a stable setter.
-  }, [initialTaskId, initialProjectId, initialChatId, initialViewMode, blitzTasks, customGroups, expandedGroups, localTasksExpanded, ensureRadioPanel, onNavigationConsumed]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [initialTaskId, initialProjectId, initialChatId, initialViewMode, blitzTasks, customGroups, expandedGroups, mainTasksExpanded, localTasksExpanded, ensureRadioPanel, onNavigationConsumed, setGroupExpanded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Navigate to the specific chat session if provided (deep-link — tray,
   // notifications, the Dynamic Island live-activity alert, ...). Separate
@@ -549,28 +632,29 @@ export function BlitzPage({
 
   const startDrag = useCallback((source: "main" | "group" | "local", index: number, taskKey: string, groupId: string) => {
     dragInfoRef.current = { source, taskKey, index, groupId };
-    setDragState({ source, taskKey, overZone: null, overIndex: null, overGroupId: null });
+    setDragState({ source, taskKey, overZone: null, overIndex: null, overGroupId: null, overPlacement: null });
   }, []);
 
-  const handleItemDragOver = useCallback((e: React.DragEvent, zone: "main" | "group" | "local", index: number, groupId?: string) => {
+  const handleItemDragOver = useCallback((e: React.DragEvent, zone: "main" | "group" | "local", index: number, taskKey: string, groupId?: string) => {
     if (!dragInfoRef.current) return;
     e.stopPropagation(); // Prevent zone-level handler from overriding index to -1
-    dropTargetRef.current = { zone, index, groupId };
-    setDragState(prev => ({ ...prev, overZone: zone, overIndex: index, overGroupId: groupId ?? null }));
+    const rect = e.currentTarget.getBoundingClientRect();
+    const placement = e.clientY < rect.top + rect.height / 2 ? "before" : "after";
+    dropTargetRef.current = { zone, index, groupId, taskKey, placement };
+    setDragState(prev => ({ ...prev, overZone: zone, overIndex: index, overGroupId: groupId ?? null, overPlacement: placement }));
   }, []);
 
   const handleZoneDragOver = useCallback((e: React.DragEvent, zone: "main" | "group" | "local", groupId?: string) => {
     if (!dragInfoRef.current) return;
-    // Don't accept drop from same group to same group header (only to items within)
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
-    dropTargetRef.current = { zone, index: -1, groupId };
-    setDragState(prev => ({ ...prev, overZone: zone, overIndex: null, overGroupId: groupId ?? null }));
+    dropTargetRef.current = { zone, index: -1, groupId, placement: "after" };
+    setDragState(prev => ({ ...prev, overZone: zone, overIndex: null, overGroupId: groupId ?? null, overPlacement: null }));
   }, []);
 
   const handleDragLeave = useCallback(() => {
     dropTargetRef.current = null;
-    setDragState(prev => ({ ...prev, overZone: null, overIndex: null, overGroupId: null }));
+    setDragState(prev => ({ ...prev, overZone: null, overIndex: null, overGroupId: null, overPlacement: null }));
   }, []);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
@@ -581,7 +665,6 @@ export function BlitzPage({
 
     const { taskKey, groupId: srcGroupId } = info;
     const { groupId: tgtGroupId } = target;
-    const targetIndex = target.index ?? -1;
 
     // Find the BlitzTask
     const bt = blitzTasks.find(b => `${b.projectId}:${b.task.id}` === taskKey);
@@ -589,54 +672,27 @@ export function BlitzPage({
 
     const resolvedTgtGroupId = tgtGroupId ?? srcGroupId;
 
-    // ── Same group reorder ──
-    if (srcGroupId === resolvedTgtGroupId && targetIndex >= 0 && info.index !== targetIndex) {
-      const group = taskGroups.find(g => g.id === srcGroupId);
-      if (group) {
-        const tasksInGroup = getGroupTasks(group);
-        if (info.index < tasksInGroup.length && targetIndex < tasksInGroup.length) {
-          const srcTask = tasksInGroup[info.index];
-          const tgtTask = tasksInGroup[targetIndex];
-          // Find their slots in the full list and swap positions
-          const newSlots = group.slots.map(s => {
-            if (s.project_id === srcTask.projectId && s.task_id === srcTask.task.id) {
-              const tgtSlot = group.slots.find(ts => ts.project_id === tgtTask.projectId && ts.task_id === tgtTask.task.id);
-              return { ...s, position: tgtSlot?.position ?? s.position };
-            }
-            if (s.project_id === tgtTask.projectId && s.task_id === tgtTask.task.id) {
-              const srcSlot = group.slots.find(ss => ss.project_id === srcTask.projectId && ss.task_id === srcTask.task.id);
-              return { ...s, position: srcSlot?.position ?? s.position };
-            }
-            return s;
-          }).sort((a, b) => a.position - b.position);
-          taskGroupsHook.setSlots(srcGroupId, newSlots);
-        }
-      }
-      clearDrag();
-      return;
-    }
-
-    // ── Cross-group move ──
-    if (srcGroupId !== resolvedTgtGroupId) {
-      taskGroupsHook.moveTask(srcGroupId, resolvedTgtGroupId, bt.projectId, bt.task.id);
-    }
+    const anchor = target.taskKey
+      ? blitzTasks.find(candidate => `${candidate.projectId}:${candidate.task.id}` === target.taskKey)
+      : undefined;
+    taskGroupsHook.moveTask(
+      srcGroupId,
+      resolvedTgtGroupId,
+      bt.projectId,
+      bt.task.id,
+      anchor?.projectId,
+      anchor?.task.id,
+      target.placement,
+    );
 
     clearDrag();
-  }, [blitzTasks, taskGroups, getGroupTasks, taskGroupsHook, clearDrag]);
+  }, [blitzTasks, taskGroupsHook, clearDrag]);
 
 
   // Toggle group folder expansion
   const toggleGroupExpanded = useCallback((groupId: string) => {
-    setExpandedGroups(prev => {
-      const next = new Set(prev);
-      if (next.has(groupId)) {
-        next.delete(groupId);
-      } else {
-        next.add(groupId);
-      }
-      return next;
-    });
-  }, []);
+    setGroupExpanded(groupId, !expandedGroups.has(groupId));
+  }, [expandedGroups, setGroupExpanded]);
 
   // Mobile: manual move up/down (replaces drag on touch devices)
   const handleMoveTask = useCallback((groupId: string, index: number, direction: "up" | "down") => {
@@ -645,21 +701,17 @@ export function BlitzPage({
     const groupTaskList = getGroupTasks(group);
     const targetIndex = direction === "up" ? index - 1 : index + 1;
     if (targetIndex < 0 || targetIndex >= groupTaskList.length) return;
-    const srcTask = groupTaskList[index];
     const tgtTask = groupTaskList[targetIndex];
-    // Swap positions in the full slot list to preserve hidden (filtered-out) tasks
-    const newSlots = group.slots.map(s => {
-      if (s.project_id === srcTask.projectId && s.task_id === srcTask.task.id) {
-        const tgtSlot = group.slots.find(ts => ts.project_id === tgtTask.projectId && ts.task_id === tgtTask.task.id);
-        return { ...s, position: tgtSlot?.position ?? s.position };
-      }
-      if (s.project_id === tgtTask.projectId && s.task_id === tgtTask.task.id) {
-        const srcSlot = group.slots.find(ss => ss.project_id === srcTask.projectId && ss.task_id === srcTask.task.id);
-        return { ...s, position: srcSlot?.position ?? s.position };
-      }
-      return s;
-    }).sort((a, b) => a.position - b.position);
-    taskGroupsHook.setSlots(groupId, newSlots);
+    const srcTask = groupTaskList[index];
+    taskGroupsHook.moveTask(
+      groupId,
+      groupId,
+      srcTask.projectId,
+      srcTask.task.id,
+      tgtTask.projectId,
+      tgtTask.task.id,
+      direction === "up" ? "before" : "after",
+    );
   }, [taskGroups, getGroupTasks, taskGroupsHook]);
 
   // Context menu handler (Blitz-specific: handle BlitzTask)
@@ -793,8 +845,11 @@ export function BlitzPage({
         if (customGroup && !expandedGroups.has(customGroup.id)) {
           setExpandedGroups((prev) => { const next = new Set(prev); next.add(customGroup.id); return next; });
         }
+        if (!customGroup && !found.task.isLocal && !mainTasksExpanded) {
+          setGroupExpanded(MAIN_GROUP_ID, true);
+        }
         if (found.task.isLocal && !localTasksExpanded) {
-          setLocalTasksExpanded(true);
+          setGroupExpanded(LOCAL_GROUP_ID, true);
         }
         handleSelectTask(found);
         if (!pageState.inWorkspace && found.task.status !== "archived") {
@@ -830,7 +885,9 @@ export function BlitzPage({
       folderLocalTasks,
       customGroups,
       expandedGroups,
+      mainTasksExpanded,
       localTasksExpanded,
+      setGroupExpanded,
       handleSelectTask,
       enabledOpenWorkspace,
     ],
@@ -1287,32 +1344,35 @@ export function BlitzPage({
             </div>
           ) : (
             <div className="flex flex-col gap-1.5 px-2 py-1">
-              {/* Main task list — universal drop zone */}
+              {/* Main is a real collapsible group, not an always-expanded flat list. */}
               <div
-                ref={mainListRef}
+                className={`rounded-lg transition-colors ${
+                  dragState.source && dragState.source !== "main" && dragState.overZone === "main" ? "bg-[var(--color-accent)]/5 ring-1 ring-[var(--color-accent)]/20" : ""
+                }`}
                 onDragOver={(e) => handleZoneDragOver(e, "main", MAIN_GROUP_ID)}
                 onDrop={handleDrop}
                 onDragLeave={handleDragLeave}
-                className={`flex flex-col gap-1.5 rounded-lg transition-colors ${
-                  dragState.source && dragState.source !== "main" && dragState.overZone === "main" ? "bg-[var(--color-accent)]/5 ring-1 ring-[var(--color-accent)]/20 p-1" : ""
-                }`}
               >
-                {mainListTasks.map((bt, index) => {
+                <button
+                  onClick={() => setGroupExpanded(MAIN_GROUP_ID, !mainTasksExpanded)}
+                  className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
+                >
+                  <ChevronRight className={`w-3.5 h-3.5 transition-transform ${mainTasksExpanded || isFilteringTasks ? "rotate-90" : ""}`} />
+                  <Folder className="w-3.5 h-3.5 text-[var(--color-highlight)]" />
+                  <span>Main</span>
+                  <span className="ml-auto px-1.5 py-0.5 rounded-full bg-[var(--color-bg-tertiary)] text-[10px]">
+                    {mainListTasks.length}
+                  </span>
+                </button>
+                {(mainTasksExpanded || isFilteringTasks) && <div ref={mainListRef} className="flex flex-col gap-1.5 pt-1.5">
+                  {mainListTasks.map((bt, index) => {
                   const notif = getTaskNotification(bt.task.id);
                   const taskKey = `${bt.projectId}:${bt.task.id}`;
                   const isThisSelected =
                     currentSelected?.task.id === bt.task.id &&
                     currentSelected?.projectId === bt.projectId;
                   return (
-                    <motion.div
-                      key={`${bt.projectId}-${bt.task.id}`}
-                      initial={{ opacity: 0, x: -16 }}
-                      animate={{ opacity: 1, x: 0 }}
-                      transition={{
-                        opacity: { delay: index * 0.06, duration: 0.35 },
-                        x: { delay: index * 0.06, duration: 0.35, ease: [0.22, 1, 0.36, 1] },
-                      }}
-                    >
+                    <div key={`${bt.projectId}-${bt.task.id}`}>
                       <BlitzTaskListItem
                         blitzTask={bt}
                         isSelected={isThisSelected}
@@ -1327,25 +1387,27 @@ export function BlitzPage({
                         notification={notif ? { level: notif.level } : undefined}
                         shortcutNumber={index < 10 ? (index === 9 ? 0 : index + 1) : undefined}
                         onDragStart={() => startDrag("main", index, taskKey, MAIN_GROUP_ID)}
-                        onDragOver={(e: React.DragEvent) => handleItemDragOver(e, "main", index, MAIN_GROUP_ID)}
+                        onDragOver={(e: React.DragEvent) => handleItemDragOver(e, "main", index, taskKey, MAIN_GROUP_ID)}
                         onDragEnd={clearDrag}
                         onDragLeave={handleDragLeave}
                         isDragging={dragState.taskKey === taskKey && dragState.source === "main"}
                         isDragOver={dragState.overZone === "main" && dragState.overIndex === index}
+                        dragPlacement={dragState.overZone === "main" && dragState.overIndex === index ? dragState.overPlacement : null}
                         onMoveUp={() => handleMoveTask(MAIN_GROUP_ID, index, "up")}
                         onMoveDown={() => handleMoveTask(MAIN_GROUP_ID, index, "down")}
                         isFirst={index === 0}
                         isLast={index === mainListTasks.length - 1}
                       />
-                    </motion.div>
+                    </div>
                   );
-                })}
+                  })}
+                </div>}
               </div>
 
               {/* TaskGroup Folders */}
               {customGroups.map((group) => {
                 const groupTasks = getGroupTasks(group);
-                const isExpanded = expandedGroups.has(group.id);
+                const isExpanded = isFilteringTasks || expandedGroups.has(group.id);
                 const isDragOverThis = dragState.overZone === "group" && dragState.overGroupId === group.id;
                 return (
                   <div
@@ -1415,15 +1477,8 @@ export function BlitzPage({
                         </span>
                       </button>
                     )}
-                    <AnimatePresence>
-                      {isExpanded && (
-                        <motion.div
-                          initial={{ height: 0, opacity: 0 }}
-                          animate={{ height: "auto", opacity: 1 }}
-                          exit={{ height: 0, opacity: 0 }}
-                          transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-                          className="overflow-hidden"
-                        >
+                    {isExpanded && (
+                        <div>
                           <div className="flex flex-col gap-1.5 pt-1.5 pl-2">
                             {groupTasks.length === 0 ? (
                               <div className="px-3 py-2 text-[10px] text-[var(--color-text-muted)] italic">
@@ -1451,19 +1506,19 @@ export function BlitzPage({
                                     onContextMenu={(e) => handleContextMenu(bt, e)}
                                     notification={notif ? { level: notif.level } : undefined}
                                     onDragStart={() => startDrag("group", gIdx, taskKey, group.id)}
-                                    onDragOver={(e: React.DragEvent) => handleItemDragOver(e, "group", gIdx, group.id)}
+                                    onDragOver={(e: React.DragEvent) => handleItemDragOver(e, "group", gIdx, taskKey, group.id)}
                                     onDragEnd={clearDrag}
                                     onDragLeave={handleDragLeave}
                                     isDragging={dragState.taskKey === taskKey && dragState.source === "group"}
                                     isDragOver={dragState.overZone === "group" && dragState.overGroupId === group.id && dragState.overIndex === gIdx}
+                                    dragPlacement={dragState.overZone === "group" && dragState.overGroupId === group.id && dragState.overIndex === gIdx ? dragState.overPlacement : null}
                                   />
                                 );
                               })
                             )}
                           </div>
-                        </motion.div>
+                        </div>
                       )}
-                    </AnimatePresence>
                   </div>
                 );
               })}
@@ -1526,11 +1581,11 @@ export function BlitzPage({
                   onDragLeave={handleDragLeave}
                 >
                   <button
-                    onClick={() => setLocalTasksExpanded(!localTasksExpanded)}
+                    onClick={() => setGroupExpanded(LOCAL_GROUP_ID, !localTasksExpanded)}
                     className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)] transition-colors"
                   >
                     <motion.span
-                      animate={{ rotate: localTasksExpanded ? 90 : 0 }}
+                      animate={{ rotate: localTasksExpanded || isFilteringTasks ? 90 : 0 }}
                       transition={{ duration: 0.15 }}
                     >
                       <ChevronRight className="w-3.5 h-3.5" />
@@ -1541,15 +1596,8 @@ export function BlitzPage({
                       {folderLocalTasks.length}
                     </span>
                   </button>
-                  <AnimatePresence>
-                    {localTasksExpanded && (
-                      <motion.div
-                        initial={{ height: 0, opacity: 0 }}
-                        animate={{ height: "auto", opacity: 1 }}
-                        exit={{ height: 0, opacity: 0 }}
-                        transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-                        className="overflow-hidden"
-                      >
+                  {(localTasksExpanded || isFilteringTasks) && (
+                      <div>
                         <div className="flex flex-col gap-1.5 pt-1.5">
                           {folderLocalTasks.map((bt, index) => {
                             const notif = getTaskNotification(bt.task.id);
@@ -1572,18 +1620,18 @@ export function BlitzPage({
                                 onContextMenu={(e) => handleContextMenu(bt, e)}
                                 notification={notif ? { level: notif.level } : undefined}
                                 onDragStart={() => startDrag("local", index, taskKey, LOCAL_GROUP_ID)}
-                                onDragOver={(e: React.DragEvent) => handleItemDragOver(e, "local", index, LOCAL_GROUP_ID)}
+                                onDragOver={(e: React.DragEvent) => handleItemDragOver(e, "local", index, taskKey, LOCAL_GROUP_ID)}
                                 onDragEnd={clearDrag}
                                 onDragLeave={handleDragLeave}
                                 isDragging={dragState.taskKey === taskKey && dragState.source === "local"}
                                 isDragOver={dragState.overZone === "local" && dragState.overIndex === index}
+                                dragPlacement={dragState.overZone === "local" && dragState.overIndex === index ? dragState.overPlacement : null}
                               />
                             );
                           })}
                         </div>
-                      </motion.div>
+                      </div>
                     )}
-                  </AnimatePresence>
                 </div>
               )}
             </div>
@@ -1726,36 +1774,44 @@ export function BlitzPage({
               </AnimatePresence>
             </motion.div>
 
-            {/* Workspace Page */}
-            <AnimatePresence mode="popLayout">
-              {pageState.inWorkspace && currentSelected && (
-                <motion.div
-                  key={currentSelected.task.id}
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.15 }}
+            {/* Workspace keep-alive layers. Hidden tasks remain mounted while
+                Blitz is mounted; leaving Blitz unmounts this whole page and
+                releases every cached workspace at once. */}
+            {workspaceTasks.map((bt) => {
+              const key = `${bt.projectId}:${bt.task.id}`;
+              const active = activeWorkspaceKey === key;
+              const studio = bt.projectType === "studio";
+              return (
+                <div
+                  key={key}
                   className="absolute inset-0"
+                  style={{ display: active ? "block" : "none" }}
+                  aria-hidden={!active}
                 >
                   <TaskView
-                    ref={taskViewCallbackRef}
-                    projectId={currentSelected.projectId}
-                    task={currentSelected.task}
-                    projectName={currentSelected.projectName}
-                    fullscreen={isFullscreen}
-                    onFullscreenChange={setIsFullscreen}
-                    onBack={handleCloseTask}
-                    onCommit={isStudioTask ? undefined : opsHandlers.handleCommit}
-                    onRebase={isStudioTask ? undefined : opsHandlers.handleRebase}
-                    onSync={isStudioTask ? undefined : opsHandlers.handleSync}
-                    onMerge={isStudioTask ? undefined : opsHandlers.handleMerge}
-                    onArchive={opsHandlers.handleArchive}
-                    onClean={isStudioTask ? undefined : opsHandlers.handleClean}
-                    onReset={isStudioTask ? undefined : opsHandlers.handleReset}
+                    ref={(handle) => {
+                      if (handle) taskViewRefs.current.set(key, handle);
+                      else taskViewRefs.current.delete(key);
+                      if (active) taskViewRef.current = handle;
+                    }}
+                    isActive={active}
+                    projectId={bt.projectId}
+                    task={bt.task}
+                    projectName={bt.projectName}
+                    fullscreen={active ? isFullscreen : false}
+                    onFullscreenChange={active ? setIsFullscreen : undefined}
+                    onBack={active ? handleCloseTask : undefined}
+                    onCommit={active && !studio ? opsHandlers.handleCommit : undefined}
+                    onRebase={active && !studio ? opsHandlers.handleRebase : undefined}
+                    onSync={active && !studio ? opsHandlers.handleSync : undefined}
+                    onMerge={active && !studio ? opsHandlers.handleMerge : undefined}
+                    onArchive={active ? opsHandlers.handleArchive : undefined}
+                    onClean={active && !studio ? opsHandlers.handleClean : undefined}
+                    onReset={active && !studio ? opsHandlers.handleReset : undefined}
                   />
-                </motion.div>
-              )}
-            </AnimatePresence>
+                </div>
+              );
+            })}
           </div>
           )}
         </div>

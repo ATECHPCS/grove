@@ -309,10 +309,10 @@ export const TaskView = forwardRef<TaskViewHandle, TaskViewProps>((props, ref) =
   // without these being set, the KeyboardManager treats them as false
   // and the bindings never fire. TaskView is the canonical owner of
   // "we're inside a task workspace" state.
-  useContextKey("taskSelected", true);
-  useContextKey("inWorkspace", true);
-  useContextKey("archived", isArchived);
-  useContextKey("canOperate", canOperate);
+  useContextKey("taskSelected", true, isActive);
+  useContextKey("inWorkspace", true, isActive);
+  useContextKey("archived", isArchived, isActive);
+  useContextKey("canOperate", canOperate, isActive);
   // panelOpen gates Mod+w (panel.closeActive). The IDE layout always boots
   // with the chat column visible (chatVisible defaults to true in
   // IDELayoutContainer's persisted state) and the flex layout always
@@ -321,7 +321,7 @@ export const TaskView = forwardRef<TaskViewHandle, TaskViewProps>((props, ref) =
   // matches the catalog intent ("close the currently focused panel tab").
   // Fine-grained tracking of aux/info/chat visibility would require
   // hoisting IDELayoutContainer state; not worth it for one command.
-  useContextKey("panelOpen", true);
+  useContextKey("panelOpen", true, isActive);
 
   const panelEnabled = useCallback(() => panelShortcutsEnabled, [panelShortcutsEnabled]);
   const commitEnabled = useCallback(() => canOperate && !!onCommit, [canOperate, onCommit]);
@@ -372,8 +372,9 @@ export const TaskView = forwardRef<TaskViewHandle, TaskViewProps>((props, ref) =
   // Workspace fullscreen toggle — same effect as the toolbar button.
   // mode.fullscreen.toggle (Mode category) and workspace.fullscreen.toggle
   // (Workspace category) are catalog aliases pointing at the same action.
-  useCommand("workspace.fullscreen.toggle", toggleFullscreen, [toggleFullscreen]);
-  useCommand("mode.fullscreen.toggle", toggleFullscreen, [toggleFullscreen]);
+  const activeWorkspaceCommand = useCallback(() => isActive, [isActive]);
+  useCommand("workspace.fullscreen.toggle", toggleFullscreen, { enabled: activeWorkspaceCommand }, [toggleFullscreen, activeWorkspaceCommand]);
+  useCommand("mode.fullscreen.toggle", toggleFullscreen, { enabled: activeWorkspaceCommand }, [toggleFullscreen, activeWorkspaceCommand]);
 
   // Workspace layout toggle — flip workspace_layout config between flex/ide
   // and refresh; refreshConfig reloads from backend so every TaskView
@@ -384,9 +385,9 @@ export const TaskView = forwardRef<TaskViewHandle, TaskViewProps>((props, ref) =
       .then(() => refreshConfig())
       .catch((err) => console.error("[TaskView] toggle layout failed:", err));
   }, [layoutMode, refreshConfig]);
-  useCommand("workspace.layout.toggle", toggleLayoutMode, [toggleLayoutMode]);
-  useCommand("workspace.ideLayout.toggle", toggleLayoutMode, [toggleLayoutMode]);
-  useCommand("mode.ide.layout.toggle", toggleLayoutMode, [toggleLayoutMode]);
+  useCommand("workspace.layout.toggle", toggleLayoutMode, { enabled: activeWorkspaceCommand }, [toggleLayoutMode, activeWorkspaceCommand]);
+  useCommand("workspace.ideLayout.toggle", toggleLayoutMode, { enabled: activeWorkspaceCommand }, [toggleLayoutMode, activeWorkspaceCommand]);
+  useCommand("mode.ide.layout.toggle", toggleLayoutMode, { enabled: activeWorkspaceCommand }, [toggleLayoutMode, activeWorkspaceCommand]);
 
   // Close workspace (Esc): return to the task list. Only meaningful when a
   // parent wired `onBack` — Work mode opens TaskView with no back affordance,

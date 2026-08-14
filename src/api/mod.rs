@@ -286,6 +286,18 @@ pub fn create_api_router() -> Router {
             patch(handlers::acp::update_chat).delete(handlers::acp::delete_chat),
         )
         .route(
+            "/projects/{id}/tasks/{taskId}/chats/archived",
+            get(handlers::acp::list_archived_chats),
+        )
+        .route(
+            "/projects/{id}/tasks/{taskId}/chats/{chatId}/archive",
+            post(handlers::acp::archive_chat),
+        )
+        .route(
+            "/projects/{id}/tasks/{taskId}/chats/{chatId}/restore",
+            post(handlers::acp::restore_chat),
+        )
+        .route(
             "/projects/{id}/tasks/{taskId}/chats/{chatId}/attachments",
             post(handlers::acp::upload_chat_attachment),
         )
@@ -862,6 +874,17 @@ pub fn create_api_router() -> Router {
             "/skills/installed/{repo_key}/{*repo_path}",
             delete(handlers::skills::uninstall_skill),
         )
+        // Unified Extensions catalog + standalone MCP configuration.
+        .route("/extensions/explore", get(handlers::extensions::explore))
+        .route("/extensions/mcp", post(handlers::extensions::create_mcp))
+        .route(
+            "/extensions/mcp/install",
+            get(handlers::extensions::list_mcp_installed).post(handlers::extensions::install_mcp),
+        )
+        .route(
+            "/extensions/plugin/install",
+            post(handlers::extensions::install_plugin),
+        )
         .route(
             "/skills/local/{source}/{*repo_path}",
             delete(handlers::skills::delete_local_skill),
@@ -871,6 +894,7 @@ pub fn create_api_router() -> Router {
             "/taskgroups",
             get(handlers::taskgroups::list_groups).post(handlers::taskgroups::create_group),
         )
+        .route("/taskgroups/move", post(handlers::taskgroups::move_slot))
         .route(
             "/taskgroups/{id}",
             patch(handlers::taskgroups::update_group).delete(handlers::taskgroups::delete_group),
@@ -907,6 +931,10 @@ pub fn create_api_router() -> Router {
             post(handlers::automations::cancel_run),
         )
         .route(
+            "/projects/{id}/automations/{aid}/runs/{run_id}/finish",
+            post(handlers::automations::finish_run),
+        )
+        .route(
             "/projects/{id}/automation-runs/ws",
             get(handlers::automations::run_updates_ws),
         )
@@ -921,6 +949,10 @@ pub fn create_api_router() -> Router {
         .route(
             "/projects/{id}/memory/entities",
             get(handlers::memory::list_entities),
+        )
+        .route(
+            "/projects/{id}/memory/entities/resolve",
+            post(handlers::memory::resolve_entities),
         )
         .route(
             "/projects/{id}/memory/entities/{entity_id}",
@@ -1585,28 +1617,15 @@ fn display_host_for(bind_host: &str, lan_ip: Option<&str>) -> String {
 pub fn start_automation_runtime() {
     crate::memory::register_automation_handlers();
 
-    let sweep_now = chrono::Utc::now().timestamp();
-    match crate::storage::automations::sweep_interrupted_runs(sweep_now) {
-        Ok(n) if n > 0 => {
-            crate::automation::awarn!("swept {n} stale queued run(s) → interrupted");
-        }
-        Ok(_) => {}
-        Err(e) => {
-            crate::automation::awarn!("startup sweep failed: {e}");
-        }
-    }
     crate::automation::scheduler::spawn();
 }
 
-/// Start the web server (API + static files)
-pub async fn start_server(
-    host: &str,
-    port: u16,
-    static_dir: Option<PathBuf>,
-    open_browser: bool,
-    auth: Arc<ServerAuth>,
-    tls_mode: crate::cli::web::TlsMode,
-) -> std::io::Result<()> {
+/// Initialize the local backend runtime shared by Web and GUI servers.
+///
+/// Listener binding, TLS, remote proxying, readiness signals, and process/UI
+/// lifecycle stay with each surface. Everything that prepares the local Grove
+/// backend belongs here so those surfaces cannot silently drift apart.
+pub async fn initialize_local_server_runtime(port: u16) -> std::io::Result<()> {
     // Record our loopback base so a plugin's MCP server (a node child process,
     // not an authenticated Grove client) knows where to POST events. Always
     // loopback — the MCP server runs on this same machine regardless of bind.
@@ -1668,37 +1687,25 @@ pub async fn start_server(
     // Automation cron scheduler — fires while Grove is running. Missed runs
     // during downtime are not back-filled; the next fire window is the next
     // scheduled tick.
-    //
-    // Sweep any `queued` runs left over from a previous Grove process (whose
-    // ACP subscriber died with the process) into `interrupted` first, so
-    // the run-history UI doesn't display them as "still running forever".
     start_automation_runtime();
 
     // Start the in-process agent_graph MCP listener (loopback-only). Failure to
     // bind is non-fatal — the rest of the server still boots; ACP sessions will
     // simply spawn without agent_graph tools available.
-    match crate::api::handlers::agent_graph_mcp::start_listener(
+    if let Err(e) = crate::api::handlers::agent_graph_mcp::start_listener(
         crate::api::handlers::agent_graph_mcp::DEFAULT_BASE_PORT,
         crate::api::handlers::agent_graph_mcp::DEFAULT_MAX_ATTEMPTS,
     )
     .await
     {
-        Ok(_port) => {
-            // Listener bound successfully; success is silent. Failures still
-            // print since they disable agent_graph tools downstream.
-        }
-        Err(e) => {
-            eprintln!(
-                "[agent_graph_mcp] failed to bind listener: {} — agent_graph tools disabled",
-                e
-            );
-        }
+        eprintln!(
+            "[agent_graph_mcp] failed to bind listener: {} — agent_graph tools disabled",
+            e
+        );
     }
 
-    // Initialize FileWatchers for all live tasks
     init_file_watchers();
 
-    // Ensure _main and _local system groups exist
     if let Err(e) = crate::storage::taskgroups::ensure_system_groups() {
         eprintln!("[warning] Failed to ensure system groups: {}", e);
     }
@@ -1706,6 +1713,20 @@ pub async fn start_server(
     // Pre-build Grove.app notification bundle (macOS only, first run compiles Swift)
     #[cfg(target_os = "macos")]
     crate::hooks::ensure_grove_app();
+
+    Ok(())
+}
+
+/// Start the web server (API + static files)
+pub async fn start_server(
+    host: &str,
+    port: u16,
+    static_dir: Option<PathBuf>,
+    open_browser: bool,
+    auth: Arc<ServerAuth>,
+    tls_mode: crate::cli::web::TlsMode,
+) -> std::io::Result<()> {
+    initialize_local_server_runtime(port).await?;
 
     let has_ui = static_dir.is_some() || has_embedded_assets();
     let app = create_router(static_dir, auth.clone(), None);

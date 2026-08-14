@@ -61,6 +61,8 @@ export interface Plugin {
   /** Declared contribution points whose built entry is missing on disk
    *  (`"panel"`/`"sidebar"`/`"mcp"`/`"backend"`). Empty = all built. */
   unbuilt?: string[];
+  /** Exact content comparison against the SDK bundled with this Grove build. */
+  sdk_status?: 'current' | 'outdated' | 'missing';
   /** Top-level `icon`: a path to an image in the plugin (served via /asset), or
    *  an emoji. Null/absent → the UI shows a default puzzle icon. */
   icon?: string | null;

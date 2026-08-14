@@ -25,6 +25,12 @@ export interface MemoryEntityDocument extends MemoryEntity {
   body: string;
 }
 
+export interface MemoryEntityMetadata {
+  entity_id: string;
+  title: string;
+  tags: MemoryTag[];
+}
+
 export interface MemoryLog {
   id: string;
   project_id: string;
@@ -83,6 +89,8 @@ export interface MemoryOverview {
   run_count: number;
   successful_run_count: number;
   failed_run_count: number;
+  in_progress_run_count: number;
+  waiting_run_count: number;
   active_run_count: number;
   last_organized_at?: number;
   usage: {
@@ -135,6 +143,13 @@ export function listMemoryEntities(projectId: string, query?: string, cursor?: s
 export function getMemoryEntity(projectId: string, entityId: string) {
   return apiClient.get<MemoryEntityDocument>(
     `/api/v1/projects/${projectId}/memory/entities/${encodeURIComponent(entityId)}`,
+  );
+}
+
+export function resolveMemoryEntities(projectId: string, entityIds: string[]) {
+  return apiClient.post<{ entity_ids: string[] }, { items: MemoryEntityMetadata[] }>(
+    `/api/v1/projects/${projectId}/memory/entities/resolve`,
+    { entity_ids: entityIds },
   );
 }
 

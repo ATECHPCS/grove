@@ -572,6 +572,39 @@ export async function listChats(
   return response.chats;
 }
 
+/** List archived chats for the SessionList's read-only section. */
+export async function listArchivedChats(
+  projectId: string,
+  taskId: string,
+): Promise<ChatSessionResponse[]> {
+  const response = await apiClient.get<ChatListResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/archived`,
+  );
+  return response.chats;
+}
+
+export async function archiveChat(
+  projectId: string,
+  taskId: string,
+  chatId: string,
+): Promise<ChatSessionResponse> {
+  return apiClient.post<Record<string, never>, ChatSessionResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/archive`,
+    {},
+  );
+}
+
+export async function restoreChat(
+  projectId: string,
+  taskId: string,
+  chatId: string,
+): Promise<ChatSessionResponse> {
+  return apiClient.post<Record<string, never>, ChatSessionResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/restore`,
+    {},
+  );
+}
+
 /**
  * Create a new chat for a task
  */

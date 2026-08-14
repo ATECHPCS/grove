@@ -152,6 +152,8 @@ pub struct MemoryOverview {
     pub run_count: i64,
     pub successful_run_count: i64,
     pub failed_run_count: i64,
+    pub in_progress_run_count: i64,
+    pub waiting_run_count: i64,
     pub active_run_count: i64,
     pub last_organized_at: Option<i64>,
     pub usage: MemoryUsageTotals,
@@ -481,6 +483,40 @@ pub fn get_entity(project_id: &str, entity_id: &str) -> Result<Option<MemoryEnti
     )
     .optional()
     .map_err(Into::into)
+}
+
+pub fn resolve_entities(project_id: &str, entity_ids: &[String]) -> Result<Vec<MemoryEntity>> {
+    validate_path_segment(project_id, "project_id")?;
+    if entity_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    for entity_id in entity_ids {
+        validate_path_segment(entity_id, "entity_id")?;
+    }
+
+    let placeholders = vec!["?"; entity_ids.len()].join(", ");
+    let sql = format!(
+        "SELECT project_id, entity_id, file_path, title, description, tags_json,
+                base_score, access_count,
+                base_score + MIN(access_count, 20), created_at, updated_at
+         FROM memory_entities WHERE project_id = ? AND entity_id IN ({placeholders})"
+    );
+    let mut values = Vec::with_capacity(entity_ids.len() + 1);
+    values.push(project_id.to_string());
+    values.extend(entity_ids.iter().cloned());
+    let conn = database::connection();
+    let mut stmt = conn.prepare(&sql)?;
+    let entities = stmt
+        .query_map(rusqlite::params_from_iter(values.iter()), row_to_entity)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut by_id = entities
+        .into_iter()
+        .map(|entity| (entity.entity_id.clone(), entity))
+        .collect::<HashMap<_, _>>();
+    Ok(entity_ids
+        .iter()
+        .filter_map(|entity_id| by_id.remove(entity_id))
+        .collect())
 }
 
 pub fn get_entity_document(
@@ -1037,8 +1073,9 @@ pub fn prepare_organization_input(
     }))
 }
 
-/// Store the Agent's proposed publication while the Run remains active.
-/// Automation commits it only after ACP reports a successful Session end.
+/// Stage the Agent's final publication inside the active Run. The MCP handler
+/// immediately commits this staged value and finishes the business Run; the
+/// ordinary Chat Session has an independent lifecycle.
 pub fn stage_organization_submission(
     project_id: &str,
     run_id: &str,
@@ -1091,6 +1128,31 @@ pub fn stage_organization_submission(
     )?;
     tx.commit()?;
     Ok(true)
+}
+
+pub fn organization_submission_staged(project_id: &str, run_id: &str) -> Result<bool> {
+    validate_path_segment(project_id, "project_id")?;
+    let conn = database::connection();
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT r.result_json FROM automation_runs r
+             JOIN automations a ON a.id = r.automation_id
+             WHERE r.id = ?1 AND r.status = 'running' AND a.project = ?2
+               AND a.handler_key = ?3",
+            params![
+                run_id,
+                project_id,
+                super::automations::MEMORY_ORGANIZATION_HANDLER
+            ],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(raw
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|value| value.get("organization_submission").cloned())
+        .is_some())
 }
 
 /// Memory post action. The Automation framework calls this inside the same
@@ -1501,12 +1563,22 @@ pub fn get_overview(project_id: &str, automation_id: &str) -> Result<MemoryOverv
         params![project_id],
         |row| row.get(0),
     )?;
-    let (run_count, successful_run_count, failed_run_count, active_run_count, last_organized_at) =
+    let (
+        run_count,
+        successful_run_count,
+        failed_run_count,
+        in_progress_run_count,
+        waiting_run_count,
+        active_run_count,
+        last_organized_at,
+    ) =
         conn.query_row(
             "SELECT COUNT(*),
                     COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN status IN ('failed', 'timeout', 'interrupted') THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN status IN ('queued', 'running', 'cancelling') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status IN ('queued', 'running') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'waiting' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status NOT IN ('success', 'cancelled') THEN 1 ELSE 0 END), 0),
                     MAX(CASE WHEN status = 'success' THEN completed_at END)
              FROM automation_runs WHERE automation_id = ?1",
             params![automation_id],
@@ -1517,6 +1589,8 @@ pub fn get_overview(project_id: &str, automation_id: &str) -> Result<MemoryOverv
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )?;
@@ -1551,6 +1625,8 @@ pub fn get_overview(project_id: &str, automation_id: &str) -> Result<MemoryOverv
         run_count,
         successful_run_count,
         failed_run_count,
+        in_progress_run_count,
+        waiting_run_count,
         active_run_count,
         last_organized_at,
         usage: MemoryUsageTotals {
@@ -1998,6 +2074,123 @@ fn normalize_tags(tags: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_entities_returns_requested_metadata_without_recording_reads() {
+        let _lock = database::test_lock().blocking_lock();
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        let first = create_entity(
+            "project-resolve-memory",
+            "First memory",
+            "First summary",
+            &[MemoryTag {
+                key: "topic".to_string(),
+                value: "architecture".to_string(),
+                icon: None,
+            }],
+            50,
+        )
+        .unwrap()
+        .entity;
+        let second = create_entity(
+            "project-resolve-memory",
+            "Second memory",
+            "Second summary",
+            &[],
+            40,
+        )
+        .unwrap()
+        .entity;
+
+        let resolved = resolve_entities(
+            "project-resolve-memory",
+            &[
+                second.entity_id.clone(),
+                "memory-missing".to_string(),
+                first.entity_id.clone(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|entity| entity.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Second memory", "First memory"]
+        );
+        assert_eq!(resolved[1].tags[0].value, "architecture");
+        assert_eq!(resolved[0].access_count, 0);
+        assert_eq!(resolved[1].access_count, 0);
+
+        crate::storage::set_grove_dir_override(None);
+    }
+
+    #[test]
+    fn organization_submission_only_finishes_after_mark_finished_is_staged() {
+        let _lock = database::test_lock().blocking_lock();
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        let project = format!("project-{}", Uuid::new_v4().simple());
+        let automation_id = format!("auto-{}", Uuid::new_v4().simple());
+        let now = Utc::now().timestamp();
+        let agent_config = crate::agent_config::AgentConfigSelection::default();
+        let automation = crate::storage::automations::Automation {
+            id: automation_id.clone(),
+            project: project.clone(),
+            name: "Memory organization".to_string(),
+            enabled: true,
+            handler_key: crate::storage::automations::MEMORY_ORGANIZATION_HANDLER.to_string(),
+            agent_config: agent_config.clone(),
+            task_mode: crate::storage::automations::TargetMode::New,
+            task_id: None,
+            task_template: None,
+            session_mode: crate::storage::automations::TargetMode::New,
+            chat_id: None,
+            session_template: None,
+            prompt: "Organize Memory".to_string(),
+            schedule_cron: "0 2 * * *".to_string(),
+            event_triggers: Vec::new(),
+            last_run_at: None,
+            last_run_status: None,
+            last_run_error: None,
+            next_run_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        crate::storage::automations::insert(&automation).unwrap();
+        let run_id = match crate::storage::automations::claim_run(
+            &automation_id,
+            "manual",
+            None,
+            &automation.prompt,
+            None,
+            &agent_config,
+            &serde_json::json!({}),
+            "project_run",
+            now,
+            true,
+        )
+        .unwrap()
+        {
+            crate::storage::automations::RunClaim::Created(run_id) => run_id,
+            crate::storage::automations::RunClaim::Existing(_) => {
+                panic!("unexpected existing run")
+            }
+        };
+        crate::storage::automations::mark_run_running(&run_id).unwrap();
+
+        assert!(!organization_submission_staged(&project, &run_id).unwrap());
+        assert!(
+            stage_organization_submission(&project, &run_id, &HashMap::new(), "Finished").unwrap()
+        );
+        assert!(organization_submission_staged(&project, &run_id).unwrap());
+
+        crate::storage::set_grove_dir_override(None);
+    }
 
     #[test]
     fn append_log_persists_normalized_record() {

@@ -1,12 +1,12 @@
 import { useState, useEffect, useCallback } from "react";
-import { motion, AnimatePresence } from "framer-motion";
 import { X, Download, CheckCircle2, Loader2, Tag, Settings2, Wrench, Scale, User, Monitor } from "lucide-react";
-import { Button } from "../ui";
+import { Button, DrawerShell } from "../ui";
 import { MarkdownRenderer } from "../ui/MarkdownRenderer";
 import { InstallDialog } from "./InstallDialog";
 import { getSkillDetail } from "../../api";
 import type { SkillDetail, AgentDef, InstalledSkill } from "../../api";
 import { useCommand, useContextKey, useDefineCommand, useKeyboardScope } from "../../keyboard";
+import { ExtensionIdentityIcon } from "./ExtensionIdentityIcon";
 
 interface SkillDetailPanelProps {
   selectedSkill: { source: string; name: string } | null;
@@ -136,34 +136,16 @@ export function SkillDetailPanel({ selectedSkill, agents, installed, projectPath
   };
 
   return (
-    <AnimatePresence>
-      {selectedSkill && (
-        <>
-          {/* Backdrop */}
-          <motion.div
-            key="drawer-backdrop"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 0.2 }}
-            onClick={onClose}
-            className="fixed inset-0 bg-black/30 z-40"
-          />
-
-          {/* Drawer */}
-          <motion.div
-            key="drawer-panel"
-            initial={{ x: "100%" }}
-            animate={{ x: 0 }}
-            exit={{ x: "100%" }}
-            transition={{ type: "spring", damping: 30, stiffness: 300 }}
-            className="fixed top-0 right-0 bottom-0 w-[520px] max-w-[90vw] z-50 flex flex-col bg-[var(--color-bg)] border-l border-[var(--color-border)] shadow-2xl"
-          >
+    <DrawerShell isOpen={!!selectedSkill} onClose={onClose} width="w-[720px]">
+      {selectedSkill && <>
             {/* Header */}
             <div className="flex items-center justify-between px-5 py-4 border-b border-[var(--color-border)] select-none">
-              <h3 className="text-base font-semibold text-[var(--color-text)] truncate select-none">
-                {detail?.name || "Loading..."}
-              </h3>
+              <div className="flex min-w-0 items-center gap-3">
+                <ExtensionIdentityIcon kind="skill" name={detail?.name || selectedSkill.name} />
+                <h3 className="text-base font-semibold text-[var(--color-text)] truncate select-none">
+                  {detail?.name || "Loading..."}
+                </h3>
+              </div>
               <button
                 onClick={onClose}
                 className="p-1.5 rounded-lg hover:bg-[var(--color-bg-secondary)] text-[var(--color-text-muted)] transition-colors"
@@ -327,9 +309,7 @@ export function SkillDetailPanel({ selectedSkill, agents, installed, projectPath
                 }}
               />
             )}
-          </motion.div>
-        </>
-      )}
-    </AnimatePresence>
+      </>}
+    </DrawerShell>
   );
 }

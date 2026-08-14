@@ -8,6 +8,9 @@ use crate::error::{GroveError, Result};
 
 /// Local Task 的固定 ID
 pub const LOCAL_TASK_ID: &str = "_local";
+/// Internal TaskChat storage namespace for Memory Organization chats.
+/// This is not a persisted Task record.
+pub const MEMORY_TASK_ID: &str = "_memory";
 
 /// Chat 会话（一个 Task 下可以有多个 Chat）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -617,13 +620,62 @@ pub fn load_chat_sessions(project: &str, task_id: &str) -> Result<Vec<ChatSessio
     let mut stmt = conn.prepare(
         "SELECT session_id, title, agent, acp_session_id, created_at, duty, launch_mode
          FROM session
-         WHERE project = ?1 AND task_id = ?2
-         ORDER BY created_at ASC",
+         WHERE project = ?1 AND task_id = ?2 AND archived_at IS NULL
+         ORDER BY COALESCE(updated_at, created_at) DESC, created_at DESC",
     )?;
     let chats = stmt
         .query_map(params![project, task_id], row_to_chat_session)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(chats)
+}
+
+/// Load archived sessions for the dedicated read-only SessionList section.
+/// Normal discovery paths intentionally use `load_chat_sessions` and therefore
+/// cannot see these rows until they are restored.
+pub fn load_archived_chat_sessions(project: &str, task_id: &str) -> Result<Vec<ChatSession>> {
+    let conn = crate::storage::database::connection();
+    let mut stmt = conn.prepare(
+        "SELECT session_id, title, agent, acp_session_id, created_at, duty, launch_mode
+         FROM session
+         WHERE project = ?1 AND task_id = ?2 AND archived_at IS NOT NULL
+         ORDER BY archived_at DESC",
+    )?;
+    let chats = stmt
+        .query_map(params![project, task_id], row_to_chat_session)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(chats)
+}
+
+pub fn archive_chat_session(project: &str, task_id: &str, chat_id: &str) -> Result<bool> {
+    let conn = crate::storage::database::connection();
+    let changed = conn.execute(
+        "UPDATE session SET archived_at = ?1
+         WHERE project = ?2 AND task_id = ?3 AND session_id = ?4 AND archived_at IS NULL",
+        params![Utc::now().to_rfc3339(), project, task_id, chat_id],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn restore_chat_session(project: &str, task_id: &str, chat_id: &str) -> Result<bool> {
+    let conn = crate::storage::database::connection();
+    let changed = conn.execute(
+        "UPDATE session SET archived_at = NULL
+         WHERE project = ?1 AND task_id = ?2 AND session_id = ?3 AND archived_at IS NOT NULL",
+        params![project, task_id, chat_id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Mark a session as recently active without changing any presentation metadata.
+/// Archived sessions are deliberately excluded: activity cannot implicitly restore one.
+pub fn touch_chat_session(project: &str, task_id: &str, chat_id: &str) -> Result<bool> {
+    let conn = crate::storage::database::connection();
+    let changed = conn.execute(
+        "UPDATE session SET updated_at = ?1
+         WHERE project = ?2 AND task_id = ?3 AND session_id = ?4 AND archived_at IS NULL",
+        params![Utc::now().to_rfc3339(), project, task_id, chat_id],
+    )?;
+    Ok(changed > 0)
 }
 
 pub fn load_acp_session_ids_for_agent(agent: &str) -> Result<std::collections::HashSet<String>> {
@@ -654,14 +706,15 @@ pub fn add_chat_session(project: &str, task_id: &str, chat: ChatSession) -> Resu
     }
     conn.execute(
         "INSERT INTO session
-         (session_id, project, task_id, title, agent, acp_session_id, duty, created_at, launch_mode)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         (session_id, project, task_id, title, agent, acp_session_id, duty, created_at, updated_at, launch_mode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)
          ON CONFLICT(session_id) DO UPDATE SET
             title = excluded.title,
             agent = excluded.agent,
             acp_session_id = excluded.acp_session_id,
             duty = excluded.duty,
-            created_at = excluded.created_at",
+            created_at = excluded.created_at,
+            updated_at = COALESCE(session.updated_at, excluded.updated_at)",
         params![
             chat.id,
             project,
@@ -782,6 +835,26 @@ pub fn get_chat_session(
         .query_row(
             "SELECT session_id, title, agent, acp_session_id, created_at, duty, launch_mode
              FROM session
+             WHERE project = ?1 AND task_id = ?2 AND session_id = ?3 AND archived_at IS NULL",
+            params![project, task_id, chat_id],
+            row_to_chat_session,
+        )
+        .optional()?;
+    Ok(chat)
+}
+
+/// Fetch a session regardless of lifecycle state. Reserved for archive/restore
+/// and read-only history; live Agent paths should use `get_chat_session`.
+pub fn get_chat_session_including_archived(
+    project: &str,
+    task_id: &str,
+    chat_id: &str,
+) -> Result<Option<ChatSession>> {
+    let conn = crate::storage::database::connection();
+    let chat = conn
+        .query_row(
+            "SELECT session_id, title, agent, acp_session_id, created_at, duty, launch_mode
+             FROM session
              WHERE project = ?1 AND task_id = ?2 AND session_id = ?3",
             params![project, task_id, chat_id],
             row_to_chat_session,
@@ -799,7 +872,7 @@ pub fn find_chat_session(chat_id: &str) -> Result<Option<(String, String, ChatSe
         .query_row(
             "SELECT project, task_id, session_id, title, agent, acp_session_id, created_at, duty, launch_mode
              FROM session
-             WHERE session_id = ?1",
+             WHERE session_id = ?1 AND archived_at IS NULL",
             params![chat_id],
             |row| {
                 let project: String = row.get(0)?;
@@ -1013,6 +1086,147 @@ mod tests {
 
         assert_eq!(uuid.len(), 32);
         assert!(uuid.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn memory_namespace_uses_ordinary_chat_storage_without_a_task_record() {
+        let _lock = crate::storage::database::test_lock().blocking_lock();
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        let project = format!("project-{}", uuid::Uuid::new_v4().simple());
+        let now = Utc::now();
+        assert!(get_task_any(&project, MEMORY_TASK_ID).unwrap().is_none());
+
+        let chat_id = generate_chat_id();
+        add_chat_session(
+            &project,
+            MEMORY_TASK_ID,
+            ChatSession {
+                id: chat_id.clone(),
+                title: "Memory Run".to_string(),
+                agent: "claude".to_string(),
+                acp_session_id: None,
+                created_at: now,
+                duty: None,
+                launch_mode: "acp".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(get_task_any(&project, MEMORY_TASK_ID).unwrap().is_none());
+        assert_eq!(
+            load_chat_sessions(&project, MEMORY_TASK_ID)
+                .unwrap()
+                .into_iter()
+                .map(|chat| chat.id)
+                .collect::<Vec<_>>(),
+            vec![chat_id]
+        );
+
+        crate::storage::set_grove_dir_override(None);
+    }
+
+    #[test]
+    fn archived_sessions_leave_normal_discovery_until_restored() {
+        let _lock = crate::storage::database::test_lock().blocking_lock();
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        let project = format!("project-{}", uuid::Uuid::new_v4().simple());
+        let task_id = "task-archive";
+        let make_chat = |id: &str| ChatSession {
+            id: id.to_string(),
+            title: id.to_string(),
+            agent: "codex".to_string(),
+            acp_session_id: None,
+            created_at: Utc::now(),
+            duty: None,
+            launch_mode: "acp".to_string(),
+        };
+        add_chat_session(&project, task_id, make_chat("active")).unwrap();
+        add_chat_session(&project, task_id, make_chat("archive-me")).unwrap();
+
+        assert!(archive_chat_session(&project, task_id, "archive-me").unwrap());
+        assert_eq!(
+            load_chat_sessions(&project, task_id)
+                .unwrap()
+                .into_iter()
+                .map(|chat| chat.id)
+                .collect::<Vec<_>>(),
+            vec!["active"]
+        );
+        assert_eq!(
+            load_archived_chat_sessions(&project, task_id)
+                .unwrap()
+                .into_iter()
+                .map(|chat| chat.id)
+                .collect::<Vec<_>>(),
+            vec!["archive-me"]
+        );
+        assert!(get_chat_session(&project, task_id, "archive-me")
+            .unwrap()
+            .is_none());
+        assert!(
+            get_chat_session_including_archived(&project, task_id, "archive-me")
+                .unwrap()
+                .is_some()
+        );
+
+        assert!(restore_chat_session(&project, task_id, "archive-me").unwrap());
+        assert!(load_archived_chat_sessions(&project, task_id)
+            .unwrap()
+            .is_empty());
+        assert!(get_chat_session(&project, task_id, "archive-me")
+            .unwrap()
+            .is_some());
+
+        crate::storage::set_grove_dir_override(None);
+    }
+
+    #[test]
+    fn active_sessions_are_ordered_by_recent_activity() {
+        let _lock = crate::storage::database::test_lock().blocking_lock();
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        let project = format!("project-{}", uuid::Uuid::new_v4().simple());
+        let task_id = "task-recent-activity";
+        let now = Utc::now();
+        let make_chat = |id: &str, created_at| ChatSession {
+            id: id.to_string(),
+            title: id.to_string(),
+            agent: "codex".to_string(),
+            acp_session_id: None,
+            created_at,
+            duty: None,
+            launch_mode: "acp".to_string(),
+        };
+        add_chat_session(
+            &project,
+            task_id,
+            make_chat("older", now - chrono::Duration::days(1)),
+        )
+        .unwrap();
+        add_chat_session(&project, task_id, make_chat("newer", now)).unwrap();
+
+        let ids = || {
+            load_chat_sessions(&project, task_id)
+                .unwrap()
+                .into_iter()
+                .map(|chat| chat.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(), vec!["newer", "older"]);
+
+        assert!(touch_chat_session(&project, task_id, "older").unwrap());
+        assert_eq!(ids(), vec!["older", "newer"]);
+
+        assert!(archive_chat_session(&project, task_id, "older").unwrap());
+        assert!(!touch_chat_session(&project, task_id, "older").unwrap());
+        assert!(restore_chat_session(&project, task_id, "older").unwrap());
+        assert_eq!(ids(), vec!["older", "newer"]);
+
+        crate::storage::set_grove_dir_override(None);
     }
 
     #[test]

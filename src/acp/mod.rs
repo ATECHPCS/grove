@@ -33,6 +33,36 @@ static STARTING_SESSIONS: once_cell::sync::Lazy<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+/// Plugin launch validation runs for every ACP session. Remember diagnostics
+/// already shown during this Grove process so one broken plugin does not flood
+/// stderr as chats connect and reconnect.
+static REPORTED_PLUGIN_MCP_ISSUES: once_cell::sync::Lazy<Mutex<std::collections::HashSet<String>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+
+fn report_plugin_mcp_issue_once(key: String, message: impl FnOnce() -> String) {
+    let should_report = REPORTED_PLUGIN_MCP_ISSUES
+        .lock()
+        .map(|mut reported| reported.insert(key))
+        .unwrap_or(true);
+    if should_report {
+        eprintln!("{}", message());
+    }
+}
+
+const SHORT_MEMORY_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+#[derive(Clone)]
+struct ShortToolWatch {
+    title: String,
+    started_at: std::time::Instant,
+    deadline: std::time::Instant,
+}
+
+fn is_short_memory_tool(title: &str) -> bool {
+    let normalized = title.to_ascii_lowercase();
+    normalized.contains("grove_agent") && normalized.contains("memory_")
+}
+
 static ACP_SESSIONS: once_cell::sync::Lazy<RwLock<HashMap<String, Arc<AcpSessionHandle>>>> =
     once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 
@@ -147,6 +177,10 @@ pub struct AcpSessionHandle {
     /// Tool calls in the current turn that have not reached a terminal status.
     /// Used to apply ACP's preemptive client-side cancellation semantics.
     active_tool_calls: Mutex<std::collections::HashSet<String>>,
+    /// Fast local Project Memory calls should finish in milliseconds. Track a
+    /// short deadline separately so a wedged MCP transport cannot hold the
+    /// entire Agent turn forever.
+    short_tool_watches: Mutex<HashMap<String, ShortToolWatch>>,
     /// True from the moment `session/cancel` is sent until the current prompt
     /// resolves. Permission requests arriving in that window are immediately
     /// answered with the protocol-level `cancelled` outcome.
@@ -1064,9 +1098,15 @@ const WORKING_BROWSER_INSTRUCTION: &str = r#"Use browser control when the work d
 
 const WORKING_MEMORY_INSTRUCTION: &str = r#"Project Memory preserves long-term knowledge about both the Project and its working context.
 
-Recall applicable Memory when previous context may affect the current work, especially goals, decisions, rationale, constraints, terminology, user preferences, communication and collaboration patterns, interaction rules, workflows, recurring problems, and reusable lessons. Apply each Memory according to its recorded scope, conditions, and current validity. Treat organized long-term Memory as established context and recent unorganized Logs as evidence that may still require reconciliation.
+At the start of every new Working Session, before substantive work, always search Project Memory. Do not decide that Memory is unnecessary without performing this initial retrieval. A search with no relevant result is valid and satisfies this requirement.
 
-When the current work establishes, changes, or corrects durable context, append a Memory Log. Preserve the meaning a future Agent will need:
+Use `memory_recall` with the user's request, current Task scope, and relevant terminology. Also use `memory_get_recent_logs` to find recent decisions, corrections, instructions, and unfinished work that may not yet be organized. For every potentially relevant Entity returned by recall, use `memory_read` before relying on it or proceeding with the work. Reconcile organized long-term Memory and recent unorganized Logs with the current Task notes and the user's latest instruction. If required context is still missing after this search, then ask the user for it rather than guessing.
+
+Repeat Memory retrieval when the user's primary intent materially changes or the work moves to a different subject whose history may matter. Do not repeat an equivalent search when the applicable Memory has already been read in the current Session and remains current.
+
+Apply each Memory according to its recorded scope, conditions, and current validity. Treat organized long-term Memory as established context and recent unorganized Logs as evidence that may still require reconciliation.
+
+When the user or the current work establishes, changes, corrects, rejects, or supersedes durable context, use `memory_append_log` in the same turn as soon as its meaning is clear. Do not defer the Log until Task completion, Session completion, or a later reminder from the user. Preserve the meaning a future Agent will need:
 
 - A decision preserves its context, outcome, rationale, status, and relevant boundaries.
 - A rule preserves when it applies, the behavior it requires, and its scope.
@@ -1140,15 +1180,15 @@ fn build_working_session_instruction(
         grove_sections.push(task_kind);
     }
     if agent_runtime_available {
+        if crate::storage::memory::project_memory_enabled(&config.project_key).unwrap_or(false) {
+            grove_sections.push(WORKING_MEMORY_INSTRUCTION);
+        }
         grove_sections.push(WORKING_AGENT_RUNTIME_INSTRUCTION);
         if crate::storage::config::load_config()
             .browser_control
             .enabled
         {
             grove_sections.push(WORKING_BROWSER_INSTRUCTION);
-        }
-        if crate::storage::memory::project_memory_enabled(&config.project_key).unwrap_or(false) {
-            grove_sections.push(WORKING_MEMORY_INSTRUCTION);
         }
     }
 
@@ -1400,8 +1440,68 @@ fn build_mcp_servers(
         // task/project context env (so a plugin's MCP server has the same "current
         // context" the panel gets from host.getInfo).
         servers.extend(load_plugin_mcp_servers(env_vars));
+        servers.extend(load_standalone_mcp_servers(env_vars));
     }
     Ok(servers)
+}
+
+fn load_standalone_mcp_servers(base_env: &HashMap<String, String>) -> Vec<acp::McpServer> {
+    let Some(agent_id) = base_env.get("GROVE_AGENT_ID") else {
+        return Vec::new();
+    };
+    let configs = crate::storage::extensions::resolve_effective_mcp_configs(
+        agent_id,
+        base_env.get("GROVE_PROJECT").map(String::as_str),
+    )
+    .unwrap_or_default();
+    configs
+        .into_iter()
+        .filter_map(|config| {
+            let name = sanitize_mcp_server_name(&config.name);
+            if config.transport == "stdio" {
+                let command = config.command?;
+                let env = config
+                    .env
+                    .into_iter()
+                    .map(|(key, value)| acp::EnvVariable::new(key, value))
+                    .collect();
+                Some(acp::McpServer::Stdio(
+                    acp::McpServerStdio::new(name, std::path::PathBuf::from(command))
+                        .args(config.args)
+                        .env(env),
+                ))
+            } else {
+                let url = config.url?;
+                let headers = config
+                    .headers
+                    .into_iter()
+                    .map(|(key, value)| acp::HttpHeader::new(key, value))
+                    .collect();
+                Some(acp::McpServer::Http(
+                    acp::McpServerHttp::new(name, url).headers(headers),
+                ))
+            }
+        })
+        .collect()
+}
+
+fn sanitize_mcp_server_name(raw: &str) -> String {
+    let value = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let value = value.trim_matches('-');
+    if value.is_empty() {
+        "mcp".into()
+    } else {
+        value.into()
+    }
 }
 
 /// Resolve Task-level linked Grove Project IDs to the absolute directories
@@ -1601,9 +1701,14 @@ fn load_plugin_mcp_servers(base_env: &HashMap<String, String>) -> Vec<acp::McpSe
             Some(c) if !c.is_empty() => match resolve_plugin_mcp_command(c, plugin_dir, base_env) {
                 Some(command) => command,
                 None => {
-                    eprintln!(
-                        "grove: skipping MCP server for plugin '{}': executable '{}' was not found",
-                        plugin.name, c
+                    report_plugin_mcp_issue_once(
+                        format!("{}:missing-executable:{c}", plugin.id),
+                        || {
+                            format!(
+                                "grove: skipping MCP server for plugin '{}': executable '{}' was not found",
+                                plugin.name, c
+                            )
+                        },
                     );
                     continue;
                 }
@@ -1615,11 +1720,10 @@ fn load_plugin_mcp_servers(base_env: &HashMap<String, String>) -> Vec<acp::McpSe
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|x| x.as_str()).map(resolve).collect())
             .unwrap_or_default();
-        // Declared permissions → Node Permission Model flags. A node-based MCP
-        // server runs under `node --permission` with fs/exec grants matching
-        // exactly what the manifest declares; Grove requires node >= 24 and
-        // refuses (skips) the server otherwise, so a permission is never left
-        // silently unenforced.
+        // Declared permissions → Node runtime flags. Scoped permissions use
+        // `node --permission`; `exec` intentionally disables that model because
+        // it already grants full machine trust and Node otherwise propagates
+        // the parent's fs restrictions to external Node/shebang CLIs.
         let perms: std::collections::HashSet<String> = manifest
             .get("permissions")
             .and_then(|p| p.as_array())
@@ -1633,11 +1737,16 @@ fn load_plugin_mcp_servers(base_env: &HashMap<String, String>) -> Vec<acp::McpSe
         let _ = std::fs::create_dir_all(&storage_root);
         if crate::plugins::runtime::is_node_command(&command) {
             if !crate::plugins::runtime::node_supports_permissions(&command) {
-                eprintln!(
-                    "grove: skipping MCP server for plugin '{}': node >= {} is required \
-                     for enforced permissions (check `node --version`)",
-                    plugin.name,
-                    crate::plugins::runtime::MIN_NODE_MAJOR
+                report_plugin_mcp_issue_once(
+                    format!("{}:node-permissions:{command}", plugin.id),
+                    || {
+                        format!(
+                            "grove: skipping MCP server for plugin '{}': node >= {} is required \
+                             for enforced permissions (check `node --version`)",
+                            plugin.name,
+                            crate::plugins::runtime::MIN_NODE_MAJOR
+                        )
+                    },
                 );
                 continue;
             }
@@ -2538,15 +2647,31 @@ async fn handle_session_notification(
         }
         acp::SessionUpdate::ToolCall(tool_call) => {
             let tool_call_id = tool_call.tool_call_id.to_string();
+            let terminal = matches!(
+                tool_call.status,
+                acp::ToolCallStatus::Completed | acp::ToolCallStatus::Failed
+            );
             {
                 let mut active = state.handle.active_tool_calls.lock().unwrap();
-                if matches!(
-                    tool_call.status,
-                    acp::ToolCallStatus::Completed | acp::ToolCallStatus::Failed
-                ) {
+                if terminal {
                     active.remove(&tool_call_id);
                 } else {
                     active.insert(tool_call_id.clone());
+                }
+            }
+            {
+                let mut watches = state.handle.short_tool_watches.lock().unwrap();
+                if terminal {
+                    watches.remove(&tool_call_id);
+                } else if is_short_memory_tool(&tool_call.title) {
+                    watches.entry(tool_call_id.clone()).or_insert_with(|| {
+                        let started_at = std::time::Instant::now();
+                        ShortToolWatch {
+                            title: tool_call.title.clone(),
+                            started_at,
+                            deadline: started_at + SHORT_MEMORY_TOOL_TIMEOUT,
+                        }
+                    });
                 }
             }
             // 标记：此处出现了 tool_call，下一段 agent 文本应另起段落。
@@ -2638,6 +2763,12 @@ async fn handle_session_notification(
                 let mut active = state.handle.active_tool_calls.lock().unwrap();
                 if matches!(status.as_str(), "completed" | "failed") {
                     active.remove(&tool_call_id);
+                    state
+                        .handle
+                        .short_tool_watches
+                        .lock()
+                        .unwrap()
+                        .remove(&tool_call_id);
                 } else {
                     active.insert(tool_call_id.clone());
                 }
@@ -3545,6 +3676,54 @@ fn store_config_snapshot(handle: &AcpSessionHandle, config_options: &[acp::Sessi
     *handle.current_config_options.lock().unwrap() = config_options.to_vec();
 }
 
+fn config_option_current_value(option: &acp::SessionConfigOption) -> Option<ConfigOptionValue> {
+    match &option.kind {
+        acp::SessionConfigKind::Boolean(boolean) => {
+            Some(ConfigOptionValue::Boolean(boolean.current_value))
+        }
+        acp::SessionConfigKind::Select(select) => {
+            Some(ConfigOptionValue::Select(select.current_value.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// Return persisted values that are still accepted by the newly-started ACP
+/// Session and differ from its current values. Iterating in the live Agent's
+/// advertised order keeps dependent options deterministic.
+fn config_options_to_restore(
+    persisted: &[acp::SessionConfigOption],
+    advertised: &[acp::SessionConfigOption],
+) -> Vec<(String, ConfigOptionValue)> {
+    let persisted_values = persisted
+        .iter()
+        .filter_map(|option| {
+            config_option_current_value(option).map(|value| (option.id.to_string(), value))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    advertised
+        .iter()
+        .filter_map(|option| {
+            let config_id = option.id.to_string();
+            let value = persisted_values.get(&config_id)?.clone();
+            (crate::agent_config::config_option_accepts(option, &value)
+                && !crate::agent_config::config_option_has_current_value(option, &value))
+            .then_some((config_id, value))
+        })
+        .collect()
+}
+
+fn legacy_mode_to_restore(
+    persisted: Option<&str>,
+    current: Option<&str>,
+    available: &[(String, String)],
+) -> Option<String> {
+    let persisted = persisted?;
+    (current != Some(persisted) && available.iter().any(|(id, _)| id == persisted))
+        .then(|| persisted.to_string())
+}
+
 fn replace_config_snapshot(
     handle: &AcpSessionHandle,
     config_options: Vec<acp::SessionConfigOption>,
@@ -4158,6 +4337,7 @@ pub async fn get_or_start_session(
                     last_plan: Mutex::new(None),
                     last_permission_info: Mutex::new(None),
                     active_tool_calls: Mutex::new(std::collections::HashSet::new()),
+                    short_tool_watches: Mutex::new(HashMap::new()),
                     cancel_requested: std::sync::atomic::AtomicBool::new(false),
                     auth_methods: Mutex::new(Vec::new()),
                     logout_capable: std::sync::atomic::AtomicBool::new(false),
@@ -4273,24 +4453,16 @@ pub async fn get_or_start_session(
                 let session_agent_name = config.agent_name.clone();
 
                 let session_result = run_acp_session(handle, config, cmd_rx).await;
-                match &session_result {
-                    Ok(()) => {
-                        eprintln!(
-                            "[ACP] session ended normally (key={} agent={} task={} chat={:?})",
-                            key_clone, session_agent_name, session_task_id, session_chat_id
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[ACP] session ended with error (key={} agent={} task={} chat={:?}): {}",
-                            key_clone, session_agent_name, session_task_id, session_chat_id, e
-                        );
-                        let message = match e {
-                            crate::error::GroveError::Session(message) => message.clone(),
-                            other => other.to_string(),
-                        };
-                        let _ = update_tx.send(AcpUpdate::Error { message });
-                    }
+                if let Err(e) = &session_result {
+                    eprintln!(
+                        "[ACP] session ended with error (key={} agent={} task={} chat={:?}): {}",
+                        key_clone, session_agent_name, session_task_id, session_chat_id, e
+                    );
+                    let message = match e {
+                        crate::error::GroveError::Session(message) => message.clone(),
+                        other => other.to_string(),
+                    };
+                    let _ = update_tx.send(AcpUpdate::Error { message });
                 }
                 let _ = update_tx.send(AcpUpdate::SessionEnded);
 
@@ -4943,6 +5115,14 @@ async fn drive_session(
             .flatten()
             .and_then(|c| c.acp_session_id)
     });
+    // Capture the last confirmed runtime settings before SessionReady replaces
+    // session.json with the Agent's startup defaults. This snapshot is used
+    // below to restore settings after an app/process restart.
+    let persisted_session_metadata = config
+        .chat_id
+        .as_ref()
+        .and_then(|cid| read_session_metadata(&config.project_key, &config.task_id, cid));
+    let should_restore_persisted_settings = saved_id.is_some();
 
     let persist_session_id = |sid: &str| {
         if let Some(ref cid) = config.chat_id {
@@ -5452,7 +5632,14 @@ async fn drive_session(
         // Resume 路线(优先):agent 支持 session/resume。不 replay 历史,所以
         // 完全不需要 suppress_emit + 300ms 那套抛弃 agent 回放的机制 — 直接发
         // ResumeSessionRequest,Grove 照常从磁盘加载自己的历史。
-        (Some(saved_id), true, _, false) => 'resume_arm: {
+        //
+        // Some agents expose both lifecycle methods but only keep resumable
+        // resources in memory; after an agent restart, resume can return
+        // Resource not found while session/load can still restore the
+        // persisted session. Fall back to load in that case (below),
+        // suppressing its replay because Grove's local history remains the
+        // display source of truth.
+        (Some(saved_id), true, supports_load, false) => 'resume_arm: {
             let mcp_servers = build_mcp_servers(
                 &config.env_vars,
                 agent_graph_token,
@@ -5461,7 +5648,8 @@ async fn drive_session(
                 config.mcp_server_policy,
             )
             .map_err(to_acp_err)?;
-            let resp = loop {
+            let mut resume_failure = None;
+            let resume_response = loop {
                 match conn
                     .send_request(
                         acp::ResumeSessionRequest::new(
@@ -5474,7 +5662,7 @@ async fn drive_session(
                     .block_task()
                     .await
                 {
-                    Ok(resp) => break resp,
+                    Ok(resp) => break Some(resp),
                     Err(error) if is_auth_required_error(&error) => {
                         await_authentication!();
                     }
@@ -5484,9 +5672,9 @@ async fn drive_session(
                         // place with a fresh session instead of dead-ending the
                         // client into a full page refresh (Blitz Findings #3); flag
                         // the handle so the WS handler sends a one-time "reconnected"
-                        // notice. Transient/transport failures keep the existing
-                        // behaviour — return a single error so the caller emits one
-                        // banner (no double-emit, no fall-through).
+                        // notice. Transient/transport failures fall through to the
+                        // load fallback below (or a single error banner when the
+                        // agent doesn't support load).
                         let resume_err_msg = format!("{}", error);
                         if is_definitive_resume_failure(&resume_err_msg) {
                             eprintln!(
@@ -5512,26 +5700,77 @@ async fn drive_session(
                             // config_options for the fresh session; skip the resume
                             // resp extraction below by yielding the arm directly.
                             break 'resume_arm new_id;
-                        } else {
-                            return Err(acp::Error::internal_error()
-                                .data(format!("Resume session failed: {}", resume_err_msg)));
                         }
+                        resume_failure = Some(error);
+                        break None;
                     }
                 }
             };
             if let Ok(mut slot) = handle.pending_auth.lock() {
                 *slot = None;
             }
-            uses_config_options = resp.config_options.is_some();
-            config_options = resp.config_options.clone().unwrap_or_default();
-            (available_modes, current_mode_id, _, mode_descriptions) =
-                extract_modes(&resp.modes, &config_options, uses_config_options);
-            (available_models, current_model_id, model_config_id) = extract_models(&config_options);
-            (
-                available_thought_levels,
-                current_thought_level_id,
-                thought_level_config_id,
-            ) = extract_thought_level(&config_options);
+            if let Some(resp) = resume_response {
+                uses_config_options = resp.config_options.is_some();
+                config_options = resp.config_options.clone().unwrap_or_default();
+                (available_modes, current_mode_id, _, mode_descriptions) =
+                    extract_modes(&resp.modes, &config_options, uses_config_options);
+                (available_models, current_model_id, model_config_id) =
+                    extract_models(&config_options);
+                (
+                    available_thought_levels,
+                    current_thought_level_id,
+                    thought_level_config_id,
+                ) = extract_thought_level(&config_options);
+            } else if supports_load {
+                handle
+                    .suppress_emit
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let load_response = loop {
+                    match conn
+                        .send_request(
+                            acp::LoadSessionRequest::new(
+                                acp::SessionId::new(&*saved_id),
+                                &config.working_dir,
+                            )
+                            .additional_directories(additional_directories.clone())
+                            .mcp_servers(mcp_servers.clone()),
+                        )
+                        .block_task()
+                        .await
+                    {
+                        Ok(resp) => break resp,
+                        Err(error) if is_auth_required_error(&error) => {
+                            await_authentication!();
+                        }
+                        Err(load_error) => {
+                            return Err(acp::Error::internal_error().data(format!(
+                                "Resume session failed: {}; load fallback failed: {}",
+                                resume_failure.expect("missing resume failure"),
+                                load_error
+                            )));
+                        }
+                    }
+                };
+                if let Ok(mut slot) = handle.pending_auth.lock() {
+                    *slot = None;
+                }
+                uses_config_options = load_response.config_options.is_some();
+                config_options = load_response.config_options.clone().unwrap_or_default();
+                (available_modes, current_mode_id, _, mode_descriptions) =
+                    extract_modes(&load_response.modes, &config_options, uses_config_options);
+                (available_models, current_model_id, model_config_id) =
+                    extract_models(&config_options);
+                (
+                    available_thought_levels,
+                    current_thought_level_id,
+                    thought_level_config_id,
+                ) = extract_thought_level(&config_options);
+            } else {
+                return Err(acp::Error::internal_error().data(format!(
+                    "Resume session failed: {}",
+                    resume_failure.expect("missing resume failure")
+                )));
+            }
             saved_id
         }
         // Load 路线:agent 不支持 resume 但支持 load_session。agent 会 replay 历史
@@ -5631,6 +5870,87 @@ async fn drive_session(
     };
 
     let session_id_arc = acp::SessionId::new(&*session_id);
+
+    // A restarted Agent may successfully resume/load the conversation while
+    // still returning default config values. Re-apply the last values Grove
+    // confirmed in session.json before publishing SessionReady, so the UI and
+    // the actual Agent runtime cannot diverge. Removed or invalid options are
+    // deliberately skipped; the new Agent snapshot remains the capability
+    // authority.
+    if should_restore_persisted_settings {
+        if let Some(persisted) = persisted_session_metadata.as_ref() {
+            if uses_config_options {
+                let restore = config_options_to_restore(&persisted.config_options, &config_options);
+                for (config_id, value) in restore {
+                    let request_value = match config_request_value(
+                        &config_options,
+                        &config_id,
+                        value,
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            handle.emit(AcpUpdate::ConfigOptionError {
+                                config_id: config_id.clone(),
+                                message: format!(
+                                    "Could not restore saved session setting '{config_id}'; using the Agent's current value. {error}"
+                                ),
+                            });
+                            continue;
+                        }
+                    };
+                    let result = conn
+                        .send_request(acp::SetSessionConfigOptionRequest::new(
+                            session_id_arc.clone(),
+                            acp::SessionConfigId::new(config_id.clone()),
+                            request_value,
+                        ))
+                        .block_task()
+                        .await;
+                    match result {
+                    Ok(response) => {
+                        config_options = response.config_options;
+                        (available_modes, current_mode_id, _, mode_descriptions) =
+                            extract_modes(&None, &config_options, true);
+                        (available_models, current_model_id, model_config_id) =
+                            extract_models(&config_options);
+                        (
+                            available_thought_levels,
+                            current_thought_level_id,
+                            thought_level_config_id,
+                        ) = extract_thought_level(&config_options);
+                    }
+                    Err(error) => handle.emit(AcpUpdate::ConfigOptionError {
+                        config_id: config_id.clone(),
+                        message: format!(
+                            "Could not restore saved session setting '{config_id}'; using the Agent's current value. {error}"
+                        ),
+                    }),
+                    }
+                }
+            } else if let Some(saved_mode) = legacy_mode_to_restore(
+                persisted.current_mode_id.as_deref(),
+                current_mode_id.as_deref(),
+                &available_modes,
+            ) {
+                let result = conn
+                    .send_request(acp::SetSessionModeRequest::new(
+                        session_id_arc.clone(),
+                        acp::SessionModeId::new(saved_mode.clone()),
+                    ))
+                    .block_task()
+                    .await;
+                match result {
+                    Ok(_) => current_mode_id = Some(saved_mode.clone()),
+                    Err(error) => handle.emit(AcpUpdate::ConfigOptionError {
+                        config_id: "__legacy_mode".to_string(),
+                        message: format!(
+                            "Could not restore saved session mode '{saved_mode}'; using the Agent's current mode. {error}"
+                        ),
+                    }),
+                }
+            }
+        }
+    }
 
     let prompt_capabilities = PromptCapabilitiesData {
         image: init_resp.agent_capabilities.prompt_capabilities.image,
@@ -5773,6 +6093,7 @@ async fn drive_session(
                     .cancel_requested
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 handle.active_tool_calls.lock().unwrap().clear();
+                handle.short_tool_watches.lock().unwrap().clear();
                 // Import replay is complete once the user starts a new turn.
                 // From here on UserMessageChunk is a normal Agent echo and
                 // must be ignored to avoid duplicating Grove's own message.
@@ -6089,6 +6410,21 @@ async fn drive_session(
                 // 选取 send_request 而非用户点 send 的时刻,是为了排除 prompt 队列
                 // 等待时间,只反映 agent 真正"思考"了多久。
                 let turn_start_ts = chrono::Utc::now().timestamp();
+                // Resolve Automation ownership at turn start. A product-level
+                // completion tool can make the Run terminal before ACP returns
+                // this turn's usage; looking it up at `Complete` would then
+                // incorrectly charge the `_memory` TaskChat namespace instead.
+                // Later turns in the still-usable Chat correctly have no Run
+                // owner because the original Run is already terminal.
+                let automation_run_id_owned = config.chat_id.as_deref().and_then(|chat_id| {
+                    crate::storage::automations::nonterminal_run_id_for_chat(
+                        &config.project_key,
+                        &config.task_id,
+                        chat_id,
+                    )
+                    .ok()
+                    .flatten()
+                });
 
                 // 用 SentRequest::block_task() 得到可被 select 的 future
                 let prompt_fut = conn
@@ -6100,18 +6436,30 @@ async fn drive_session(
                 tokio::pin!(prompt_fut);
 
                 let mut got_kill = false;
+                let mut short_tool_watchdog =
+                    tokio::time::interval(std::time::Duration::from_secs(1));
+                short_tool_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-                // No client-side cancel timeout: agents can legitimately take
-                // arbitrarily long to acknowledge a cancel (long tool calls,
-                // network roundtrips, etc.). Any timer that force-breaks the
-                // inner loop drops `prompt_fut`'s oneshot Receiver — when the
-                // agent's late response finally arrives, the protocol layer
-                // logs "failed to send response, receiver dropped" and the
-                // ACP session enters a broken state. Trust the agent to
-                // resolve `prompt_fut` (success, error, or cancel-ack).
+                // There is no generic turn timeout: agents may legitimately
+                // run long tools. Fast local Memory MCP calls are the narrow
+                // exception above; their watchdog sends protocol cancellation
+                // without dropping `prompt_fut`, so the ACP session can still
+                // finish its normal cancel acknowledgement.
                 let result = loop {
                     tokio::select! {
                         res = &mut prompt_fut => break res,
+                        _ = short_tool_watchdog.tick() => {
+                            if let Some((tool_call_id, watch)) = handle.take_expired_short_tool() {
+                                eprintln!(
+                                    "[ACP] short MCP tool timed out after {:.1}s; cancelling turn (id={}, title={})",
+                                    watch.started_at.elapsed().as_secs_f64(),
+                                    tool_call_id,
+                                    watch.title,
+                                );
+                                handle.cancel_current_turn_state();
+                                let _ = conn.send_notification(acp::CancelNotification::new(session_id_arc.clone()));
+                            }
+                        }
                         Some(inner_cmd) = cmd_rx.recv() => {
                             match inner_cmd {
                                 AcpCommand::Cancel => {
@@ -6303,14 +6651,17 @@ async fn drive_session(
                         if let Some(usage) = &turn_usage {
                             let model_owned =
                                 handle.current_model_id.lock().ok().and_then(|g| g.clone());
-                            let automation_run_id = config
-                                .artifact_dir
-                                .as_ref()
-                                .map(|_| config.task_id.as_str());
+                            let automation_run_id = automation_run_id_owned.as_deref();
                             let rec = crate::storage::token_usage::TokenUsageRecord {
                                 project_key: &config.project_key,
-                                task_id: config.chat_id.as_ref().map(|_| config.task_id.as_str()),
-                                chat_id: config.chat_id.as_deref(),
+                                task_id: automation_run_id
+                                    .is_none()
+                                    .then_some(config.task_id.as_str())
+                                    .filter(|_| config.chat_id.is_some()),
+                                chat_id: automation_run_id
+                                    .is_none()
+                                    .then_some(config.chat_id.as_deref())
+                                    .flatten(),
                                 automation_run_id,
                                 agent: &config.agent_name,
                                 model: model_owned.as_deref(),
@@ -7190,6 +7541,22 @@ impl AcpSessionHandle {
                     chat_id,
                     &update,
                 );
+                if matches!(
+                    &update,
+                    AcpUpdate::UserMessage { .. } | AcpUpdate::Complete { .. }
+                ) && crate::storage::tasks::touch_chat_session(
+                    &self.project_key,
+                    &self.task_id,
+                    chat_id,
+                )
+                .unwrap_or(false)
+                {
+                    use crate::api::handlers::walkie_talkie::{broadcast_radio_event, RadioEvent};
+                    broadcast_radio_event(RadioEvent::ChatListChanged {
+                        project_id: self.project_key.clone(),
+                        task_id: self.task_id.clone(),
+                    });
+                }
             }
             if let Some(ref artifact_dir) = self.artifact_dir {
                 crate::storage::chat_history::append_event_to_path(
@@ -7414,6 +7781,15 @@ impl AcpSessionHandle {
             }
         }
 
+        if let Some(ref chat_id) = self.chat_id {
+            crate::storage::automations::sync_run_state_for_chat_event(
+                &self.project_key,
+                &self.task_id,
+                chat_id,
+                &update,
+            );
+        }
+
         // broadcast
         let _ = self.update_tx.send(update);
 
@@ -7600,6 +7976,7 @@ impl AcpSessionHandle {
 
         let active_tool_calls: Vec<String> =
             self.active_tool_calls.lock().unwrap().drain().collect();
+        self.short_tool_watches.lock().unwrap().clear();
         for id in active_tool_calls {
             self.emit(AcpUpdate::ToolCallUpdate {
                 id,
@@ -7609,6 +7986,17 @@ impl AcpSessionHandle {
                 raw_input: None,
             });
         }
+    }
+
+    fn take_expired_short_tool(&self) -> Option<(String, ShortToolWatch)> {
+        let now = std::time::Instant::now();
+        let mut watches = self.short_tool_watches.lock().unwrap();
+        let id = watches
+            .iter()
+            .filter(|(_, watch)| watch.deadline <= now)
+            .min_by_key(|(_, watch)| watch.deadline)
+            .map(|(id, _)| id.clone())?;
+        watches.remove(&id).map(|watch| (id, watch))
     }
 
     /// 终止会话
@@ -8260,6 +8648,7 @@ pub fn new_handle_for_test(
         last_plan: Mutex::new(None),
         last_permission_info: Mutex::new(None),
         active_tool_calls: Mutex::new(std::collections::HashSet::new()),
+        short_tool_watches: Mutex::new(HashMap::new()),
         cancel_requested: std::sync::atomic::AtomicBool::new(false),
         auth_methods: Mutex::new(Vec::new()),
         logout_capable: std::sync::atomic::AtomicBool::new(false),
@@ -9151,6 +9540,50 @@ async fn drain_stderr_to_file(stderr: tokio::process::ChildStderr, path: PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_agent_memory_mcp_tools_use_the_short_watchdog() {
+        assert!(is_short_memory_tool("mcp.grove_agent.memory_append_log"));
+        assert!(is_short_memory_tool(
+            "Tool: grove_agent/memory_get_recent_logs"
+        ));
+        assert!(!is_short_memory_tool("mcp.grove_agent.grove_agent_spawn"));
+        assert!(!is_short_memory_tool("memory_append_log"));
+    }
+
+    #[test]
+    fn working_memory_instruction_requires_initial_retrieval_and_timely_append() {
+        for tool in [
+            "memory_recall",
+            "memory_get_recent_logs",
+            "memory_read",
+            "memory_append_log",
+        ] {
+            assert!(WORKING_MEMORY_INSTRUCTION.contains(tool));
+        }
+        assert!(WORKING_MEMORY_INSTRUCTION.contains(
+            "At the start of every new Working Session, before substantive work, always search Project Memory"
+        ));
+        assert!(WORKING_MEMORY_INSTRUCTION.contains(
+            "Do not decide that Memory is unnecessary without performing this initial retrieval"
+        ));
+        assert!(
+            WORKING_MEMORY_INSTRUCTION.contains("before relying on it or proceeding with the work")
+        );
+        assert!(WORKING_MEMORY_INSTRUCTION
+            .contains("Repeat Memory retrieval when the user's primary intent materially changes"));
+        assert!(WORKING_MEMORY_INSTRUCTION.contains(
+            "Do not repeat an equivalent search when the applicable Memory has already been read"
+        ));
+        assert!(WORKING_MEMORY_INSTRUCTION
+            .contains("If required context is still missing after this search, then ask the user"));
+        assert!(
+            WORKING_MEMORY_INSTRUCTION.contains("in the same turn as soon as its meaning is clear")
+        );
+        assert!(WORKING_MEMORY_INSTRUCTION.contains(
+            "Do not defer the Log until Task completion, Session completion, or a later reminder"
+        ));
+    }
 
     fn client_state_for_test(
         handle: Arc<AcpSessionHandle>,
@@ -10192,6 +10625,81 @@ mod tests {
                 ("deep".to_string(), "Deep".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn restart_restore_keeps_only_valid_changed_config_values_in_live_order() {
+        let persisted = vec![
+            acp::SessionConfigOption::boolean("autoApprove", "Auto approve", true),
+            acp::SessionConfigOption::select(
+                "model",
+                "Model",
+                "opus",
+                vec![
+                    acp::SessionConfigSelectOption::new("sonnet", "Sonnet"),
+                    acp::SessionConfigSelectOption::new("opus", "Opus"),
+                ],
+            ),
+            acp::SessionConfigOption::select(
+                "removed",
+                "Removed",
+                "old",
+                vec![acp::SessionConfigSelectOption::new("old", "Old")],
+            ),
+        ];
+        let advertised = vec![
+            acp::SessionConfigOption::select(
+                "model",
+                "Model",
+                "sonnet",
+                vec![
+                    acp::SessionConfigSelectOption::new("sonnet", "Sonnet"),
+                    acp::SessionConfigSelectOption::new("opus", "Opus"),
+                ],
+            ),
+            acp::SessionConfigOption::boolean("autoApprove", "Auto approve", true),
+        ];
+
+        assert_eq!(
+            config_options_to_restore(&persisted, &advertised),
+            vec![(
+                "model".to_string(),
+                ConfigOptionValue::Select("opus".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn restart_restore_rejects_saved_values_removed_by_the_agent() {
+        let persisted = vec![acp::SessionConfigOption::select(
+            "model",
+            "Model",
+            "opus",
+            vec![acp::SessionConfigSelectOption::new("opus", "Opus")],
+        )];
+        let advertised = vec![acp::SessionConfigOption::select(
+            "model",
+            "Model",
+            "sonnet",
+            vec![acp::SessionConfigSelectOption::new("sonnet", "Sonnet")],
+        )];
+
+        assert!(config_options_to_restore(&persisted, &advertised).is_empty());
+    }
+
+    #[test]
+    fn restart_restore_only_reapplies_an_available_changed_legacy_mode() {
+        let available = vec![
+            ("code".to_string(), "Code".to_string()),
+            ("plan".to_string(), "Plan".to_string()),
+        ];
+
+        assert_eq!(
+            legacy_mode_to_restore(Some("plan"), Some("code"), &available).as_deref(),
+            Some("plan")
+        );
+        assert!(legacy_mode_to_restore(Some("plan"), Some("plan"), &available).is_none());
+        assert!(legacy_mode_to_restore(Some("removed"), Some("code"), &available).is_none());
     }
 
     #[test]

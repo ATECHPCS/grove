@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { listChats, createChat } from "../../../api";
+import { listChats, listArchivedChats, createChat } from "../../../api";
 import type { ChatSessionResponse } from "../../../api";
 import {
   readLastActiveTab,
@@ -9,6 +9,7 @@ import {
 interface Params {
   projectId: string;
   taskId: string;
+  fixedChatId?: string;
   setChats: (chats: ChatSessionResponse[]) => void;
   setActiveChatId: (id: string) => void;
   /** If provided, the parent has pinned a specific chat (Blitz grid
@@ -29,6 +30,7 @@ interface Params {
 export function useInitialChatLoad({
   projectId,
   taskId,
+  fixedChatId,
   setChats,
   setActiveChatId,
   pinnedChatId,
@@ -37,6 +39,26 @@ export function useInitialChatLoad({
     let cancelled = false;
 
     const init = async () => {
+      if (fixedChatId) {
+        try {
+          const chatList = await listChats(projectId, taskId);
+          let chat = chatList.find((item) => item.id === fixedChatId);
+          if (!chat) {
+            const archived = await listArchivedChats(projectId, taskId);
+            chat = archived.find((item) => item.id === fixedChatId);
+          }
+          if (cancelled) return;
+          if (!chat) {
+            console.error("Fixed chat not found:", fixedChatId);
+            return;
+          }
+          setChats([chat]);
+          setActiveChatId(chat.id);
+        } catch (err) {
+          console.error("Failed to load fixed chat:", err);
+        }
+        return;
+      }
       // Pull as much branching logic as possible OUT of the try/catch:
       // React Compiler 1.0 bails out when a try block contains optional
       // chaining / logical-or / ternary / `if` over computed values.
@@ -89,11 +111,11 @@ export function useInitialChatLoad({
         delete win.__grove_pending_chat;
       } else {
         const remembered = readLastActiveTab("chat", projectId, taskId);
-        const lastId = chatList[chatList.length - 1].id;
+        const latestId = chatList[0].id;
         const restoredId =
           remembered && chatList.some((c) => c.id === remembered)
             ? remembered
-            : lastId;
+            : latestId;
         setActiveChatId(restoredId);
       }
     };
@@ -101,5 +123,5 @@ export function useInitialChatLoad({
     return () => {
       cancelled = true;
     };
-  }, [projectId, taskId, setChats, setActiveChatId, pinnedChatId]);
+  }, [projectId, taskId, fixedChatId, pinnedChatId, setChats, setActiveChatId]);
 }

@@ -454,33 +454,18 @@ pub async fn execute(port: u16, remote_url: Option<String>) {
         );
     }
 
+    // GUI-specific setup ends at listener binding/remote proxy selection.
+    // Local backend initialization is shared with `grove web` so new startup
+    // responsibilities cannot be added to one surface and omitted from the other.
+    if !is_remote {
+        if let Err(e) = api::initialize_local_server_runtime(actual_port).await {
+            eprintln!("Failed to initialize Grove backend: {}", e);
+            return;
+        }
+    }
+
     // Start HTTP server in a background task
     let handle = tokio::spawn(async move {
-        if !is_remote {
-            // Initialize FileWatchers for all live tasks
-            api::init_file_watchers();
-
-            // The desktop server owns the same Automation runtime as `grove web`.
-            // Register built-in consumers before Run Now or event triggers can fire.
-            api::start_automation_runtime();
-
-            // Start the agent_graph MCP listener (loopback-only). Non-fatal on failure.
-            match api::handlers::agent_graph_mcp::start_listener(
-                api::handlers::agent_graph_mcp::DEFAULT_BASE_PORT,
-                api::handlers::agent_graph_mcp::DEFAULT_MAX_ATTEMPTS,
-            )
-            .await
-            {
-                Ok(_port) => {
-                    // Silent on success
-                }
-                Err(e) => eprintln!(
-                    "[agent_graph_mcp] failed to bind listener: {} — agent_graph tools disabled",
-                    e
-                ),
-            }
-        }
-
         let auth = std::sync::Arc::new(api::auth::ServerAuth::no_auth());
         let app = api::create_router(None, auth, remote_url_clone);
 

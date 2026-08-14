@@ -64,7 +64,10 @@ export {
   deleteFileOrDir,
   moveFileOrDir,
   listChats,
+  listArchivedChats,
   createChat,
+  archiveChat,
+  restoreChat,
   updateChatTitle,
   sendGraphChatMessage,
   getTaskGraph,
@@ -187,6 +190,9 @@ export {
   installSkill,
   checkSourceUpdates,
 } from './skills';
+
+export { exploreExtensions, createManagedMcp, installMcp, installCatalogPlugin } from './extensions';
+export type { ExtensionArtifact, ExtensionKind } from './extensions';
 export type {
   AgentDef,
   SkillSource,
@@ -211,4 +217,5 @@ export {
   upsertTaskSlot,
   removeTaskSlot,
   setSlots,
+  moveTaskSlot,
 } from './taskgroups';

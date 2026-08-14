@@ -12,14 +12,28 @@ use super::types::*;
 
 fn build_graph_response(project_key: &str, task_id: &str) -> Option<GraphResponse> {
     let chats = tasks::load_chat_sessions(project_key, task_id).ok()?;
-    let edges = {
+    let active_ids: std::collections::HashSet<&str> =
+        chats.iter().map(|chat| chat.id.as_str()).collect();
+    let edges: Vec<_> = {
         let conn = database::connection();
         graph_db::list_edges_for_task(&conn, project_key, task_id).ok()?
-    };
-    let pending_messages = {
+    }
+    .into_iter()
+    .filter(|edge| {
+        active_ids.contains(edge.from_session.as_str())
+            && active_ids.contains(edge.to_session.as_str())
+    })
+    .collect();
+    let pending_messages: Vec<_> = {
         let conn = database::connection();
         graph_db::list_pending_for_task(&conn, project_key, task_id).ok()?
-    };
+    }
+    .into_iter()
+    .filter(|message| {
+        active_ids.contains(message.from_session.as_str())
+            && active_ids.contains(message.to_session.as_str())
+    })
+    .collect();
     let pending_pairs: std::collections::HashSet<(String, String)> = pending_messages
         .iter()
         .map(|p| (p.from_session.clone(), p.to_session.clone()))
@@ -517,35 +531,29 @@ fn build_mention_candidates(
 
     let outgoing: Vec<MentionOutgoing> = outgoing_edges
         .into_iter()
-        .map(|c| {
-            let agent = chat_meta
-                .get(&c.to_session_id)
-                .map(|(_, a)| a.clone())
-                .unwrap_or_default();
-            MentionOutgoing {
+        .filter_map(|c| {
+            let (_, agent) = chat_meta.get(&c.to_session_id)?;
+            Some(MentionOutgoing {
                 session_id: c.to_session_id,
                 name: c.to_session_name,
-                agent,
+                agent: agent.clone(),
                 duty: c.to_session_duty,
-            }
+            })
         })
         .collect();
 
     let make_excerpt = crate::agent_graph::pending_body_excerpt;
     let pending_replies = pending
         .into_iter()
-        .map(|p| {
-            let (name, agent) = chat_meta
-                .get(&p.from_session)
-                .cloned()
-                .unwrap_or_else(|| (p.from_session.clone(), String::new()));
-            MentionPendingReply {
+        .filter_map(|p| {
+            let (name, agent) = chat_meta.get(&p.from_session)?.clone();
+            Some(MentionPendingReply {
                 session_id: p.from_session,
                 name,
                 agent,
                 msg_id: p.msg_id,
                 body_preview: make_excerpt(&p.body),
-            }
+            })
         })
         .collect();
 
@@ -694,7 +702,11 @@ mod tests {
             assert_eq!(resp.edges[0].state, "blocked");
             assert_eq!(resp.edges[0].purpose.as_deref(), Some("delegate"));
 
-            let sender = &resp.nodes[0];
+            let sender = resp
+                .nodes
+                .iter()
+                .find(|node| node.chat_id == "chat-1")
+                .unwrap();
             assert_eq!(sender.chat_id, "chat-1");
             assert_eq!(sender.pending_in, 0);
             assert_eq!(sender.pending_out, 1);
@@ -703,7 +715,11 @@ mod tests {
             assert_eq!(sender.pending_messages[0].to_name, "Chat 2");
             assert!(sender.pending_messages[0].body_excerpt.contains("Hello"));
 
-            let receiver = &resp.nodes[1];
+            let receiver = resp
+                .nodes
+                .iter()
+                .find(|node| node.chat_id == "chat-2")
+                .unwrap();
             assert_eq!(receiver.chat_id, "chat-2");
             assert_eq!(receiver.pending_in, 1);
             assert_eq!(receiver.pending_out, 0);
@@ -713,6 +729,46 @@ mod tests {
             assert_eq!(edge_pending.from_name, "Chat 1");
             assert_eq!(edge_pending.to_name, "Chat 2");
             assert_eq!(edge_pending.body_excerpt, "Hello, please review this.");
+        });
+    }
+
+    #[test]
+    fn archived_session_and_its_edges_are_hidden_from_task_graph() {
+        with_temp_home(|project_id, task_id| {
+            for id in ["chat-active", "chat-archived"] {
+                add_chat_session(
+                    project_id,
+                    task_id,
+                    ChatSession {
+                        id: id.to_string(),
+                        title: id.to_string(),
+                        agent: "codex".to_string(),
+                        acp_session_id: None,
+                        created_at: chrono::Utc::now(),
+                        duty: None,
+                        launch_mode: "acp".to_string(),
+                    },
+                )
+                .unwrap();
+            }
+            {
+                let conn = connection();
+                graph_db::add_edge(
+                    &conn,
+                    project_id,
+                    task_id,
+                    "chat-active",
+                    "chat-archived",
+                    None,
+                )
+                .unwrap();
+            }
+            tasks::archive_chat_session(project_id, task_id, "chat-archived").unwrap();
+
+            let response = build_graph_response(project_id, task_id).unwrap();
+            assert_eq!(response.nodes.len(), 1);
+            assert_eq!(response.nodes[0].chat_id, "chat-active");
+            assert!(response.edges.is_empty());
         });
     }
 

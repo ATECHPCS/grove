@@ -14,6 +14,7 @@ pub mod custom_agent;
 pub mod dashboard;
 pub mod env;
 pub mod extension;
+pub mod extensions;
 pub mod files;
 pub mod folder;
 pub mod git;

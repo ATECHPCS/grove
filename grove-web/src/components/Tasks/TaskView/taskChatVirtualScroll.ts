@@ -12,20 +12,14 @@ export function shouldVirtualizeTaskChat(
 export function taskChatVirtualizationLayoutKey({
   chatId,
   hiddenMessageCount,
-  measurementWidth,
   virtualized,
-  coldBoundaryIndex,
 }: {
   chatId: string;
   hiddenMessageCount: number;
-  measurementWidth: number;
   virtualized: boolean;
-  coldBoundaryIndex: number;
 }): string {
   const scope = `${chatId}:${hiddenMessageCount}`;
-  return virtualized
-    ? `virtual:${scope}:${measurementWidth}:${coldBoundaryIndex}`
-    : `direct:${scope}`;
+  return virtualized ? `virtual:${scope}` : `direct:${scope}`;
 }
 
 export type TaskChatScrollAnchor = {
@@ -55,6 +49,24 @@ export function taskChatLayoutTransitionTarget(
   return anchor === null
     ? { kind: "none" }
     : { kind: "anchor", anchor };
+}
+
+/**
+ * Virtuoso reports `isScrolling` for its own follow-output corrections as
+ * well as for user input. Detach bottom-following only when a real gesture was
+ * observed; otherwise streaming height changes can masquerade as an upward
+ * reader scroll, most visibly when `complete` compacts the live turn.
+ */
+export function shouldDisengageTaskChatAutoStick({
+  atBottom,
+  userGestureActive,
+  programmaticScroll,
+}: {
+  atBottom: boolean;
+  userGestureActive: boolean;
+  programmaticScroll: boolean;
+}): boolean {
+  return !atBottom && userGestureActive && !programmaticScroll;
 }
 
 /** Build per-item Virtuoso estimates from heights measured while rows were in
