@@ -111,6 +111,9 @@ pub struct AcpSessionHandle {
     pending_queue: Mutex<Vec<QueuedMessage>>,
     /// 队列暂停标志（用户正在编辑队列消息时暂停 auto-send）
     queue_paused: std::sync::atomic::AtomicBool,
+    /// Serializes end-of-turn and edit-resume queue drains. Without this,
+    /// both paths can observe an idle session and dequeue separate messages.
+    queue_drain_lock: Mutex<()>,
     /// 队列合并发送模式（Separate = 逐条发送；Compact = 合并成一条）
     queue_mode: Mutex<QueueMode>,
     /// 当前 agent mode id（用于 PlanFileUpdate 检测和 QueuedConfig 快照）。
@@ -4258,6 +4261,7 @@ pub async fn get_or_start_session(
                     ),
                     pending_queue: Mutex::new(Vec::new()),
                     queue_paused: std::sync::atomic::AtomicBool::new(false),
+                    queue_drain_lock: Mutex::new(()),
                     queue_mode: Mutex::new(QueueMode::default()),
                     current_mode_id: Mutex::new(None),
                     current_model_id: Mutex::new(None),
@@ -6553,37 +6557,7 @@ async fn drive_session(
                     }
                 }
 
-                let auth_pending = handle
-                    .pending_auth
-                    .lock()
-                    .map(|state| state.is_some())
-                    .unwrap_or(false);
-                if !auth_pending
-                    && !handle
-                        .queue_paused
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    if let Some((send_msg, original_msgs)) = handle.pop_queue_for_auto_send() {
-                        // M5: emit QueueUpdate only after successful enqueue.
-                        // On failure, re-insert the original (pre-merge) messages at
-                        // front, preserving their order, so nothing is lost.
-                        let text = send_msg.text.clone();
-                        let attachments = send_msg.attachments.clone();
-                        let sender = send_msg.sender.clone();
-                        let terminal = send_msg.terminal;
-                        let config = send_msg.config.clone();
-                        if handle.try_enqueue_prompt(text, attachments, sender, terminal, config) {
-                            handle.emit(AcpUpdate::QueueUpdate {
-                                messages: handle.get_queue(),
-                            });
-                        } else {
-                            let mut q = handle.pending_queue.lock().unwrap();
-                            for (i, msg) in original_msgs.into_iter().enumerate() {
-                                q.insert(i, msg);
-                            }
-                        }
-                    }
-                }
+                handle.drain_queue_if_ready();
             }
             AcpCommand::Cancel => {
                 // Agent 空闲时收到 Cancel,忽略
@@ -8076,6 +8050,54 @@ impl AcpSessionHandle {
             .is_ok()
     }
 
+    /// Drain one auto-send unit only when the session is genuinely ready.
+    ///
+    /// The end-of-turn path and `resume_queue` can race around the Busy(false)
+    /// edge. The lock plus the eager busy reservation ensures exactly one of
+    /// them dequeues; the next command-loop iteration replaces the reservation
+    /// with the authoritative Busy updates from the actual prompt.
+    fn drain_queue_if_ready(&self) {
+        let Ok(_drain_guard) = self.queue_drain_lock.lock() else {
+            return;
+        };
+        if self.queue_paused.load(std::sync::atomic::Ordering::Relaxed)
+            || self.is_busy.load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .pending_auth
+                .lock()
+                .map(|state| state.is_some())
+                .unwrap_or(true)
+        {
+            return;
+        }
+        let Some((send_msg, original_msgs)) = self.pop_queue_for_auto_send() else {
+            return;
+        };
+
+        // Reserve the idle slot before enqueueing so a concurrent resume or
+        // end-of-turn drain cannot remove the next queued message as well.
+        self.is_busy
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if self.try_enqueue_prompt(
+            send_msg.text.clone(),
+            send_msg.attachments.clone(),
+            send_msg.sender.clone(),
+            send_msg.terminal,
+            send_msg.config.clone(),
+        ) {
+            self.emit(AcpUpdate::QueueUpdate {
+                messages: self.get_queue(),
+            });
+        } else {
+            self.is_busy
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            let mut q = self.pending_queue.lock().unwrap();
+            for (i, msg) in original_msgs.into_iter().enumerate() {
+                q.insert(i, msg);
+            }
+        }
+    }
+
     /// Re-dispatch the prompt that failed with `auth_required`. If producers
     /// filled the bounded command channel while authentication was completing,
     /// retain the prompt at the front of the visible queue instead of dropping it.
@@ -8168,28 +8190,12 @@ impl AcpSessionHandle {
         }
     }
 
-    /// 恢复队列 auto-send，如果队列非空则立即尝试发送第一条
+    /// 恢复队列 auto-send。Agent 忙时保持原队列不动，等待 turn-end drain；
+    /// Agent 已空闲时补偿编辑期间被跳过的 drain。
     pub fn resume_queue(&self) {
         self.queue_paused
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        // 尝试发送队列中的第一条消息（如果 agent 空闲会被处理）
-        if let Some(next_msg) = self.pop_queue_front() {
-            // M5: try_enqueue_prompt 在 cmd_tx 满 / closed 时会失败 — 失败时
-            // 把消息回插队首，避免出队但未送达的"幽灵丢失"。
-            let text = next_msg.text.clone();
-            let attachments = next_msg.attachments.clone();
-            let sender = next_msg.sender.clone();
-            let terminal = next_msg.terminal;
-            let config = next_msg.config.clone();
-            if self.try_enqueue_prompt(text, attachments, sender, terminal, config) {
-                self.emit(AcpUpdate::QueueUpdate {
-                    messages: self.get_queue(),
-                });
-            } else {
-                let mut q = self.pending_queue.lock().unwrap();
-                q.insert(0, next_msg);
-            }
-        }
+        self.drain_queue_if_ready();
     }
 
     /// 用户直接执行终端命令（Shell 模式，不经过 AI agent）
@@ -8460,6 +8466,7 @@ pub fn new_handle_for_test(
         replay_user_messages: std::sync::atomic::AtomicBool::new(false),
         pending_queue: Mutex::new(Vec::new()),
         queue_paused: std::sync::atomic::AtomicBool::new(false),
+        queue_drain_lock: Mutex::new(()),
         queue_mode: Mutex::new(QueueMode::default()),
         current_mode_id: Mutex::new(None),
         current_model_id: Mutex::new(None),
@@ -9370,6 +9377,36 @@ async fn drain_stderr_to_file(stderr: tokio::process::ChildStderr, path: PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn editing_a_queued_message_while_busy_preserves_its_position() {
+        let key = format!("queue-edit-order-test-{}", uuid::Uuid::new_v4());
+        let (handle, _updates, _guard) = new_handle_for_test(&key, "project", "task", "chat");
+        let first = QueuedMessage::new("first".to_string(), Vec::new(), None, false, None);
+        let first_id = first.id.clone();
+        let second = QueuedMessage::new("second".to_string(), Vec::new(), None, false, None);
+        let second_id = second.id.clone();
+        handle.queue_message(first);
+        handle.queue_message(second);
+        handle
+            .is_busy
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        handle.pause_queue();
+        let (found, _) = handle.update_queued_message_by_id(&first_id, "first edited".to_string());
+        assert!(found);
+        handle.resume_queue();
+
+        let queue = handle.get_queue();
+        assert_eq!(
+            queue
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first_id.as_str(), second_id.as_str()]
+        );
+        assert_eq!(queue[0].text, "first edited");
+    }
 
     #[test]
     fn only_agent_memory_mcp_tools_use_the_short_watchdog() {
