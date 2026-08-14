@@ -1073,6 +1073,40 @@ pub fn prepare_organization_input(
     }))
 }
 
+/// Scheduled organization only needs an Agent when its immutable input window
+/// contains evidence. Manual and event triggers intentionally bypass this
+/// check in the handler so users can still request a full review explicitly.
+pub fn organization_has_pending_input(project_id: &str, automation_id: &str) -> Result<bool> {
+    let input = prepare_organization_input(project_id, automation_id, None)?;
+    let has_logs = input
+        .get("log_through_rowid")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        > 0;
+    if has_logs {
+        return Ok(true);
+    }
+    if !input
+        .get("deep_organization")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    let input_from_at = input
+        .get("input_from_at")
+        .and_then(serde_json::Value::as_str);
+    let input_through_at = input
+        .get("input_through_at")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| GroveError::invalid_data("Memory input has no input_through_at"))?;
+    Ok(
+        !list_recent_chat_files(project_id, input_from_at, input_through_at, None, 1)?
+            .items
+            .is_empty(),
+    )
+}
+
 /// Stage the Agent's final publication inside the active Run. The MCP handler
 /// immediately commits this staged value and finishes the business Run; the
 /// ordinary Chat Session has an independent lifecycle.
@@ -1729,6 +1763,11 @@ pub fn list_recent_chat_files(
         for task in fs::read_dir(tasks_dir)? {
             let task = task?;
             let task_id = task.file_name().to_string_lossy().into_owned();
+            // Organization Run chats are stored in an ordinary TaskChat
+            // namespace but are not project-task evidence for the next Run.
+            if task_id == super::tasks::MEMORY_TASK_ID {
+                continue;
+            }
             let chats_dir = task.path().join("chats");
             if !chats_dir.is_dir() {
                 continue;
@@ -2074,6 +2113,104 @@ fn normalize_tags(tags: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn insert_test_memory_config(project_id: &str, automation_id: &str, deep: bool) {
+        let now = Utc::now().to_rfc3339();
+        let timestamp = Utc::now().timestamp();
+        let automation = crate::storage::automations::Automation {
+            id: automation_id.to_string(),
+            project: project_id.to_string(),
+            name: "Memory organization".to_string(),
+            enabled: true,
+            handler_key: crate::storage::automations::MEMORY_ORGANIZATION_HANDLER.to_string(),
+            agent_config: Default::default(),
+            task_mode: crate::storage::automations::TargetMode::New,
+            task_id: None,
+            task_template: None,
+            session_mode: crate::storage::automations::TargetMode::New,
+            chat_id: None,
+            session_template: None,
+            prompt: "Organize Memory".to_string(),
+            schedule_cron: "0 2 * * *".to_string(),
+            event_triggers: Vec::new(),
+            last_run_at: None,
+            last_run_status: None,
+            last_run_error: None,
+            next_run_at: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        save_project_config_with_automation(
+            &MemoryProjectConfig {
+                project_id: project_id.to_string(),
+                enabled: true,
+                deep_organization: deep,
+                pending_log_threshold: None,
+                organization_automation_id: automation_id.to_string(),
+                last_input_through_at: Some("2000-01-01T00:00:00Z".to_string()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            &automation,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scheduled_organization_requires_logs_when_deep_organization_is_off() {
+        let _lock = database::test_lock().blocking_lock();
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+        let project = "project-scheduled-memory";
+        let automation = "automation-scheduled-memory";
+        insert_test_memory_config(project, automation, false);
+
+        assert!(!organization_has_pending_input(project, automation).unwrap());
+        append_log(&NewMemoryLog {
+            project_id: project,
+            task_id: "task-1",
+            chat_id: None,
+            agent: Some("Codex"),
+            title: "New decision",
+            tags: &[],
+            description: "A durable project decision was recorded.",
+        })
+        .unwrap();
+        assert!(organization_has_pending_input(project, automation).unwrap());
+
+        crate::storage::set_grove_dir_override(None);
+    }
+
+    #[test]
+    fn deep_scheduled_organization_uses_new_task_chats_but_ignores_its_own_runs() {
+        let _lock = database::test_lock().blocking_lock();
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+        let project = "project-deep-scheduled-memory";
+        let automation = "automation-deep-scheduled-memory";
+        insert_test_memory_config(project, automation, true);
+
+        let tasks_dir = temp.path().join("projects").join(project).join("tasks");
+        let memory_history = tasks_dir
+            .join(crate::storage::tasks::MEMORY_TASK_ID)
+            .join("chats")
+            .join("organization-chat")
+            .join("history.jsonl");
+        fs::create_dir_all(memory_history.parent().unwrap()).unwrap();
+        fs::write(&memory_history, "{\"type\":\"complete\",\"end_ts\":1}\n").unwrap();
+        assert!(!organization_has_pending_input(project, automation).unwrap());
+
+        let task_history = tasks_dir
+            .join("task-1")
+            .join("chats")
+            .join("chat-1")
+            .join("history.jsonl");
+        fs::create_dir_all(task_history.parent().unwrap()).unwrap();
+        fs::write(&task_history, "{\"type\":\"complete\",\"end_ts\":1}\n").unwrap();
+        assert!(organization_has_pending_input(project, automation).unwrap());
+
+        crate::storage::set_grove_dir_override(None);
+    }
 
     #[test]
     fn resolve_entities_returns_requested_metadata_without_recording_reads() {

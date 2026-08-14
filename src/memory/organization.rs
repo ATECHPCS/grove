@@ -4,7 +4,7 @@ use crate::acp::{LoopbackMcpServer, McpServerPolicy};
 use crate::api::handlers::memory_mcp;
 use crate::automation::consumer::{
     AbortContext, AfterCommitContext, AutomationHandler, ConcurrencyPolicy, PostActionContext,
-    PreActionContext, RuntimeBindings, RuntimeContext,
+    PreActionContext, RuntimeBindings, RuntimeContext, TriggerCheckContext,
 };
 use crate::error::{GroveError, Result};
 use crate::storage::{automations, memory, workspace};
@@ -59,6 +59,13 @@ impl AutomationHandler for MemoryOrganizationHandler {
 
     fn concurrency_policy(&self, _automation: &automations::Automation) -> ConcurrencyPolicy {
         ConcurrencyPolicy::SingleFlight
+    }
+
+    fn should_run(&self, context: TriggerCheckContext<'_>) -> Result<bool> {
+        if context.trigger.kind != "cron" {
+            return Ok(true);
+        }
+        memory::organization_has_pending_input(&context.automation.project, &context.automation.id)
     }
 
     fn pre_action(&self, context: PreActionContext<'_>) -> Result<serde_json::Value> {
@@ -177,6 +184,32 @@ impl AutomationHandler for MemoryOrganizationHandler {
 mod tests {
     use super::*;
 
+    fn test_automation(project: &str) -> automations::Automation {
+        automations::Automation {
+            id: "memory-automation".to_string(),
+            project: project.to_string(),
+            name: "Memory organization".to_string(),
+            enabled: true,
+            handler_key: automations::MEMORY_ORGANIZATION_HANDLER.to_string(),
+            agent_config: Default::default(),
+            task_mode: automations::TargetMode::New,
+            task_id: None,
+            task_template: None,
+            session_mode: automations::TargetMode::New,
+            chat_id: None,
+            session_template: None,
+            prompt: ORGANIZATION_PROMPT.to_string(),
+            schedule_cron: "0 2 * * *".to_string(),
+            event_triggers: Vec::new(),
+            last_run_at: None,
+            last_run_status: None,
+            last_run_error: None,
+            next_run_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
     #[test]
     fn organization_instruction_always_enforces_interactive_run_lifecycle() {
         let instruction = organization_session_instruction(false);
@@ -192,5 +225,21 @@ mod tests {
         let instruction = organization_session_instruction(true);
         assert!(instruction.contains("Only `memory_mark_organization_finished` finishes"));
         assert!(instruction.contains("Deep organization includes Task Chat histories"));
+    }
+
+    #[test]
+    fn manual_trigger_always_runs_even_when_automatic_input_would_be_empty() {
+        let automation = test_automation("missing-project");
+        let trigger = crate::automation::consumer::TriggerContext {
+            kind: "manual".to_string(),
+            payload: None,
+        };
+
+        assert!(MemoryOrganizationHandler
+            .should_run(TriggerCheckContext {
+                automation: &automation,
+                trigger: &trigger,
+            })
+            .unwrap());
     }
 }
