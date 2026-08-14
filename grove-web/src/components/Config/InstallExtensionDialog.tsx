@@ -7,10 +7,15 @@
  *         forward to their own protocol automatically).
  *
  *         The directory normally comes from the server's native OS folder
- *         picker. That picker is unusable when the browser is on a different
- *         machine (the dialog would open on the server's desktop) or when the
- *         server is headless, so both cases fall back to the in-app
- *         FolderTreePickerDialog.
+ *         picker. When that picker is merely unavailable (headless host, or
+ *         DISPLAY pointing at a dead session) but the browser still shares a
+ *         filesystem with Grove, install falls back to the in-app
+ *         FolderTreePickerDialog, which browses the SERVER's filesystem.
+ *         That fallback is wrong when the browser is on a different machine
+ *         from Grove (remote/mobile mode) — a server-side path is
+ *         unreachable from the client. In that case, skip the server-side
+ *         install entirely and download the packaged extension straight to
+ *         the client's browser instead, for manual extract + Load Unpacked.
  *
  * Step 2: "Load Unpacked" — always shows the chosen install path with
  *         click-to-copy and a "Reveal in Finder" button, plus three short
@@ -43,6 +48,7 @@ import {
   revealCompanionPath,
   browseInstallFolder,
   getExtensionStatus,
+  getCompanionDownloadUrl,
 } from "../../api/extension";
 import { FolderTreePickerDialog } from "../Projects/FolderTreePickerDialog";
 
@@ -63,8 +69,12 @@ export function InstallExtensionDialog({ onClose }: Props) {
   const [chromeWarning, setChromeWarning] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [revealError, setRevealError] = useState<string | null>(null);
-  // In-app folder browser, used when the native picker cannot be shown.
+  // In-app folder browser, used when the native picker cannot be shown but
+  // the browser still shares a filesystem with Grove (same-host headless).
   const [pickerOpen, setPickerOpen] = useState(false);
+  // True once the remote-mode download flow has produced a file — Step 2
+  // then shows client-side instructions instead of a server install path.
+  const [remoteMode, setRemoteMode] = useState(false);
   // Extension connection — fetched on dialog mount only. No polling. If the
   // user plugs in the extension AFTER opening this dialog, closing + reopening
   // the dialog refreshes the badge (the parent conditionally mounts us).
@@ -105,12 +115,40 @@ export function InstallExtensionDialog({ onClose }: Props) {
     }
   };
 
+  // Remote mode: the browser is on a different machine than Grove, so
+  // neither the native picker nor the in-app FolderTreePickerDialog (both of
+  // which resolve a SERVER-side path) can produce anywhere the client could
+  // actually use — `installCompanion()` would unpack the extension onto a
+  // filesystem the browser can never load unpacked from. Download the
+  // packaged extension straight to the client's own Downloads folder
+  // instead; Step 2 then walks through manual extract + Load Unpacked.
+  const handleRemoteDownload = async () => {
+    setInstalling(true);
+    setInstallError(null);
+    try {
+      const url = await getCompanionDownloadUrl();
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "grove-companion.zip";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setRemoteMode(true);
+      setStep(2);
+    } catch (err) {
+      setInstallError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setInstalling(false);
+    }
+  };
+
   const handleInstall = async () => {
     // Browsing from another machine: the native dialog would open on the
-    // server's desktop where the user cannot reach it, so go straight to the
-    // in-app folder browser.
+    // server's desktop where the user cannot reach it, and the in-app
+    // FolderTreePickerDialog would only resolve a server-side path — go
+    // straight to the client-side download instead.
     if (isRemoteMode()) {
-      setPickerOpen(true);
+      await handleRemoteDownload();
       return;
     }
     setInstalling(true);
@@ -123,7 +161,8 @@ export function InstallExtensionDialog({ onClose }: Props) {
       }
       if (!picked.cancelled) {
         // Native dialog unavailable (headless host, or DISPLAY pointing at a
-        // dead session). Open the web picker instead of dead-ending.
+        // dead session) but the browser still shares Grove's filesystem —
+        // open the server-side web picker instead of dead-ending.
         setPickerOpen(true);
       }
       // cancelled === true → user dismissed the native dialog; do nothing.
@@ -206,7 +245,14 @@ export function InstallExtensionDialog({ onClose }: Props) {
               onInstall={handleInstall}
             />
           )}
-          {step === 2 && installPath && (
+          {step === 2 && remoteMode && (
+            <Step2RemoteDownload
+              downloading={installing}
+              error={installError}
+              onRedownload={handleRemoteDownload}
+            />
+          )}
+          {step === 2 && !remoteMode && installPath && (
             <Step2LoadUnpacked
               path={installPath}
               connected={connected}
@@ -476,6 +522,72 @@ function Step2LoadUnpacked({
           </button>
         </div>
       )}
+    </div>
+  );
+}
+
+function Step2RemoteDownload({
+  downloading,
+  error,
+  onRedownload,
+}: {
+  downloading: boolean;
+  error: string | null;
+  onRedownload: () => void;
+}) {
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col items-center gap-2 text-center">
+        <Check className="h-8 w-8 text-[var(--color-success)]" />
+        <div className="text-sm font-semibold text-[var(--color-text)]">
+          grove-companion.zip downloaded
+        </div>
+        <div className="mx-auto max-w-[360px] text-xs leading-relaxed text-[var(--color-text-muted)]">
+          Grove and this browser are on different machines, so the extension
+          was downloaded to your own Downloads folder instead of installed on
+          the server. Extract the zip, then load the extracted folder below.
+        </div>
+      </div>
+
+      <ol className="space-y-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-4 py-3 text-xs">
+        <li className="flex gap-3">
+          <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-[var(--color-bg-tertiary)] text-[10px] font-bold text-[var(--color-text)]">
+            1
+          </span>
+          <span className="text-[var(--color-text)]">
+            Extract <span className="font-mono font-semibold">grove-companion.zip</span> anywhere on this computer.
+          </span>
+        </li>
+        <li className="flex gap-3">
+          <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-[var(--color-bg-tertiary)] text-[10px] font-bold text-[var(--color-text)]">
+            2
+          </span>
+          <span className="text-[var(--color-text)]">
+            Open a new tab to <span className="font-mono font-semibold">chrome://extensions/</span> and
+            toggle <span className="font-mono font-semibold">Developer mode</span> (top-right).
+          </span>
+        </li>
+        <li className="flex gap-3">
+          <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-[var(--color-bg-tertiary)] text-[10px] font-bold text-[var(--color-text)]">
+            3
+          </span>
+          <span className="text-[var(--color-text)]">
+            Click <span className="font-mono font-semibold">Load unpacked</span> and
+            select the extracted folder.
+          </span>
+        </li>
+      </ol>
+
+      {error && <ErrorBanner message={error} />}
+
+      <button
+        type="button"
+        onClick={onRedownload}
+        disabled={downloading}
+        className="self-center text-[11px] text-[var(--color-highlight)] hover:underline disabled:opacity-50"
+      >
+        {downloading ? "Downloading…" : "Download again"}
+      </button>
     </div>
   );
 }
