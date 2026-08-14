@@ -110,7 +110,7 @@ function BlitzChatPane({
       <div className="relative flex flex-1 min-h-0 min-w-0 overflow-hidden">
         <TaskChat
           projectId={live.projectId}
-          task={live.task}
+          taskId={live.task.id}
           pinnedChatId={chatId}
           hideHeader={true}
           onConnected={() => {
