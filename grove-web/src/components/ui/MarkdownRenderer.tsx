@@ -1153,8 +1153,8 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, render
         ul: ({ children, node }) => (
           <ul data-grove-markdown-source={source(node)} className={isDocument ? "list-disc list-outside text-[17px] leading-7 text-[var(--color-text)] mb-4 ml-7 space-y-1" : "list-disc list-inside text-sm text-[var(--color-text)] mb-2 ml-2 space-y-0.5"}>{children}</ul>
         ),
-        ol: ({ children, node }) => (
-          <ol data-grove-markdown-source={source(node)} className={isDocument ? "list-decimal list-outside text-[17px] leading-7 text-[var(--color-text)] mb-4 ml-7 space-y-1" : "list-decimal list-outside text-sm text-[var(--color-text)] mb-2 ml-2 space-y-0.5"}>{children}</ol>
+        ol: ({ children, node, start }) => (
+          <ol start={start} data-grove-markdown-source={source(node)} className={isDocument ? "list-decimal list-outside text-[17px] leading-7 text-[var(--color-text)] mb-4 ml-7 space-y-1" : "list-decimal list-outside text-sm text-[var(--color-text)] mb-2 ml-2 space-y-0.5"}>{children}</ol>
         ),
         li: ({ children }) => (
           <li className={isDocument ? "text-[17px] leading-8 text-[var(--color-text)] break-words" : "text-sm text-[var(--color-text)] break-words"}>{children}</li>

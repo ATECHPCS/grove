@@ -85,6 +85,17 @@ describe("MarkdownRenderer lists", () => {
     expect(html).toContain("<li");
     expect(html).toContain("<p");
   });
+
+  it("preserves ordered-list numbers across intervening content", () => {
+    const html = renderToStaticMarkup(
+      <MarkdownRenderer
+        content={'5. First topic\n\nSupporting detail.\n\n```text\nexample\n```\n\n6. Second topic'}
+      />,
+    );
+
+    expect(html).toContain('<ol start="5"');
+    expect(html).toContain('<ol start="6"');
+  });
 });
 
 describe("MarkdownRenderer heading links", () => {
