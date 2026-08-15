@@ -716,8 +716,6 @@ interface PerChatState {
   showPlan: boolean;
   slashCommands: SlashCommand[];
   isConnected: boolean;
-  agentLabel: string;
-  agentIcon: React.ComponentType<{ size?: number; className?: string }> | null;
   promptCaps: PromptCaps;
   /** Agent 是否声明 ACP `session/fork` 能力(`unstable_session_fork`)。
    * true → 在 chat 菜单的当前 chat 行显示 Fork 按钮。 */
@@ -797,8 +795,6 @@ function defaultPerChatState(): PerChatState {
     showPlan: false,
     slashCommands: [],
     isConnected: false,
-    agentLabel: "Chat",
-    agentIcon: null,
     isRemoteSession: false,
     remoteOwnerName: "",
     promptCaps: { image: false, audio: false, embeddedContext: false },
@@ -3572,7 +3568,10 @@ export function TaskChat({
     return { label: sender, Icon: Bot };
   };
 
-  // Resolve agent label and icon from active chat's agent
+  // Agent identity belongs to the persisted ChatSession, not the transient
+  // per-chat UI cache. Resolve known chat agents synchronously so an async
+  // config response from the previously selected chat cannot overwrite the
+  // current label/icon (for example, Claude Code replacing TraeX).
   useEffect(() => {
     const resolve = (cmd: string, customAgents?: CustomAgentServer[]) => {
       // Check Custom Agents (personas) first — their id starts with "ca-"
@@ -3588,6 +3587,7 @@ export function TaskChat({
       const custom = customAgents?.find((a) => a.id === cmd);
       if (custom) {
         setAgentLabel(custom.name);
+        setAgentIcon(() => (custom.type === "remote" ? Globe : Terminal));
         return;
       }
       // Fall back to the unified icon util — handles every alias the
@@ -3601,18 +3601,24 @@ export function TaskChat({
     };
 
     if (activeChat) {
-      // Load config to get custom agents for resolution
-      getConfig()
-        .then((cfg) => resolve(activeChat.agent, cfg.acp?.custom_agents))
-        .catch(() => resolve(activeChat.agent));
-    } else {
-      getConfig()
-        .then((cfg) =>
-          resolve(cfg.layout.agent_command || "", cfg.acp?.custom_agents),
-        )
-        .catch(() => resolve(""));
+      resolve(activeChat.agent, customAgents);
+      return;
     }
-  }, [activeChat, customAgentPersonas]);
+
+    let cancelled = false;
+    getConfig()
+      .then((cfg) => {
+        if (!cancelled) {
+          resolve(cfg.layout.agent_command || "", cfg.acp?.custom_agents);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) resolve("");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeChat, customAgents, customAgentPersonas]);
 
   // ─── @ mention file list with TTL cache (5s) ──────────────────────
   const TASK_FILES_TTL_MS = 10_000;
@@ -4118,8 +4124,6 @@ export function TaskChat({
       showPlan,
       slashCommands,
       isConnected,
-      agentLabel,
-      agentIcon: AgentIcon,
       promptCaps,
       forkCapable,
       importCapable,
@@ -4153,8 +4157,6 @@ export function TaskChat({
     showPlan,
     slashCommands,
     isConnected,
-    agentLabel,
-    AgentIcon,
     promptCaps,
     forkCapable,
     importCapable,
@@ -4191,8 +4193,6 @@ export function TaskChat({
       setShowPlan(cached.showPlan ?? false);
       setSlashCommands(cached.slashCommands);
       setIsConnected(cached.isConnected);
-      setAgentLabel(cached.agentLabel);
-      if (cached.agentIcon) setAgentIcon(() => cached.agentIcon);
       setPromptCaps(cached.promptCaps);
       // Each live WebSocket keeps its own initialized Agent capabilities.
       // Switching chats does not trigger another session_ready, so restore
