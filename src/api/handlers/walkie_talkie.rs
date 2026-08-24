@@ -51,6 +51,14 @@ pub enum RadioEvent {
     ClientCount { count: usize },
     /// TaskGroup data changed (Blitz updated groups via REST).
     GroupChanged,
+    /// A task moved to a different Kanban board column (or reordered within one).
+    /// Board listeners update the card's column live without a full refetch.
+    TaskStageChanged {
+        project_id: String,
+        task_id: String,
+        board_column: String,
+        board_order: i64,
+    },
     /// Theme changed on desktop.
     ThemeChanged { name: String },
     /// An ACP session's busy state changed — push status to Radio clients.

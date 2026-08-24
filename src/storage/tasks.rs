@@ -82,10 +82,22 @@ pub struct Task {
     pub files_changed: u32,
     #[serde(default)]
     pub is_local: bool,
+    /// Kanban board stage: "todo" | "planned" | "ongoing" | "done".
+    /// Independent of `status` (Active/Archived): the board column is a
+    /// user/agent-driven workflow stage, `status` is the archival lifecycle.
+    #[serde(default = "default_board_column")]
+    pub board_column: String,
+    /// Ordering position within a board column (ascending).
+    #[serde(default)]
+    pub board_order: i64,
 }
 
 fn default_multiplexer() -> String {
     "tmux".to_string()
+}
+
+fn default_board_column() -> String {
+    "todo".to_string()
 }
 
 fn default_updated_at() -> DateTime<Utc> {
@@ -108,6 +120,8 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let code_additions: i64 = row.get(15)?;
     let code_deletions: i64 = row.get(16)?;
     let files_changed: i64 = row.get(17)?;
+    let board_column: String = row.get(18)?;
+    let board_order: i64 = row.get(19)?;
 
     Ok(Task {
         id: row.get(1)?,
@@ -130,10 +144,12 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         code_additions: code_additions as u32,
         code_deletions: code_deletions as u32,
         files_changed: files_changed as u32,
+        board_column,
+        board_order,
     })
 }
 
-const TASK_COLUMNS: &str = "project, id, name, branch, target, worktree_path, initial_commit, created_at, updated_at, status, multiplexer, session_name, created_by, archived_at, is_local, code_additions, code_deletions, files_changed";
+const TASK_COLUMNS: &str = "project, id, name, branch, target, worktree_path, initial_commit, created_at, updated_at, status, multiplexer, session_name, created_by, archived_at, is_local, code_additions, code_deletions, files_changed, board_column, board_order";
 
 /// 加载活跃任务列表
 pub fn load_tasks(project: &str) -> Result<Vec<Task>> {
@@ -165,7 +181,7 @@ pub fn load_archived_tasks(project: &str) -> Result<Vec<Task>> {
 pub fn add_task(project: &str, task: Task) -> Result<()> {
     let conn = crate::storage::database::connection();
     conn.execute(
-        &format!("INSERT INTO tasks ({}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)", TASK_COLUMNS),
+        &format!("INSERT INTO tasks ({}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)", TASK_COLUMNS),
         params![
             project,
             task.id,
@@ -185,6 +201,8 @@ pub fn add_task(project: &str, task: Task) -> Result<()> {
             task.code_additions as i64,
             task.code_deletions as i64,
             task.files_changed as i64,
+            task.board_column,
+            task.board_order,
         ],
     )?;
     Ok(())
@@ -322,6 +340,76 @@ pub fn update_task_name(project: &str, task_id: &str, new_name: &str) -> Result<
         )));
     }
     Ok(())
+}
+
+/// Outcome of a board-stage move.
+pub enum StageMove {
+    /// The task was moved; carries the resolved intra-column order.
+    Moved { board_order: i64 },
+    /// The task is drag-locked (in `ongoing`/`done`) and the target is not
+    /// `done`, so the move was rejected.
+    Locked,
+    /// No such task in the project.
+    NotFound,
+}
+
+/// Atomically move a task to a board column (kanban stage), enforcing the
+/// drag-lock: a task already in `ongoing` or `done` may only advance to
+/// `done`. The current-stage read, the append-order computation, and the
+/// write all run under a single DB-connection lock, so concurrent moves
+/// cannot interleave and regress a task or collide on an appended order.
+///
+/// `explicit_order` places the card at a caller-chosen position; when `None`
+/// the task is appended after the current max order in the target column.
+pub fn move_task_stage(
+    project: &str,
+    task_id: &str,
+    target_column: &str,
+    explicit_order: Option<i64>,
+) -> Result<StageMove> {
+    let conn = crate::storage::database::connection();
+
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT board_column FROM tasks WHERE project = ?1 AND id = ?2",
+            params![project, task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let from = match current {
+        None => return Ok(StageMove::NotFound),
+        Some(c) => c,
+    };
+
+    if matches!(from.as_str(), "ongoing" | "done") && target_column != "done" {
+        return Ok(StageMove::Locked);
+    }
+
+    let board_order = match explicit_order {
+        Some(o) => o,
+        None => {
+            // MAX(...) yields exactly one row (NULL when the column is empty).
+            let max: Option<i64> = conn.query_row(
+                "SELECT MAX(board_order) FROM tasks WHERE project = ?1 AND board_column = ?2",
+                params![project, target_column],
+                |row| row.get(0),
+            )?;
+            max.map(|m| m.saturating_add(1)).unwrap_or(0)
+        }
+    };
+
+    conn.execute(
+        "UPDATE tasks SET board_column = ?1, board_order = ?2, updated_at = ?3
+         WHERE project = ?4 AND id = ?5",
+        params![
+            target_column,
+            board_order,
+            Utc::now().to_rfc3339(),
+            project,
+            task_id
+        ],
+    )?;
+    Ok(StageMove::Moved { board_order })
 }
 
 /// Project IDs linked into a Task's ACP workspace, in user-defined order.
@@ -495,6 +583,8 @@ fn build_local_task(
         code_deletions: 0,
         files_changed: 0,
         is_local: true,
+        board_column: "todo".to_string(),
+        board_order: 0,
     }
 }
 

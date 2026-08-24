@@ -94,6 +94,17 @@ pub struct RenameTaskRequest {
     pub name: String,
 }
 
+/// Move task to a Kanban board column request
+#[derive(Debug, Deserialize)]
+pub struct MoveStageRequest {
+    /// Target column: "todo" | "planned" | "ongoing" | "done".
+    pub board_column: String,
+    /// Explicit position within the column. When omitted, the task is appended
+    /// to the end of the target column.
+    #[serde(default)]
+    pub board_order: Option<i64>,
+}
+
 /// Notes response
 #[derive(Debug, Serialize)]
 pub struct NotesResponse {

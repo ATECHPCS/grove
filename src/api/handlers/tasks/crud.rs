@@ -246,6 +246,8 @@ pub async fn create_task(
         multiplexer: result.task.multiplexer.clone(),
         created_by: result.task.created_by.clone(),
         is_local: false,
+        board_column: result.task.board_column.clone(),
+        board_order: result.task.board_order,
     }))
 }
 
@@ -543,6 +545,57 @@ pub async fn rename_task(
         })?;
 
     // Return the updated task
+    get_task(Path((id, task_id))).await
+}
+
+/// Valid Kanban board columns, left → right.
+const BOARD_COLUMNS: [&str; 4] = ["todo", "planned", "ongoing", "done"];
+
+/// PATCH /api/v1/projects/{id}/tasks/{taskId}/stage
+///
+/// Move a task to a board column (kanban stage). Enforces the workflow lock: a
+/// task already in `ongoing` or `done` may only advance to `done` (an in-work
+/// card can be stopped or completed, but not dragged back). Broadcasts
+/// `TaskStageChanged` so open boards update the card live.
+pub async fn move_task_stage(
+    Path((id, task_id)): Path<(String, String)>,
+    Json(req): Json<MoveStageRequest>,
+) -> Result<Json<TaskResponse>, StatusCode> {
+    let (_project, project_key) = common::find_project_by_id(&id)?;
+
+    let target = req.board_column.trim().to_string();
+    if !BOARD_COLUMNS.contains(&target.as_str()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Read-lock-check-write happen atomically in the storage layer under one
+    // DB-connection lock (see tasks::move_task_stage), so concurrent moves
+    // cannot interleave.
+    let pk = project_key.clone();
+    let tid = task_id.clone();
+    let col = target.clone();
+    let explicit = req.board_order;
+    let outcome =
+        tokio::task::spawn_blocking(move || tasks::move_task_stage(&pk, &tid, &col, explicit))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let board_order = match outcome {
+        tasks::StageMove::NotFound => return Err(StatusCode::NOT_FOUND),
+        // Drag-locked: an ongoing/done task may only advance to done.
+        tasks::StageMove::Locked => return Err(StatusCode::CONFLICT),
+        tasks::StageMove::Moved { board_order } => board_order,
+    };
+
+    use crate::api::handlers::walkie_talkie::{broadcast_radio_event, RadioEvent};
+    broadcast_radio_event(RadioEvent::TaskStageChanged {
+        project_id: id.clone(),
+        task_id: task_id.clone(),
+        board_column: target,
+        board_order,
+    });
+
     get_task(Path((id, task_id))).await
 }
 

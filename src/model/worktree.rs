@@ -103,6 +103,10 @@ pub struct Worktree {
     pub created_by: String,
     /// 是否为 Local Task（指向主仓库，非 worktree）
     pub is_local: bool,
+    /// Kanban board column: "todo" | "planned" | "ongoing" | "done".
+    pub board_column: String,
+    /// Ordering position within the board column.
+    pub board_order: i64,
 }
 
 /// 格式化相对时间

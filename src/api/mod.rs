@@ -492,6 +492,10 @@ pub fn create_api_router() -> Router {
             post(handlers::tasks::activate_task),
         )
         .route(
+            "/projects/{id}/tasks/{taskId}/stage",
+            patch(handlers::tasks::move_task_stage),
+        )
+        .route(
             "/projects/{id}/tasks/{taskId}/linked-projects",
             get(handlers::tasks::get_linked_projects).put(handlers::tasks::update_linked_projects),
         )
