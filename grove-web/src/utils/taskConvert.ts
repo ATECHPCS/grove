@@ -14,5 +14,10 @@ export function convertTaskResponse(task: TaskResponse): Task {
     multiplexer: task.multiplexer || "tmux",
     createdBy: task.created_by || "",
     isLocal: task.is_local || false,
+    boardColumn: task.board_column || "todo",
+    boardOrder: task.board_order ?? 0,
+    additions: task.additions ?? 0,
+    deletions: task.deletions ?? 0,
+    filesChanged: task.files_changed ?? 0,
   };
 }

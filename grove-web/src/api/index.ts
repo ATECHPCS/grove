@@ -103,9 +103,15 @@ export {
   addArtifactWorkdir,
   deleteArtifactWorkdir,
   openArtifactWorkdir,
+  moveTaskStage,
+  dispatchTask,
+  startTask,
 } from './tasks';
 export type {
   TaskResponse,
+  BoardColumn,
+  DispatchRequest,
+  DispatchResponse,
   SymbolCandidate,
   DiffResponse,
   CommitsResponse,

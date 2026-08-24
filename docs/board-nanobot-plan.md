@@ -106,7 +106,7 @@ card), not a 5th column — faithful to Dorothy's 4-column layout.
 | **0** | Pin a stable HMAC secret for `grove mobile` (:3002); store in 1Password | secret survives restart |
 | **1** | Backend: `board_column` + `board_order` migration (`database.rs`), fields on `Task` + `TASK_COLUMNS` (`tasks.rs`), `PATCH /api/v1/.../tasks/{id}/stage`, `RadioEvent::TaskStageChanged` broadcast | `cargo build` + test |
 | **2** | Backend: `POST /api/v1/projects/{id}/tasks/dispatch` = `create_task` + `create_chat` + auto-start; body `{title, body, agent:"claude"\|"codex", auto_start, into:"todo"\|"planned"}`; works on :3001 no-auth and :3002 HMAC | curl both ports |
-| **3** | Web: `"board"` nav id + `components/Board/` — 4 columns (zinc/blue/amber/green accents), drag-to-PLANNED=dispatch, ongoing/done drag-locked, card anatomy per Dorothy + Grove diff stats, green-pulse/amber affordances, live via `useRadioEvents` | ✋ visual review |
+| **3** ✅ | Web: `"board"` nav id + `components/Board/` — 4 columns (zinc/blue/amber/green accents), drag-to-PLANNED=dispatch, ongoing/done drag-locked, card anatomy per Dorothy + Grove diff stats, green-pulse/amber affordances, live via `useRadioEvents`. **Also added** backend `POST /tasks/{id}/start` (start agent on an *existing* card — dispatch only creates new tasks) + shared `start_agent_on_task` helper. | ✋ visual review |
 | **4** | nanobot: rework `file_bug` — transcribe → classify → HMAC POST :3002 `/dispatch` (Grove lane) or Linear (Symphony lane); knob: drop into `todo` vs `planned` | dry-run |
 | **5** | End-to-end smoke: voice bug → card → agent in worktree → PR | ✋ USER GATE |
 | **6** *(opt)* | Grove-side skill-match auto-assign watcher (Dorothy `kanban-automation` analog) | later |

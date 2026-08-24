@@ -49,6 +49,14 @@ export interface RadioEventCallbacks {
   /** Fired when the shared WS opens or reopens after a disconnect. Useful for
    *  consumers who need to re-sync state after a missed-events window. */
   onConnected?: () => void;
+  /** A task moved to a different Kanban board column (or reordered within one).
+   *  Board listeners update the card's column live without a full refetch. */
+  onTaskStageChanged?: (
+    projectId: string,
+    taskId: string,
+    boardColumn: string,
+    boardOrder: number,
+  ) => void;
 }
 
 const RECONNECT_BASE_DELAY = 3000;
@@ -102,6 +110,15 @@ function dispatch(event: RadioEvent) {
     case "chat_list_changed":
       for (const s of subscribers)
         s.current.onChatListChanged?.(event.project_id, event.task_id);
+      break;
+    case "task_stage_changed":
+      for (const s of subscribers)
+        s.current.onTaskStageChanged?.(
+          event.project_id,
+          event.task_id,
+          event.board_column,
+          event.board_order,
+        );
       break;
     case "chat_status":
       for (const s of subscribers)

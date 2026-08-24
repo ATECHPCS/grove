@@ -764,88 +764,27 @@ pub async fn dispatch_task(
     // 3. Optionally start an agent and hand it the opening prompt. Every failure
     //    past task creation is non-fatal: the task is already filed, so we
     //    report the reason via `agent_error` and still return 200.
-    let mut chat_id_out: Option<String> = None;
-    let mut agent_started = false;
-    let mut agent_error: Option<String> = None;
-
-    if let Some(agent) = agent {
-        let chat = tasks::ChatSession {
-            id: tasks::generate_chat_id(),
-            title: crate::api::handlers::acp::default_chat_title(
-                &agent,
-                &full_config,
+    let AgentStartOutcome {
+        chat_id: chat_id_out,
+        agent_started,
+        agent_error,
+    } = match agent {
+        Some(agent) => {
+            start_agent_on_task(
+                &id,
                 &project_key,
-                &task.id,
-            ),
-            agent: agent.clone(),
-            acp_session_id: None,
-            created_at: chrono::Utc::now(),
-            duty: None,
-            // Headless dispatch drives the agent over ACP, not a PTY.
-            launch_mode: "acp".to_string(),
-        };
-        let chat_id = chat.id.clone();
-        chat_id_out = Some(chat_id.clone());
-
-        let persisted = {
-            let pk = project_key.clone();
-            let tid = task.id.clone();
-            let chat = chat.clone();
-            tokio::task::spawn_blocking(move || tasks::add_chat_session(&pk, &tid, chat)).await
-        };
-
-        match persisted {
-            Ok(Ok(())) => {
-                match crate::api::handlers::acp::start_dispatch_session(
-                    &project_key,
-                    &project_path,
-                    &project_name,
-                    &task,
-                    &chat_id,
-                    &agent,
-                )
-                .await
-                {
-                    Ok((handle, confirmed)) => {
-                        let prompt = build_dispatch_prompt(&title, req.body.as_deref());
-                        match handle
-                            .send_prompt(prompt, vec![], Some("dispatch".to_string()), false, None)
-                            .await
-                        {
-                            Ok(_) => {
-                                agent_started = true;
-                                if !confirmed {
-                                    agent_error = Some(
-                                        "agent start not confirmed within 45s; it may still be initializing"
-                                            .to_string(),
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                agent_error = Some(format!("failed to send opening prompt: {e}"));
-                            }
-                        }
-                    }
-                    Err(e) => agent_error = Some(e.message()),
-                }
-                // Let listeners know a chat now exists on this task.
-                crate::api::handlers::walkie_talkie::broadcast_radio_event(
-                    crate::api::handlers::walkie_talkie::RadioEvent::ChatListChanged {
-                        project_id: id.clone(),
-                        task_id: task.id.clone(),
-                    },
-                );
-            }
-            Ok(Err(e)) => {
-                agent_error = Some(format!("failed to persist chat: {e}"));
-                chat_id_out = None;
-            }
-            Err(_) => {
-                agent_error = Some("chat persistence task failed".to_string());
-                chat_id_out = None;
-            }
+                &project_path,
+                &project_name,
+                &task,
+                &agent,
+                &title,
+                req.body.as_deref(),
+                &full_config,
+            )
+            .await
         }
-    }
+        None => AgentStartOutcome::default(),
+    };
 
     // 4. Build the response from the created task overlaid with the board
     //    stage captured from the atomic move (step 2) — no lossy reload.
@@ -869,6 +808,231 @@ pub async fn dispatch_task(
         board_column,
         agent_started,
         agent_error,
+    }))
+}
+
+/// Outcome of launching a headless agent on a task.
+#[derive(Default)]
+struct AgentStartOutcome {
+    chat_id: Option<String>,
+    agent_started: bool,
+    agent_error: Option<String>,
+}
+
+/// Create a headless ACP chat on `task`, start the agent, and hand it the
+/// opening prompt built from `title`/`body`. Shared by `POST /tasks/dispatch`
+/// (brand-new task) and `POST /tasks/{taskId}/start` (an existing board card
+/// dragged into PLANNED). `agent` must already be canonicalized + validated.
+/// Every failure past chat creation is non-fatal and surfaced via `agent_error`
+/// so the caller keeps the card filed. `id` is the public project id (radio
+/// events); the rest are the resolved project + task.
+#[allow(clippy::too_many_arguments)]
+async fn start_agent_on_task(
+    id: &str,
+    project_key: &str,
+    project_path: &str,
+    project_name: &str,
+    task: &tasks::Task,
+    agent: &str,
+    title: &str,
+    body: Option<&str>,
+    full_config: &crate::storage::config::Config,
+) -> AgentStartOutcome {
+    let mut out = AgentStartOutcome::default();
+
+    let chat = tasks::ChatSession {
+        id: tasks::generate_chat_id(),
+        title: crate::api::handlers::acp::default_chat_title(
+            agent,
+            full_config,
+            project_key,
+            &task.id,
+        ),
+        agent: agent.to_string(),
+        acp_session_id: None,
+        created_at: chrono::Utc::now(),
+        duty: None,
+        // Headless dispatch drives the agent over ACP, not a PTY.
+        launch_mode: "acp".to_string(),
+    };
+    let chat_id = chat.id.clone();
+    out.chat_id = Some(chat_id.clone());
+
+    let persisted = {
+        let pk = project_key.to_string();
+        let tid = task.id.clone();
+        let chat = chat.clone();
+        tokio::task::spawn_blocking(move || tasks::add_chat_session(&pk, &tid, chat)).await
+    };
+
+    match persisted {
+        Ok(Ok(())) => {
+            match crate::api::handlers::acp::start_dispatch_session(
+                project_key,
+                project_path,
+                project_name,
+                task,
+                &chat_id,
+                agent,
+            )
+            .await
+            {
+                Ok((handle, confirmed)) => {
+                    let prompt = build_dispatch_prompt(title, body);
+                    match handle
+                        .send_prompt(prompt, vec![], Some("dispatch".to_string()), false, None)
+                        .await
+                    {
+                        Ok(_) => {
+                            out.agent_started = true;
+                            if !confirmed {
+                                out.agent_error = Some(
+                                    "agent start not confirmed within 45s; it may still be initializing"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            out.agent_error = Some(format!("failed to send opening prompt: {e}"));
+                        }
+                    }
+                }
+                Err(e) => out.agent_error = Some(e.message()),
+            }
+            // Let listeners know a chat now exists on this task.
+            crate::api::handlers::walkie_talkie::broadcast_radio_event(
+                crate::api::handlers::walkie_talkie::RadioEvent::ChatListChanged {
+                    project_id: id.to_string(),
+                    task_id: task.id.clone(),
+                },
+            );
+        }
+        Ok(Err(e)) => {
+            out.agent_error = Some(format!("failed to persist chat: {e}"));
+            out.chat_id = None;
+        }
+        Err(_) => {
+            out.agent_error = Some("chat persistence task failed".to_string());
+            out.chat_id = None;
+        }
+    }
+
+    out
+}
+
+/// POST /api/v1/projects/{id}/tasks/{taskId}/start
+///
+/// Start a headless agent on an *existing* task and file it into PLANNED. This
+/// is the board's "drag a TODO card into PLANNED" gesture: unlike
+/// `POST /tasks/dispatch` (which creates a fresh task + worktree), the task and
+/// worktree already exist here — we only create the chat, start the agent, send
+/// the opening prompt (the task's existing notes/body), and move the stage.
+///
+/// Idempotent-ish: if a session for this task is already live, `start_dispatch_session`
+/// returns the existing handle rather than double-launching. Partial success is
+/// explicit (agent may fail to start; the card is still moved to PLANNED).
+pub async fn start_task(
+    Path((id, task_id)): Path<(String, String)>,
+    Json(req): Json<StartTaskRequest>,
+) -> Result<Json<DispatchResponse>, (StatusCode, Json<ApiError>)> {
+    let err = |s: StatusCode, m: &str| {
+        (
+            s,
+            Json(ApiError {
+                error: m.to_string(),
+            }),
+        )
+    };
+
+    let (project, project_key) =
+        common::find_project_by_id(&id).map_err(|s| err(s, "Project not found"))?;
+
+    if project.project_type == workspace::ProjectType::Studio {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "starting an agent is not supported for Studio projects",
+        ));
+    }
+
+    let project_path = project.path.clone();
+    let project_name = project.name.clone();
+
+    // The task must already exist (with its worktree).
+    let task = {
+        let pk = project_key.clone();
+        let tid = task_id.clone();
+        tokio::task::spawn_blocking(move || tasks::get_task(&pk, &tid))
+            .await
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "task join error"))?
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, "Task not found"))?
+    };
+
+    let full_config = storage::config::load_config();
+
+    // Validate + canonicalize the agent before creating the chat.
+    let agent = crate::storage::installed_agents::canonicalize_agent_id(
+        &req.agent.clone().unwrap_or_else(|| {
+            full_config
+                .acp
+                .agent_command
+                .clone()
+                .unwrap_or_else(|| "claude-acp".to_string())
+        }),
+    );
+    crate::api::handlers::acp::validate_dispatch_agent(&agent)
+        .map_err(|e| err(e.status(), &e.message()))?;
+
+    // File the card into PLANNED (append). Do this before starting so the board
+    // reflects intent immediately even if the agent is slow to confirm.
+    let (board_column, board_order) = {
+        let pk = project_key.clone();
+        let tid = task_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            tasks::move_task_stage(&pk, &tid, "planned", None)
+        })
+        .await
+        {
+            Ok(Ok(tasks::StageMove::Moved { board_order })) => ("planned".to_string(), board_order),
+            // Drag-locked (already ongoing/done) or not found — keep current stage.
+            _ => (task.board_column.clone(), task.board_order),
+        }
+    };
+
+    use crate::api::handlers::walkie_talkie::{broadcast_radio_event, RadioEvent};
+    broadcast_radio_event(RadioEvent::TaskStageChanged {
+        project_id: id.clone(),
+        task_id: task_id.clone(),
+        board_column: board_column.clone(),
+        board_order,
+    });
+
+    // The opening prompt reuses the task name as the title; the body defaults to
+    // the caller-supplied text (a manual board start has none, and the agent
+    // just picks up the worktree's own notes/context).
+    let outcome = start_agent_on_task(
+        &id,
+        &project_key,
+        &project_path,
+        &project_name,
+        &task,
+        &agent,
+        &task.name,
+        req.body.as_deref(),
+        &full_config,
+    )
+    .await;
+
+    let mut resp_task = task;
+    resp_task.board_column = board_column.clone();
+    resp_task.board_order = board_order;
+
+    Ok(Json(DispatchResponse {
+        task: storage_task_to_response(&resp_task),
+        chat_id: outcome.chat_id,
+        board_column,
+        agent_started: outcome.agent_started,
+        agent_error: outcome.agent_error,
     }))
 }
 

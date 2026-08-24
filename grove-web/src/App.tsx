@@ -28,6 +28,7 @@ import { AIPage, GlobalAudioRecorder, GlobalVoiceControlRecorder } from "./compo
 import { AutomationPage } from "./components/Automation/AutomationPage";
 import { MemoryPage } from "./components/Memory";
 import { ProjectStatsPage } from "./components/Stats/ProjectStatsPage";
+import { BoardPage } from "./components/Board";
 import { UpdateBanner } from "./components/ui/UpdateBanner";
 import { CommandPalette } from "./components/ui/CommandPalette";
 import { ProjectCommandPalette } from "./components/ui/ProjectCommandPalette";
@@ -892,6 +893,7 @@ function AppContent() {
   useCommand("nav.skills", () => setActiveItem("skills"), []);
   useCommand("nav.ai", () => setActiveItem("ai"), []);
   useCommand("nav.statistics", () => setActiveItem("statistics"), []);
+  useCommand("nav.board", () => setActiveItem("board"), []);
   useCommand("nav.settings", () => setActiveItem("settings"), []);
   useCommand("nav.projects", () => setActiveItem("projects"), []);
   // nav.sidebar.collapse removed — view.sidebar.toggle is the SSoT.
@@ -1274,6 +1276,8 @@ function AppContent() {
         return <AIPage />;
       case "statistics":
         return <ProjectStatsPage projectId={selectedProject?.id} />;
+      case "board":
+        return <BoardPage />;
       case "settings":
         return <SettingsPage config={mockConfig} />;
       default: {
@@ -1318,6 +1322,7 @@ function AppContent() {
     activeItem === "memory" ||
     activeItem === "automation" ||
     activeItem === "statistics" ||
+    activeItem === "board" ||
     activeItem.startsWith("plugin:");
 
   const sidebarProps = {

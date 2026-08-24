@@ -123,6 +123,20 @@ pub struct DispatchRequest {
     pub into: Option<String>,
 }
 
+/// Start an agent on an existing task (POST /tasks/{taskId}/start). The board's
+/// "drag a TODO card into PLANNED" gesture. The task + worktree already exist;
+/// this only launches the agent and files the card into PLANNED.
+#[derive(Debug, Deserialize)]
+pub struct StartTaskRequest {
+    /// Agent id ("claude", "codex", …). Defaults to the configured ACP agent.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Optional extra prompt appended below the task title. A manual board start
+    /// sends none — the agent picks up the worktree's own notes/context.
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
 /// Response for POST /tasks/dispatch.
 #[derive(Debug, Serialize)]
 pub struct DispatchResponse {
