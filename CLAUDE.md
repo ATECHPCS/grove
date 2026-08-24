@@ -244,7 +244,7 @@ Reset the histogram before measuring an isolated operation; otherwise the cold-s
 - `grove tui` — Keyboard-first terminal UI
 - `grove web` — Browser IDE on `http://localhost:3001`; `--remote` when published through a reverse proxy/tunnel with no auth of its own, so the frontend knows not to trust server-side native OS dialogs
 - `grove gui` — Native desktop window (requires `--features gui` build)
-- `grove mobile` — LAN access for phone / tablet (HMAC-signed requests); `--private` for localhost-only, `--passkey <key>` for custom secret
+- `grove mobile` — LAN access for phone / tablet (HMAC-signed requests); `--private` for localhost-only. Set `GROVE_MOBILE_PASSKEY` in the environment to pin a stable HMAC secret across restarts (sourced from a secret store, kept out of argv); otherwise a key is auto-generated per start (or typed at the prompt on a TTY)
 - `grove mcp` — MCP server (stdio) for orchestrator agents
 - `grove acp` — Headless ACP bridge
 - `grove hooks <level>` — Send notification (`notice` / `warn` / `critical`)
