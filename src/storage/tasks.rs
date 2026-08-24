@@ -343,6 +343,7 @@ pub fn update_task_name(project: &str, task_id: &str, new_name: &str) -> Result<
 }
 
 /// Outcome of a board-stage move.
+#[derive(Debug)]
 pub enum StageMove {
     /// The task was moved; carries the resolved intra-column order.
     Moved { board_order: i64 },
