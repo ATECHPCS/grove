@@ -28,6 +28,8 @@ interface BoardColumnProps {
   onDragOverColumn: (e: React.DragEvent, column: ColumnId) => void;
   onDragLeaveColumn: (column: ColumnId) => void;
   onDropColumn: (e: React.DragEvent, column: ColumnId) => void;
+  /** Open a card's live workspace on click. */
+  onOpenCard?: (taskId: string, isLocal: boolean) => void;
 }
 
 export function BoardColumn({
@@ -40,6 +42,7 @@ export function BoardColumn({
   onDragOverColumn,
   onDragLeaveColumn,
   onDropColumn,
+  onOpenCard,
 }: BoardColumnProps) {
   return (
     <div className="flex flex-col min-w-0 flex-1 basis-0">
@@ -78,6 +81,7 @@ export function BoardColumn({
             pending={pendingTaskId === card.task.id}
             onDragStart={onDragStart}
             onDragEnd={onDragEnd}
+            onOpen={onOpenCard}
           />
         ))}
         {cards.length === 0 && (

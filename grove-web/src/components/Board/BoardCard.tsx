@@ -11,6 +11,8 @@ interface BoardCardProps {
   draggable: boolean;
   onDragStart: (e: React.DragEvent, taskId: string) => void;
   onDragEnd: () => void;
+  /** Open this task's live workspace (chat / terminal / diff). */
+  onOpen?: (taskId: string, isLocal: boolean) => void;
   /** True while a stage/start mutation for this card is in flight. */
   pending?: boolean;
 }
@@ -20,6 +22,7 @@ export function BoardCard({
   draggable,
   onDragStart,
   onDragEnd,
+  onOpen,
   pending,
 }: BoardCardProps) {
   const { task, projectName, live } = card;
@@ -36,11 +39,17 @@ export function BoardCard({
       draggable={draggable}
       onDragStart={(e) => onDragStart(e, task.id)}
       onDragEnd={onDragEnd}
+      onClick={onOpen ? () => onOpen(task.id, task.isLocal ?? false) : undefined}
+      title={onOpen ? "Open task workspace" : undefined}
       className={[
         "group relative rounded-xl p-3 select-none",
         "bg-[var(--color-bg-secondary)] border border-[var(--color-border)]",
         "shadow-sm transition-all",
-        draggable ? "cursor-grab active:cursor-grabbing hover:border-[var(--color-text-muted)]" : "cursor-default",
+        draggable
+          ? "cursor-grab active:cursor-grabbing hover:border-[var(--color-text-muted)]"
+          : onOpen
+            ? "cursor-pointer hover:border-[var(--color-text-muted)]"
+            : "cursor-default",
         working ? "ring-1 ring-emerald-500/40" : "",
         waiting ? "ring-1 ring-amber-500/50" : "",
         pending ? "opacity-60" : "",

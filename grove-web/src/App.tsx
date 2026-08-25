@@ -845,6 +845,17 @@ function AppContent() {
     }
   }, []);
 
+  // Board card click: open the task's live workspace (chat / terminal / diff).
+  // Mirrors the palette path — local tasks live on the "work" page.
+  const handleOpenBoardTask = useCallback((taskId: string, isLocal: boolean) => {
+    if (isLocal) {
+      setActiveItem("work");
+    } else {
+      setActiveItem("tasks");
+      setNavigationData({ taskId });
+    }
+  }, []);
+
   // Register global commands for the command palette
   const toggleMode = useCallback(() => {
     setTasksMode((prev) => (prev === "zen" ? "blitz" : "zen"));
@@ -1277,7 +1288,7 @@ function AppContent() {
       case "statistics":
         return <ProjectStatsPage projectId={selectedProject?.id} />;
       case "board":
-        return <BoardPage />;
+        return <BoardPage onOpenTask={handleOpenBoardTask} />;
       case "settings":
         return <SettingsPage config={mockConfig} />;
       default: {

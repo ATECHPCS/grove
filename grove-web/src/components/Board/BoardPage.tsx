@@ -15,7 +15,12 @@ import { BOARD_COLUMNS, type BoardCardData, type ColumnId } from "./types";
 
 const DRAG_MIME = "application/x-grove-task";
 
-export function BoardPage() {
+interface BoardPageProps {
+  /** Open a task's live workspace (chat / terminal / diff) when its card is clicked. */
+  onOpenTask?: (taskId: string, isLocal: boolean) => void;
+}
+
+export function BoardPage({ onOpenTask }: BoardPageProps = {}) {
   const {
     byColumn,
     cards,
@@ -251,6 +256,7 @@ export function BoardPage() {
             onDragOverColumn={onDragOverColumn}
             onDragLeaveColumn={onDragLeaveColumn}
             onDropColumn={onDropColumn}
+            onOpenCard={onOpenTask}
           />
         ))}
       </div>
