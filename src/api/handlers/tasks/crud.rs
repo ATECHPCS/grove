@@ -786,6 +786,28 @@ pub async fn dispatch_task(
         None => AgentStartOutcome::default(),
     };
 
+    // 3b. If an agent actually started, advance the card to IN WORK (ongoing)
+    //     so the board places the running agent correctly across remounts. The
+    //     persisted board_column is authoritative when no live Radio event has
+    //     yet repainted the card; without this the card falls back to PLANNED
+    //     the moment the board is re-rendered.
+    let (board_column, board_order) = if agent_started {
+        let pk = project_key.clone();
+        let tid = task.id.clone();
+        match tokio::task::spawn_blocking(move || {
+            tasks::move_task_stage(&pk, &tid, "ongoing", None)
+        })
+        .await
+        {
+            Ok(Ok(tasks::StageMove::Moved { board_order })) => {
+                ("ongoing".to_string(), board_order)
+            }
+            _ => (board_column, board_order),
+        }
+    } else {
+        (board_column, board_order)
+    };
+
     // 4. Build the response from the created task overlaid with the board
     //    stage captured from the atomic move (step 2) — no lossy reload.
     let mut resp_task = task;
@@ -1022,6 +1044,33 @@ pub async fn start_task(
         &full_config,
     )
     .await;
+
+    // If the agent actually started, advance the card from PLANNED to IN WORK
+    // (ongoing) so the board reflects the running agent across remounts. The
+    // persisted column is authoritative when no live Radio event has repainted
+    // the card yet; without this the card silently falls back to PLANNED.
+    let (board_column, board_order) = if outcome.agent_started {
+        let pk = project_key.clone();
+        let tid = task_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            tasks::move_task_stage(&pk, &tid, "ongoing", None)
+        })
+        .await
+        {
+            Ok(Ok(tasks::StageMove::Moved { board_order })) => {
+                broadcast_radio_event(RadioEvent::TaskStageChanged {
+                    project_id: id.clone(),
+                    task_id: task_id.clone(),
+                    board_column: "ongoing".to_string(),
+                    board_order,
+                });
+                ("ongoing".to_string(), board_order)
+            }
+            _ => (board_column, board_order),
+        }
+    } else {
+        (board_column, board_order)
+    };
 
     let mut resp_task = task;
     resp_task.board_column = board_column.clone();
