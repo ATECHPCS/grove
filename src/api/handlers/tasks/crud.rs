@@ -600,13 +600,54 @@ pub async fn move_task_stage(
 }
 
 /// Build the opening prompt handed to a dispatched agent.
-fn build_dispatch_prompt(title: &str, body: Option<&str>) -> String {
-    let mut p = format!("# Task: {title}\n\n");
+/// Resolve which agent to launch, in precedence order:
+/// explicit request → project default (from settings) → global default
+/// (`config.acp.agent_command`) → the built-in `claude-acp`.
+fn resolve_agent(
+    explicit: Option<&str>,
+    project_default: &str,
+    config: &crate::storage::config::Config,
+) -> String {
+    if let Some(a) = explicit {
+        if !a.trim().is_empty() {
+            return a.trim().to_string();
+        }
+    }
+    if !project_default.trim().is_empty() {
+        return project_default.trim().to_string();
+    }
+    config
+        .acp
+        .agent_command
+        .clone()
+        .filter(|a| !a.trim().is_empty())
+        .unwrap_or_else(|| "claude-acp".to_string())
+}
+
+fn build_dispatch_prompt(
+    title: &str,
+    body: Option<&str>,
+    preamble: &str,
+    rules: &str,
+) -> String {
+    let mut p = String::new();
+    // Per-project preamble is prepended; the hardcoded closing instruction
+    // below always remains, so the agent is never left without a commit step.
+    if !preamble.trim().is_empty() {
+        p.push_str(preamble.trim());
+        p.push_str("\n\n");
+    }
+    p.push_str(&format!("# Task: {title}\n\n"));
     if let Some(b) = body {
         if !b.trim().is_empty() {
             p.push_str(b.trim());
             p.push_str("\n\n");
         }
+    }
+    if !rules.trim().is_empty() {
+        p.push_str("## Rules\n");
+        p.push_str(rules.trim());
+        p.push_str("\n\n");
     }
     p.push_str(
         "Investigate and implement a fix for the above in this worktree. \
@@ -668,6 +709,7 @@ pub async fn dispatch_task(
     }
 
     let full_config = storage::config::load_config();
+    let settings = crate::storage::project_settings::get(&project_key).unwrap_or_default();
     let is_studio = project.project_type == workspace::ProjectType::Studio;
 
     // Validate the agent up front, BEFORE creating a task, so an unknown or
@@ -679,15 +721,12 @@ pub async fn dispatch_task(
                 "auto_start is not supported for Studio projects",
             ));
         }
-        let a = crate::storage::installed_agents::canonicalize_agent_id(
-            &req.agent.clone().unwrap_or_else(|| {
-                full_config
-                    .acp
-                    .agent_command
-                    .clone()
-                    .unwrap_or_else(|| "claude-acp".to_string())
-            }),
-        );
+        // Agent precedence: explicit request → project default → global default.
+        let a = crate::storage::installed_agents::canonicalize_agent_id(&resolve_agent(
+            req.agent.as_deref(),
+            &settings.default_agent,
+            &full_config,
+        ));
         crate::api::handlers::acp::validate_dispatch_agent(&a)
             .map_err(|e| err(e.status(), &e.message()))?;
         Some(a)
@@ -700,6 +739,7 @@ pub async fn dispatch_task(
     let ppath = project_path.clone();
     let name = title.clone();
     let target = req.target.clone();
+    let default_target = settings.default_target_branch.clone();
     let cfg = full_config.clone();
     let result = tokio::task::spawn_blocking(move || {
         if is_studio {
@@ -711,9 +751,17 @@ pub async fn dispatch_task(
                 "dispatch",
             )
         } else {
-            let target = target.unwrap_or_else(|| {
-                git::current_branch(&ppath).unwrap_or_else(|_| "main".to_string())
-            });
+            // Target precedence: explicit request → project default → the
+            // project's current branch.
+            let target = target
+                .filter(|t| !t.trim().is_empty())
+                .or_else(|| {
+                    let d = default_target.trim();
+                    if d.is_empty() { None } else { Some(d.to_string()) }
+                })
+                .unwrap_or_else(|| {
+                    git::current_branch(&ppath).unwrap_or_else(|_| "main".to_string())
+                });
             crate::operations::tasks::create_task(
                 &ppath,
                 &pk,
@@ -900,7 +948,22 @@ async fn start_agent_on_task(
             .await
             {
                 Ok((handle, confirmed)) => {
-                    let prompt = build_dispatch_prompt(title, body);
+                    // Per-project preamble + rules injected into the opening
+                    // prompt (empty when unset → identical to the old framing).
+                    let settings = {
+                        let pk = project_key.to_string();
+                        tokio::task::spawn_blocking(move || {
+                            crate::storage::project_settings::get(&pk).unwrap_or_default()
+                        })
+                        .await
+                        .unwrap_or_default()
+                    };
+                    let prompt = build_dispatch_prompt(
+                        title,
+                        body,
+                        &settings.prompt_preamble,
+                        &settings.task_rules,
+                    );
                     match handle
                         .send_prompt(prompt, vec![], Some("dispatch".to_string()), false, None)
                         .await
@@ -991,17 +1054,15 @@ pub async fn start_task(
     };
 
     let full_config = storage::config::load_config();
+    let settings = crate::storage::project_settings::get(&project_key).unwrap_or_default();
 
     // Validate + canonicalize the agent before creating the chat.
-    let agent = crate::storage::installed_agents::canonicalize_agent_id(
-        &req.agent.clone().unwrap_or_else(|| {
-            full_config
-                .acp
-                .agent_command
-                .clone()
-                .unwrap_or_else(|| "claude-acp".to_string())
-        }),
-    );
+    // Agent precedence: explicit request → project default → global default.
+    let agent = crate::storage::installed_agents::canonicalize_agent_id(&resolve_agent(
+        req.agent.as_deref(),
+        &settings.default_agent,
+        &full_config,
+    ));
     crate::api::handlers::acp::validate_dispatch_agent(&agent)
         .map_err(|e| err(e.status(), &e.message()))?;
 

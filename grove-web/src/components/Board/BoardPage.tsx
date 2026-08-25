@@ -7,10 +7,11 @@
 // Live updates arrive via the shared Radio socket (useBoardTasks).
 
 import { useCallback, useMemo, useRef, useState } from "react";
-import { SquareKanban, Plus, Loader2, X } from "lucide-react";
+import { SquareKanban, Plus, Loader2, X, Settings } from "lucide-react";
 import { dispatchTask, moveTaskStage, startTask } from "../../api";
 import { useBoardTasks } from "./useBoardTasks";
 import { BoardColumn } from "./BoardColumn";
+import { BoardSettings } from "./BoardSettings";
 import { BOARD_COLUMNS, type BoardCardData, type ColumnId } from "./types";
 
 const DRAG_MIME = "application/x-grove-task";
@@ -39,6 +40,7 @@ export function BoardPage({ onOpenTask }: BoardPageProps = {}) {
 
   const [composerOpen, setComposerOpen] = useState(false);
   const [newTitle, setNewTitle] = useState("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const composerRef = useRef<HTMLInputElement | null>(null);
 
@@ -169,18 +171,39 @@ export function BoardPage({ onOpenTask }: BoardPageProps = {}) {
             <Loader2 className="w-4 h-4 text-[var(--color-text-muted)] animate-spin" />
           )}
         </div>
-        <button
-          type="button"
-          onClick={() => {
-            setComposerOpen(true);
-            requestAnimationFrame(() => composerRef.current?.focus());
-          }}
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium bg-[var(--color-highlight)] text-[var(--color-bg)] hover:opacity-90 transition-opacity"
-        >
-          <Plus className="w-4 h-4" />
-          New card
-        </button>
+        <div className="flex items-center gap-2">
+          {projectId && !isStudio && (
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(true)}
+              title="Task defaults"
+              className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)] transition-colors"
+              aria-label="Task defaults"
+            >
+              <Settings className="w-4 h-4" />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              setComposerOpen(true);
+              requestAnimationFrame(() => composerRef.current?.focus());
+            }}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium bg-[var(--color-highlight)] text-[var(--color-bg)] hover:opacity-90 transition-opacity"
+          >
+            <Plus className="w-4 h-4" />
+            New card
+          </button>
+        </div>
       </header>
+
+      {settingsOpen && projectId && (
+        <BoardSettings
+          projectId={projectId}
+          projectName={projectName ?? ""}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
 
       {/* Composer */}
       {composerOpen && (

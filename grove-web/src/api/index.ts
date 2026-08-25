@@ -22,13 +22,14 @@ export type {
 
 export { checkAllDependencies, checkCommands } from './env';
 
-export { listProjects, getProject, addProject, deleteProject, renameProject, archiveProject, restoreProject, getProjectStats, getBranches, getRemotes, openIDE, openTerminal, initGitRepo, createNewProject, cloneProject, listResources, uploadResource, deleteResource, previewResource, resourceDownloadUrl, openResourceFile, revealResourceFile, getInstructions, updateInstructions, getMemory, migrateMemory, listResourceWorkdirs, addResourceWorkdir, deleteResourceWorkdir, openResourceWorkdir, createResourceFolder, moveResource, createResourceLink, updateResourceLink } from './projects';
+export { listProjects, getProject, addProject, deleteProject, renameProject, archiveProject, restoreProject, getProjectStats, getBranches, getRemotes, openIDE, openTerminal, initGitRepo, createNewProject, cloneProject, listResources, uploadResource, deleteResource, previewResource, resourceDownloadUrl, openResourceFile, revealResourceFile, getInstructions, updateInstructions, getMemory, migrateMemory, listResourceWorkdirs, addResourceWorkdir, deleteResourceWorkdir, openResourceWorkdir, createResourceFolder, moveResource, createResourceLink, updateResourceLink, getProjectSettings, updateProjectSettings } from './projects';
 export type {
   ProjectListItem,
   ProjectResponse,
   ProjectStatsResponse,
   ResourceFile,
   WorkDirectoryEntry,
+  ProjectSettings,
 } from './projects';
 
 export {

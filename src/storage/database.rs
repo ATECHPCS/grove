@@ -437,6 +437,22 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             updated_at    TEXT NOT NULL
         );
 
+        -- Per-project task defaults applied when a task is dispatched or
+        -- started: which agent runs, an opening-prompt preamble, task rules
+        -- injected into the prompt, and free-form routing rules read by the
+        -- nanobot file_bug classifier (over the HMAC mobile server). All fields
+        -- default to the empty string; an absent or empty row means no override
+        -- and dispatch/start fall back to the global default agent + prompt.
+        CREATE TABLE IF NOT EXISTS project_settings (
+            project               TEXT PRIMARY KEY,
+            default_agent         TEXT NOT NULL DEFAULT '',
+            prompt_preamble       TEXT NOT NULL DEFAULT '',
+            task_rules            TEXT NOT NULL DEFAULT '',
+            routing_rules         TEXT NOT NULL DEFAULT '',
+            default_target_branch TEXT NOT NULL DEFAULT '',
+            updated_at            TEXT NOT NULL DEFAULT ''
+        );
+
         -- Plugins registry. One row per installed/registered plugin (a folder
         -- containing plugin.json). `source` decides where local_path points and
         -- whether delete removes files:
