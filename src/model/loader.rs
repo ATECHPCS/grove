@@ -213,6 +213,8 @@ fn archived_task_to_worktree(task: Task) -> Worktree {
         is_local: false,
         board_column: task.board_column,
         board_order: task.board_order,
+        origin_key: task.origin_key,
+        origin_ref: task.origin_ref,
     }
 }
 
@@ -284,6 +286,8 @@ fn task_to_worktree(
             is_local: true,
             board_column: task.board_column.clone(),
             board_order: task.board_order,
+            origin_key: task.origin_key.clone(),
+            origin_ref: task.origin_ref.clone(),
         };
     }
 
@@ -365,5 +369,7 @@ fn task_to_worktree(
         is_local: false,
         board_column: task.board_column.clone(),
         board_order: task.board_order,
+        origin_key: task.origin_key.clone(),
+        origin_ref: task.origin_ref.clone(),
     }
 }

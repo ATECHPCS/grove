@@ -619,6 +619,8 @@ mod tests {
             is_local: false,
             board_column: "todo".to_string(),
             board_order: 0,
+            origin_key: String::new(),
+            origin_ref: String::new(),
         };
         add_task(project_id, task).unwrap();
 
@@ -1070,6 +1072,8 @@ mod tests {
                 is_local: false,
                 board_column: "todo".to_string(),
                 board_order: 0,
+                origin_key: String::new(),
+                origin_ref: String::new(),
             };
             add_task(project_id, other_task).unwrap();
 

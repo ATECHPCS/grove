@@ -1719,6 +1719,8 @@ fn resolve_chat_task_context(project_key: &str, task_id: &str) -> Result<tasks::
         is_local: true,
         board_column: "todo".to_string(),
         board_order: 0,
+        origin_key: String::new(),
+        origin_ref: String::new(),
     })
 }
 

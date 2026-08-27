@@ -169,8 +169,20 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             -- independent of `status` (active/archived)
             board_column   TEXT    NOT NULL DEFAULT 'todo',
             board_order    INTEGER NOT NULL DEFAULT 0,
+            -- provenance of a dispatched card: origin_key = system:id
+            -- (dedup key, derived server-side), origin_ref = JSON
+            -- with system/id/agent. Both empty for human-created cards.
+            origin_key     TEXT    NOT NULL DEFAULT '',
+            origin_ref     TEXT    NOT NULL DEFAULT '',
             PRIMARY KEY (project, id)
         );
+
+        -- Dedup lookup for dispatched cards. Non-unique: a done/archived card
+        -- can share an origin_key with a fresh re-file (F1 filters on
+        -- non-terminal board_column at query time). Partial index skips the
+        -- many human-created rows whose origin_key is ''.
+        CREATE INDEX IF NOT EXISTS ix_tasks_origin_key
+            ON tasks (project, origin_key) WHERE origin_key <> '';
 
         -- Hot path: load_tasks() / load_archived_tasks() filter by
         -- (project, status) and ORDER BY updated_at DESC. The PK alone
@@ -1068,6 +1080,19 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'todo'",
     )?;
     add_column_if_missing(conn, "tasks", "board_order", "INTEGER NOT NULL DEFAULT 0")?;
+
+    // Provenance columns for dispatched cards (nanobot ⇄ Grove comms). origin_key
+    // is the "{system}:{id}" dedup key derived server-side; origin_ref is the
+    // {system,id,agent} JSON. Both '' for human-created cards. Additive, safe on
+    // the shared grove.db.
+    add_column_if_missing(conn, "tasks", "origin_key", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "tasks", "origin_ref", "TEXT NOT NULL DEFAULT ''")?;
+    // Dedup lookup index; partial on non-empty origin_key. Idempotent.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS ix_tasks_origin_key
+         ON tasks (project, origin_key) WHERE origin_key <> ''",
+        [],
+    )?;
 
     // Chat session launch mode: "acp" (default, JSON-RPC over stdio) or
     // "terminal" (spawn agent CLI under a PTY, no protocol). Old chats stay

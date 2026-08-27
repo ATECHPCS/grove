@@ -41,6 +41,8 @@ pub(crate) fn worktree_to_response(wt: &model::Worktree) -> TaskResponse {
         is_local: wt.is_local,
         board_column: wt.board_column.clone(),
         board_order: wt.board_order,
+        origin_key: wt.origin_key.clone(),
+        origin_ref: wt.origin_ref.clone(),
     }
 }
 

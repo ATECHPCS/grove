@@ -36,6 +36,10 @@ export interface TaskResponse {
   board_column: string;
   /** Ordering position within the board column. */
   board_order: number;
+  /** Dedup key for dispatched cards ("{system}:{id}"); empty for human cards. */
+  origin_key?: string;
+  /** Provenance JSON {system,id,agent} for dispatched cards; empty for human cards. */
+  origin_ref?: string;
 }
 
 interface TaskListResponse {

@@ -90,6 +90,16 @@ pub struct Task {
     /// Ordering position within a board column (ascending).
     #[serde(default)]
     pub board_order: i64,
+    /// Dedup key for dispatched cards: `"{system}:{id}"`, lowercased
+    /// (e.g. `"ebay-messages:ticket-8842"`). Derived server-side from
+    /// `origin_ref`; empty for human-created cards.
+    #[serde(default)]
+    pub origin_key: String,
+    /// Provenance of a dispatched card as a JSON string
+    /// `{ "system": str, "id": str, "agent": str }` where `agent` is the
+    /// nanobot agent that filed it. Empty for human-created cards.
+    #[serde(default)]
+    pub origin_ref: String,
 }
 
 fn default_multiplexer() -> String {
@@ -122,6 +132,8 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let files_changed: i64 = row.get(17)?;
     let board_column: String = row.get(18)?;
     let board_order: i64 = row.get(19)?;
+    let origin_key: String = row.get(20)?;
+    let origin_ref: String = row.get(21)?;
 
     Ok(Task {
         id: row.get(1)?,
@@ -146,10 +158,12 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         files_changed: files_changed as u32,
         board_column,
         board_order,
+        origin_key,
+        origin_ref,
     })
 }
 
-const TASK_COLUMNS: &str = "project, id, name, branch, target, worktree_path, initial_commit, created_at, updated_at, status, multiplexer, session_name, created_by, archived_at, is_local, code_additions, code_deletions, files_changed, board_column, board_order";
+const TASK_COLUMNS: &str = "project, id, name, branch, target, worktree_path, initial_commit, created_at, updated_at, status, multiplexer, session_name, created_by, archived_at, is_local, code_additions, code_deletions, files_changed, board_column, board_order, origin_key, origin_ref";
 
 /// 加载活跃任务列表
 pub fn load_tasks(project: &str) -> Result<Vec<Task>> {
@@ -181,7 +195,7 @@ pub fn load_archived_tasks(project: &str) -> Result<Vec<Task>> {
 pub fn add_task(project: &str, task: Task) -> Result<()> {
     let conn = crate::storage::database::connection();
     conn.execute(
-        &format!("INSERT INTO tasks ({}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)", TASK_COLUMNS),
+        &format!("INSERT INTO tasks ({}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)", TASK_COLUMNS),
         params![
             project,
             task.id,
@@ -203,7 +217,61 @@ pub fn add_task(project: &str, task: Task) -> Result<()> {
             task.files_changed as i64,
             task.board_column,
             task.board_order,
+            task.origin_key,
+            task.origin_ref,
         ],
+    )?;
+    Ok(())
+}
+
+/// F1 dedup lookup: the most recent **active, non-terminal** task carrying
+/// `origin_key`, if any. Returns `None` for empty keys, or when every match
+/// has reached `done`/archived (so a re-file creates a fresh card).
+pub fn find_active_by_origin_key(project: &str, origin_key: &str) -> Result<Option<Task>> {
+    if origin_key.is_empty() {
+        return Ok(None);
+    }
+    let conn = crate::storage::database::connection();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM tasks
+         WHERE project = ?1 AND origin_key = ?2 AND status = 'active'
+           AND board_column IN ('todo','planned','ongoing')
+         ORDER BY updated_at DESC LIMIT 1",
+        TASK_COLUMNS
+    ))?;
+    let mut rows = stmt.query_map(params![project, origin_key], row_to_task)?;
+    match rows.next() {
+        Some(task) => Ok(Some(task?)),
+        None => Ok(None),
+    }
+}
+
+/// Persist the F1 provenance columns on an already-created task. `origin_key`
+/// is the canonical dedup key; `origin_ref` is the `{system,id,agent}` JSON.
+pub fn set_origin(project: &str, task_id: &str, origin_key: &str, origin_ref: &str) -> Result<()> {
+    let conn = crate::storage::database::connection();
+    conn.execute(
+        "UPDATE tasks SET origin_key = ?1, origin_ref = ?2, updated_at = ?3
+         WHERE project = ?4 AND id = ?5",
+        params![
+            origin_key,
+            origin_ref,
+            Utc::now().to_rfc3339(),
+            project,
+            task_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Overwrite an existing card's title/body on an `update_on_match` dedup hit.
+/// `body` is written to the on-disk notes, mirroring task creation; a `None`
+/// body leaves the notes untouched. Returns the refreshed task.
+pub fn update_title(project: &str, task_id: &str, title: &str) -> Result<()> {
+    let conn = crate::storage::database::connection();
+    conn.execute(
+        "UPDATE tasks SET name = ?1, updated_at = ?2 WHERE project = ?3 AND id = ?4",
+        params![title, Utc::now().to_rfc3339(), project, task_id],
     )?;
     Ok(())
 }
@@ -586,6 +654,8 @@ fn build_local_task(
         is_local: true,
         board_column: "todo".to_string(),
         board_order: 0,
+        origin_key: String::new(),
+        origin_ref: String::new(),
     }
 }
 
@@ -1375,5 +1445,134 @@ created_at = "2025-01-01T00:00:00Z"
         session.duty = None;
         let toml_str2 = toml::to_string(&session).unwrap();
         assert!(!toml_str2.contains("duty"));
+    }
+
+    // ── F1 origin_ref dedup (DB-backed) ─────────────────────────────────────
+
+    use crate::storage::database::test_lock as FILE_LOCK_FN;
+
+    struct HomeGuard {
+        prev: String,
+        temp: std::path::PathBuf,
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            std::env::set_var("HOME", &self.prev);
+            let _ = std::fs::remove_dir_all(&self.temp);
+        }
+    }
+    fn sandbox_home() -> HomeGuard {
+        let prev = std::env::var("HOME").unwrap_or_default();
+        let temp = std::env::temp_dir().join(format!(
+            "grove-tasks-origin-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        std::env::set_var("HOME", &temp);
+        HomeGuard { prev, temp }
+    }
+
+    fn mk_task(id: &str, origin_key: &str, origin_ref: &str, board_column: &str) -> Task {
+        let now = Utc::now();
+        Task {
+            id: id.to_string(),
+            name: id.to_string(),
+            branch: format!("grove/{id}"),
+            target: "main".to_string(),
+            worktree_path: format!("/tmp/{id}"),
+            initial_commit: None,
+            created_at: now,
+            updated_at: now,
+            status: TaskStatus::Active,
+            multiplexer: "tmux".to_string(),
+            session_name: String::new(),
+            created_by: "dispatch".to_string(),
+            archived_at: None,
+            code_additions: 0,
+            code_deletions: 0,
+            files_changed: 0,
+            is_local: false,
+            board_column: board_column.to_string(),
+            board_order: 0,
+            origin_key: origin_key.to_string(),
+            origin_ref: origin_ref.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_dedup_matches_non_terminal_card() {
+        let _lock = FILE_LOCK_FN().blocking_lock();
+        let _home = sandbox_home();
+        let project = "proj-dedup-1";
+        let key = "ebay-messages:ticket-8842";
+        add_task(project, mk_task("t-open", key, "{}", "planned")).unwrap();
+
+        let found = find_active_by_origin_key(project, key).unwrap();
+        assert!(
+            found.is_some(),
+            "non-terminal card should match its origin_key"
+        );
+        assert_eq!(found.unwrap().id, "t-open");
+    }
+
+    #[test]
+    fn test_dedup_ignores_done_and_archived() {
+        let _lock = FILE_LOCK_FN().blocking_lock();
+        let _home = sandbox_home();
+        let project = "proj-dedup-2";
+        let key = "helpdesk:case-42";
+        // A finished card must NOT block a re-file.
+        add_task(project, mk_task("t-done", key, "{}", "done")).unwrap();
+        assert!(
+            find_active_by_origin_key(project, key).unwrap().is_none(),
+            "done card must not match (re-file should create fresh)"
+        );
+
+        // An archived card with the same key is likewise ignored.
+        let mut archived = mk_task("t-arch", key, "{}", "todo");
+        archived.status = TaskStatus::Archived;
+        add_task(project, archived).unwrap();
+        assert!(
+            find_active_by_origin_key(project, key).unwrap().is_none(),
+            "archived card must not match"
+        );
+    }
+
+    #[test]
+    fn test_dedup_empty_key_returns_none() {
+        let _lock = FILE_LOCK_FN().blocking_lock();
+        let _home = sandbox_home();
+        let project = "proj-dedup-3";
+        add_task(project, mk_task("t-human", "", "", "todo")).unwrap();
+        assert!(
+            find_active_by_origin_key(project, "").unwrap().is_none(),
+            "empty origin_key never matches"
+        );
+    }
+
+    #[test]
+    fn test_set_origin_persists_and_enables_dedup() {
+        let _lock = FILE_LOCK_FN().blocking_lock();
+        let _home = sandbox_home();
+        let project = "proj-dedup-4";
+        let key = "voice:log-7";
+        // Card created with no origin (mirrors create_task), then stamped.
+        add_task(project, mk_task("t-stamp", "", "", "planned")).unwrap();
+        assert!(find_active_by_origin_key(project, key).unwrap().is_none());
+
+        set_origin(
+            project,
+            "t-stamp",
+            key,
+            r#"{"system":"voice","id":"log-7","agent":"andy"}"#,
+        )
+        .unwrap();
+        let found = find_active_by_origin_key(project, key).unwrap();
+        assert_eq!(found.as_ref().map(|t| t.id.as_str()), Some("t-stamp"));
+        assert!(found.unwrap().origin_ref.contains("andy"));
     }
 }

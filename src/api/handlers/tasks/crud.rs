@@ -248,6 +248,8 @@ pub async fn create_task(
         is_local: false,
         board_column: result.task.board_column.clone(),
         board_order: result.task.board_order,
+        origin_key: result.task.origin_key.clone(),
+        origin_ref: result.task.origin_ref.clone(),
     }))
 }
 
@@ -703,6 +705,11 @@ pub async fn dispatch_task(
         ));
     }
 
+    // F1: parse + validate the origin_ref. `None` = human-style create (no
+    // dedup); `Some` = derive the canonical origin_key and dedup on it.
+    let origin = OriginRef::parse(req.origin_ref.as_deref())
+        .map_err(|m| err(StatusCode::BAD_REQUEST, &m))?;
+
     let full_config = storage::config::load_config();
     let settings = crate::storage::project_settings::get(&project_key).unwrap_or_default();
     let is_studio = project.project_type == workspace::ProjectType::Studio;
@@ -728,6 +735,48 @@ pub async fn dispatch_task(
     } else {
         None
     };
+
+    // F1 dedup: if this file carries an origin_ref, look for an existing
+    // non-terminal card with the same origin_key. A hit short-circuits the
+    // whole create/worktree/agent flow and returns the existing card.
+    if let Some(ref o) = origin {
+        let origin_key = o.origin_key();
+        let pk = project_key.clone();
+        let ok = origin_key.clone();
+        let existing =
+            tokio::task::spawn_blocking(move || tasks::find_active_by_origin_key(&pk, &ok))
+                .await
+                .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "dedup join error"))?
+                .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+        if let Some(mut existing) = existing {
+            // Optionally refresh title/body from the new payload — off by
+            // default so an in-flight agent's context is not clobbered.
+            if req.update_on_match {
+                let pk = project_key.clone();
+                let tid = existing.id.clone();
+                let new_title = title.clone();
+                let new_body = req.body.clone();
+                let _ = tokio::task::spawn_blocking(move || -> crate::error::Result<()> {
+                    tasks::update_title(&pk, &tid, &new_title)?;
+                    if let Some(b) = new_body {
+                        let _ = notes::save_notes(&pk, &tid, &b);
+                    }
+                    Ok(())
+                })
+                .await;
+                existing.name = title.clone();
+            }
+            return Ok(Json(DispatchResponse {
+                board_column: existing.board_column.clone(),
+                task: storage_task_to_response(&existing),
+                chat_id: None,
+                agent_started: false,
+                agent_error: None,
+                matched_existing: true,
+            }));
+        }
+    }
 
     // 1. Create the task (+ worktree for repo projects).
     let pk = project_key.clone();
@@ -783,7 +832,21 @@ pub async fn dispatch_task(
         }
     })?;
 
-    let task = result.task;
+    let mut task = result.task;
+
+    // 1b. Persist F1 provenance on the fresh card so future re-files dedup and
+    //     the escalation bridge (F2) can route back to the origin agent.
+    if let Some(ref o) = origin {
+        let origin_key = o.origin_key();
+        let origin_ref_json = o.to_json();
+        let pk = project_key.clone();
+        let tid = task.id.clone();
+        let ok = origin_key.clone();
+        let oref = origin_ref_json.clone();
+        let _ = tokio::task::spawn_blocking(move || tasks::set_origin(&pk, &tid, &ok, &oref)).await;
+        task.origin_key = origin_key;
+        task.origin_ref = origin_ref_json;
+    }
 
     // 2. File the new card on the board (from the created default "todo"),
     //    capturing the atomic move's own result so the response and event
@@ -875,6 +938,7 @@ pub async fn dispatch_task(
         board_column,
         agent_started,
         agent_error,
+        matched_existing: false,
     }))
 }
 
@@ -1140,6 +1204,7 @@ pub async fn start_task(
         board_column,
         agent_started: outcome.agent_started,
         agent_error: outcome.agent_error,
+        matched_existing: false,
     }))
 }
 

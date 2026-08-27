@@ -59,6 +59,10 @@ pub struct TaskResponse {
     pub board_column: String,
     /// Ordering position within the board column.
     pub board_order: i64,
+    /// Dedup key for dispatched cards ("{system}:{id}"); empty for human cards.
+    pub origin_key: String,
+    /// Provenance JSON {system,id,agent} for dispatched cards; empty for human cards.
+    pub origin_ref: String,
 }
 
 /// Commit response

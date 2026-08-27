@@ -121,6 +121,76 @@ pub struct DispatchRequest {
     /// auto_start, else "todo").
     #[serde(default)]
     pub into: Option<String>,
+    /// Provenance of the originating record as a raw JSON string
+    /// `{ "system": str, "id": str, "agent": str }`. When present with a
+    /// non-empty system+id, the server derives an `origin_key` and dedups:
+    /// re-filing the same source returns the existing non-terminal card
+    /// instead of creating a duplicate. Empty/absent → always create.
+    #[serde(default)]
+    pub origin_ref: Option<String>,
+    /// On a dedup hit, overwrite the existing card's title/body from this
+    /// payload. Default false — avoid clobbering an in-flight agent's context.
+    #[serde(default)]
+    pub update_on_match: bool,
+}
+
+/// Parsed `origin_ref` payload. `agent` is the nanobot agent that filed the
+/// card (andy/cody/stefany/wilson); used to route escalations back (F2).
+#[derive(Debug, Clone, Deserialize)]
+pub struct OriginRef {
+    #[serde(default)]
+    pub system: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub agent: String,
+}
+
+/// Max byte length accepted for a raw `origin_ref` JSON string.
+pub const ORIGIN_REF_MAX_BYTES: usize = 1024;
+
+impl OriginRef {
+    /// Parse + validate a raw `origin_ref` JSON string. Returns:
+    /// - `Ok(None)` when the input is absent/empty (human-created card),
+    /// - `Ok(Some(_))` when it parses and carries a non-empty system + id,
+    /// - `Err(msg)` when it is oversized, unparseable, or missing system/id.
+    pub fn parse(raw: Option<&str>) -> Result<Option<OriginRef>, String> {
+        let raw = match raw.map(str::trim) {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(None),
+        };
+        if raw.len() > ORIGIN_REF_MAX_BYTES {
+            return Err(format!(
+                "origin_ref too large (max {ORIGIN_REF_MAX_BYTES} bytes)"
+            ));
+        }
+        let parsed: OriginRef =
+            serde_json::from_str(raw).map_err(|e| format!("origin_ref not valid JSON: {e}"))?;
+        if parsed.system.trim().is_empty() || parsed.id.trim().is_empty() {
+            return Err("origin_ref requires non-empty 'system' and 'id'".to_string());
+        }
+        Ok(Some(parsed))
+    }
+
+    /// Canonical dedup key: `"{system}:{id}"`, lowercased and trimmed. Derived
+    /// server-side, never trusted from the client, so the key stays canonical.
+    pub fn origin_key(&self) -> String {
+        format!(
+            "{}:{}",
+            self.system.trim().to_lowercase(),
+            self.id.trim().to_lowercase()
+        )
+    }
+
+    /// Re-serialize to the canonical JSON stored in `tasks.origin_ref`.
+    pub fn to_json(&self) -> String {
+        serde_json::json!({
+            "system": self.system.trim(),
+            "id": self.id.trim(),
+            "agent": self.agent.trim(),
+        })
+        .to_string()
+    }
 }
 
 /// Start an agent on an existing task (POST /tasks/{taskId}/start). The board's
@@ -150,6 +220,10 @@ pub struct DispatchResponse {
     /// board). Present only on partial success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_error: Option<String>,
+    /// True when an existing non-terminal card matched the request's
+    /// `origin_key` and was returned instead of creating a duplicate (F1).
+    /// The caller should say "already tracked" rather than "new card filed".
+    pub matched_existing: bool,
 }
 
 /// Move task to a Kanban board column request
@@ -597,4 +671,59 @@ pub struct MentionCandidatesResponse {
     pub agents: Vec<MentionAgent>,
     pub outgoing: Vec<MentionOutgoing>,
     pub pending_replies: Vec<MentionPendingReply>,
+}
+
+#[cfg(test)]
+mod origin_ref_tests {
+    use super::OriginRef;
+
+    #[test]
+    fn parse_absent_or_empty_is_none() {
+        assert!(OriginRef::parse(None).unwrap().is_none());
+        assert!(OriginRef::parse(Some("")).unwrap().is_none());
+        assert!(OriginRef::parse(Some("   ")).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_valid_yields_origin_key() {
+        let o = OriginRef::parse(Some(
+            r#"{"system":"eBay-Messages","id":"Ticket-8842","agent":"andy"}"#,
+        ))
+        .unwrap()
+        .unwrap();
+        // origin_key is lowercased + trimmed, derived server-side.
+        assert_eq!(o.origin_key(), "ebay-messages:ticket-8842");
+        assert_eq!(o.agent, "andy");
+    }
+
+    #[test]
+    fn parse_missing_system_or_id_errors() {
+        assert!(OriginRef::parse(Some(r#"{"system":"x"}"#)).is_err());
+        assert!(OriginRef::parse(Some(r#"{"id":"y"}"#)).is_err());
+        assert!(OriginRef::parse(Some(r#"{"system":" ","id":"y"}"#)).is_err());
+    }
+
+    #[test]
+    fn parse_bad_json_errors() {
+        assert!(OriginRef::parse(Some("not json")).is_err());
+    }
+
+    #[test]
+    fn parse_oversized_errors() {
+        let big = format!(r#"{{"system":"s","id":"{}"}}"#, "x".repeat(2000));
+        assert!(OriginRef::parse(Some(&big)).is_err());
+    }
+
+    #[test]
+    fn to_json_roundtrips_trimmed_fields() {
+        let o = OriginRef::parse(Some(
+            r#"{"system":" helpdesk ","id":" case-1 ","agent":" cody "}"#,
+        ))
+        .unwrap()
+        .unwrap();
+        let json = o.to_json();
+        assert!(json.contains("\"helpdesk\""));
+        assert!(json.contains("\"case-1\""));
+        assert!(json.contains("\"cody\""));
+    }
 }

@@ -762,6 +762,10 @@ fn create_task_inner(
         is_local: false,
         board_column: "todo".to_string(),
         board_order: 0,
+        // Origin provenance is set by the dispatch handler (F1) after creation,
+        // via tasks::set_origin; plain creation paths leave it empty.
+        origin_key: String::new(),
+        origin_ref: String::new(),
     };
 
     tasks::add_task(project_key, task.clone())?;
