@@ -49,6 +49,19 @@ pub struct ServerAuth {
     /// the default browser) would even be visible to the person making the
     /// request. Set via `grove web --remote`.
     pub remote: bool,
+    /// A4 — authorization in code. Allowlist of sender identities (the
+    /// `x-grove-sender` header) permitted to drive the *sensitive* routes
+    /// that inject attacker-controllable text into a skip-permissions agent
+    /// (`/tray/send-prompt`, `…/tasks/dispatch`). **Empty ⇒ enforcement off**
+    /// (back-compat); non-empty ⇒ fail closed (a missing or unlisted sender is
+    /// refused with 403). Populated from `GROVE_MOBILE_SENDER_ALLOWLIST`
+    /// (comma-separated) at HMAC-server startup. A shared symmetric HMAC key
+    /// can't cryptographically bind identity, so this is defense-in-depth /
+    /// an audit tag / a per-sender kill-switch, not an auth boundary on its own.
+    pub sender_allowlist: Vec<String>,
+    /// A3 — audit sink for sensitive-route decisions, one JSON object per line.
+    /// `None` ⇒ no audit. Populated from `GROVE_MOBILE_AUDIT_LOG`.
+    pub audit_path: Option<std::path::PathBuf>,
     /// Nonce replay-prevention map: nonce → timestamp (epoch secs).
     used_nonces: Mutex<HashMap<String, i64>>,
 }
@@ -63,6 +76,10 @@ impl ServerAuth {
             secret_key: None,
             key_is_generated: false,
             remote,
+            // No auth ⇒ loopback / trusted; the sensitive-route gates below
+            // only engage in HMAC mode, so leave these inert.
+            sender_allowlist: Vec::new(),
+            audit_path: None,
             used_nonces: Mutex::new(HashMap::new()),
         }
     }
@@ -74,12 +91,63 @@ impl ServerAuth {
     /// it (the frontend's `required` check already covers HMAC mode, but
     /// setting it here keeps `ServerAuth::remote` meaningful on its own).
     pub fn hmac(secret_key: String, is_generated: bool) -> Self {
+        let sender_allowlist = std::env::var("GROVE_MOBILE_SENDER_ALLOWLIST")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let audit_path = std::env::var("GROVE_MOBILE_AUDIT_LOG")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
         Self {
             mode: AuthMode::Hmac,
             secret_key: Some(secret_key),
             key_is_generated: is_generated,
             remote: true,
+            sender_allowlist,
+            audit_path,
             used_nonces: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// A4 — is `sender` (the `x-grove-sender` header) allowed to drive a
+    /// sensitive route? Enforcement is off (returns true) when the allowlist is
+    /// empty; otherwise fail closed: a missing sender is refused.
+    pub fn sender_allowed(&self, sender: Option<&str>) -> bool {
+        if self.sender_allowlist.is_empty() {
+            return true;
+        }
+        match sender {
+            Some(s) => self.sender_allowlist.iter().any(|a| a == s),
+            None => false,
+        }
+    }
+
+    /// A3 — append one JSON line to the audit sink (best-effort; never blocks
+    /// the request path on an I/O error). No-op when no sink is configured.
+    pub fn audit(&self, method: &str, path: &str, sender: Option<&str>, outcome: &str) {
+        let Some(p) = &self.audit_path else {
+            return;
+        };
+        let line = serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "method": method,
+            "path": path,
+            "sender": sender.unwrap_or(""),
+            "outcome": outcome,
+        });
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", line);
         }
     }
 
@@ -89,6 +157,13 @@ impl ServerAuth {
     /// `canonical_path` is `path` plus a sorted, `&`-joined query string (see
     /// [`canonical_path`]). Caller is responsible for canonicalizing before
     /// passing the value in.
+    ///
+    /// A2 — body integrity: when `body_sha256` is `Some(digest)` the signed
+    /// message is extended to `"{ts}|{nonce}|{METHOD}|{path}|{digest}"`, binding
+    /// the request body into the signature so a LAN MITM can't rewrite it. The
+    /// caller passes the digest **it recomputed from the received bytes** (not a
+    /// client-supplied header), so a tampered body fails the check. `None`
+    /// preserves the legacy body-less message for GET / WS-upgrade requests.
     pub fn verify_signature(
         &self,
         timestamp: &str,
@@ -96,6 +171,7 @@ impl ServerAuth {
         method: &str,
         path: &str,
         signature: &str,
+        body_sha256: Option<&str>,
     ) -> bool {
         let sk = match &self.secret_key {
             Some(sk) => sk,
@@ -128,7 +204,10 @@ impl ServerAuth {
         }
 
         // 3. Compute expected HMAC
-        let message = format!("{}|{}|{}|{}", timestamp, nonce, method, path);
+        let message = match body_sha256 {
+            Some(digest) => format!("{}|{}|{}|{}|{}", timestamp, nonce, method, path, digest),
+            None => format!("{}|{}|{}|{}", timestamp, nonce, method, path),
+        };
         let mut mac =
             HmacSha256::new_from_slice(sk.as_bytes()).expect("HMAC accepts any key length");
         mac.update(message.as_bytes());
@@ -215,6 +294,29 @@ pub fn canonical_path(path: &str, query: Option<&str>, exclude_keys: &[&str]) ->
     out
 }
 
+/// Upper bound on a request body we will buffer + digest in the auth
+/// middleware for A2 body integrity. Only bodies that opt into the digest
+/// (via `x-body-sha256`) or hit a sensitive route are buffered here; the
+/// largest legitimate one is a base64 image upload (~12 MB payload → ~16 MB
+/// JSON), so 32 MB leaves generous headroom while capping abuse.
+const MAX_SIGNED_BODY: usize = 32 * 1024 * 1024;
+
+/// Lowercase-hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
+}
+
+/// A2/A4 — routes that inject attacker-controllable text into a
+/// skip-permissions agent. These MUST carry a body digest (`x-body-sha256`,
+/// folded into the signature) and, when the allowlist is configured, an
+/// allowed `x-grove-sender`.
+fn is_sensitive_route(method: &str, path: &str) -> bool {
+    method == "POST" && (path == "/api/v1/tray/send-prompt" || path.ends_with("/tasks/dispatch"))
+}
+
 /// Axum middleware — checks HMAC signature (headers or query params).
 ///
 /// Uses `OriginalUri` so that the path seen here is the full request path
@@ -232,21 +334,84 @@ pub async fn auth_middleware(
 
     let method = request.method().as_str().to_uppercase();
     // Use the original (un-stripped) URI so the path matches what the client signed.
-    let path = original_uri.path();
-    let query = original_uri.query();
+    let path = original_uri.path().to_string();
+    let query = original_uri.query().map(|q| q.to_string());
+    let sensitive = is_sensitive_route(&method, &path);
 
-    // Try headers first. Header-signed requests include the full query string
-    // in the canonical path (after sorting by key); no keys are excluded.
+    // Header creds + the two hardening headers.
     let from_headers = (|| {
         let ts = request.headers().get("x-timestamp")?.to_str().ok()?;
         let nonce = request.headers().get("x-nonce")?.to_str().ok()?;
         let sig = request.headers().get("x-signature")?.to_str().ok()?;
         Some((ts.to_string(), nonce.to_string(), sig.to_string()))
     })();
+    let body_sha_header = request
+        .headers()
+        .get("x-body-sha256")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let sender = request
+        .headers()
+        .get("x-grove-sender")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // A2 gate: a sensitive route with no body digest is a downgrade attempt —
+    // refuse before doing anything else. (The digest is folded into the
+    // signature below, so an absent digest can never be a valid v2 request.)
+    if sensitive && body_sha_header.is_none() {
+        auth.audit(&method, &path, sender.as_deref(), "reject:no-body-digest");
+        return (StatusCode::UNAUTHORIZED, "body integrity required").into_response();
+    }
 
     if let Some((ts, nonce, sig)) = from_headers {
-        let canonical = canonical_path(path, query, &[]);
-        if auth.verify_signature(&ts, &nonce, &method, &canonical, &sig) {
+        let canonical = canonical_path(&path, query.as_deref(), &[]);
+
+        // v2 (body-signed): buffer the body, digest it ourselves, fold the
+        // recomputed digest into the verification, then rebuild the request.
+        if let Some(claimed) = body_sha_header {
+            let (parts, body) = request.into_parts();
+            let bytes = match axum::body::to_bytes(body, MAX_SIGNED_BODY).await {
+                Ok(b) => b,
+                Err(_) => {
+                    if sensitive {
+                        auth.audit(&method, &path, sender.as_deref(), "reject:body-too-large");
+                    }
+                    return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();
+                }
+            };
+            let actual = sha256_hex(&bytes);
+            // The client committed to `claimed`; we bind `actual`. If they
+            // differ the signature check below fails anyway, but rejecting here
+            // gives a crisp error and skips a doomed HMAC computation.
+            if actual != claimed {
+                if sensitive {
+                    auth.audit(&method, &path, sender.as_deref(), "reject:body-mismatch");
+                }
+                return (StatusCode::UNAUTHORIZED, "Invalid body digest").into_response();
+            }
+            if !auth.verify_signature(&ts, &nonce, &method, &canonical, &sig, Some(&actual)) {
+                if sensitive {
+                    auth.audit(&method, &path, sender.as_deref(), "reject:signature");
+                }
+                return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
+            }
+            // Authenticated. A4: authorize the sender on sensitive routes.
+            if sensitive && !auth.sender_allowed(sender.as_deref()) {
+                auth.audit(&method, &path, sender.as_deref(), "reject:sender");
+                return (StatusCode::FORBIDDEN, "sender not authorized").into_response();
+            }
+            if sensitive {
+                auth.audit(&method, &path, sender.as_deref(), "accept");
+            }
+            let request = Request::from_parts(parts, Body::from(bytes));
+            return next.run(request).await;
+        }
+
+        // Legacy (body-less message) — GETs and non-sensitive writes that
+        // haven't adopted the digest. Sensitive routes never reach here (gated
+        // above), so no unsigned body can drive a skip-permissions agent.
+        if auth.verify_signature(&ts, &nonce, &method, &canonical, &sig, None) {
             return next.run(request).await;
         }
         return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
@@ -255,14 +420,15 @@ pub async fn auth_middleware(
     // Fallback: query params (WebSocket upgrade). The signature itself rides
     // on the URL as `ts/nonce/sig`, so we strip those three keys before
     // canonicalizing — otherwise the signature would have to sign itself.
-    if let Some(query) = query {
+    // WS upgrades carry no body, so the digest is always absent here.
+    if let Some(query) = query.as_deref() {
         if let (Some(ts), Some(nonce), Some(sig)) = (
             query_param(query, "ts"),
             query_param(query, "nonce"),
             query_param(query, "sig"),
         ) {
-            let canonical = canonical_path(path, Some(query), &["ts", "nonce", "sig"]);
-            if auth.verify_signature(ts, nonce, &method, &canonical, sig) {
+            let canonical = canonical_path(&path, Some(query), &["ts", "nonce", "sig"]);
+            if auth.verify_signature(ts, nonce, &method, &canonical, sig, None) {
                 return next.run(request).await;
             }
             return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
@@ -327,7 +493,27 @@ pub async fn auth_verify(
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_path;
+    use super::{canonical_path, is_sensitive_route, sha256_hex, ServerAuth};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    /// Client-side signer mirror (matches grove_client.py / file_bug.py / client.ts).
+    fn client_sig(
+        key: &str,
+        ts: &str,
+        nonce: &str,
+        method: &str,
+        path: &str,
+        body_sha: Option<&str>,
+    ) -> String {
+        let msg = match body_sha {
+            Some(d) => format!("{}|{}|{}|{}|{}", ts, nonce, method, path, d),
+            None => format!("{}|{}|{}|{}", ts, nonce, method, path),
+        };
+        let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).unwrap();
+        mac.update(msg.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
 
     #[test]
     fn no_query() {
@@ -385,5 +571,98 @@ mod tests {
             canonical_path("/x", Some("b=2&_sm_nck=1&a=1&_sm_byp=123"), &[]),
             "/x?a=1&b=2"
         );
+    }
+
+    #[test]
+    fn sensitive_route_detection() {
+        assert!(is_sensitive_route("POST", "/api/v1/tray/send-prompt"));
+        assert!(is_sensitive_route(
+            "POST",
+            "/api/v1/projects/abc/tasks/dispatch"
+        ));
+        // Wrong method, or a read/other route, is not sensitive.
+        assert!(!is_sensitive_route("GET", "/api/v1/tray/send-prompt"));
+        assert!(!is_sensitive_route(
+            "POST",
+            "/api/v1/tray/resolve-permission"
+        ));
+        assert!(!is_sensitive_route("POST", "/api/v1/projects/abc/tasks"));
+    }
+
+    #[test]
+    fn legacy_signature_still_verifies() {
+        let key = "test-key-123";
+        let auth = ServerAuth::hmac(key.to_string(), false);
+        let ts = chrono::Utc::now().timestamp().to_string();
+        let sig = client_sig(key, &ts, "n1", "GET", "/api/v1/projects", None);
+        assert!(auth.verify_signature(&ts, "n1", "GET", "/api/v1/projects", &sig, None));
+    }
+
+    #[test]
+    fn body_signed_signature_verifies_and_binds_body() {
+        let key = "test-key-123";
+        let auth = ServerAuth::hmac(key.to_string(), false);
+        let ts = chrono::Utc::now().timestamp().to_string();
+        let body = br#"{"text":"hello"}"#;
+        let digest = sha256_hex(body);
+        let sig = client_sig(
+            key,
+            &ts,
+            "n2",
+            "POST",
+            "/api/v1/tray/send-prompt",
+            Some(&digest),
+        );
+        // Correct digest verifies.
+        assert!(auth.verify_signature(
+            &ts,
+            "n2",
+            "POST",
+            "/api/v1/tray/send-prompt",
+            &sig,
+            Some(&digest)
+        ));
+        // A tampered body yields a different digest → same signature no longer
+        // matches (new nonce to dodge replay purge).
+        let tampered = sha256_hex(br#"{"text":"HELLO EVIL"}"#);
+        assert!(!auth.verify_signature(
+            &ts,
+            "n3",
+            "POST",
+            "/api/v1/tray/send-prompt",
+            &sig,
+            Some(&tampered)
+        ));
+    }
+
+    #[test]
+    fn scheme_versions_do_not_cross_verify() {
+        // A legacy-signed signature must not validate under the v2 (body) msg
+        // and vice-versa, so a MITM can't strip the digest field.
+        let key = "k";
+        let auth = ServerAuth::hmac(key.to_string(), false);
+        let ts = chrono::Utc::now().timestamp().to_string();
+        let digest = sha256_hex(b"{}");
+        let legacy_sig = client_sig(key, &ts, "a", "POST", "/p", None);
+        assert!(!auth.verify_signature(&ts, "a", "POST", "/p", &legacy_sig, Some(&digest)));
+        let v2_sig = client_sig(key, &ts, "b", "POST", "/p", Some(&digest));
+        assert!(!auth.verify_signature(&ts, "b", "POST", "/p", &v2_sig, None));
+    }
+
+    #[test]
+    fn sender_allowlist_semantics() {
+        // Empty allowlist ⇒ enforcement off, everything allowed.
+        let open = ServerAuth::hmac("k".to_string(), false);
+        assert!(open.sender_allowlist.is_empty());
+        assert!(open.sender_allowed(None));
+        assert!(open.sender_allowed(Some("anyone")));
+
+        // Non-empty ⇒ fail closed.
+        let mut gated = ServerAuth::hmac("k".to_string(), false);
+        gated.sender_allowlist = vec!["nanobot".into(), "grove-web".into()];
+        assert!(gated.sender_allowed(Some("nanobot")));
+        assert!(gated.sender_allowed(Some("grove-web")));
+        assert!(!gated.sender_allowed(Some("intruder")));
+        assert!(!gated.sender_allowed(None));
     }
 }

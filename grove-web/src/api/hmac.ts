@@ -143,3 +143,19 @@ export async function hmacSha256Hex(key: string, message: string): Promise<strin
 
   return toHex(hmacSha256(keyBytes, msgBytes));
 }
+
+/**
+ * SHA-256 of a UTF-8 string, hex-encoded. Used for A2 body integrity — the
+ * digest of a request body is folded into the HMAC message. Must match the
+ * Rust server's `sha256_hex(body_bytes)` over the exact bytes fetch sends,
+ * i.e. the UTF-8 encoding of the JSON string. Prefers `crypto.subtle` and
+ * falls back to the pure-JS implementation on plain HTTP.
+ */
+export async function sha256Hex(message: string): Promise<string> {
+  const bytes = encoder.encode(message);
+  if (hasSubtle) {
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    return toHex(new Uint8Array(digest));
+  }
+  return toHex(sha256(bytes));
+}
