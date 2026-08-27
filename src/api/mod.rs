@@ -289,6 +289,13 @@ pub fn create_api_router() -> Router {
             "/projects/{id}/tasks/{taskId}/chats/archived",
             get(handlers::acp::list_archived_chats),
         )
+        // Authoritative live-chat resolver for the two-way-comms `message` verb:
+        // only chats with a live ACP handle in this process, tagged status +
+        // launch_mode. Never resolve a steer target from persisted `chats`.
+        .route(
+            "/projects/{id}/tasks/{taskId}/live-chats",
+            get(handlers::walkie_talkie::get_task_live_chats),
+        )
         .route(
             "/projects/{id}/tasks/{taskId}/chats/{chatId}/archive",
             post(handlers::acp::archive_chat),

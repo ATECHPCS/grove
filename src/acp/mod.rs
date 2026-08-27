@@ -8498,8 +8498,8 @@ pub fn snapshot_active_chats() -> Vec<crate::api::handlers::walkie_talkie::ChatS
         .unwrap_or_default();
     // (project_key, task_id) -> task_name
     let mut task_names: HashMap<(String, String), Option<String>> = HashMap::new();
-    // (project_key, task_id, chat_id) -> (title, agent)
-    let mut chat_info: HashMap<(String, String, String), (String, String)> = HashMap::new();
+    // (project_key, task_id, chat_id) -> (title, agent, launch_mode)
+    let mut chat_info: HashMap<(String, String, String), (String, String, String)> = HashMap::new();
     let mut chats_loaded: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
 
@@ -8525,15 +8525,15 @@ pub fn snapshot_active_chats() -> Vec<crate::api::handlers::walkie_talkie::ChatS
                 for c in chats {
                     chat_info.insert(
                         (project_key.clone(), task_id.clone(), c.id.clone()),
-                        (c.title, c.agent),
+                        (c.title, c.agent, c.launch_mode),
                     );
                 }
             }
         }
-        let (chat_title, agent) = chat_info
+        let (chat_title, agent, launch_mode) = chat_info
             .get(&(project_key.clone(), task_id.clone(), chat_id.clone()))
-            .map(|(t, a)| (Some(t.clone()), Some(a.clone())))
-            .unwrap_or((None, None));
+            .map(|(t, a, lm)| (Some(t.clone()), Some(a.clone()), Some(lm.clone())))
+            .unwrap_or((None, None, None));
 
         let status = handle.derive_node_status();
         let permission = if status == "permission_required" {
@@ -8566,6 +8566,7 @@ pub fn snapshot_active_chats() -> Vec<crate::api::handlers::walkie_talkie::ChatS
             task_name,
             chat_title,
             agent,
+            launch_mode,
             status: status.to_string(),
             permission,
             prompt,
