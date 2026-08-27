@@ -90,7 +90,15 @@ export function clearRadioToken() {
 
 // ─── HMAC-SHA256 signing ─────────────────────────────────────────────────────
 
-import { hmacSha256Hex } from './hmac';
+import { hmacSha256Hex, sha256Hex } from './hmac';
+
+/**
+ * A4 provenance tag sent as `X-Grove-Sender`. With a shared symmetric HMAC key
+ * this is not a cryptographic identity — it's an audit tag / allowlist key so
+ * the server can gate or cut off a sender on the sensitive prompt-injection
+ * routes independently of key rotation.
+ */
+const GROVE_SENDER = 'grove-web';
 
 /** Compute HMAC-SHA256(sk, message) and return hex string. */
 export async function computeHmac(message: string): Promise<string | null> {
@@ -141,26 +149,39 @@ export function canonicalPath(path: string, excludeKeys: string[] = []): string 
   return `${pathname}?${pairs.map(([k, v]) => `${k}=${v}`).join('&')}`;
 }
 
-/** Sign a request and return {timestamp, nonce, signature}. */
+/**
+ * Sign a request and return {timestamp, nonce, signature}. When `bodySha` is
+ * given (A2 body integrity), it is folded into the signed message as a trailing
+ * `|<digest>` field, binding the body so a LAN MITM can't rewrite it. Mirrors
+ * the Rust server's `verify_signature`.
+ */
 async function signRequest(
   method: string,
   path: string,
+  bodySha?: string,
 ): Promise<{ timestamp: string; nonce: string; signature: string } | null> {
   const sk = getSecretKey();
   if (!sk) return null;
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const nonce = generateNonce();
   const canonical = canonicalPath(path);
-  const message = `${timestamp}|${nonce}|${method}|${canonical}`;
+  const message = bodySha
+    ? `${timestamp}|${nonce}|${method}|${canonical}|${bodySha}`
+    : `${timestamp}|${nonce}|${method}|${canonical}`;
   const signature = await computeHmac(message);
   if (!signature) return null;
   return { timestamp, nonce, signature };
 }
 
-/** Build HMAC auth headers for an HTTP request. */
+/**
+ * Build HMAC auth headers for an HTTP request. Pass the exact request body
+ * string (`bodyStr`) for writes so its SHA-256 is folded into the signature
+ * and echoed in `X-Body-Sha256`; omit it for bodyless GET/DELETE.
+ */
 async function getSignedHeaders(
   method: string,
   path: string,
+  bodyStr?: string,
 ): Promise<Record<string, string>> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -173,16 +194,22 @@ async function getSignedHeaders(
     return headers;
   }
 
-  const sig = await signRequest(method, path);
+  const bodySha = bodyStr !== undefined ? await sha256Hex(bodyStr) : undefined;
+  const sig = await signRequest(method, path, bodySha);
   if (sig) {
     headers['X-Timestamp'] = sig.timestamp;
     headers['X-Nonce'] = sig.nonce;
     headers['X-Signature'] = sig.signature;
+    if (bodySha) headers['X-Body-Sha256'] = bodySha;
+    headers['X-Grove-Sender'] = GROVE_SENDER;
   }
   return headers;
 }
 
-/** Build auth-only headers (no Content-Type — for FormData uploads). */
+/** Build auth-only headers (no Content-Type — for FormData / binary uploads).
+ *  These bodies aren't JSON-string digestible here and never hit a sensitive
+ *  route, so they stay on the legacy (body-less) signature; the sender tag is
+ *  still attached. */
 async function getAuthOnlyHeaders(
   method: string,
   path: string,
@@ -201,6 +228,7 @@ async function getAuthOnlyHeaders(
     headers['X-Timestamp'] = sig.timestamp;
     headers['X-Nonce'] = sig.nonce;
     headers['X-Signature'] = sig.signature;
+    headers['X-Grove-Sender'] = GROVE_SENDER;
   }
   return headers;
 }
@@ -324,10 +352,11 @@ class ApiClient {
   }
 
   async patch<T, R>(path: string, data: T, signal?: AbortSignal): Promise<R> {
+    const bodyStr = JSON.stringify(data);
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: 'PATCH',
-      headers: await getSignedHeaders('PATCH', path),
-      body: JSON.stringify(data),
+      headers: await getSignedHeaders('PATCH', path, bodyStr),
+      body: bodyStr,
       signal,
     });
 
@@ -349,10 +378,11 @@ class ApiClient {
   }
 
   async post<T, R>(path: string, data?: T): Promise<R> {
+    const bodyStr = data ? JSON.stringify(data) : undefined;
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: 'POST',
-      headers: await getSignedHeaders('POST', path),
-      body: data ? JSON.stringify(data) : undefined,
+      headers: await getSignedHeaders('POST', path, bodyStr),
+      body: bodyStr,
     });
 
     if (!response.ok) {
@@ -377,10 +407,11 @@ class ApiClient {
    * streaming body — e.g. the plugin exec NDJSON stream. Throws on non-2xx.
    */
   async postStream<T>(path: string, data?: T): Promise<Response> {
+    const bodyStr = data ? JSON.stringify(data) : undefined;
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: 'POST',
-      headers: await getSignedHeaders('POST', path),
-      body: data ? JSON.stringify(data) : undefined,
+      headers: await getSignedHeaders('POST', path, bodyStr),
+      body: bodyStr,
     });
     if (!response.ok) {
       const payload = await extractErrorPayload(response);
@@ -488,10 +519,11 @@ class ApiClient {
    * only.
    */
   async putKeepalive<T>(path: string, data: T): Promise<void> {
+    const bodyStr = JSON.stringify(data);
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: 'PUT',
-      headers: await getSignedHeaders('PUT', path),
-      body: JSON.stringify(data),
+      headers: await getSignedHeaders('PUT', path, bodyStr),
+      body: bodyStr,
       keepalive: true,
     });
     if (!response.ok) {
@@ -505,10 +537,11 @@ class ApiClient {
   }
 
   async put<T, R>(path: string, data: T): Promise<R> {
+    const bodyStr = JSON.stringify(data);
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: 'PUT',
-      headers: await getSignedHeaders('PUT', path),
-      body: JSON.stringify(data),
+      headers: await getSignedHeaders('PUT', path, bodyStr),
+      body: bodyStr,
     });
 
     if (!response.ok) {
