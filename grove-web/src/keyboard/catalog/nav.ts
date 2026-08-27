@@ -56,6 +56,14 @@ export const NAV_COMMANDS: CommandDef[] = [
     passThroughTextInput: true,
   },
   {
+    id: "nav.globalboard",
+    name: "Go to All Boards (global)",
+    category: "Navigation",
+    // Cross-project board — reachable from any project (or Blitz). No default
+    // binding to avoid clashing with the per-project Mod+N nav shortcuts.
+    passThroughTextInput: true,
+  },
+  {
     id: "nav.memory",
     name: "Go to Memory",
     category: "Navigation",

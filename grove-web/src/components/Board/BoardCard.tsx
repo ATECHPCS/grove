@@ -9,10 +9,10 @@ interface BoardCardProps {
   card: BoardCardData;
   /** TODO/PLANNED cards are user-draggable; IN WORK/COMPLETED are locked. */
   draggable: boolean;
-  onDragStart: (e: React.DragEvent, taskId: string) => void;
+  onDragStart: (e: React.DragEvent, taskId: string, projectId: string) => void;
   onDragEnd: () => void;
   /** Open this task's live workspace (chat / terminal / diff). */
-  onOpen?: (taskId: string, isLocal: boolean) => void;
+  onOpen?: (taskId: string, isLocal: boolean, projectId: string) => void;
   /** True while a stage/start mutation for this card is in flight. */
   pending?: boolean;
 }
@@ -37,9 +37,9 @@ export function BoardCard({
   return (
     <div
       draggable={draggable}
-      onDragStart={(e) => onDragStart(e, task.id)}
+      onDragStart={(e) => onDragStart(e, task.id, card.projectId)}
       onDragEnd={onDragEnd}
-      onClick={onOpen ? () => onOpen(task.id, task.isLocal ?? false) : undefined}
+      onClick={onOpen ? () => onOpen(task.id, task.isLocal ?? false, card.projectId) : undefined}
       title={onOpen ? "Open task workspace" : undefined}
       className={[
         "group relative rounded-xl p-3 select-none",

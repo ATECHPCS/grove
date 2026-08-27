@@ -22,6 +22,15 @@ interface ProjectContextType {
   /** ID of the project matching the server's current working directory */
   currentProjectId: string | null;
   selectProject: (project: Project | null) => void;
+  /**
+   * Select a project by id, resolving the full object ourselves. If the id
+   * isn't in the loaded list (e.g. a project registered out-of-band this
+   * session), its details are fetched directly rather than relying on the list
+   * being current. Resolves to `true` when a project was selected, `false`
+   * when the id couldn't be resolved. Use this for cross-project navigation
+   * (e.g. the global board) where the caller only has an id.
+   */
+  selectProjectById: (id: string) => Promise<boolean>;
   addProject: (path: string, name?: string) => Promise<Project>;
   createNewProject: (parentDir: string, name: string, initGit: boolean, projectType?: string) => Promise<Project>;
   cloneProject: (url: string, name?: string) => Promise<Project>;
@@ -219,6 +228,26 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
     [loadProjectDetails]
   );
 
+  const selectProjectById = useCallback(
+    async (id: string): Promise<boolean> => {
+      const existing = projects.find((p) => p.id === id);
+      if (existing) {
+        selectProject(existing);
+        return true;
+      }
+      // Not in the loaded list — fetch its details directly and select it
+      // (no dependence on the list being refreshed first), then reconcile the
+      // list in the background.
+      const full = await loadProjectDetails(id);
+      if (!full) return false;
+      setSelectedProject(full);
+      localStorage.setItem("grove-selected-project", full.id);
+      void loadProjects();
+      return true;
+    },
+    [projects, selectProject, loadProjectDetails, loadProjects]
+  );
+
   const addProject = useCallback(
     async (path: string, name?: string): Promise<Project> => {
       const response = await apiAddProject(path, name);
@@ -331,6 +360,7 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
         projects,
         currentProjectId,
         selectProject,
+        selectProjectById,
         addProject,
         createNewProject,
         cloneProject,

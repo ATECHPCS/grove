@@ -7,7 +7,7 @@
 // Live updates arrive via the shared Radio socket (useBoardTasks).
 
 import { useCallback, useMemo, useRef, useState } from "react";
-import { SquareKanban, Plus, Loader2, X, Settings } from "lucide-react";
+import { SquareKanban, Plus, Loader2, X, Settings, Layers } from "lucide-react";
 import { dispatchTask, moveTaskStage, startTask } from "../../api";
 import { useBoardTasks } from "./useBoardTasks";
 import { BoardColumn } from "./BoardColumn";
@@ -19,9 +19,11 @@ const DRAG_MIME = "application/x-grove-task";
 interface BoardPageProps {
   /** Open a task's live workspace (chat / terminal / diff) when its card is clicked. */
   onOpenTask?: (taskId: string, isLocal: boolean) => void;
+  /** Switch to the cross-project global board. */
+  onViewAllProjects?: () => void;
 }
 
-export function BoardPage({ onOpenTask }: BoardPageProps = {}) {
+export function BoardPage({ onOpenTask, onViewAllProjects }: BoardPageProps = {}) {
   const {
     byColumn,
     cards,
@@ -85,7 +87,8 @@ export function BoardPage({ onOpenTask }: BoardPageProps = {}) {
       const card = cardsById.get(taskId);
       if (!card || card.column === target) return;
 
-      setPendingTaskId(taskId);
+      // Composite key so BoardColumn's `${projectId}:${taskId}` match holds.
+      setPendingTaskId(`${projectId}:${taskId}`);
       setError(null);
       try {
         if (target === "planned") {
@@ -172,6 +175,17 @@ export function BoardPage({ onOpenTask }: BoardPageProps = {}) {
           )}
         </div>
         <div className="flex items-center gap-2">
+          {onViewAllProjects && (
+            <button
+              type="button"
+              onClick={onViewAllProjects}
+              title="View all projects"
+              className="inline-flex items-center gap-1.5 px-2.5 h-8 rounded-lg text-sm text-[var(--color-text-muted)] hover:bg-[var(--color-bg-tertiary)] hover:text-[var(--color-text)] transition-colors"
+            >
+              <Layers className="w-4 h-4" />
+              All boards
+            </button>
+          )}
           {projectId && !isStudio && (
             <button
               type="button"

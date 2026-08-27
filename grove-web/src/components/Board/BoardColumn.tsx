@@ -23,13 +23,13 @@ interface BoardColumnProps {
   cards: BoardCardData[];
   isDropTarget: boolean;
   pendingTaskId: string | null;
-  onDragStart: (e: React.DragEvent, taskId: string) => void;
+  onDragStart: (e: React.DragEvent, taskId: string, projectId: string) => void;
   onDragEnd: () => void;
   onDragOverColumn: (e: React.DragEvent, column: ColumnId) => void;
   onDragLeaveColumn: (column: ColumnId) => void;
   onDropColumn: (e: React.DragEvent, column: ColumnId) => void;
   /** Open a card's live workspace on click. */
-  onOpenCard?: (taskId: string, isLocal: boolean) => void;
+  onOpenCard?: (taskId: string, isLocal: boolean, projectId: string) => void;
 }
 
 export function BoardColumn({
@@ -78,7 +78,7 @@ export function BoardColumn({
             key={`${card.projectId}:${card.task.id}`}
             card={card}
             draggable={def.droppable}
-            pending={pendingTaskId === card.task.id}
+            pending={pendingTaskId === `${card.projectId}:${card.task.id}`}
             onDragStart={onDragStart}
             onDragEnd={onDragEnd}
             onOpen={onOpenCard}
