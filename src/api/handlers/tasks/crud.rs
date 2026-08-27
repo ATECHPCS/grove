@@ -624,12 +624,7 @@ fn resolve_agent(
         .unwrap_or_else(|| "claude-acp".to_string())
 }
 
-fn build_dispatch_prompt(
-    title: &str,
-    body: Option<&str>,
-    preamble: &str,
-    rules: &str,
-) -> String {
+fn build_dispatch_prompt(title: &str, body: Option<&str>, preamble: &str, rules: &str) -> String {
     let mut p = String::new();
     // Per-project preamble is prepended; the hardcoded closing instruction
     // below always remains, so the agent is never left without a commit step.
@@ -757,7 +752,11 @@ pub async fn dispatch_task(
                 .filter(|t| !t.trim().is_empty())
                 .or_else(|| {
                     let d = default_target.trim();
-                    if d.is_empty() { None } else { Some(d.to_string()) }
+                    if d.is_empty() {
+                        None
+                    } else {
+                        Some(d.to_string())
+                    }
                 })
                 .unwrap_or_else(|| {
                     git::current_branch(&ppath).unwrap_or_else(|_| "main".to_string())
@@ -847,9 +846,7 @@ pub async fn dispatch_task(
         })
         .await
         {
-            Ok(Ok(tasks::StageMove::Moved { board_order })) => {
-                ("ongoing".to_string(), board_order)
-            }
+            Ok(Ok(tasks::StageMove::Moved { board_order })) => ("ongoing".to_string(), board_order),
             _ => (board_column, board_order),
         }
     } else {
