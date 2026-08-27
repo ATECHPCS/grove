@@ -188,22 +188,9 @@ impl ServerAuth {
             return false;
         }
 
-        // 2. Nonce replay check
-        {
-            let mut nonces = self.used_nonces.lock().expect("nonce lock poisoned");
-
-            if nonces.contains_key(nonce) {
-                return false; // replay
-            }
-
-            // Record this nonce
-            nonces.insert(nonce.to_string(), ts);
-
-            // Purge stale nonces (> 120 s old)
-            nonces.retain(|_, &mut t| (now - t).abs() <= 120);
-        }
-
-        // 3. Compute expected HMAC
+        // 2. Compute expected HMAC and verify in constant time — BEFORE touching
+        //    the nonce map, so a request with an invalid signature can't consume
+        //    (and thereby poison or pre-empt) a nonce it never legitimately held.
         let message = match body_sha256 {
             Some(digest) => format!("{}|{}|{}|{}|{}", timestamp, nonce, method, path, digest),
             None => format!("{}|{}|{}|{}", timestamp, nonce, method, path),
@@ -211,10 +198,31 @@ impl ServerAuth {
         let mut mac =
             HmacSha256::new_from_slice(sk.as_bytes()).expect("HMAC accepts any key length");
         mac.update(message.as_bytes());
-        let expected = hex::encode(mac.finalize().into_bytes());
+        // Decode the client-supplied hex signature and compare via the MAC's
+        // constant-time `verify_slice` (avoids a timing side-channel on the tag).
+        // A malformed hex signature simply fails to decode and is rejected.
+        let provided = match hex::decode(signature) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        if mac.verify_slice(&provided).is_err() {
+            return false;
+        }
 
-        // Constant-time-ish comparison (hex strings, both lowercase)
-        expected == signature
+        // 3. Signature is valid → enforce single-use of the nonce. Check and
+        //    insert atomically under the lock so concurrent replays of the same
+        //    valid request can't both slip through.
+        {
+            let mut nonces = self.used_nonces.lock().expect("nonce lock poisoned");
+            if nonces.contains_key(nonce) {
+                return false; // replay
+            }
+            nonces.insert(nonce.to_string(), ts);
+            // Purge stale nonces (> 120 s old)
+            nonces.retain(|_, &mut t| (now - t).abs() <= 120);
+        }
+
+        true
     }
 }
 
@@ -301,6 +309,26 @@ pub fn canonical_path(path: &str, query: Option<&str>, exclude_keys: &[&str]) ->
 /// JSON), so 32 MB leaves generous headroom while capping abuse.
 const MAX_SIGNED_BODY: usize = 32 * 1024 * 1024;
 
+/// `Content-Length` header as a `usize`, if present and parseable.
+fn content_length(headers: &axum::http::HeaderMap) -> Option<usize> {
+    headers
+        .get(axum::http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
+/// Is `timestamp` within the ±60 s signing window? Mirrors the first check in
+/// [`ServerAuth::verify_signature`] so the middleware can reject a stale (or
+/// far-future) request *before* buffering its body.
+fn timestamp_fresh(timestamp: &str) -> bool {
+    match timestamp.parse::<i64>() {
+        Ok(ts) => (chrono::Utc::now().timestamp() - ts).abs() <= 60,
+        Err(_) => false,
+    }
+}
+
 /// Lowercase-hex SHA-256 of `bytes`.
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
@@ -364,12 +392,40 @@ pub async fn auth_middleware(
         return (StatusCode::UNAUTHORIZED, "body integrity required").into_response();
     }
 
+    // A2/A4 hardening: a sensitive route may ONLY be satisfied by the header-
+    // carried v2 (body-signed) branch below. The query-string fallback verifies
+    // a body-less legacy message and forwards the body unverified — so without
+    // this guard a sensitive POST that omits the HMAC headers but supplies
+    // ts/nonce/sig in the query (plus a bogus x-body-sha256 to clear the gate
+    // above) would slip past body-binding and the sender allowlist entirely.
+    if sensitive && from_headers.is_none() {
+        auth.audit(&method, &path, sender.as_deref(), "reject:no-header-creds");
+        return (StatusCode::UNAUTHORIZED, "body integrity required").into_response();
+    }
+
     if let Some((ts, nonce, sig)) = from_headers {
         let canonical = canonical_path(&path, query.as_deref(), &[]);
 
         // v2 (body-signed): buffer the body, digest it ourselves, fold the
         // recomputed digest into the verification, then rebuild the request.
         if let Some(claimed) = body_sha_header {
+            // Cheap pre-buffer rejections so a bogus request can't force us to
+            // read up to MAX_SIGNED_BODY before any auth work happens:
+            //  - a declared Content-Length past the cap is refused outright;
+            //  - a timestamp outside the signing window is refused before the
+            //    body is read (verify_signature re-checks it afterward too).
+            if content_length(request.headers()).is_some_and(|len| len > MAX_SIGNED_BODY) {
+                if sensitive {
+                    auth.audit(&method, &path, sender.as_deref(), "reject:body-too-large");
+                }
+                return (StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();
+            }
+            if !timestamp_fresh(&ts) {
+                if sensitive {
+                    auth.audit(&method, &path, sender.as_deref(), "reject:stale-timestamp");
+                }
+                return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
+            }
             let (parts, body) = request.into_parts();
             let bytes = match axum::body::to_bytes(body, MAX_SIGNED_BODY).await {
                 Ok(b) => b,
@@ -622,12 +678,15 @@ mod tests {
             &sig,
             Some(&digest)
         ));
-        // A tampered body yields a different digest → same signature no longer
-        // matches (new nonce to dodge replay purge).
+        // Body-binding proof: change ONLY the digest — same ts, same nonce, same
+        // signature — on a FRESH auth so the nonce map is empty and can't be the
+        // reason it fails. A tampered body yields a different digest, so the
+        // (still valid, still unused) signature must no longer verify.
+        let auth2 = ServerAuth::hmac(key.to_string(), false);
         let tampered = sha256_hex(br#"{"text":"HELLO EVIL"}"#);
-        assert!(!auth.verify_signature(
+        assert!(!auth2.verify_signature(
             &ts,
-            "n3",
+            "n2",
             "POST",
             "/api/v1/tray/send-prompt",
             &sig,
