@@ -43,6 +43,12 @@ pub fn create_api_router() -> Router {
     let v1 = Router::new()
         // Version API
         .route("/version", get(handlers::version::get_version))
+        // Capabilities API (F3): agent types + per-project skills/routing +
+        // liveness, consumed by the nanobot file_bug classifier before dispatch.
+        .route(
+            "/capabilities",
+            get(handlers::capabilities::get_capabilities),
+        )
         // Agent usage quota API (Claude Code / Codex / Gemini)
         .route(
             "/agent-usage/{agent}",
