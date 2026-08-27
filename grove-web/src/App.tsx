@@ -45,6 +45,7 @@ import { getConfig, patchConfig, openIDE, openTerminal } from "./api";
 import { listMarketplace } from "./api/marketplace";
 import { setMarketplaceIcons } from "./utils/agentIcon";
 import { useIsMobile, buildCommands, useAddLibraryHashHandler } from "./hooks";
+import { useTaskDeepLink, dropPending as dropTaskDeepLink } from "./hooks/useTaskDeepLink";
 import type { UseCommandsOptions } from "./hooks/useCommands";
 import { REPO_NAV_IDS, STUDIO_NAV_IDS } from "./data/nav";
 import { readLastProjectView, writeLastProjectView } from "./utils/lastProjectView";
@@ -150,6 +151,9 @@ function AppContent() {
   // broadcast to peer tabs. Runs on any landing page — the callback tab
   // can't be guaranteed to land on a sketch view.
   const addLibrary = useAddLibraryHashHandler();
+  // Cold-load task deep-link (#project=<pid>&task=<tid>), parked on mount.
+  // Consumed once projects are loaded, below, via handleOpenGlobalTask.
+  const taskDeepLink = useTaskDeepLink();
 
   const [activeItem, setActiveItem] = useState("dashboard");
   const [tasksMode, setTasksMode] = useState<TasksMode>("zen");
@@ -883,6 +887,18 @@ function AppContent() {
     },
     [selectProjectById],
   );
+
+  // Consume a cold-load task deep-link once projects are available. Fires the
+  // same cross-project open path a notification/tray handoff uses; dropped
+  // after one attempt so a later remount never re-navigates. If the target
+  // card can't be resolved, handleOpenGlobalTask is a no-op — we still drop
+  // the parked link so we don't retry a card that no longer exists.
+  useEffect(() => {
+    if (!taskDeepLink || isLoading || projects.length === 0) return;
+    handleOpenGlobalTask(taskDeepLink.taskId, false, taskDeepLink.projectId);
+    dropTaskDeepLink();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [taskDeepLink, isLoading, projects.length]);
 
   // Register global commands for the command palette
   const toggleMode = useCallback(() => {
