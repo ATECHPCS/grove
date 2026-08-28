@@ -119,3 +119,73 @@ Bigger, riskier structural work, to do only if measurement shows it's needed:
 - Behavioral: switching between chats still shows correct, current history;
   streaming a live turn still renders incrementally; permissions and resume-cancel
   still reconcile correctly after the backend change.
+
+## Tranche 2 — implemented 2026-08-28
+
+Chosen sub-item: **default render windowing** (the O(total)-derivation fix),
+built measure-first. The other tranche-2 items (tail pagination, progressive
+hot-zone mount, scroll-positioning rework) stay deferred — see the assessment
+below.
+
+### Why windowing is the fix
+
+`buildRenderItems` (render-item list) and `buildConversationTurns` (minimap) are
+recomputed from scratch over the **whole** `messages` array on every change
+(`useMemo([messages, isBusy])`). While an assistant streams, each token yields a
+new `messages` reference → both memos rebuild over the entire history, so a
+streaming turn costs **O(history × tokens)**. A render window bounds the derived
+(and mounted) set, making the per-token cost flat regardless of conversation
+length. The projection is turn-local — a completed turn's render items depend
+only on that turn's own messages — so slicing off older turns never changes the
+tail (locked by a test).
+
+### Measurement (autonomous, pre-change)
+
+From `taskChatRenderItems.test.ts` "derivation cost profile" (jsdom on the dev
+box; relative shape is the point, not absolute ms):
+
+```
+   50 turns (  200 msgs)  build=0.6ms   streamReplay(40 tok)= 29ms
+  200 turns (  800 msgs)  build=2.2ms   streamReplay(40 tok)= 48ms
+  800 turns ( 3200 msgs)  build=4.3ms   streamReplay(40 tok)=208ms
+ 2000 turns ( 8000 msgs)  build=7.3ms   streamReplay(40 tok)=171ms
+```
+
+A single from-scratch build grows with total history, and the chat pays one such
+build **per streamed token** — so a 40-token reply on a 3k-message chat burns
+~200ms of main-thread work in derivations alone. Bounding the input at
+`DEFAULT_CHAT_RENDER_WINDOW_LIMIT = 600` (prune trigger 1100) holds each build in
+the ~2ms band no matter how long the chat gets. (Frontend React-profiler
+before/after on a real long chat still wants an interactive `PERF=1` session.)
+
+### Changes
+
+1. **Extraction (no behavior change).** Moved the chat message model
+   (`chatMessageTypes.ts`) and the pure projection builders
+   (`taskChatRenderItems.ts`: `buildRenderItems`, `buildConversationTurns`,
+   `renderItemKey`, `normalizeToolVerb`, `isEditTool`, …) out of the ~14k-line
+   `TaskChat.tsx` into colocated, unit-tested modules — matching the repo's
+   `foo.ts` + `foo.test.ts` convention and unblocking measurement.
+2. **Default render window ON** (`chatRenderWindow.ts`).
+   `normalizeChatRenderWindowSettings` now distinguishes an **unset**
+   `render_window_limit` (→ default 600 / trigger 1100) from an explicit **0**
+   (→ disabled / unbounded, the opt-out is preserved — both used to collapse to
+   0). Chats past ~1100 messages drop their oldest turns from the *view* only;
+   the existing "N earlier messages are hidden" banner already communicates this
+   and the full history stays on disk / served by the history API.
+   `pruneChatViewMessages` (already wired on the load + live-stream paths) is now
+   generic and reused unchanged.
+
+Tests: `taskChatRenderItems.test.ts` (projection golden + turn-locality +
+cost profile) and `chatRenderWindow.test.ts` (defaulting rules, opt-out,
+prune math). All 75 TaskView suite tests pass; tsc + eslint clean.
+
+### Incremental derivations — deferred (assessment)
+
+With the window bounding the input to ≤~1100 messages, each rebuild is already
+~2ms, so memoizing completed turns to avoid re-deriving them per token is a
+constant-factor win with diminishing returns behind the windowing cap. The
+turn-local structure makes it feasible later (cache per-turn render items keyed
+by turn identity, rebuild only the streaming tail), but it is not needed to
+remove the asymptotic blow-up. Revisit only if an interactive PERF session on a
+long chat shows the bounded per-token build is still over budget.
