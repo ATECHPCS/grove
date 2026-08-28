@@ -177,12 +177,11 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY (project, id)
         );
 
-        -- Dedup lookup for dispatched cards. Non-unique: a done/archived card
-        -- can share an origin_key with a fresh re-file (F1 filters on
-        -- non-terminal board_column at query time). Partial index skips the
-        -- many human-created rows whose origin_key is ''.
-        CREATE INDEX IF NOT EXISTS ix_tasks_origin_key
-            ON tasks (project, origin_key) WHERE origin_key <> '';
+        -- NOTE: the ix_tasks_origin_key dedup index is created later in this
+        -- function, AFTER add_column_if_missing adds origin_key to already-
+        -- existing task tables. Creating it here would reference a column that
+        -- does not yet exist on an upgraded DB (the CREATE TABLE above is a
+        -- no-op when the table already exists), panicking startup.
 
         -- Hot path: load_tasks() / load_archived_tasks() filter by
         -- (project, status) and ORDER BY updated_at DESC. The PK alone
