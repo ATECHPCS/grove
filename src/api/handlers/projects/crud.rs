@@ -43,6 +43,8 @@ pub fn storage_task_to_response(task: &tasks::Task) -> TaskResponse {
         multiplexer: task.multiplexer.clone(),
         created_by: task.created_by.clone(),
         is_local: task.is_local,
+        board_column: task.board_column.clone(),
+        board_order: task.board_order,
     }
 }
 
@@ -508,6 +510,8 @@ pub async fn add_project(
         multiplexer: wt.multiplexer,
         created_by: wt.created_by,
         is_local: true,
+        board_column: wt.board_column,
+        board_order: wt.board_order,
     });
 
     let _ = crate::storage::taskgroups::ensure_system_groups();
@@ -610,6 +614,8 @@ pub async fn create_new_project(
             multiplexer: wt.multiplexer,
             created_by: wt.created_by,
             is_local: true,
+            board_column: wt.board_column,
+            board_order: wt.board_order,
         });
         let _ = crate::storage::taskgroups::ensure_system_groups();
         use crate::api::handlers::walkie_talkie::{broadcast_radio_event, RadioEvent};

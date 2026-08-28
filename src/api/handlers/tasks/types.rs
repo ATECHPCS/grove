@@ -94,6 +94,61 @@ pub struct RenameTaskRequest {
     pub name: String,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Composite "create task + auto-start an agent" request (POST /tasks/dispatch).
+/// The single call an external caller (e.g. nanobot) makes to file a bug.
+#[derive(Debug, Deserialize)]
+pub struct DispatchRequest {
+    /// Task title / one-line bug summary.
+    pub title: String,
+    /// Full bug description, sent to the agent as its opening prompt.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Agent id ("claude", "codex", …). Defaults to the configured ACP agent.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Start an agent immediately (default true). When false the card is just
+    /// filed on the board for a human to dispatch later.
+    #[serde(default = "default_true")]
+    pub auto_start: bool,
+    /// Target branch for the worktree (defaults to the project's current branch).
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Initial board column: "todo" or "planned" (default "planned" when
+    /// auto_start, else "todo").
+    #[serde(default)]
+    pub into: Option<String>,
+}
+
+/// Response for POST /tasks/dispatch.
+#[derive(Debug, Serialize)]
+pub struct DispatchResponse {
+    pub task: TaskResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
+    pub board_column: String,
+    /// Whether an agent session was actually started for the task.
+    pub agent_started: bool,
+    /// Reason the agent did not start (task is still created + filed on the
+    /// board). Present only on partial success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_error: Option<String>,
+}
+
+/// Move task to a Kanban board column request
+#[derive(Debug, Deserialize)]
+pub struct MoveStageRequest {
+    /// Target column: "todo" | "planned" | "ongoing" | "done".
+    pub board_column: String,
+    /// Explicit position within the column. When omitted, the task is appended
+    /// to the end of the target column.
+    #[serde(default)]
+    pub board_order: Option<i64>,
+}
+
 /// Notes response
 #[derive(Debug, Serialize)]
 pub struct NotesResponse {

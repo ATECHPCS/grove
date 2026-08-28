@@ -246,6 +246,8 @@ pub async fn create_task(
         multiplexer: result.task.multiplexer.clone(),
         created_by: result.task.created_by.clone(),
         is_local: false,
+        board_column: result.task.board_column.clone(),
+        board_order: result.task.board_order,
     }))
 }
 
@@ -544,6 +546,330 @@ pub async fn rename_task(
 
     // Return the updated task
     get_task(Path((id, task_id))).await
+}
+
+/// Valid Kanban board columns, left → right.
+const BOARD_COLUMNS: [&str; 4] = ["todo", "planned", "ongoing", "done"];
+
+/// PATCH /api/v1/projects/{id}/tasks/{taskId}/stage
+///
+/// Move a task to a board column (kanban stage). Enforces the workflow lock: a
+/// task already in `ongoing` or `done` may only advance to `done` (an in-work
+/// card can be stopped or completed, but not dragged back). Broadcasts
+/// `TaskStageChanged` so open boards update the card live.
+pub async fn move_task_stage(
+    Path((id, task_id)): Path<(String, String)>,
+    Json(req): Json<MoveStageRequest>,
+) -> Result<Json<TaskResponse>, StatusCode> {
+    let (_project, project_key) = common::find_project_by_id(&id)?;
+
+    let target = req.board_column.trim().to_string();
+    if !BOARD_COLUMNS.contains(&target.as_str()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Read-lock-check-write happen atomically in the storage layer under one
+    // DB-connection lock (see tasks::move_task_stage), so concurrent moves
+    // cannot interleave.
+    let pk = project_key.clone();
+    let tid = task_id.clone();
+    let col = target.clone();
+    let explicit = req.board_order;
+    let outcome =
+        tokio::task::spawn_blocking(move || tasks::move_task_stage(&pk, &tid, &col, explicit))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let board_order = match outcome {
+        tasks::StageMove::NotFound => return Err(StatusCode::NOT_FOUND),
+        // Drag-locked: an ongoing/done task may only advance to done.
+        tasks::StageMove::Locked => return Err(StatusCode::CONFLICT),
+        tasks::StageMove::Moved { board_order } => board_order,
+    };
+
+    use crate::api::handlers::walkie_talkie::{broadcast_radio_event, RadioEvent};
+    broadcast_radio_event(RadioEvent::TaskStageChanged {
+        project_id: id.clone(),
+        task_id: task_id.clone(),
+        board_column: target,
+        board_order,
+    });
+
+    get_task(Path((id, task_id))).await
+}
+
+/// Build the opening prompt handed to a dispatched agent.
+fn build_dispatch_prompt(title: &str, body: Option<&str>) -> String {
+    let mut p = format!("# Task: {title}\n\n");
+    if let Some(b) = body {
+        if !b.trim().is_empty() {
+            p.push_str(b.trim());
+            p.push_str("\n\n");
+        }
+    }
+    p.push_str(
+        "Investigate and implement a fix for the above in this worktree. \
+         When you are done, commit your changes with a clear message.",
+    );
+    p
+}
+
+/// POST /api/v1/projects/{id}/tasks/dispatch
+///
+/// Composite "create task + auto-start an agent" for external callers (e.g. the
+/// nanobot bug connector). Creates the task (worktree + branch), files it on the
+/// board in `todo`/`planned`, and — when `auto_start` — creates a chat, starts
+/// the agent headlessly in the worktree, and sends the task body as the opening
+/// prompt. The card stays in its filed column; the board surfaces it as IN WORK
+/// off the live session status, not a persisted `ongoing`.
+///
+/// Partial success is explicit: once the task is created the call returns 200
+/// even if the agent fails to start, with `agent_started:false` and an
+/// `agent_error` reason (the task is still filed for a human to retry).
+///
+/// SECURITY: on the no-auth `grove web` (:3001, loopback) this endpoint lets any
+/// local caller create a task and spawn an auto-approving agent. External
+/// callers must use the HMAC-authenticated mobile server (:3002); :3001 is
+/// loopback-only by design.
+pub async fn dispatch_task(
+    Path(id): Path<String>,
+    Json(req): Json<DispatchRequest>,
+) -> Result<Json<DispatchResponse>, (StatusCode, Json<ApiError>)> {
+    let err = |s: StatusCode, m: &str| {
+        (
+            s,
+            Json(ApiError {
+                error: m.to_string(),
+            }),
+        )
+    };
+
+    let (project, project_key) =
+        common::find_project_by_id(&id).map_err(|s| err(s, "Project not found"))?;
+    let project_path = project.path.clone();
+    let project_name = project.name.clone();
+
+    let title = req.title.trim().to_string();
+    if title.is_empty() || title.len() > 200 {
+        return Err(err(StatusCode::BAD_REQUEST, "title required (1-200 chars)"));
+    }
+    // A card may only be *filed* into todo or planned. ongoing/done are
+    // reached by the agent lifecycle / user action, never as an initial stage.
+    let into = req
+        .into
+        .clone()
+        .unwrap_or_else(|| if req.auto_start { "planned" } else { "todo" }.to_string());
+    if into != "todo" && into != "planned" {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "into must be 'todo' or 'planned'",
+        ));
+    }
+
+    let full_config = storage::config::load_config();
+    let is_studio = project.project_type == workspace::ProjectType::Studio;
+
+    // Validate the agent up front, BEFORE creating a task, so an unknown or
+    // terminal-only agent fails fast without leaving an orphaned worktree.
+    let agent = if req.auto_start {
+        if is_studio {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "auto_start is not supported for Studio projects",
+            ));
+        }
+        let a = crate::storage::installed_agents::canonicalize_agent_id(
+            &req.agent.clone().unwrap_or_else(|| {
+                full_config
+                    .acp
+                    .agent_command
+                    .clone()
+                    .unwrap_or_else(|| "claude-acp".to_string())
+            }),
+        );
+        crate::api::handlers::acp::validate_dispatch_agent(&a)
+            .map_err(|e| err(e.status(), &e.message()))?;
+        Some(a)
+    } else {
+        None
+    };
+
+    // 1. Create the task (+ worktree for repo projects).
+    let pk = project_key.clone();
+    let ppath = project_path.clone();
+    let name = title.clone();
+    let target = req.target.clone();
+    let cfg = full_config.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        if is_studio {
+            crate::operations::tasks::create_studio_task(
+                &ppath,
+                &pk,
+                name,
+                &cfg.default_session_type(),
+                "dispatch",
+            )
+        } else {
+            let target = target.unwrap_or_else(|| {
+                git::current_branch(&ppath).unwrap_or_else(|_| "main".to_string())
+            });
+            crate::operations::tasks::create_task(
+                &ppath,
+                &pk,
+                name,
+                target,
+                &cfg.default_session_type(),
+                &cfg.auto_link.patterns,
+                "dispatch",
+            )
+        }
+    })
+    .await
+    .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "task join error"))?
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("already exists") {
+            err(StatusCode::CONFLICT, &msg)
+        } else {
+            err(StatusCode::INTERNAL_SERVER_ERROR, &msg)
+        }
+    })?;
+
+    let task = result.task;
+
+    // 2. File the new card on the board (from the created default "todo"),
+    //    capturing the atomic move's own result so the response and event
+    //    reflect the true persisted stage without a lossy reload.
+    let (board_column, board_order) = {
+        let pk = project_key.clone();
+        let tid = task.id.clone();
+        let col = into.clone();
+        match tokio::task::spawn_blocking(move || tasks::move_task_stage(&pk, &tid, &col, None))
+            .await
+        {
+            Ok(Ok(tasks::StageMove::Moved { board_order })) => (into.clone(), board_order),
+            other => {
+                // The move should always succeed for a fresh task; if it did
+                // not, the card is still at its created default (todo, order 0).
+                eprintln!(
+                    "[dispatch] failed to file task {} into {}: {:?}",
+                    task.id, into, other
+                );
+                (task.board_column.clone(), task.board_order)
+            }
+        }
+    };
+
+    // 3. Optionally start an agent and hand it the opening prompt. Every failure
+    //    past task creation is non-fatal: the task is already filed, so we
+    //    report the reason via `agent_error` and still return 200.
+    let mut chat_id_out: Option<String> = None;
+    let mut agent_started = false;
+    let mut agent_error: Option<String> = None;
+
+    if let Some(agent) = agent {
+        let chat = tasks::ChatSession {
+            id: tasks::generate_chat_id(),
+            title: crate::api::handlers::acp::default_chat_title(
+                &agent,
+                &full_config,
+                &project_key,
+                &task.id,
+            ),
+            agent: agent.clone(),
+            acp_session_id: None,
+            created_at: chrono::Utc::now(),
+            duty: None,
+            // Headless dispatch drives the agent over ACP, not a PTY.
+            launch_mode: "acp".to_string(),
+        };
+        let chat_id = chat.id.clone();
+        chat_id_out = Some(chat_id.clone());
+
+        let persisted = {
+            let pk = project_key.clone();
+            let tid = task.id.clone();
+            let chat = chat.clone();
+            tokio::task::spawn_blocking(move || tasks::add_chat_session(&pk, &tid, chat)).await
+        };
+
+        match persisted {
+            Ok(Ok(())) => {
+                match crate::api::handlers::acp::start_dispatch_session(
+                    &project_key,
+                    &project_path,
+                    &project_name,
+                    &task,
+                    &chat_id,
+                    &agent,
+                )
+                .await
+                {
+                    Ok((handle, confirmed)) => {
+                        let prompt = build_dispatch_prompt(&title, req.body.as_deref());
+                        match handle
+                            .send_prompt(prompt, vec![], Some("dispatch".to_string()), false, None)
+                            .await
+                        {
+                            Ok(_) => {
+                                agent_started = true;
+                                if !confirmed {
+                                    agent_error = Some(
+                                        "agent start not confirmed within 45s; it may still be initializing"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                agent_error = Some(format!("failed to send opening prompt: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => agent_error = Some(e.message()),
+                }
+                // Let listeners know a chat now exists on this task.
+                crate::api::handlers::walkie_talkie::broadcast_radio_event(
+                    crate::api::handlers::walkie_talkie::RadioEvent::ChatListChanged {
+                        project_id: id.clone(),
+                        task_id: task.id.clone(),
+                    },
+                );
+            }
+            Ok(Err(e)) => {
+                agent_error = Some(format!("failed to persist chat: {e}"));
+                chat_id_out = None;
+            }
+            Err(_) => {
+                agent_error = Some("chat persistence task failed".to_string());
+                chat_id_out = None;
+            }
+        }
+    }
+
+    // 4. Build the response from the created task overlaid with the board
+    //    stage captured from the atomic move (step 2) — no lossy reload.
+    let mut resp_task = task;
+    resp_task.board_column = board_column.clone();
+    resp_task.board_order = board_order;
+
+    // 5. Notify listeners and return.
+    use crate::api::handlers::walkie_talkie::{broadcast_radio_event, RadioEvent};
+    broadcast_radio_event(RadioEvent::GroupChanged);
+    broadcast_radio_event(RadioEvent::TaskStageChanged {
+        project_id: id.clone(),
+        task_id: resp_task.id.clone(),
+        board_column: board_column.clone(),
+        board_order,
+    });
+
+    Ok(Json(DispatchResponse {
+        task: storage_task_to_response(&resp_task),
+        chat_id: chat_id_out,
+        board_column,
+        agent_started,
+        agent_error,
+    }))
 }
 
 /// DELETE /api/v1/projects/{id}/tasks/{taskId}

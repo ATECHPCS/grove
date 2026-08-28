@@ -917,6 +917,8 @@ mod tests {
                 code_deletions: 0,
                 files_changed: 0,
                 is_local: false,
+                board_column: "todo".to_string(),
+                board_order: 0,
             };
             crate::storage::tasks::add_task(&project, task).unwrap();
             Self {

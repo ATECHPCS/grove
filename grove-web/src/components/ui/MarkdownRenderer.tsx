@@ -43,6 +43,22 @@ const markdownSanitizeSchema = {
     ],
   },
 };
+
+// Hoisted so the remark→rehype-raw→sanitize parse is keyed only on the content:
+// passing fresh-identity inline arrays/functions on every render would defeat the
+// per-content parse memo below and re-tokenize every visible message on each
+// parent re-render (e.g. on every streamed token of the active turn).
+const MARKDOWN_REMARK_PLUGINS: React.ComponentProps<typeof ReactMarkdown>["remarkPlugins"] = [remarkGfm];
+const MARKDOWN_REHYPE_PLUGINS: React.ComponentProps<typeof ReactMarkdown>["rehypePlugins"] = [
+  rehypeRaw,
+  [rehypeSanitize, markdownSanitizeSchema],
+];
+const markdownUrlTransform = (url: string): string => {
+  if (url.startsWith("sketch://")) return url;
+  if (/^data:image\//i.test(url)) return url;
+  if (url.startsWith("file://")) return url;
+  return defaultUrlTransform(url);
+};
 import mermaid from "mermaid";
 import { VSCodeIcon } from "./VSCodeIcon";
 import { SketchChip } from "./SketchChip";
@@ -1420,25 +1436,32 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, render
     });
   }, [onFileClick, resolveImageUrl, location, resourceSrcResolver, onMermaidClick, onImageClick, onD2Click, enableRunCommand, sketchContext, sketchRenderMode, enableHeadingIds, onHeadingLinkClick, isDocument]);
 
+  // Parse memo: react-markdown re-runs the full remark→rehype-raw→sanitize
+  // pipeline on every render. `components` is memoized on its handler/config deps
+  // and `processedContent` on the raw content, so a completed message re-parses
+  // only when its content actually changes — not on every parent re-render while
+  // another turn streams.
+  const markdownEl = useMemo(
+    () => (
+      <ReactMarkdown
+        remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+        rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+        components={components}
+        urlTransform={markdownUrlTransform}
+      >
+        {processedContent}
+      </ReactMarkdown>
+    ),
+    [components, processedContent],
+  );
+
   const rendered = (
     <div
       ref={markdownRootRef}
       className={isDocument ? "markdown-document-preview mx-auto max-w-[78rem]" : undefined}
       onCopy={(event) => copySelectedMarkdown(event, markdownRootRef.current)}
     >
-      <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      rehypePlugins={[rehypeRaw, [rehypeSanitize, markdownSanitizeSchema]]}
-      components={components}
-      urlTransform={(url) => {
-        if (url.startsWith("sketch://")) return url;
-        if (/^data:image\//i.test(url)) return url;
-        if (url.startsWith("file://")) return url;
-        return defaultUrlTransform(url);
-      }}
-      >
-        {processedContent}
-      </ReactMarkdown>
+      {markdownEl}
     </div>
   );
   return effectiveComments

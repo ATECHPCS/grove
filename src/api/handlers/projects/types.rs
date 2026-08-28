@@ -55,6 +55,10 @@ pub struct TaskResponse {
     pub multiplexer: String,
     pub created_by: String,
     pub is_local: bool,
+    /// Kanban board column: "todo" | "planned" | "ongoing" | "done".
+    pub board_column: String,
+    /// Ordering position within the board column.
+    pub board_order: i64,
 }
 
 /// Commit response

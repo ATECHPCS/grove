@@ -178,6 +178,34 @@ pub enum TlsMode {
     Custom { cert: String, key: String },
 }
 
+/// Environment variable that pins the mobile server's HMAC secret.
+const MOBILE_PASSKEY_ENV: &str = "GROVE_MOBILE_PASSKEY";
+
+/// Resolve the mobile server's HMAC secret.
+///
+/// Precedence:
+///   1. `GROVE_MOBILE_PASSKEY` env — a pinned, operator-supplied secret. Stable
+///      across restarts, so it is NOT flagged as generated (no ephemerality
+///      banner). This is what pre-shared clients (the nanobot bug connector)
+///      rely on; the value should come from a secret store (1Password) via the
+///      launcher's environment, never from argv.
+///   2. Interactive prompt / auto-generate (see `read_passkey_interactive`).
+///
+/// Returns `(secret, is_generated)`.
+fn resolve_mobile_passkey(public_bind: bool) -> (String, bool) {
+    if let Ok(raw) = std::env::var(MOBILE_PASSKEY_ENV) {
+        let pk = raw.trim().to_string();
+        if !pk.is_empty() {
+            if let Err(msg) = validate_passkey(&pk) {
+                eprintln!("Error: {MOBILE_PASSKEY_ENV} is invalid: {msg}");
+                std::process::exit(2);
+            }
+            return (pk, false);
+        }
+    }
+    read_passkey_interactive(public_bind)
+}
+
 /// Read a passkey interactively, ssh-keygen style.
 ///
 /// - TTY + empty input → auto-generate.
@@ -234,7 +262,13 @@ pub async fn execute_mobile(
     private: bool,
 ) {
     let bind_host = resolve_mobile_host(host, public, private);
-    let (sk, key_is_generated) = read_passkey_interactive(bind_host == "0.0.0.0");
+    // A pinned secret via env (GROVE_MOBILE_PASSKEY) takes precedence over the
+    // interactive prompt / auto-generate. This is the only way to give the
+    // mobile server a *stable* HMAC key across restarts without a TTY — the
+    // no-TTY interactive path auto-generates a fresh key every start, which
+    // breaks any pre-shared client (e.g. the nanobot bug connector). Source the
+    // value from a secret store (1Password) via the launcher's environment.
+    let (sk, key_is_generated) = resolve_mobile_passkey(bind_host == "0.0.0.0");
     let auth = Arc::new(ServerAuth::hmac(sk, key_is_generated));
 
     // Determine TLS mode: --cert/--key implies --tls
@@ -465,5 +499,33 @@ async fn execute_remote_mode(port: u16, no_open: bool, base_url: String) {
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("Server error: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_secret_length_and_shape() {
+        // A pinned GROVE_MOBILE_PASSKEY is validated by `validate_passkey`, so a
+        // secret shaped like `generate_secret_key()` output (64 lowercase hex)
+        // must be accepted — otherwise an operator couldn't pin the same kind of
+        // key the auto-generate path produces.
+        let sk = crate::api::auth::generate_secret_key();
+        assert_eq!(sk.len(), 64, "secret key should be 64 hex chars");
+        assert!(sk.chars().all(|c| c.is_ascii_hexdigit()));
+        // A representative 64-hex key (letters + digits, length 64) validates.
+        let sample = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(validate_passkey(sample).is_ok());
+    }
+
+    #[test]
+    fn validate_passkey_rejects_weak_values() {
+        assert!(validate_passkey("").is_err()); // empty
+        assert!(validate_passkey("short1").is_err()); // < 8 chars
+        assert!(validate_passkey("alllettersonly").is_err()); // no digit
+        assert!(validate_passkey("12345678").is_err()); // no letter
+        assert!(validate_passkey("abc12345").is_ok()); // letters + digits, len 8
     }
 }

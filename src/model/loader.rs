@@ -211,6 +211,8 @@ fn archived_task_to_worktree(task: Task) -> Worktree {
         updated_at: task.updated_at,
         created_by: task.created_by,
         is_local: false,
+        board_column: task.board_column,
+        board_order: task.board_order,
     }
 }
 
@@ -280,6 +282,8 @@ fn task_to_worktree(
             updated_at: task.updated_at,
             created_by: task.created_by.clone(),
             is_local: true,
+            board_column: task.board_column.clone(),
+            board_order: task.board_order,
         };
     }
 
@@ -359,5 +363,7 @@ fn task_to_worktree(
         updated_at: task.updated_at,
         created_by: task.created_by.clone(),
         is_local: false,
+        board_column: task.board_column.clone(),
+        board_order: task.board_order,
     }
 }

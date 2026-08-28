@@ -1382,10 +1382,29 @@ fn restored_available_commands_message(
 }
 
 /// Error type for ACP handler
+#[derive(Debug)]
 pub enum AcpError {
     BadRequest(String),
     NotFound(String),
     Internal(String),
+}
+
+impl AcpError {
+    /// The human-readable message, without the variant wrapper.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            AcpError::BadRequest(s) | AcpError::NotFound(s) | AcpError::Internal(s) => s.clone(),
+        }
+    }
+
+    /// The HTTP status this error maps to.
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            AcpError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AcpError::NotFound(_) => StatusCode::NOT_FOUND,
+            AcpError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
 }
 
 impl IntoResponse for AcpError {
@@ -1512,6 +1531,136 @@ pub(crate) fn build_grove_env(
     env
 }
 
+/// Validate that `agent` (a canonical id) can be launched **headlessly** over
+/// ACP for task dispatch. Rejects unknown agents and terminal-only agents (an
+/// External channel whose registry entry only defines a PTY `terminal_launch`),
+/// which a headless dispatch cannot drive. Call this **before** creating a task
+/// so an invalid agent fails fast without leaving an orphaned worktree.
+///
+/// NOTE: unlike the interactive WebSocket path, dispatch does not apply persona
+/// resolution or per-install arg/env overrides — it uses the same simplified
+/// headless config as the MCP auto-start path. Dispatch is intended for plain
+/// base agents ("claude", "codex", …).
+pub(crate) fn validate_dispatch_agent(agent: &str) -> Result<(), AcpError> {
+    acp::resolve_agent(agent)
+        .ok_or_else(|| AcpError::BadRequest(format!("Unknown agent: {agent}")))?;
+    if let Some(rec) = crate::storage::installed_agents::get(agent).ok().flatten() {
+        if matches!(
+            rec.selected_install_method,
+            crate::storage::installed_agents::InstallMethod::External
+        ) {
+            let terminal_only = crate::storage::agent_registry::get()
+                .agents
+                .iter()
+                .find(|a| a.id == agent)
+                .and_then(|a| a.terminal_launch.as_ref())
+                .is_some();
+            if terminal_only {
+                return Err(AcpError::BadRequest(format!(
+                    "agent {agent} is terminal-only and cannot be dispatched headlessly"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Start (or attach to) an ACP agent session **headlessly** — no WebSocket
+/// client required. Used by task dispatch (POST /tasks/dispatch) to kick an
+/// agent in a worktree. If a session is already registered for this chat it is
+/// reused but reported unconfirmed (registration precedes startup); otherwise a
+/// `WorkingSession` config is built,
+/// `get_or_start_session` spawns the agent, and we wait (bounded) for the
+/// agent to actually reach `SessionReady` before reporting success. Permissions
+/// are auto-approved because a dispatched agent runs autonomously with no human
+/// attached to answer prompts.
+///
+/// Returns `(handle, confirmed)` where `confirmed` is true once the agent
+/// signalled `SessionReady`, and false if the readiness window elapsed while
+/// the agent was still starting (the session is live but unconfirmed — the
+/// prompt still queues). Returns `Err` only when the agent definitively failed
+/// to start (protocol error, auth required, or the session closed).
+pub(crate) async fn start_dispatch_session(
+    project_key: &str,
+    project_path: &str,
+    project_name: &str,
+    task: &tasks::Task,
+    chat_id: &str,
+    agent: &str,
+) -> Result<(std::sync::Arc<acp::AcpSessionHandle>, bool), AcpError> {
+    let session_key = format!("{}:{}:{}", project_key, task.id, chat_id);
+    if let Some(handle) = acp::get_session_handle(&session_key) {
+        // A handle registers before startup finishes, so a pre-existing one is
+        // not proof the agent is ready — report it unconfirmed rather than
+        // claiming readiness we never observed.
+        return Ok((handle, false));
+    }
+
+    validate_dispatch_agent(agent)?;
+    let resolved = acp::resolve_agent(agent)
+        .ok_or_else(|| AcpError::BadRequest(format!("Unknown agent: {agent}")))?;
+    let env_vars = build_grove_env(project_key, project_path, project_name, task, Some(chat_id));
+
+    let config = AcpStartConfig {
+        auto_approve_permissions: true,
+        agent_command: resolved.command,
+        agent_name: resolved.agent_name,
+        agent_args: resolved.args,
+        working_dir: std::path::PathBuf::from(&task.worktree_path),
+        env_vars,
+        project_key: project_key.to_string(),
+        task_id: task.id.clone(),
+        chat_id: Some(chat_id.to_string()),
+        artifact_dir: None,
+        additional_mcp_servers: Vec::new(),
+        mcp_server_policy: acp::McpServerPolicy::WorkingSession,
+        agent_type: resolved.agent_type,
+        remote_url: resolved.url,
+        remote_auth: resolved.auth_header,
+        suppress_initial_connecting: false,
+        import_session: false,
+        persona_injection: None,
+    };
+
+    let (handle, mut rx) = acp::get_or_start_session(session_key, config)
+        .await
+        .map_err(|e| AcpError::Internal(format!("Failed to start agent session: {e}")))?;
+
+    // Wait for the agent to actually initialize before reporting it started.
+    // send_prompt only enqueues, so without this the caller would report
+    // success even if the subprocess fails to spawn or authenticate.
+    use tokio::sync::broadcast::error::RecvError;
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(45), async {
+        loop {
+            match rx.recv().await {
+                Ok(acp::AcpUpdate::SessionReady { .. }) | Ok(acp::AcpUpdate::Complete { .. }) => {
+                    return Ok(())
+                }
+                Ok(acp::AcpUpdate::Error { .. }) => {
+                    return Err("agent reported an error during startup".to_string())
+                }
+                Ok(acp::AcpUpdate::AuthRequired { .. }) | Ok(acp::AcpUpdate::AuthFailed { .. }) => {
+                    return Err("agent requires authentication".to_string())
+                }
+                Ok(_) => continue,
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => {
+                    return Err("agent session closed before becoming ready".to_string())
+                }
+            }
+        }
+    })
+    .await;
+
+    match ready {
+        Ok(Ok(())) => Ok((handle, true)),
+        Ok(Err(msg)) => Err(AcpError::Internal(msg)),
+        // Timed out: the session is live and the prompt will still queue, but we
+        // could not confirm readiness within the window.
+        Err(_) => Ok((handle, false)),
+    }
+}
+
 /// Helper: resolve project key, path, name from project_id path param
 fn resolve_project_key(project_id: &str) -> Result<(String, String, String), AcpError> {
     let projects = workspace::load_projects()
@@ -1568,6 +1717,8 @@ fn resolve_chat_task_context(project_key: &str, task_id: &str) -> Result<tasks::
         code_deletions: 0,
         files_changed: 0,
         is_local: true,
+        board_column: "todo".to_string(),
+        board_order: 0,
     })
 }
 
@@ -2450,9 +2601,14 @@ pub async fn get_chat_history(
     let history = chat_history::load_history(&project_key, &task_id, &chat_id);
     let total = history.len();
     let offset = params.offset.unwrap_or(0).min(total);
-    let events: Vec<ServerMessage> = history[offset..]
-        .iter()
-        .cloned()
+    // Consume the loaded history by value: `ServerMessage::from` takes an owned
+    // AcpUpdate, so `into_iter().skip(offset)` transforms in place instead of
+    // deep-cloning every retained event first (offset is 0 in practice, so the
+    // old `[offset..].iter().cloned()` cloned the entire history — up to tens of
+    // MB of tool/terminal content — purely to feed the map).
+    let events: Vec<ServerMessage> = history
+        .into_iter()
+        .skip(offset)
         .map(ServerMessage::from)
         .collect();
 

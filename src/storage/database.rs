@@ -165,6 +165,10 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             code_additions INTEGER NOT NULL DEFAULT 0,
             code_deletions INTEGER NOT NULL DEFAULT 0,
             files_changed  INTEGER NOT NULL DEFAULT 0,
+            -- kanban board stage (todo|planned|ongoing|done) + intra-column order,
+            -- independent of `status` (active/archived)
+            board_column   TEXT    NOT NULL DEFAULT 'todo',
+            board_order    INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (project, id)
         );
 
@@ -1038,6 +1042,16 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     add_column_if_missing(conn, "tasks", "files_changed", "INTEGER NOT NULL DEFAULT 0")?;
+
+    // Kanban board stage + intra-column order for pre-board task tables.
+    // NOT NULL DEFAULT backfills existing rows to the backlog column.
+    add_column_if_missing(
+        conn,
+        "tasks",
+        "board_column",
+        "TEXT NOT NULL DEFAULT 'todo'",
+    )?;
+    add_column_if_missing(conn, "tasks", "board_order", "INTEGER NOT NULL DEFAULT 0")?;
 
     // Chat session launch mode: "acp" (default, JSON-RPC over stdio) or
     // "terminal" (spawn agent CLI under a PTY, no protocol). Old chats stay

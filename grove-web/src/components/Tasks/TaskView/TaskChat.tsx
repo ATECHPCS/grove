@@ -3110,6 +3110,9 @@ export function TaskChat({
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const wsEventBufferRef = useRef<any[]>([]);
   const historyLoadingRef = useRef(false);
+  // Chats whose full HTTP history load has succeeded this session. Gates the
+  // warm-cache fast path that skips the redundant refetch on re-open.
+  const historyLoadedRef = useRef<Set<string>>(new Set());
 
   const activeChat =
     chats.find((c) => c.id === activeChatId) ??
@@ -4639,6 +4642,11 @@ export function TaskChat({
         // the new connection. (upstream 0.12)
         if (wsMapRef.current.get(chatId) !== ws) return;
         wsMapRef.current.delete(chatId);
+        // The socket detached, so the cache may now miss events. Clear the
+        // warm-cache fast-path flag: the next open must refetch history to
+        // resync anything that happened during the gap (even a quick auto-
+        // reconnect doesn't replay missed history over the WS).
+        historyLoadedRef.current.delete(chatId);
         console.warn(
           `[grove-ws] closed chat ${chatId}: code=${ev.code} reason=${ev.reason || "(none)"} clean=${ev.wasClean} attempt=${reconnectAttemptRef.current.get(chatId) ?? 0}`,
         );
@@ -4793,6 +4801,25 @@ export function TaskChat({
   useEffect(() => {
     if (!activeChatId) return;
     const chatId = activeChatId;
+    // Warm-cache fast path (perf): when this chat's full history already loaded
+    // this session and its live WebSocket is still attached, restoreChatState
+    // (run synchronously in switchChat just before this effect) has already
+    // repainted current state from the per-chat cache, and the socket keeps it
+    // live — with historyLoadingRef=false, handleServerMessage applies new
+    // events straight to the view. So skip the redundant full HTTP refetch +
+    // reduce that would otherwise rebuild and re-replace the entire message
+    // array on every switch, forcing a second full re-render/re-mount/re-measure.
+    if (
+      !isReadOnlyHistory &&
+      initialImportChatIdRef.current !== chatId &&
+      historyLoadedRef.current.has(chatId) &&
+      wsMapRef.current.has(chatId) &&
+      (perChatStateRef.current.get(chatId)?.messages.length ?? 0) > 0
+    ) {
+      historyLoadingRef.current = false;
+      wsRef.current = wsMapRef.current.get(chatId) ?? null;
+      return;
+    }
     const isInitialImport = initialImportChatIdRef.current === chatId;
     historyLoadingRef.current = !isInitialImport;
     if (!isInitialImport) wsEventBufferRef.current = [];
@@ -4846,6 +4873,10 @@ export function TaskChat({
         );
         msgs = prunedHistory.messages;
         setMessages(msgs);
+        // Full history is now in the view (and about to be cached). Future
+        // re-opens of this chat can take the warm-cache fast path above while
+        // its socket stays attached.
+        historyLoadedRef.current.add(chatId);
         updateHiddenMessageCount(prunedHistory.hiddenMessageCount);
         if (historicalPlanEntries) {
           setPlanEntries(historicalPlanEntries);
