@@ -188,17 +188,40 @@ function buildSequentialRenderItems(
   return items;
 }
 
+type RenderItemsSlice = {
+  items: RenderItem[];
+  /** Absolute message index where the final processed turn began — the safe
+   *  restart cursor for the next incremental build (everything before it is
+   *  stable as long as those message refs and positions are unchanged). */
+  lastTurnStartCursor: number;
+  /** Index into `items` where that final turn's items begin. */
+  lastTurnStartItems: number;
+};
+
 /**
  * Keep the live turn chronological, then compact completed turns in the same
  * way command-oriented agents do: everything through the final tool call is
  * one expandable work record, while the answer emitted after that boundary
  * remains fully visible.
+ *
+ * Restartable from `startCursor` (a turn boundary): the loop uses absolute
+ * message indices, so building from a mid-array user index yields exactly the
+ * tail a full build would — this is what lets `buildRenderItemsIncremental`
+ * rebuild only the streaming turn.
  */
-export function buildRenderItems(messages: ChatMessage[], isBusy = false): RenderItem[] {
+function buildRenderItemsFrom(
+  messages: ChatMessage[],
+  isBusy: boolean,
+  startCursor: number,
+): RenderItemsSlice {
   const items: RenderItem[] = [];
-  let cursor = 0;
+  let cursor = startCursor;
+  let lastTurnStartCursor = startCursor;
+  let lastTurnStartItems = 0;
 
   while (cursor < messages.length) {
+    lastTurnStartCursor = cursor;
+    lastTurnStartItems = items.length;
     let userIndex = cursor;
     while (userIndex < messages.length && messages[userIndex].type !== "user") {
       userIndex += 1;
@@ -359,5 +382,89 @@ export function buildRenderItems(messages: ChatMessage[], isBusy = false): Rende
     }
     cursor = nextUserIndex;
   }
-  return items;
+  return { items, lastTurnStartCursor, lastTurnStartItems };
+}
+
+export function buildRenderItems(messages: ChatMessage[], isBusy = false): RenderItem[] {
+  return buildRenderItemsFrom(messages, isBusy, 0).items;
+}
+
+/** Persistent state for `buildRenderItemsIncremental`. Opaque to callers —
+ *  create one per chat surface with `createRenderItemsCache()` and pass it back
+ *  on every build. */
+export type RenderItemsCache = {
+  valid: boolean;
+  messages: ChatMessage[];
+  items: RenderItem[];
+  lastTurnStartCursor: number;
+  lastTurnStartItems: number;
+};
+
+export function createRenderItemsCache(): RenderItemsCache {
+  return {
+    valid: false,
+    messages: [],
+    items: [],
+    lastTurnStartCursor: 0,
+    lastTurnStartItems: 0,
+  };
+}
+
+/**
+ * Incremental equivalent of `buildRenderItems`: reuses the render items of the
+ * already-completed turns and rebuilds only the final (streaming) turn, turning
+ * the per-token cost from O(history) into O(last turn). The result is always
+ * byte-identical to `buildRenderItems(messages, isBusy)` — a completed turn's
+ * projection depends only on its own messages, so any change to the reusable
+ * prefix (an edit, or a front-prune that shifts indices) is detected by a
+ * reference-equality check and falls back to a full rebuild.
+ *
+ * Idempotent: calling twice with the same `messages`/`isBusy` returns the same
+ * result and leaves the cache equivalent (safe under React StrictMode
+ * double-invoke / concurrent re-render — a mismatch only ever costs a full
+ * rebuild, never a wrong result).
+ */
+export function buildRenderItemsIncremental(
+  messages: ChatMessage[],
+  isBusy: boolean,
+  cache: RenderItemsCache,
+): RenderItem[] {
+  const pivot = cache.valid ? cache.lastTurnStartCursor : 0;
+  let reuse =
+    cache.valid &&
+    pivot > 0 &&
+    pivot <= messages.length &&
+    pivot <= cache.messages.length &&
+    cache.lastTurnStartItems <= cache.items.length;
+  if (reuse) {
+    for (let i = 0; i < pivot; i += 1) {
+      if (messages[i] !== cache.messages[i]) {
+        reuse = false;
+        break;
+      }
+    }
+  }
+
+  let result: RenderItem[];
+  let newStartCursor: number;
+  let newStartItems: number;
+  if (reuse) {
+    const prefix = cache.items.slice(0, cache.lastTurnStartItems);
+    const tail = buildRenderItemsFrom(messages, isBusy, pivot);
+    result = prefix.concat(tail.items);
+    newStartCursor = tail.lastTurnStartCursor;
+    newStartItems = cache.lastTurnStartItems + tail.lastTurnStartItems;
+  } else {
+    const full = buildRenderItemsFrom(messages, isBusy, 0);
+    result = full.items;
+    newStartCursor = full.lastTurnStartCursor;
+    newStartItems = full.lastTurnStartItems;
+  }
+
+  cache.valid = true;
+  cache.messages = messages;
+  cache.items = result;
+  cache.lastTurnStartCursor = newStartCursor;
+  cache.lastTurnStartItems = newStartItems;
+  return result;
 }

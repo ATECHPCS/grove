@@ -180,12 +180,32 @@ Tests: `taskChatRenderItems.test.ts` (projection golden + turn-locality +
 cost profile) and `chatRenderWindow.test.ts` (defaulting rules, opt-out,
 prune math). All 75 TaskView suite tests pass; tsc + eslint clean.
 
-### Incremental derivations — deferred (assessment)
+### Incremental derivations — implemented 2026-08-28
 
-With the window bounding the input to ≤~1100 messages, each rebuild is already
-~2ms, so memoizing completed turns to avoid re-deriving them per token is a
-constant-factor win with diminishing returns behind the windowing cap. The
-turn-local structure makes it feasible later (cache per-turn render items keyed
-by turn identity, rebuild only the streaming tail), but it is not needed to
-remove the asymptotic blow-up. Revisit only if an interactive PERF session on a
-long chat shows the bounded per-token build is still over budget.
+`buildRenderItems` refactored into a restartable core (`buildRenderItemsFrom`,
+which takes a start cursor and reports the last turn's boundary) plus
+`buildRenderItemsIncremental(messages, isBusy, cache)`. The cache holds the prior
+result and the last turn's `{startCursor, startItems}`; a build reuses every
+completed turn's items and rebuilds only the streaming turn — O(last turn) per
+token instead of O(history). A reference-equality check on the reusable prefix
+falls back to a full rebuild on any prefix change (an edit, a front-prune that
+shifts indices, or a chat switch). It is idempotent, so React StrictMode /
+concurrent double-invoke is safe (a mismatch only ever costs a full rebuild).
+
+Wired into `TaskChat` behind a `useRef` cache (reset on `activeChatId` change).
+The projection stays byte-identical to the batch builder — proven by a seeded
+400-step randomized append/stream/complete/prune equivalence test plus targeted
+transition tests (`taskChatRenderItems.test.ts`).
+
+Measured (streaming 60 tokens onto a fresh turn atop N prior turns):
+
+```
+  200 prior turns   batch= 29ms   incremental= 3.0ms   ( 9.6× faster)
+  800 prior turns   batch=112ms   incremental= 5.4ms   (20.7× faster)
+ 2000 prior turns   batch=287ms   incremental=11.9ms   (24.1× faster)
+```
+
+This matters most for the unbounded opt-out (`render_window_limit: 0`), where the
+render window provides no bound — incremental keeps streaming flat regardless.
+`buildConversationTurns` (the minimap) is left batch: it is lighter (single
+forEach, no slicing) and the render window already bounds its input.

@@ -136,7 +136,8 @@ import type {
   TurnUsageData,
 } from "./chatMessageTypes";
 import {
-  buildRenderItems,
+  buildRenderItemsIncremental,
+  createRenderItemsCache,
   buildConversationTurns,
   renderItemKey,
   normalizeToolVerb,
@@ -8162,8 +8163,17 @@ export function TaskChat({
     ],
   );
 
+  // Incremental render-item derivation: reuse the completed turns' items and
+  // rebuild only the streaming turn, so a token costs O(last turn) instead of
+  // O(history). Byte-identical to buildRenderItems (see taskChatRenderItems.test);
+  // a front-prune or chat switch changes the message refs, which the cache
+  // detects and falls back to a full rebuild.
+  const renderItemsCacheRef = useRef(createRenderItemsCache());
+  useEffect(() => {
+    renderItemsCacheRef.current = createRenderItemsCache();
+  }, [activeChatId]);
   const renderItems = useMemo(
-    () => buildRenderItems(messages, isBusy),
+    () => buildRenderItemsIncremental(messages, isBusy, renderItemsCacheRef.current),
     [messages, isBusy],
   );
   // The minimap is deliberately derived from the same `messages` state that
