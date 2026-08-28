@@ -75,18 +75,29 @@ cheap content hash so each distinct message body parses once. Streaming
 - Shrinks the hot-zone mount burst (the dominant on-open frontend cost).
 - Isolated to `MarkdownRenderer`; no behavior change to rendered output.
 
-### Option 3 — Collapse the 3× backend history reads per open (backend)
+### Option 3 — Trim the backend HTTP-handler passes (backend)
 
-`load_history` runs up to three times on one open. Reduce to one:
+Original intent was to collapse the up-to-3× `load_history` per open to one.
+Closer reading narrowed the *safe* scope:
 
-- Have the WS permission-reconcile and resume-cancel paths reuse a single
-  in-memory read instead of each calling `load_history` independently, and/or
-- Skip the redundant read-path `prepare_update_for_storage` normalization
-  (already applied at write time) and avoid the extra full clone in the HTTP
-  handler where a borrowing transform suffices.
+- **Removed the full deep clone in `get_chat_history`** (`acp.rs:2595`): the old
+  `history[offset..].iter().cloned().map(ServerMessage::from)` deep-cloned every
+  retained event (up to 32 KB tool/terminal content each) just to feed the map.
+  `ServerMessage::from` takes an owned `AcpUpdate`, so `into_iter().skip(offset)`
+  transforms in place — one fewer full allocation of the whole history, zero
+  behavior change. **Done.**
 
-- Cuts backend open cost ~3×→~1× for long, tool-heavy chats; pure server-side,
-  no protocol/shape change to what the client receives.
+**Deferred as unsafe (documented so we don't retry them blindly):**
+
+- *Skipping the read-path `prepare_update_for_storage`* — it is **not** redundant
+  normalization; it is a live legacy-data migration (`chat_history.rs:134`,
+  `legacy_raw_input/output` → structured `input`/`output`). Dropping it would
+  break rendering of tool calls in older on-disk histories.
+- *Sharing one read across the WS permission-reconcile (`acp.rs:1054`) and
+  resume-cancel (`acp.rs:818` → `cancel_unresolved_events`) paths* — `cancel`
+  **writes** synthetic cancellation events and the reconcile must read the
+  post-write state, so a single pre-cancel read would be incorrect. A true
+  3×→1× needs a cache with invalidation — bigger, riskier, out of this tranche.
 
 ## Out of scope (deferred — tracked for a later tranche)
 

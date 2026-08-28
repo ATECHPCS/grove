@@ -2601,9 +2601,14 @@ pub async fn get_chat_history(
     let history = chat_history::load_history(&project_key, &task_id, &chat_id);
     let total = history.len();
     let offset = params.offset.unwrap_or(0).min(total);
-    let events: Vec<ServerMessage> = history[offset..]
-        .iter()
-        .cloned()
+    // Consume the loaded history by value: `ServerMessage::from` takes an owned
+    // AcpUpdate, so `into_iter().skip(offset)` transforms in place instead of
+    // deep-cloning every retained event first (offset is 0 in practice, so the
+    // old `[offset..].iter().cloned()` cloned the entire history — up to tens of
+    // MB of tool/terminal content — purely to feed the map).
+    let events: Vec<ServerMessage> = history
+        .into_iter()
+        .skip(offset)
         .map(ServerMessage::from)
         .collect();
 
