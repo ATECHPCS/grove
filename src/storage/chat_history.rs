@@ -362,6 +362,35 @@ pub fn load_history(project: &str, task_id: &str, chat_id: &str) -> Vec<AcpUpdat
     history
 }
 
+/// Async wrapper: run the blocking `load_history` file read + JSON parse on a
+/// blocking thread so it never stalls a tokio worker. A big `history.jsonl`
+/// (up to `MAX_HISTORY_READ_BYTES`) parsed on the async runtime blocks every
+/// other future sharing that worker — the cause of the grid-fan-out stall when
+/// K panes each load history at once.
+pub async fn load_history_async(project: &str, task_id: &str, chat_id: &str) -> Vec<AcpUpdate> {
+    let (p, t, c) = (
+        project.to_string(),
+        task_id.to_string(),
+        chat_id.to_string(),
+    );
+    tokio::task::spawn_blocking(move || load_history(&p, &t, &c))
+        .await
+        .unwrap_or_default()
+}
+
+/// Async wrapper for `cancel_unresolved_events` (reads history + appends
+/// synthetic events) — same blocking-thread rationale as `load_history_async`.
+pub async fn cancel_unresolved_events_async(project: &str, task_id: &str, chat_id: &str) -> usize {
+    let (p, t, c) = (
+        project.to_string(),
+        task_id.to_string(),
+        chat_id.to_string(),
+    );
+    tokio::task::spawn_blocking(move || cancel_unresolved_events(&p, &t, &c))
+        .await
+        .unwrap_or(0)
+}
+
 /// On reconnect/history replay, unresolved tool calls and terminal executions are treated
 /// as cancelled and synthetic cancellation events are appended so replayed history is
 /// self-consistent. Unresolved permission requests are intentionally NOT cancelled here —

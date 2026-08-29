@@ -2663,8 +2663,14 @@ export function TaskChat({
   // active chat, nudge the load effect to resync now.
   const markChatNeedsHistoryResync = useCallback(
     (chatId: string) => {
-      historyLoadedRef.current.delete(chatId);
-      if (chatId === getActiveChatId()) setHistoryResyncNonce((n) => n + 1);
+      // Only chats that had already completed a load can go stale. Gating on
+      // Set.delete's "was present" return means a socket blip during the very
+      // first (cold) load — e.g. while K blitz-grid panes connect at once —
+      // never triggers a resync refetch, so the fix can't amplify that storm.
+      const wasLoaded = historyLoadedRef.current.delete(chatId);
+      if (wasLoaded && chatId === getActiveChatId()) {
+        setHistoryResyncNonce((n) => n + 1);
+      }
     },
     [getActiveChatId],
   );

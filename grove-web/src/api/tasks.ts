@@ -1117,15 +1117,47 @@ interface ReconnectChatResponse {
 /**
  * Get incremental chat history (for read-only polling mode)
  */
+// Bound concurrent history fetches. A blitz-grid mode switch mounts K panes that
+// each load their chat's history at once, and every request reads+parses that
+// chat's whole history.jsonl on the backend. Firing all K simultaneously is a
+// thundering herd that stalls every pane; draining a few at a time lets the
+// first panes become interactive quickly instead of all blocking together.
+const HISTORY_FETCH_CONCURRENCY = 3;
+let historyFetchActive = 0;
+const historyFetchWaiters: Array<() => void> = [];
+
+function acquireHistorySlot(): Promise<void> {
+  if (historyFetchActive < HISTORY_FETCH_CONCURRENCY) {
+    historyFetchActive += 1;
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => historyFetchWaiters.push(resolve));
+}
+
+function releaseHistorySlot(): void {
+  const next = historyFetchWaiters.shift();
+  if (next) {
+    // Hand the slot straight to the next waiter — active count is unchanged.
+    next();
+  } else {
+    historyFetchActive -= 1;
+  }
+}
+
 export async function getChatHistory(
   projectId: string,
   taskId: string,
   chatId: string,
   offset: number = 0
 ): Promise<ChatHistoryResponse> {
-  return apiClient.get<ChatHistoryResponse>(
-    `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/history?offset=${offset}`
-  );
+  await acquireHistorySlot();
+  try {
+    return await apiClient.get<ChatHistoryResponse>(
+      `/api/v1/projects/${projectId}/tasks/${taskId}/chats/${chatId}/history?offset=${offset}`
+    );
+  } finally {
+    releaseHistorySlot();
+  }
 }
 
 /**
