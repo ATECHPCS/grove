@@ -2651,6 +2651,23 @@ export function TaskChat({
   // Chats whose full HTTP history load has succeeded this session. Gates the
   // warm-cache fast path that skips the redundant refetch on re-open.
   const historyLoadedRef = useRef<Set<string>>(new Set());
+  // Bumped to force the history-load effect to re-run without an activeChatId
+  // change. Needed because clearing historyLoadedRef alone doesn't re-fire the
+  // effect, and a replacement WebSocket never replays transcript events missed
+  // during a gap — so after a socket drop/replace the active view could sit on
+  // a stale cache until the next navigation (Codex review of the tranche-1
+  // warm-cache guard).
+  const [historyResyncNonce, setHistoryResyncNonce] = useState(0);
+  // A chat's socket was dropped or replaced out from under the warm-cache fast
+  // path. Clear its loaded flag so the next open refetches, and if it's the
+  // active chat, nudge the load effect to resync now.
+  const markChatNeedsHistoryResync = useCallback(
+    (chatId: string) => {
+      historyLoadedRef.current.delete(chatId);
+      if (chatId === getActiveChatId()) setHistoryResyncNonce((n) => n + 1);
+    },
+    [getActiveChatId],
+  );
 
   const activeChat =
     chats.find((c) => c.id === activeChatId) ??
@@ -4181,10 +4198,11 @@ export function TaskChat({
         if (wsMapRef.current.get(chatId) !== ws) return;
         wsMapRef.current.delete(chatId);
         // The socket detached, so the cache may now miss events. Clear the
-        // warm-cache fast-path flag: the next open must refetch history to
-        // resync anything that happened during the gap (even a quick auto-
+        // warm-cache fast-path flag AND, if this is the active chat, resync
+        // now — the next open (or the current view) must refetch history to
+        // recover anything that happened during the gap (even a quick auto-
         // reconnect doesn't replay missed history over the WS).
-        historyLoadedRef.current.delete(chatId);
+        markChatNeedsHistoryResync(chatId);
         console.warn(
           `[grove-ws] closed chat ${chatId}: code=${ev.code} reason=${ev.reason || "(none)"} clean=${ev.wasClean} attempt=${reconnectAttemptRef.current.get(chatId) ?? 0}`,
         );
@@ -4247,7 +4265,7 @@ export function TaskChat({
         }
       };
     },
-    [projectId, taskId, getActiveChatId],
+    [projectId, taskId, getActiveChatId, markChatNeedsHistoryResync],
   );
 
 
@@ -4347,11 +4365,14 @@ export function TaskChat({
     // events straight to the view. So skip the redundant full HTTP refetch +
     // reduce that would otherwise rebuild and re-replace the entire message
     // array on every switch, forcing a second full re-render/re-mount/re-measure.
+    // Require an actually-open socket, not merely a map entry: a CONNECTING /
+    // CLOSING / not-yet-removed CLOSED socket still satisfies `.has()` but
+    // can't be trusted to keep the cache live, so treat those as a cold open.
     if (
       !isReadOnlyHistory &&
       initialImportChatIdRef.current !== chatId &&
       historyLoadedRef.current.has(chatId) &&
-      wsMapRef.current.has(chatId) &&
+      wsMapRef.current.get(chatId)?.readyState === WebSocket.OPEN &&
       (perChatStateRef.current.get(chatId)?.messages.length ?? 0) > 0
     ) {
       historyLoadingRef.current = false;
@@ -4690,7 +4711,7 @@ export function TaskChat({
     // loading after this effect's first run (when launch_mode was still
     // undefined → connectChatWs bailed), the effect re-fires with the
     // resolved mode and routes the chat correctly (ACP WS vs PTY-only).
-  }, [activeChatId, activeChat?.launch_mode, connectChatWs, isReadOnlyHistory, projectId, taskId, updateBusy, chatRenderWindowSettings, updateHiddenMessageCount, getActiveChatId, seedChatDefaults, applyConfigOptionsSnapshot]);
+  }, [activeChatId, historyResyncNonce, activeChat?.launch_mode, connectChatWs, isReadOnlyHistory, projectId, taskId, updateBusy, chatRenderWindowSettings, updateHiddenMessageCount, getActiveChatId, seedChatDefaults, applyConfigOptionsSnapshot]);
 
   // Cleanup all WebSockets on unmount, plus any pending reconnect timers —
   // otherwise an in-flight backoff timer fires after unmount and creates a
@@ -4771,8 +4792,13 @@ export function TaskChat({
           continue;
         }
         // A dead socket lingering in the map makes connectChatWs bail on its
-        // `wsMapRef.has` guard — drop it first.
-        if (ws) wsMapRef.current.delete(chatId);
+        // `wsMapRef.has` guard — drop it first. Its onclose may already have
+        // fired (or never will), so clear the warm-cache flag / resync here
+        // rather than relying on that callback.
+        if (ws) {
+          wsMapRef.current.delete(chatId);
+          markChatNeedsHistoryResync(chatId);
+        }
         console.warn(
           `[grove-ws] reviving dead socket for chat ${chatId} (readyState=${ws?.readyState ?? "none"})`,
         );
@@ -4801,7 +4827,7 @@ export function TaskChat({
       window.removeEventListener("pageshow", onEvent);
       clearInterval(pollId);
     };
-  }, [getActiveChatId]);
+  }, [getActiveChatId, markChatNeedsHistoryResync]);
 
   // GC stale chat drafts from prior sessions on first mount of any
   // TaskChat. Idempotent across mounts thanks to a module-level guard.
@@ -5474,10 +5500,15 @@ export function TaskChat({
             );
             state.messages = pruned.messages;
             state.hiddenMessageCount = pruned.hiddenMessageCount;
+            const wasBusy = state.isBusy;
             state.isBusy = false;
             setSessionActivity((previous) =>
               updateSessionRunning(previous, chatId, false, getActiveChatId()),
             );
+            // A background chat sharing this task's worktree just finished — its
+            // edits change the diff. Nudge the task-level idle callback so the
+            // review panel refreshes without the user re-triggering a busy cycle.
+            if (wasBusy) onChatBecameIdle?.();
           }
           break;
         case "queue_update":
@@ -5495,7 +5526,8 @@ export function TaskChat({
           // 不要保留已发出的消息;cache 的 pendingMessages 会被下一条
           // queue_update 自然覆盖,这里不用手动处理。
           break;
-        case "busy":
+        case "busy": {
+          const wasBusy = state.isBusy;
           state.isBusy = msg.value;
           setSessionActivity((previous) =>
             updateSessionRunning(previous, chatId, msg.value, getActiveChatId()),
@@ -5508,8 +5540,10 @@ export function TaskChat({
             );
             state.messages = pruned.messages;
             state.hiddenMessageCount = pruned.hiddenMessageCount;
+            if (wasBusy) onChatBecameIdle?.();
           }
           break;
+        }
         case "plan_update": {
           const entries = normalizePlanEntries(msg.entries);
           state.planEntries = entries;
@@ -5531,13 +5565,23 @@ export function TaskChat({
             { type: "system", content: "Signed out of the agent." },
           ];
           break;
-        case "session_ended":
+        case "session_ended": {
           state.isConnected = false;
+          // A background session that ended is no longer running. Without this
+          // the cached isBusy / session-rail indicator stays "running" and a
+          // switch-back restores a terminated session as if it were live.
+          const wasBusy = state.isBusy;
+          state.isBusy = false;
+          setSessionActivity((previous) =>
+            updateSessionRunning(previous, chatId, false, getActiveChatId()),
+          );
+          if (wasBusy) onChatBecameIdle?.();
           break;
+        }
       }
       perChatStateRef.current.set(chatId, state);
     },
-    [chatRenderWindowSettings, getActiveChatId],
+    [chatRenderWindowSettings, getActiveChatId, onChatBecameIdle],
   );
 
   // Keep refs in sync so connectChatWs WS handlers always call latest versions
@@ -6229,10 +6273,13 @@ export function TaskChat({
     const existingWs = wsMapRef.current.get(activeChatId);
     if (existingWs) existingWs.close();
     wsMapRef.current.delete(activeChatId);
+    // Replacing the socket bypasses onclose's identity check, so clear the
+    // warm-cache flag here; the reconnect below re-fetches fresh history.
+    markChatNeedsHistoryResync(activeChatId);
     await connectChatWs(activeChatId);
     wsRef.current = wsMapRef.current.get(activeChatId) ?? null;
     setIsTakingControl(false);
-  }, [activeChatId, isTakingControl, projectId, taskId, connectChatWs]);
+  }, [activeChatId, isTakingControl, projectId, taskId, connectChatWs, markChatNeedsHistoryResync]);
 
   const handleSavePlanToNote = useCallback(async () => {
     if (!planFileContent || isSavingToNote) return;
@@ -7076,6 +7123,9 @@ export function TaskChat({
       if (wsMapRef.current.get(chatId) === existingWs) {
         wsMapRef.current.delete(chatId);
       }
+      // Old socket gone; its onclose won't clear the warm-cache flag (identity
+      // no longer matches). Clear it here so the reconnect refetches history.
+      markChatNeedsHistoryResync(chatId);
       intentionalCloseRef.current.delete(chatId);
       connectingRef.current.delete(chatId);
       if (getActiveChatId() === chatId) {
@@ -7108,7 +7158,7 @@ export function TaskChat({
     } finally {
       setIsReconnecting(false);
     }
-  }, [activeChatId, connectChatWs, getActiveChatId, isReconnecting, projectId, taskId, updateBusy]);
+  }, [activeChatId, connectChatWs, getActiveChatId, isReconnecting, projectId, taskId, updateBusy, markChatNeedsHistoryResync]);
 
   const handleReconnect = useCallback(() => {
     if (isReconnecting) return;
