@@ -4567,56 +4567,22 @@ async fn run_acp_session(
         reader = Box::new(r);
         writer = Box::new(w);
     } else {
-        // Pre-warm npm cache for npx-spawned agents. First-run npx fetches
-        // can stall for ~30s; without this hint the user stares at
-        // "Connecting..." not knowing if the app is dead. Run a dummy
-        // `--version` invocation to populate the cache before the real
-        // spawn. The "downloading" UI hint is only emitted if the pre-warm
-        // is *still running* after 1.5s — hot-cache runs (which finish in
-        // <2s) skip the emit entirely so users don't see a confusing flash.
-        //
-        // Heuristic: assumes built-in npx invocations always look like
-        // `npx -y <pkg>`. Custom agents using more exotic forms (e.g.
-        // `npx --package=X cli-name`) may pre-warm the wrong identifier;
-        // since the result is timeout-wrapped and discarded, the worst case
-        // is a no-op that adds a brief delay before the real spawn.
+        // NOTE: we deliberately do NOT pre-warm the npm cache with a separate
+        // `npx -y <pkg> --version` pass here. That ran npx to completion BEFORE
+        // the real spawn below, which itself invokes npx again — i.e. the whole
+        // npx resolve/download cost was paid TWICE on every fresh session start
+        // (measured ~3s warm / ~19s cold for claude-agent-acp, ~12s for
+        // codex-acp). Since `session_ready` can't fire until after the real
+        // spawn anyway, the pre-warm added pure latency for only a "downloading"
+        // progress label. The real spawn already populates the cache; combined
+        // with `--prefer-offline` on the npx args (see storage::installed_agents
+        // ::spawn_for), warm starts skip the registry round-trip entirely.
         if config.agent_command == "npx" {
-            if let Some(pkg) = config
-                .agent_args
-                .iter()
-                .find(|a| !a.starts_with('-'))
-                .cloned()
-            {
-                let prewarm = tokio::process::Command::new("npx")
-                    .args(["-y", &pkg, "--version"])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .kill_on_drop(true)
-                    .status();
-                let prewarm_with_timeout =
-                    tokio::time::timeout(std::time::Duration::from_secs(120), prewarm);
-                tokio::pin!(prewarm_with_timeout);
-                let mut emitted = false;
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1500)) => {
-                        handle.emit(AcpUpdate::ConnectPhase {
-                            phase: "downloading".to_string(),
-                        });
-                        emitted = true;
-                        let _ = (&mut prewarm_with_timeout).await;
-                    }
-                    _ = &mut prewarm_with_timeout => {
-                        // Hot-cache fast path: pre-warm finished before the
-                        // 1.5s threshold; never emit the "downloading" hint.
-                    }
-                }
-                if emitted {
-                    handle.emit(AcpUpdate::ConnectPhase {
-                        phase: "ready".to_string(),
-                    });
-                }
-            }
+            // Surface a one-shot "downloading" hint so a cold first-run fetch
+            // doesn't look like a hang; no extra subprocess, no double cost.
+            handle.emit(AcpUpdate::ConnectPhase {
+                phase: "downloading".to_string(),
+            });
         }
         // Local: 子进程
         // Resolve the program through PATH+PATHEXT before spawning. On Windows
@@ -4988,8 +4954,13 @@ async fn drive_session(
         .and_then(|_| config.env_vars.get("GROVE_MCP_TOKEN"))
         .map(String::as_str);
 
-    // 初始化连接
-    let init_resp = conn
+    // 初始化连接. Bound the handshake: the interactive chat WS path has no
+    // outer readiness timeout (unlike start_dispatch_session's 45s guard), so a
+    // wedged or half-spawned agent binary would otherwise leave the client stuck
+    // on "Connecting…" indefinitely. 60s is generous headroom over a cold node
+    // start; resume/load below stay unbounded on purpose, since replaying a
+    // large history can legitimately take a while.
+    let init_fut = conn
         .send_request(
             acp::InitializeRequest::new(acp::ProtocolVersion::V1)
                 .client_capabilities(grove_client_capabilities())
@@ -4997,8 +4968,12 @@ async fn drive_session(
                     acp::Implementation::new("grove", env!("CARGO_PKG_VERSION")).title("Grove"),
                 ),
         )
-        .block_task()
-        .await?;
+        .block_task();
+    let init_resp = tokio::time::timeout(std::time::Duration::from_secs(60), init_fut)
+        .await
+        .map_err(|_| {
+            acp::Error::internal_error().data("ACP agent did not respond to initialize within 60s")
+        })??;
 
     validate_v1_protocol_version(init_resp.protocol_version)?;
 

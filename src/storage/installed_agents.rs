@@ -486,7 +486,13 @@ pub fn spawn_for(
             let reg = registry_agent?;
             let npx = reg.distribution.npx.as_ref()?;
             let pinned = pin_package_version(&npx.package, &install.version);
-            let mut args = vec!["-y".to_string(), pinned];
+            // `--prefer-offline` makes npm resolve from the local cache and skip
+            // the registry staleness round-trip when the package is already
+            // downloaded (the common case on every chat open). It still falls
+            // back to the network on a genuine cache miss, so first-ever launch
+            // of a new agent is unaffected. Shaves the ~3s warm-cache tax that
+            // otherwise gates `session_ready` on every fresh session start.
+            let mut args = vec!["-y".to_string(), "--prefer-offline".to_string(), pinned];
             args.extend(npx.args.iter().cloned());
             Some(("npx".to_string(), args))
         }
@@ -1338,7 +1344,10 @@ mod tests {
             spawn_for_launch_mode(&agent, Some(&registry.agents[0]), "acp").unwrap();
 
         assert_eq!(command, "npx");
-        assert_eq!(args, vec!["-y", "@example/claude-acp@1.0.0"]);
+        assert_eq!(
+            args,
+            vec!["-y", "--prefer-offline", "@example/claude-acp@1.0.0"]
+        );
     }
 
     #[test]
