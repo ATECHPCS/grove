@@ -20,6 +20,14 @@ const MAX_TOOL_CONTENT_BYTES: usize = 32 * 1024;
 /// `load_history` 只读文件尾部这么多字节，避免超大 history.jsonl 把内存打爆。
 const MAX_HISTORY_READ_BYTES: u64 = 50 * 1024 * 1024;
 
+/// The WS-connect permission reconcile only needs *recent* unresolved
+/// permission requests (a pending permission belongs to the current/recent
+/// agent turn), so it reads a bounded tail instead of the full 50 MiB. For any
+/// history smaller than this the read is byte-identical to the full load; only
+/// pathological multi-MiB histories — the ones that cause the grid-switch stall
+/// — are trimmed. Kept generous so an actionable pending dialog is never missed.
+const RECONCILE_READ_BYTES: u64 = 8 * 1024 * 1024;
+
 /// 截断标记，附加在被截断的 content 末尾。
 const TRUNCATED_MARKER: &str = "\n...[truncated]";
 
@@ -302,16 +310,34 @@ fn append_json_line(f: &mut fs::File, event: &AcpUpdate) {
 /// 另外对每条事件的 `ToolCallUpdate.content` 做兜底截断，保护历史文件里
 /// 已经写入的超大 content（在截断逻辑上线前生成的）。
 pub fn load_history(project: &str, task_id: &str, chat_id: &str) -> Vec<AcpUpdate> {
+    load_history_capped(project, task_id, chat_id, MAX_HISTORY_READ_BYTES)
+}
+
+/// Like `load_history` but caps the tail read at `max_bytes`. The reconcile
+/// path passes `RECONCILE_READ_BYTES`; the HTTP/frontend path uses the full
+/// `MAX_HISTORY_READ_BYTES` via `load_history`.
+fn load_history_capped(
+    project: &str,
+    task_id: &str,
+    chat_id: &str,
+    max_bytes: u64,
+) -> Vec<AcpUpdate> {
     let path = history_file_path(project, task_id, chat_id);
-    let mut file = match fs::File::open(&path) {
+    load_history_from_path_capped(&path, max_bytes)
+}
+
+/// Path-based, byte-capped history load. Split out so the tail-cap read is
+/// unit-testable without going through `grove_dir()`.
+fn load_history_from_path_capped(path: &Path, max_bytes: u64) -> Vec<AcpUpdate> {
+    let mut file = match fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
 
     let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut skip_partial_first_line = false;
-    if file_len > MAX_HISTORY_READ_BYTES {
-        let start = file_len - MAX_HISTORY_READ_BYTES;
+    if file_len > max_bytes {
+        let start = file_len - max_bytes;
         if file.seek(SeekFrom::Start(start)).is_ok() {
             skip_partial_first_line = true;
         }
@@ -374,6 +400,26 @@ pub async fn load_history_async(project: &str, task_id: &str, chat_id: &str) -> 
         chat_id.to_string(),
     );
     tokio::task::spawn_blocking(move || load_history(&p, &t, &c))
+        .await
+        .unwrap_or_default()
+}
+
+/// Async, bounded-tail history read for the WS-connect permission reconcile.
+/// Same `spawn_blocking` rationale as `load_history_async`, but caps the read
+/// at `RECONCILE_READ_BYTES` so a multi-MiB history isn't fully re-parsed just
+/// to find recent unresolved permission ids (a second full parse per open was
+/// an amplifier of the grid-switch stall).
+pub async fn load_recent_history_async(
+    project: &str,
+    task_id: &str,
+    chat_id: &str,
+) -> Vec<AcpUpdate> {
+    let (p, t, c) = (
+        project.to_string(),
+        task_id.to_string(),
+        chat_id.to_string(),
+    );
+    tokio::task::spawn_blocking(move || load_history_capped(&p, &t, &c, RECONCILE_READ_BYTES))
         .await
         .unwrap_or_default()
 }
@@ -1554,6 +1600,44 @@ mod tests {
                 ("c.rs".into(), None),
             ],
             "ToolCallUpdate flush should accumulate deduped locations in insertion order"
+        );
+    }
+
+    #[test]
+    fn reconcile_tail_read_keeps_recent_pending_and_matches_full_when_uncapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+
+        append_event_to_path(&path, &perm_req("a"));
+        let after_a = fs::metadata(&path).unwrap().len();
+        append_event_to_path(&path, &perm_req("b"));
+        append_event_to_path(&path, &perm_req("c"));
+        let total = fs::metadata(&path).unwrap().len();
+
+        // Full read (cap larger than the file) sees every unresolved request.
+        let full = load_history_from_path_capped(&path, u64::MAX);
+        assert_eq!(
+            unresolved_permission_ids(&full),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+
+        // A cap that makes the tail read seek to exactly `after_a` (the start of
+        // b's line) drops b via the partial-first-line discard, leaving only the
+        // most recent pending — proving the bounded reconcile read still finds a
+        // recent unresolved permission after older history is trimmed.
+        let cap = total - after_a;
+        let tail = load_history_from_path_capped(&path, cap);
+        assert_eq!(
+            unresolved_permission_ids(&tail),
+            vec!["c".to_string()],
+            "tail read must keep the recent pending and drop older events"
+        );
+
+        // For any history smaller than the cap the read is byte-identical.
+        let uncapped = load_history_from_path_capped(&path, total + 1024);
+        assert_eq!(
+            unresolved_permission_ids(&uncapped),
+            unresolved_permission_ids(&full)
         );
     }
 }

@@ -1052,8 +1052,14 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
     // 不再发 WS-only synthetic Cancelled —— 所有 cancel 都走 emit，确保多 WS
     // 视图状态一致。
     if let Some(ref chat_id) = history_chat_id {
-        let history =
-            chat_history::load_history_async(&history_project_key, &history_task_id, chat_id).await;
+        // A3: only a bounded tail is needed — unresolved permissions are recent,
+        // so this avoids a second full-file parse per WS connect on big chats.
+        let history = chat_history::load_recent_history_async(
+            &history_project_key,
+            &history_task_id,
+            chat_id,
+        )
+        .await;
         let unresolved_ids = chat_history::unresolved_permission_ids(&history);
         let live_id = handle.pending_permission_id();
         for id in unresolved_ids {
