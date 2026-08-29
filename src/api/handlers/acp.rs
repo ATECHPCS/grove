@@ -1447,6 +1447,20 @@ pub struct ChatListResponse {
     pub chats: Vec<ChatSessionResponse>,
 }
 
+/// One live chat's transient run status, for seeding the session rail on mount.
+#[derive(Serialize)]
+pub struct ActiveChat {
+    pub chat_id: String,
+    pub task_id: String,
+    /// "idle" | "busy" | "permission_required" (mirrors `ChatSnapshot.status`).
+    pub status: String,
+}
+
+#[derive(Serialize)]
+pub struct ActiveChatsResponse {
+    pub chats: Vec<ActiveChat>,
+}
+
 #[derive(Deserialize)]
 pub struct CreateChatRequest {
     pub title: Option<String>,
@@ -1765,6 +1779,28 @@ pub async fn list_archived_chats(
             .map(|chat| ChatSessionResponse::build(&project_key, &task_id, chat))
             .collect(),
     }))
+}
+
+/// GET /projects/{id}/active-chats — lightweight snapshot of which chats in
+/// this project have a live ACP session that is busy or awaiting a permission.
+/// Reads the in-memory ACP handle registry only (no history parse), so the web
+/// session rail can seed sibling running-indicators immediately on mount
+/// instead of waiting to connect a WS to each sibling — the empty-rail-after-
+/// mode-switch gap (Defect B: B2).
+pub async fn list_active_chats(
+    Path(project_id): Path<String>,
+) -> Result<Json<ActiveChatsResponse>, AcpError> {
+    let (project_key, _, _) = resolve_project_key(&project_id)?;
+    let chats = crate::acp::snapshot_active_chats()
+        .into_iter()
+        .filter(|c| c.project_id == project_key && c.status != "idle")
+        .map(|c| ActiveChat {
+            chat_id: c.chat_id,
+            task_id: c.task_id,
+            status: c.status,
+        })
+        .collect();
+    Ok(Json(ActiveChatsResponse { chats }))
 }
 
 pub async fn archive_chat(

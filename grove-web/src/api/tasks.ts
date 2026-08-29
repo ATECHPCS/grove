@@ -1160,6 +1160,25 @@ export async function getChatHistory(
   }
 }
 
+export interface ActiveChat {
+  chat_id: string;
+  task_id: string;
+  /** "idle" | "busy" | "permission_required" */
+  status: string;
+}
+
+/**
+ * Lightweight snapshot of which chats in a project currently have a busy /
+ * permission-pending live ACP session. Reads the backend's in-memory handle
+ * registry (no history parse), for seeding the session rail on mount.
+ */
+export async function getActiveChats(projectId: string): Promise<ActiveChat[]> {
+  const res = await apiClient.get<{ chats: ActiveChat[] }>(
+    `/api/v1/projects/${projectId}/active-chats`
+  );
+  return res.chats ?? [];
+}
+
 /**
  * Read a file by absolute path (for Plan File rendering)
  */

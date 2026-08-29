@@ -31,6 +31,35 @@ export function updateSessionRunning(
   };
 }
 
+export interface RunningChatSnapshot {
+  chatId: string;
+  /** "idle" | "busy" | "permission_required" */
+  status: string;
+}
+
+/**
+ * Seed running-indicators from a mount-time snapshot of live sessions, so the
+ * session rail shows busy siblings immediately after a remount (mode switch)
+ * instead of appearing idle until each sibling's WS connects. Only siblings are
+ * seeded — the active chat is driven by its own WS — and a chat already tracked
+ * is left untouched, so the live stream stays the source of truth.
+ */
+export function seedRunningFromSnapshot(
+  previous: SessionActivityMap,
+  snapshot: RunningChatSnapshot[],
+  activeChatId: string | null,
+): SessionActivityMap {
+  let next = previous;
+  for (const { chatId, status } of snapshot) {
+    if (chatId === activeChatId) continue;
+    if (chatId in next) continue;
+    const running = status === "busy" || status === "permission_required";
+    if (!running) continue;
+    next = updateSessionRunning(next, chatId, true, activeChatId);
+  }
+  return next;
+}
+
 export function markSessionRead(
   previous: SessionActivityMap,
   chatId: string,

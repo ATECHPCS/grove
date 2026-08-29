@@ -84,6 +84,7 @@ export {
   importSession,
   uploadChatAttachment,
   getChatHistory,
+  getActiveChats,
   takeControl,
   reconnectChat,
   readFile,

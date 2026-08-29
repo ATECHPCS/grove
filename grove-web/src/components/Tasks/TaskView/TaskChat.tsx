@@ -174,6 +174,7 @@ import { useTypewriter } from "./useTypewriter";
 import {
   markSessionRead,
   removeSessionActivity,
+  seedRunningFromSnapshot,
   updateSessionRunning,
   type SessionActivityMap,
 } from "./sessionActivity";
@@ -235,6 +236,7 @@ import {
   uploadChatAttachment,
   getTaskFiles,
   getChatHistory,
+  getActiveChats,
   takeControl,
   reconnectChat,
   readFile,
@@ -2202,6 +2204,32 @@ export function TaskChat({
     if (!value) setIsCancelling(false);
     onBusyStateChange?.(value);
   }, [getActiveChatId, onBusyStateChange]);
+  // Seed sibling running-indicators from a one-shot snapshot on mount, so the
+  // session rail shows busy siblings immediately after a remount (a blitz/grid
+  // mode switch wipes per-instance sessionActivity) instead of appearing idle
+  // until each sibling's WS connects. Best-effort; the live WS remains the
+  // source of truth and seedRunningFromSnapshot never overrides tracked chats.
+  // (Defect B: B2)
+  useEffect(() => {
+    let cancelled = false;
+    getActiveChats(projectId)
+      .then((chats) => {
+        if (cancelled) return;
+        const snapshot = chats
+          .filter((c) => c.task_id === taskId)
+          .map((c) => ({ chatId: c.chat_id, status: c.status }));
+        if (snapshot.length === 0) return;
+        setSessionActivity((previous) =>
+          seedRunningFromSnapshot(previous, snapshot, getActiveChatId()),
+        );
+      })
+      .catch(() => {
+        /* best-effort seed; live WS still updates running state */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, taskId, getActiveChatId]);
   const terminalRunningRef = useRef(false);
   const composingRef = useRef(false);
   const [selectedModel, setSelectedModel] = useState("");

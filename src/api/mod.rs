@@ -289,6 +289,11 @@ pub fn create_api_router() -> Router {
             "/projects/{id}/tasks/{taskId}/chats/archived",
             get(handlers::acp::list_archived_chats),
         )
+        // Live busy/permission snapshot for seeding the session rail on mount
+        .route(
+            "/projects/{id}/active-chats",
+            get(handlers::acp::list_active_chats),
+        )
         .route(
             "/projects/{id}/tasks/{taskId}/chats/{chatId}/archive",
             post(handlers::acp::archive_chat),
