@@ -1,7 +1,18 @@
 # Chat switch/boot load latency (Defect B)
 
-_Status: planned — 2026-08-28_
+_Status: A1 + B1 + A3 + B2 shipped (0.12.6–0.12.7); A2 (structural tail pagination) still deferred — 2026-08-28_
 _Branch: `local/prod`_
+
+## Progress
+
+- **A1** ✅ `spawn_blocking` the history read+parse (`load_history_async`) — 0.12.6.
+- **B1** ✅ 3-slot concurrency limiter on the grid `getChatHistory` fan-out — 0.12.6.
+- **A3** ✅ bounded (8 MiB tail) reconcile read (`load_recent_history_async`) so the
+  WS-connect permission reconcile no longer re-parses the whole file — 0.12.7.
+- **B2** ✅ seed sibling running-indicators on mount from `GET /projects/{id}/active-chats`
+  (in-memory ACP snapshot, no history parse) → `seedRunningFromSnapshot` — 0.12.7.
+- **A2** ⏳ real tail pagination — still deferred; needs the Virtuoso prepend surface +
+  server-side memory/attachment metadata (see below).
 
 Distinct from the render-derivation work in `2026-08-28-chat-load-perf.md`. That
 tranche cut **in-chat streaming** cost. This one targets **time-to-visible** when
