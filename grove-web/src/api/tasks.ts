@@ -32,6 +32,10 @@ export interface TaskResponse {
   enableChat: boolean;
   created_by: string;
   is_local: boolean;
+  /** Kanban board column: "todo" | "planned" | "ongoing" | "done". */
+  board_column: string;
+  /** Ordering position within the board column. */
+  board_order: number;
 }
 
 interface TaskListResponse {
@@ -268,6 +272,91 @@ export async function archiveTask(
 export async function activateTask(projectId: string, taskId: string): Promise<void> {
   await apiClient.post<undefined, void>(
     `/api/v1/projects/${projectId}/tasks/${taskId}/activate`
+  );
+}
+
+// ============================================================================
+// Board (Kanban) — stage moves, dispatch, start
+// ============================================================================
+
+/** A board column. Mirrors the backend `BOARD_COLUMNS`. */
+export type BoardColumn = 'todo' | 'planned' | 'ongoing' | 'done';
+
+interface MoveStageRequest {
+  board_column: BoardColumn;
+  /** Explicit position within the column; omit to append. */
+  board_order?: number;
+}
+
+/**
+ * Move a task to a board column (kanban stage). The backend enforces the
+ * workflow lock: a task already in `ongoing`/`done` may only advance to `done`
+ * (returns 409 otherwise). Broadcasts `TaskStageChanged` so open boards update
+ * live. Returns the updated task.
+ */
+export async function moveTaskStage(
+  projectId: string,
+  taskId: string,
+  boardColumn: BoardColumn,
+  boardOrder?: number,
+): Promise<TaskResponse> {
+  return apiClient.patch<MoveStageRequest, TaskResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/stage`,
+    { board_column: boardColumn, board_order: boardOrder },
+  );
+}
+
+export interface DispatchRequest {
+  title: string;
+  body?: string;
+  agent?: string;
+  auto_start?: boolean;
+  target?: string;
+  into?: 'todo' | 'planned';
+}
+
+export interface DispatchResponse {
+  task: TaskResponse;
+  chat_id?: string;
+  board_column: string;
+  agent_started: boolean;
+  agent_error?: string;
+}
+
+/**
+ * Composite "create task + auto-start an agent" (POST /tasks/dispatch). Files a
+ * brand-new card on the board. Used by the board's "New card" affordance and by
+ * external callers (nanobot).
+ */
+export async function dispatchTask(
+  projectId: string,
+  req: DispatchRequest,
+): Promise<DispatchResponse> {
+  return apiClient.post<DispatchRequest, DispatchResponse>(
+    `/api/v1/projects/${projectId}/tasks/dispatch`,
+    req,
+  );
+}
+
+interface StartTaskRequest {
+  agent?: string;
+  body?: string;
+}
+
+/**
+ * Start a headless agent on an *existing* task and file it into PLANNED. This is
+ * the board's "drag a TODO card into PLANNED" gesture — the task + worktree
+ * already exist, so this only launches the agent (unlike `dispatchTask`, which
+ * creates a fresh task). Returns the same shape as dispatch.
+ */
+export async function startTask(
+  projectId: string,
+  taskId: string,
+  req: StartTaskRequest = {},
+): Promise<DispatchResponse> {
+  return apiClient.post<StartTaskRequest, DispatchResponse>(
+    `/api/v1/projects/${projectId}/tasks/${taskId}/start`,
+    req,
   );
 }
 

@@ -300,6 +300,13 @@ pub fn create_api_router() -> Router {
             "/projects/{id}/active-chats",
             get(handlers::acp::list_active_chats),
         )
+        // Authoritative live-chat resolver for the two-way-comms `message` verb:
+        // only chats with a live ACP handle in this process, tagged status +
+        // launch_mode. Never resolve a steer target from persisted `chats`.
+        .route(
+            "/projects/{id}/tasks/{taskId}/live-chats",
+            get(handlers::walkie_talkie::get_task_live_chats),
+        )
         .route(
             "/projects/{id}/tasks/{taskId}/chats/{chatId}/archive",
             post(handlers::acp::archive_chat),
@@ -390,6 +397,11 @@ pub fn create_api_router() -> Router {
             post(handlers::projects::restore_project),
         )
         .route("/projects/{id}/stats", get(handlers::projects::get_stats))
+        .route(
+            "/projects/{id}/settings",
+            get(handlers::project_settings::get_project_settings)
+                .put(handlers::project_settings::put_project_settings),
+        )
         // Unified read-only file API. Project, Resource and Task routes share
         // the same resolver, access policy and streaming response builder.
         .route(
@@ -509,6 +521,10 @@ pub fn create_api_router() -> Router {
         .route(
             "/projects/{id}/tasks/{taskId}/stage",
             patch(handlers::tasks::move_task_stage),
+        )
+        .route(
+            "/projects/{id}/tasks/{taskId}/start",
+            post(handlers::tasks::start_task),
         )
         .route(
             "/projects/{id}/tasks/{taskId}/linked-projects",

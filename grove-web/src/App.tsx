@@ -28,6 +28,8 @@ import { AIPage, GlobalAudioRecorder, GlobalVoiceControlRecorder } from "./compo
 import { AutomationPage } from "./components/Automation/AutomationPage";
 import { MemoryPage } from "./components/Memory";
 import { ProjectStatsPage } from "./components/Stats/ProjectStatsPage";
+import { BoardPage } from "./components/Board";
+import { GlobalBoardPage } from "./components/GlobalBoard";
 import { UpdateBanner } from "./components/ui/UpdateBanner";
 import { CommandPalette } from "./components/ui/CommandPalette";
 import { ProjectCommandPalette } from "./components/ui/ProjectCommandPalette";
@@ -293,7 +295,7 @@ function AppContent() {
       cancelled = true;
     };
   }, []);
-  const { selectedProject, currentProjectId, isLoading, selectProject, projects, addProject, createNewProject, cloneProject, refreshProjects, refreshSelectedProject } = useProject();
+  const { selectedProject, currentProjectId, isLoading, selectProject, selectProjectById, projects, addProject, createNewProject, cloneProject, refreshProjects, refreshSelectedProject } = useProject();
   useReportDebugId("projectId", selectedProject?.id ?? null);
   useVoiceControlContext("projects_list", () => ({
     selectedProjectId: selectedProject?.id ?? null,
@@ -499,6 +501,9 @@ function AppContent() {
   // page the user is on.
   useEffect(() => {
     if (!selectedProject) return;
+    // The global board is a cross-project view, not a page belonging to the
+    // selected project — don't persist it as that project's last view.
+    if (activeItem === "globalboard") return;
     writeLastProjectView(selectedProject.id, activeItem);
   }, [selectedProject, activeItem]);
 
@@ -844,6 +849,41 @@ function AppContent() {
     }
   }, []);
 
+  // Board card click: open the task's live workspace (chat / terminal / diff).
+  // Mirrors the palette path — local tasks live on the "work" page.
+  const handleOpenBoardTask = useCallback((taskId: string, isLocal: boolean) => {
+    if (isLocal) {
+      setActiveItem("work");
+    } else {
+      setActiveItem("tasks");
+      setNavigationData({ taskId });
+    }
+  }, []);
+
+  // Global-board card click: the card can belong to any project, so switch to
+  // its project first (mirrors the tray/notification cross-project open path)
+  // before routing into the workspace. Local tasks always have id "_local".
+  const handleOpenGlobalTask = useCallback(
+    (taskId: string, isLocal: boolean, projectId: string) => {
+      // Resolve + select the card's project first (it may not be the one
+      // currently selected, and may not even be in the loaded list yet).
+      // Only route once the switch is guaranteed — TasksPage keys off the
+      // selected project, so opening before it lands would target the wrong
+      // one. If the project can't be resolved, do nothing rather than open
+      // the task under some other project.
+      void selectProjectById(projectId).then((ok) => {
+        if (!ok) return;
+        if (isLocal || taskId === "_local") {
+          setActiveItem("work");
+        } else {
+          setActiveItem("tasks");
+          setNavigationData({ taskId, projectId, viewMode: "terminal" });
+        }
+      });
+    },
+    [selectProjectById],
+  );
+
   // Register global commands for the command palette
   const toggleMode = useCallback(() => {
     setTasksMode((prev) => (prev === "zen" ? "blitz" : "zen"));
@@ -892,6 +932,17 @@ function AppContent() {
   useCommand("nav.skills", () => setActiveItem("skills"), []);
   useCommand("nav.ai", () => setActiveItem("ai"), []);
   useCommand("nav.statistics", () => setActiveItem("statistics"), []);
+  useCommand("nav.board", () => setActiveItem("board"), []);
+  // Global board is a cross-project view rendered in the Zen content area, so
+  // snap back to Zen first (Blitz mode ignores activeItem).
+  useCommand(
+    "nav.globalboard",
+    () => {
+      setTasksMode("zen");
+      setActiveItem("globalboard");
+    },
+    [],
+  );
   useCommand("nav.settings", () => setActiveItem("settings"), []);
   useCommand("nav.projects", () => setActiveItem("projects"), []);
   // nav.sidebar.collapse removed — view.sidebar.toggle is the SSoT.
@@ -1274,6 +1325,15 @@ function AppContent() {
         return <AIPage />;
       case "statistics":
         return <ProjectStatsPage projectId={selectedProject?.id} />;
+      case "board":
+        return (
+          <BoardPage
+            onOpenTask={handleOpenBoardTask}
+            onViewAllProjects={() => setActiveItem("globalboard")}
+          />
+        );
+      case "globalboard":
+        return <GlobalBoardPage onOpenTask={handleOpenGlobalTask} />;
       case "settings":
         return <SettingsPage config={mockConfig} />;
       default: {
@@ -1318,6 +1378,8 @@ function AppContent() {
     activeItem === "memory" ||
     activeItem === "automation" ||
     activeItem === "statistics" ||
+    activeItem === "board" ||
+    activeItem === "globalboard" ||
     activeItem.startsWith("plugin:");
 
   const sidebarProps = {
@@ -1502,7 +1564,8 @@ function AppContent() {
             </AnimatePresence>
           </div>
           {selectedProject && !selectedProject.exists &&
-            activeItem !== "projects" && activeItem !== "settings" && (
+            activeItem !== "projects" && activeItem !== "settings" &&
+            activeItem !== "globalboard" && (
               <div className="absolute inset-0 z-40 bg-[var(--color-bg)] flex items-center justify-center">
                 <MissingProjectState project={selectedProject} />
               </div>
@@ -1641,7 +1704,8 @@ function AppContent() {
                 </div>
               )}
               {selectedProject && !selectedProject.exists &&
-                activeItem !== "projects" && activeItem !== "settings" && (
+                activeItem !== "projects" && activeItem !== "settings" &&
+            activeItem !== "globalboard" && (
                   <div className="absolute inset-0 z-40 bg-[var(--color-bg)] flex items-center justify-center">
                     <MissingProjectState project={selectedProject} />
                   </div>

@@ -22,6 +22,7 @@ import {
   Plus,
   Settings2,
   Brain,
+  SquareKanban,
 } from "lucide-react";
 import type { Plugin } from "../../api/plugins";
 import { PluginIcon } from "../Plugins/PluginIcon";
@@ -94,6 +95,7 @@ const ALL_NAV_ITEMS: Record<string, NavItem> = {
   skills: { id: "skills", label: "Extensions", icon: Blocks },
   ai: { id: "ai", label: "AI", icon: Sparkles },
   statistics: { id: "statistics", label: "Statistics", icon: BarChart2 },
+  board: { id: "board", label: "Board", icon: SquareKanban, beta: true },
 };
 
 function resolveNavItems(isStudio: boolean): NavItem[] {

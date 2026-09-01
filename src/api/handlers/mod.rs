@@ -28,6 +28,7 @@ pub mod memory_mcp;
 #[cfg(feature = "perf-monitor")]
 pub mod perf;
 pub mod plugins;
+pub mod project_settings;
 pub mod projects;
 pub mod render;
 pub mod skills;

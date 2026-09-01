@@ -349,3 +349,27 @@ export async function listFolder(path: string): Promise<ListFolderResponse> {
   const qs = new URLSearchParams({ path });
   return apiClient.get<ListFolderResponse>(`/api/v1/folders/list?${qs.toString()}`);
 }
+
+// ─── Per-project task defaults (agent / prompt preamble / rules / routing) ───
+
+export interface ProjectSettings {
+  default_agent: string;
+  prompt_preamble: string;
+  task_rules: string;
+  routing_rules: string;
+  default_target_branch: string;
+}
+
+export async function getProjectSettings(id: string): Promise<ProjectSettings> {
+  return apiClient.get<ProjectSettings>(`/api/v1/projects/${id}/settings`);
+}
+
+export async function updateProjectSettings(
+  id: string,
+  settings: ProjectSettings,
+): Promise<ProjectSettings> {
+  return apiClient.put<ProjectSettings, ProjectSettings>(
+    `/api/v1/projects/${id}/settings`,
+    settings,
+  );
+}

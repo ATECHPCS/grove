@@ -217,6 +217,12 @@ pub struct ChatSnapshot {
     pub chat_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Chat launch mode: "acp" (JSON-RPC agent) or "terminal" (PTY CLI). The
+    /// two-way-comms `message` verb must refuse to steer a "terminal" chat, so
+    /// this is surfaced to the client. `None` when the chat's session record
+    /// couldn't be loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch_mode: Option<String>,
     /// "idle" | "busy" | "permission_required".
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1277,6 +1283,28 @@ pub async fn get_tray_chats() -> axum::response::Json<serde_json::Value> {
         }
     }
     let chats = crate::acp::snapshot_active_chats();
+    axum::response::Json(serde_json::json!({ "chats": chats }))
+}
+
+/// GET /api/v1/projects/{id}/tasks/{taskId}/live-chats — Authoritative list of
+/// the chats for this task that currently have a LIVE ACP session handle in
+/// THIS process, each tagged with `status` and `launch_mode`. This is the
+/// source of truth the two-way-comms `message` verb must use to resolve a
+/// steer target — never `list_chats` (which returns persisted rows ordered by
+/// activity, cannot tell live from dead, and may include terminal chats).
+///
+/// Returns `{ "chats": ChatSnapshot[] }`. An empty array means no live handle
+/// exists for the task in this process (the agent may have exited, or was
+/// dispatched by a different Grove process — handles are per-process). The
+/// caller decides: send only when exactly one live, non-terminal chat matches;
+/// otherwise refuse and surface the candidates.
+pub async fn get_task_live_chats(
+    axum::extract::Path((project_id, task_id)): axum::extract::Path<(String, String)>,
+) -> axum::response::Json<serde_json::Value> {
+    let chats: Vec<ChatSnapshot> = crate::acp::snapshot_active_chats()
+        .into_iter()
+        .filter(|c| c.project_id == project_id && c.task_id == task_id)
+        .collect();
     axum::response::Json(serde_json::json!({ "chats": chats }))
 }
 

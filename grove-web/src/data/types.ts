@@ -25,6 +25,16 @@ export interface Task {
   multiplexer: string;
   createdBy?: string;
   isLocal?: boolean;
+  /** Kanban board column: "todo" | "planned" | "ongoing" | "done". */
+  boardColumn?: string;
+  /** Ordering position within the board column. */
+  boardOrder?: number;
+  /** Lines added in the worktree diff (for the board card's diff stats). */
+  additions?: number;
+  /** Lines deleted in the worktree diff. */
+  deletions?: number;
+  /** Files changed in the worktree diff. */
+  filesChanged?: number;
 }
 
 export interface Project {
