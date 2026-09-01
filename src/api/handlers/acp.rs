@@ -1924,13 +1924,19 @@ pub(crate) fn default_chat_title(
     }
 }
 
-pub async fn create_chat(
-    Path((project_id, task_id)): Path<(String, String)>,
-    Json(body): Json<CreateChatRequest>,
-) -> Result<Json<ChatSessionResponse>, AcpError> {
-    let (project_key, _, _) = resolve_project_key(&project_id)?;
-    require_chat_namespace(&project_key, &task_id)?;
-
+/// Build and persist a chat session on a task, applying the same agent
+/// defaulting, canonicalization, and launch-mode snapshotting as the
+/// `create_chat` HTTP handler. Shared with task auto-start
+/// (`tasks/crud.rs`) so both entry points produce identical chat rows.
+/// `launch_mode` is the optional per-chat override (New-chat picker); auto-start
+/// passes `None` to take the agent's default channel.
+pub(crate) fn create_chat_session_row(
+    project_key: &str,
+    task_id: &str,
+    agent: Option<String>,
+    title: Option<String>,
+    launch_mode: Option<String>,
+) -> Result<tasks::ChatSession, AcpError> {
     let cfg = config::load_config();
     // Resolve to canonical id BEFORE any installed_agents / registry
     // lookup. Legacy ids on disk (older chats / configs) and the
@@ -1938,7 +1944,7 @@ pub async fn create_chat(
     // rows (`claude` → `claude-acp` etc.). The chat row is also persisted
     // with the canonical id so future reads stay consistent.
     let agent =
-        crate::storage::installed_agents::canonicalize_agent_id(&body.agent.unwrap_or_else(|| {
+        crate::storage::installed_agents::canonicalize_agent_id(&agent.unwrap_or_else(|| {
             cfg.acp
                 .agent_command
                 .clone()
@@ -1982,7 +1988,7 @@ pub async fn create_chat(
     };
     // A per-chat override from the New-chat picker wins over the selected
     // install channel, but only when the registry declares that launch mode.
-    let launch_mode = match body.launch_mode {
+    let launch_mode = match launch_mode {
         Some(req) if req != default_mode => {
             let supports_terminal = crate::storage::agent_registry::get()
                 .agents
@@ -2002,10 +2008,9 @@ pub async fn create_chat(
         _ => default_mode,
     };
     let now = chrono::Utc::now();
-    let title = body
-        .title
+    let title = title
         .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| default_chat_title(&agent, &cfg, &project_key, &task_id));
+        .unwrap_or_else(|| default_chat_title(&agent, &cfg, project_key, task_id));
 
     let chat = tasks::ChatSession {
         id: tasks::generate_chat_id(),
@@ -2017,8 +2022,20 @@ pub async fn create_chat(
         launch_mode,
     };
 
-    tasks::add_chat_session(&project_key, &task_id, chat.clone())
+    tasks::add_chat_session(project_key, task_id, chat.clone())
         .map_err(|e| AcpError::Internal(e.to_string()))?;
+    Ok(chat)
+}
+
+pub async fn create_chat(
+    Path((project_id, task_id)): Path<(String, String)>,
+    Json(body): Json<CreateChatRequest>,
+) -> Result<Json<ChatSessionResponse>, AcpError> {
+    let (project_key, _, _) = resolve_project_key(&project_id)?;
+    require_chat_namespace(&project_key, &task_id)?;
+
+    let chat =
+        create_chat_session_row(&project_key, &task_id, body.agent, body.title, body.launch_mode)?;
 
     crate::api::handlers::walkie_talkie::broadcast_radio_event(
         crate::api::handlers::walkie_talkie::RadioEvent::ChatListChanged {
