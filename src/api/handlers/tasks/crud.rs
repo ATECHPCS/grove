@@ -626,6 +626,38 @@ fn resolve_agent(
         .unwrap_or_else(|| "claude-acp".to_string())
 }
 
+/// Standing environment note prepended to every dispatched agent's opening
+/// prompt. The agent runs headless with auto-approved permissions, so it can
+/// shell out freely — but it has no human to ask "how do I reach Odoo?". This
+/// block gives it the one recipe it keeps getting stuck on: fetching the
+/// CloudPepper SSH key from the 1Password `op` CLI. Written conditionally so it
+/// is inert noise on a non-Odoo bug and an actionable directive on an Odoo one.
+const DISPATCH_INFRA_PREAMBLE: &str = "\
+## Environment access (read before you shell out)
+
+You are running headless with permissions auto-approved — run whatever bash you \
+need, no one will prompt you. If the fix requires reaching a live **Odoo / \
+CloudPepper** instance (AndersonTech: prod `atech.cloudpepper.site`, staging \
+`staging-atech.cloudpepper.site`; both resolve to one host `root@149.28.98.14`), \
+do NOT ask for credentials or give up — fetch the SSH key yourself from the \
+1Password `op` CLI, which is already authenticated in this environment:
+
+```bash
+export PATH=\"$HOME/.local/bin:$PATH\"; umask 077
+op read \"op://hfzhysxfh3fwdor5vh3qoy2wf4/yj6rx2bugcvhahky6vwhlcswjy/private key?ssh-format=openssh\" > ~/.ssh/cloudpepper_key
+chmod 600 ~/.ssh/cloudpepper_key
+ssh -i ~/.ssh/cloudpepper_key -o IdentitiesOnly=yes root@149.28.98.14
+```
+
+Two `op` gotchas: use the vault **ID** (not the slashed name) in the `op://` \
+ref, and keep `?ssh-format=openssh` (the raw field is PKCS#8, which OpenSSH \
+refuses). Per-site layout: `/var/odoo/<site>/` with `odoo-bin`, `odoo.conf`, \
+**DB name == site name**, systemd unit `odona-<site>.service`. Superuser shell \
+(bypasses ACLs): `sudo -u odoo <python> /var/odoo/<site>/src/odoo-bin shell -c \
+/var/odoo/<site>/odoo.conf -d <site> --no-http`. If a step genuinely can't run \
+here, say exactly which command failed and why — never stop at \"blocked / no \
+access\".";
+
 fn build_dispatch_prompt(title: &str, body: Option<&str>, preamble: &str, rules: &str) -> String {
     let mut p = String::new();
     // Per-project preamble is prepended; the hardcoded closing instruction
@@ -646,6 +678,8 @@ fn build_dispatch_prompt(title: &str, body: Option<&str>, preamble: &str, rules:
         p.push_str(rules.trim());
         p.push_str("\n\n");
     }
+    p.push_str(DISPATCH_INFRA_PREAMBLE);
+    p.push_str("\n\n");
     p.push_str(
         "Investigate and implement a fix for the above in this worktree. \
          When you are done, commit your changes with a clear message.",
