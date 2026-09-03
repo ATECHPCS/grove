@@ -26,6 +26,11 @@ export const PALETTE_COMMANDS: CommandDef[] = [
     defaultBindings: [{ key: "Enter" }],
     scope: "palette",
     defaultWhen: "commandSelected",
+    // Execute fires while the palette's search input has focus. Bare
+    // Enter is suppressed as text input by default (KeyboardManager
+    // TEXT_INPUT_KEYS) — without this flag the palette couldn't execute
+    // from the field.
+    passThroughTextInput: true,
   },
   {
     id: "palette.project.open",

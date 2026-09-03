@@ -478,6 +478,45 @@ describe("KeyboardManager — text input suppression", () => {
     expect(deleteHandler).not.toHaveBeenCalled();
   });
 
+  it("bare Enter suppressed in textarea (dialog field doesn't leak Enter to page scopes)", () => {
+    // Regression: with the New Task dialog open, pressing Enter in the
+    // notes textarea fell through the `dialog.newTask` scope and fired
+    // `task.open` (bare Enter, tasks scope), entering the selected
+    // task's workspace behind the dialog. Enter is text input — it must
+    // be suppressed like alpha keys unless the command opts in.
+    const handler = vi.fn();
+    commandRegistry.contribute(
+      { id: "task.open", name: "open", category: "t", defaultBindings: [{ key: "Enter" }], scope: "tasks" },
+      handler,
+    );
+    mgr.pushScope("tasks");
+    textarea.focus();
+    dispatchKey("Enter");
+    expect(handler).not.toHaveBeenCalled();
+
+    // Focus outside any text field (e.g. task list) → still fires.
+    (document.activeElement as HTMLElement).blur();
+    dispatchKey("Enter");
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
+  it("Enter fires in textarea with passThroughTextInput (chat.send / palette execute)", () => {
+    const handler = vi.fn();
+    commandRegistry.contribute(
+      {
+        id: "chat.send",
+        name: "send",
+        category: "t",
+        defaultBindings: [{ key: "Enter" }],
+        passThroughTextInput: true,
+      },
+      handler,
+    );
+    textarea.focus();
+    dispatchKey("Enter");
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
   it("passThroughTextInput overrides suppression", () => {
     const handler = vi.fn();
     commandRegistry.contribute(

@@ -71,6 +71,15 @@ const TEXT_INPUT_KEYS = new Set([
   "Backspace",
   "Delete",
   "Insert",
+  // Enter is text input too — a textarea inserts a newline, a single-line
+  // input may trigger a native form submit. Without this, a bare Enter
+  // inside a dialog field falls through the dialog scope (which only
+  // binds Escape / Mod+Enter) and fires page-scoped Enter bindings —
+  // e.g. `task.open` entering the selected task's workspace behind the
+  // open New Task dialog. Commands that genuinely want Enter from a
+  // focused field opt in with `passThroughTextInput` (chat.send,
+  // palette.command.execute).
+  "Enter",
 ]);
 
 function isAlphaKey(e: KeyboardEvent): boolean {
