@@ -1,12 +1,108 @@
-import type { VirtuosoHandle } from "react-virtuoso";
+export type TaskChatFollowState =
+  | "following"
+  | "detached"
+  | "reattaching";
 
-type BottomScrollableVirtuoso = Pick<VirtuosoHandle, "scrollTo">;
+export type TaskChatFollowEvent =
+  | "user-left-bottom"
+  | "request-bottom"
+  | "bottom-confirmed";
+
+/**
+ * Bottom following is an explicit state machine rather than a collection of
+ * independent booleans. In particular, requesting the bottom does not enable
+ * streaming follow until the scroller confirms that it actually arrived.
+ */
+export function nextTaskChatFollowState(
+  state: TaskChatFollowState,
+  event: TaskChatFollowEvent,
+): TaskChatFollowState {
+  switch (event) {
+    case "user-left-bottom":
+      return "detached";
+    case "request-bottom":
+      return state === "following" ? "following" : "reattaching";
+    case "bottom-confirmed":
+      return "following";
+    default:
+      return state;
+  }
+}
+
+export function taskChatShouldDriveBottom(
+  state: TaskChatFollowState,
+): boolean {
+  return state !== "detached";
+}
 
 export function shouldVirtualizeTaskChat(
   turnCount: number,
   directTurnLimit: number,
 ): boolean {
   return turnCount > directTurnLimit;
+}
+
+export function taskChatWindowStartForLastTurns(
+  turnRenderIndexes: readonly number[],
+  retainedTurnCount: number,
+): number {
+  if (turnRenderIndexes.length === 0) return 0;
+  const turnIndex = Math.max(
+    0,
+    turnRenderIndexes.length - retainedTurnCount,
+  );
+  return turnIndex === 0 ? 0 : turnRenderIndexes[turnIndex];
+}
+
+export function taskChatWindowStartForRenderIndex(
+  turnRenderIndexes: readonly number[],
+  renderIndex: number,
+  leadingTurnCount: number,
+): number {
+  if (turnRenderIndexes.length === 0) return 0;
+  let containingTurnIndex = 0;
+  for (let index = 1; index < turnRenderIndexes.length; index += 1) {
+    if (turnRenderIndexes[index] > renderIndex) break;
+    containingTurnIndex = index;
+  }
+  const turnIndex = Math.max(0, containingTurnIndex - leadingTurnCount);
+  return turnIndex === 0 ? 0 : turnRenderIndexes[turnIndex];
+}
+
+export function taskChatPrependTurnWindowStart(
+  turnRenderIndexes: readonly number[],
+  currentRenderStart: number,
+  batchTurnCount: number,
+): number {
+  if (currentRenderStart <= 0) return 0;
+  const currentTurnIndex = turnRenderIndexes.findIndex(
+    (renderIndex) => renderIndex >= currentRenderStart,
+  );
+  if (currentTurnIndex <= 0) return 0;
+  const turnIndex = Math.max(0, currentTurnIndex - batchTurnCount);
+  return turnIndex === 0 ? 0 : turnRenderIndexes[turnIndex];
+}
+
+export function taskChatVirtuosoIndex(
+  renderIndex: number,
+  indexBase: number,
+): number {
+  return indexBase + renderIndex;
+}
+
+export function taskChatRenderIndex(
+  virtuosoIndex: number,
+  indexBase: number,
+): number {
+  return virtuosoIndex - indexBase;
+}
+
+/** Use one exact key for both ResizeObserver writes and estimate reads. */
+export function taskChatHeightCacheKey(
+  measurementScope: string,
+  renderKey: string,
+): string {
+  return `${measurementScope}:${renderKey}`;
 }
 
 export function taskChatVirtualizationLayoutKey({
@@ -69,8 +165,43 @@ export function shouldDisengageTaskChatAutoStick({
   return !atBottom && userGestureActive && !programmaticScroll;
 }
 
-/** Build per-item Virtuoso estimates from heights measured while rows were in
- * TaskChat's fully mounted hot zone. */
+/**
+ * `atBottomStateChange(true)` is a geometry observation, not proof of user
+ * intent. Virtuoso can emit it while Footer height or item estimates change.
+ * A detached reader may therefore reattach only after an explicit bottom
+ * request, or after a real downward user gesture reaches the bottom.
+ */
+export function shouldConfirmTaskChatBottom({
+  state,
+  atBottom,
+  userMovedTowardBottom,
+  programmaticScroll,
+}: {
+  state: TaskChatFollowState;
+  atBottom: boolean;
+  userMovedTowardBottom: boolean;
+  programmaticScroll: boolean;
+}): boolean {
+  if (!atBottom) return false;
+  if (state !== "detached") return true;
+  return userMovedTowardBottom && !programmaticScroll;
+}
+
+/**
+ * A prompt that starts a new turn should reveal the user's new transcript
+ * row. A queued prompt has no transcript row yet and must not steal the
+ * viewport from someone reading history; it follows only when they were
+ * already following the tail.
+ */
+export function shouldFollowTaskChatSend(
+  queued: boolean,
+  alreadyFollowingBottom: boolean,
+): boolean {
+  return !queued || alreadyFollowingBottom;
+}
+
+/** Build per-item Virtuoso estimates from heights measured whenever a row was
+ * mounted. Writes and reads must use the same scoped key. */
 export function taskChatHeightEstimates<T>(
   items: readonly T[],
   keyForItem: (item: T) => string,
@@ -110,18 +241,4 @@ export function firstVisibleTaskChatRow(
     }
   }
   return rowAt(candidate);
-}
-
-/**
- * Scroll to the complete Virtuoso extent, including its Footer. Aligning the
- * last data item is insufficient when the Footer owns bottom UI and spacing.
- */
-export function scrollVirtuosoToBottom(
-  handle: BottomScrollableVirtuoso,
-  behavior: "auto" | "smooth",
-): void {
-  handle.scrollTo({
-    top: Number.MAX_SAFE_INTEGER,
-    behavior,
-  });
 }

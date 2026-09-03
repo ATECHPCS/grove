@@ -1,112 +1,53 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import type { MutableRefObject, RefObject } from "react";
+import { useEffect } from "react";
+import type { MutableRefObject } from "react";
 
 interface Params {
   activeChatId: string | null;
   hasMessages: boolean;
-  scrollMessagesToBottom: (behavior: "auto" | "smooth") => void;
-  // Refs that are owned by TaskChat but flipped here as part of the chat-
-  // switch positioning sequence.
+  requestBottom: (behavior: "auto" | "smooth") => void;
   initialPinChatIdRef: MutableRefObject<string | null>;
-  suppressNextSmoothScrollRef: MutableRefObject<boolean>;
-  prevAutoScrollTailRef: MutableRefObject<string>;
-  autoScrollTailSignatureRef: RefObject<string>;
-  autoStickToBottomRef: MutableRefObject<boolean>;
   setShowScrollToBottom: (v: boolean) => void;
 }
 
-interface Result {
-  chatPositioning: boolean;
-  /**
-   * Call from `handleAtBottomStateChange` (or wherever Virtuoso confirms
-   * we've landed at the bottom) to fade the list in early instead of
-   * waiting for the hard fallback timeout.
-   */
-  notifyPositionedAtBottom: () => void;
-}
-
 /**
- * Manages the chat-switch "scroll → reveal" sequence. Pulled out of
- * TaskChat so the captured-mutable `let` pattern (cancelled / rafId /
- * revealTimer / attempts) lives in a small hook that React Compiler
- * can analyze independently of TaskChat's main body.
+ * Starts exactly one bottom-reattachment transaction when loaded history
+ * first becomes available for a chat. TaskChat owns every subsequent scroll.
  */
 export function useChatPositioning({
   activeChatId,
   hasMessages,
-  scrollMessagesToBottom,
+  requestBottom,
   initialPinChatIdRef,
-  suppressNextSmoothScrollRef,
-  prevAutoScrollTailRef,
-  autoScrollTailSignatureRef,
-  autoStickToBottomRef,
   setShowScrollToBottom,
-}: Params): Result {
-  const [chatPositioning, setChatPositioning] = useState(false);
-  const onPositionedAtBottomRef = useRef<(() => void) | null>(null);
-
+}: Params): void {
   useEffect(() => {
     if (!hasMessages) {
       initialPinChatIdRef.current = null;
-      const resetTimer = window.setTimeout(() => setChatPositioning(false), 0);
-      return () => window.clearTimeout(resetTimer);
+      return;
     }
     if (initialPinChatIdRef.current === activeChatId) return;
     initialPinChatIdRef.current = activeChatId;
-    suppressNextSmoothScrollRef.current = true;
-    prevAutoScrollTailRef.current = autoScrollTailSignatureRef.current ?? "";
-    autoStickToBottomRef.current = true;
     setShowScrollToBottom(false);
-    // Begin the position-pin orchestration (RAF/timer-driven below); the flag
-    // is read by the chat scroller to suppress its own auto-scroll while we pin.
-    setChatPositioning(true);
 
     let cancelled = false;
     let rafId: number | null = null;
-    let revealTimer: number | null = null;
-    let attempts = 0;
-    const MAX_ATTEMPTS = 12;
-    const HARD_FALLBACK_MS = 180;
 
-    const reveal = () => {
-      if (cancelled) return;
-      onPositionedAtBottomRef.current = null;
-      setChatPositioning(false);
-    };
-    onPositionedAtBottomRef.current = reveal;
-    revealTimer = window.setTimeout(reveal, HARD_FALLBACK_MS);
-
-    const tick = () => {
-      if (cancelled) return;
-      scrollMessagesToBottom("auto");
-      attempts += 1;
-      if (attempts < MAX_ATTEMPTS) {
-        rafId = requestAnimationFrame(tick);
-      }
-    };
-    rafId = requestAnimationFrame(tick);
+    // One request starts reattachment. Subsequent estimate corrections are
+    // coalesced by TaskChat's single bottom controller; this hook must not run
+    // its own multi-frame scroll loop.
+    rafId = requestAnimationFrame(() => {
+      if (!cancelled) requestBottom("auto");
+    });
 
     return () => {
       cancelled = true;
       if (rafId !== null) cancelAnimationFrame(rafId);
-      if (revealTimer !== null) clearTimeout(revealTimer);
-      onPositionedAtBottomRef.current = null;
     };
   }, [
     activeChatId,
     hasMessages,
-    scrollMessagesToBottom,
+    requestBottom,
     initialPinChatIdRef,
-    suppressNextSmoothScrollRef,
-    prevAutoScrollTailRef,
-    autoScrollTailSignatureRef,
-    autoStickToBottomRef,
     setShowScrollToBottom,
   ]);
-
-  const notifyPositionedAtBottom = useCallback(() => {
-    onPositionedAtBottomRef.current?.();
-  }, []);
-
-  return { chatPositioning, notifyPositionedAtBottom };
 }

@@ -54,6 +54,39 @@ describe("ACP v1 tool-call reduction", () => {
     );
   });
 
+  it("restores MCP image blocks wrapped in ACP text JSON", () => {
+    const message = applyToolCallUpdated(undefined, {
+      type: "tool_call_update",
+      id: "screenshot-1",
+      title: "mcp.grove_agent.browser_screenshot",
+      status: "completed",
+      protocol_v1: true,
+      output: [{
+        type: "content",
+        content: {
+          type: "text",
+          text: JSON.stringify({
+            result: {
+              content: [
+                { type: "text", text: "{\"mode\":\"viewport\"}" },
+                { type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
+              ],
+            },
+          }),
+        },
+      }],
+    });
+
+    expect(message.output).toEqual([
+      { type: "content", content: { type: "text", text: "{\"mode\":\"viewport\"}" } },
+      {
+        type: "content",
+        content: { type: "image", data: "aW1hZ2U=", mime_type: "image/png" },
+      },
+    ]);
+    expect(message.content).toBe('{"mode":"viewport"}\n\n<image>');
+  });
+
   it("keeps legacy string-delta history incremental", () => {
     const created = applyToolCallCreated(undefined, {
       type: "tool_call",

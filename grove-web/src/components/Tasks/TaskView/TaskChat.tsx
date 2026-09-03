@@ -89,6 +89,7 @@ import {
   parseGroveMetaSegments,
 } from "../../../utils/groveMeta";
 import { renderGroveMetaEnvelope } from "./groveMetaRenderers";
+import { composerPresenceUpdate } from "./composerPresence";
 import { FormPill } from "./FormPill";
 import { ElicitationUrlPill } from "./ElicitationUrlPill";
 import {
@@ -119,11 +120,12 @@ import { useConfig } from "../../../context/ConfigContext";
 import { useTheme } from "../../../context/ThemeContext";
 import { previewCommentTaskLabel, usePreviewComments, type PreviewCommentDraft, type PreviewCommentLocator } from "../../../context";
 import { PreviewSearchBar } from "../../Review/PreviewSearchBar";
+import { type ContextProp } from "react-virtuoso";
 import {
-  Virtuoso,
-  type ContextProp,
-  type VirtuosoHandle,
-} from "react-virtuoso";
+  BottomOriginTurnList,
+  type BottomOriginTurn,
+  type BottomOriginTurnListHandle,
+} from "./BottomOriginTurnList";
 import { useChatSearch } from "./useChatSearch";
 import { useChatPositioning } from "./useChatPositioning";
 import { ChatListErrorBoundary } from "./ChatListErrorBoundary";
@@ -133,20 +135,28 @@ import {
   extractEditToolPaths,
 } from "./editToolPaths";
 import { nextExpandedToolDetail } from "./toolDetailExpansion";
-import { extractThoughtStatus } from "./thoughtStatus";
+import {
+  extractThoughtStatus,
+  shouldShowGenericThinking,
+} from "./thoughtStatus";
 import {
   firstVisibleTaskChatRow,
-  scrollVirtuosoToBottom,
+  nextTaskChatFollowState,
+  shouldConfirmTaskChatBottom,
   shouldDisengageTaskChatAutoStick,
+  shouldFollowTaskChatSend,
   shouldVirtualizeTaskChat,
-  taskChatHeightEstimates,
+  taskChatHeightCacheKey,
   taskChatLayoutTransitionTarget,
+  taskChatShouldDriveBottom,
   taskChatVirtualizationLayoutKey,
+  type TaskChatFollowState,
   type TaskChatScrollAnchor,
 } from "./taskChatVirtualScroll";
 import { useACPAvailability } from "./useACPAvailability";
 import { useInitialChatLoad } from "./useInitialChatLoad";
 import { useActiveChatId } from "./useActiveChatId";
+import { useLiveSessionMessages } from "./useLiveSessionMessages";
 import { useTypewriter } from "./useTypewriter";
 import {
   markSessionRead,
@@ -154,6 +164,11 @@ import {
   updateSessionRunning,
   type SessionActivityMap,
 } from "./sessionActivity";
+import {
+  preserveActiveSessionInRefresh,
+  promoteSession,
+  resolveRestoredBusy,
+} from "./sessionListState";
 import {
   appendStructuredContentBlock,
   appendTextContentBlock,
@@ -174,8 +189,8 @@ import {
   type ToolCallMessage,
 } from "./toolCallReducer";
 import {
+  nextPlanVisibility,
   normalizePlanEntries,
-  shouldOpenPlan,
   sortPlanEntries,
   type PlanEntry,
 } from "./planEntries";
@@ -869,7 +884,6 @@ function renderItemKey(item: RenderItem): string {
 
 type TaskChatVirtuosoContext = {
   hiddenMessageCount: number;
-  hotRows: ReactNode;
   inputAreaHeight: number;
   showThinking: boolean;
 };
@@ -894,7 +908,6 @@ function TaskChatVirtuosoFooter({
 }: ContextProp<TaskChatVirtuosoContext>) {
   return (
     <div>
-      {context.hotRows}
       {context.showThinking && (
         <div className="mx-auto w-full max-w-[920px] px-4 py-2 sm:px-6">
           <ThinkingStatus label="Thinking" active />
@@ -905,15 +918,9 @@ function TaskChatVirtuosoFooter({
   );
 }
 
-const TASK_CHAT_VIRTUOSO_COMPONENTS = {
-  Header: TaskChatVirtuosoHeader,
-  Footer: TaskChatVirtuosoFooter,
-};
-
-const TASK_CHAT_RECENT_TURN_HOT_ZONE = 50;
-const TASK_CHAT_DEFAULT_ITEM_HEIGHT = 120;
-const TASK_CHAT_WINDOWED_VIEWPORT = { top: 1_600, bottom: 1_600 } as const;
-const TASK_CHAT_MIN_OVERSCAN_ITEMS = { top: 12, bottom: 12 } as const;
+const TASK_CHAT_DIRECT_TURN_LIMIT = 50;
+const TASK_CHAT_INITIAL_VIRTUAL_TURNS = 50;
+const TASK_CHAT_PREPEND_TURNS = 10;
 
 const MeasuredTaskChatRow = memo(function MeasuredTaskChatRow({
   className,
@@ -959,6 +966,8 @@ const MeasuredTaskChatRow = memo(function MeasuredTaskChatRow({
 type ConversationTurn = {
   messageIndex: number;
   renderIndex: number;
+  renderStart: number;
+  renderEnd: number;
   user: string;
   assistant: string;
   isStreaming: boolean;
@@ -1010,6 +1019,8 @@ function buildConversationTurns(
       current = {
         messageIndex,
         renderIndex,
+        renderStart: renderIndex,
+        renderEnd: renderItems.length,
         user: compactConversationText(message.content) || "Attachment",
         assistant: "",
         isStreaming: false,
@@ -1033,6 +1044,12 @@ function buildConversationTurns(
     );
     if (!message.complete) current.isStreaming = true;
   });
+  turns.forEach((turn, index) => {
+    turn.renderEnd = turns[index + 1]?.renderIndex ?? renderItems.length;
+  });
+  if (turns[0] && turns[0].renderIndex > 0) {
+    turns[0].renderStart = 0;
+  }
   return turns;
 }
 
@@ -2446,6 +2463,11 @@ export function TaskChat({
   useEffect(() => {
     chatsRef.current = chats;
   }, [chats]);
+  const promoteChatForLocalActivity = useCallback((chatId: string) => {
+    const next = promoteSession(chatsRef.current, chatId);
+    chatsRef.current = next;
+    setChats(next);
+  }, []);
   const {
     activeChatId,
     getActiveChatId,
@@ -2548,8 +2570,15 @@ export function TaskChat({
 
   // Per-chat state cache (preserved across chat switches)
   const perChatStateRef = useRef<Map<string, PerChatState>>(new Map());
+  // Transport-owned runtime truth. Unlike PerChatState.isBusy, this map is
+  // updated synchronously for every Busy/Complete event and is never replaced
+  // by a switch-time UI snapshot.
+  const runtimeBusyRef = useRef<Map<string, boolean>>(new Map());
   // Per-chat WebSocket connections
   const wsMapRef = useRef<Map<string, WebSocket>>(new Map());
+  // ChatListChanged may fire for both UserMessage and Complete. Only the most
+  // recent async refresh may commit; otherwise an older ordering can win late.
+  const chatListRefreshGenerationRef = useRef(0);
   const finishedRef = useRef(finished);
   finishedRef.current = finished;
   // Track intentionally closed WebSockets (don't auto-reconnect these)
@@ -2579,6 +2608,10 @@ export function TaskChat({
   const connectingRef = useRef<Set<string>>(new Set());
   // Debounce timer for auto-saving composer draft to localStorage
   const draftSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // A text expander replaces its trigger with a rapid delete-then-insert
+  // sequence. Keep the brief empty midpoint from re-rendering contentEditable
+  // and disturbing the browser's caret/editing transaction.
+  const composerEmptyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Wall-clock anchor for the max-debounce: the first keystroke since
   // the last successful save. We force a flush 5s after this anchor so
   // a fast-typing user can never leave the page without ANY save.
@@ -2593,6 +2626,8 @@ export function TaskChat({
   const [connectPhase, setConnectPhase] = useState<string | null>(null);
   const [connectPhaseStartedAt, setConnectPhaseStartedAt] = useState<number | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const { resolveMessages, forgetMessages } =
+    useLiveSessionMessages(activeChatId, messages);
   const [hiddenMessageCount, setHiddenMessageCount] = useState(0);
   const hiddenMessageCountRef = useRef(0);
   const [hasContent, setHasContent] = useState(false);
@@ -2604,13 +2639,17 @@ export function TaskChat({
   // "click 11 times spams 11 CancelNotifications" pattern that previously
   // drove the agent's request channel into a broken state.
   const [isCancelling, setIsCancelling] = useState(false);
-  const updateBusy = useCallback((value: boolean) => {
+  const updateBusy = useCallback((value: boolean, chatId = getActiveChatId()) => {
+    if (chatId) {
+      runtimeBusyRef.current.set(chatId, value);
+      const cached = perChatStateRef.current.get(chatId);
+      if (cached) cached.isBusy = value;
+    }
     busyRef.current = value;
     setIsBusy(value);
-    const chatId = getActiveChatId();
     if (chatId) {
       setSessionActivity((previous) =>
-        updateSessionRunning(previous, chatId, value, chatId),
+        updateSessionRunning(previous, chatId, value, getActiveChatId()),
       );
     }
     if (!value) setIsCancelling(false);
@@ -2814,7 +2853,7 @@ export function TaskChat({
   const messagesViewportRef = useRef<HTMLDivElement>(null);
   const messagePaneRef = useRef<HTMLDivElement>(null);
   const directListContentRef = useRef<HTMLDivElement>(null);
-  const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const bottomOriginListRef = useRef<BottomOriginTurnListHandle>(null);
   const [measuredRowHeights] = useState<Map<string, number>>(
     () => new Map(),
   );
@@ -2832,6 +2871,13 @@ export function TaskChat({
   // be 240–400 px tall) so the first paint doesn't briefly hide the tail
   // before ResizeObserver fires.
   const [inputAreaHeight, setInputAreaHeight] = useState(220);
+  // Footer geometry is part of the transcript's scroll extent. Freeze it
+  // while the reader is detached so clearing/collapsing the composer or
+  // toggling Thinking cannot clamp or shift the history viewport.
+  const [transcriptFooterState, setTranscriptFooterState] = useState({
+    inputAreaHeight: 220,
+    showThinking: false,
+  });
   const editableRef = useRef<HTMLDivElement>(null);
   const modelMenuRef = useRef<HTMLDivElement>(null);
   const permMenuRef = useRef<HTMLDivElement>(null);
@@ -2999,13 +3045,12 @@ export function TaskChat({
   const [chatSearchQuery, setChatSearchQuery] = useState("");
   const planFilePathRef = useRef("");
   const planFileToolIdsRef = useRef<Set<string>>(new Set());
-  const autoStickToBottomRef = useRef(true);
+  const followStateRef = useRef<TaskChatFollowState>("following");
   // Capture the reader's intent before a completion commit replaces the live
   // sequential rows with a much shorter WorkSummary. Virtuoso emits transient
   // off-bottom measurements during that height collapse; those measurements
   // must not erase the fact that the reader was following the tail.
   const preserveBottomOnBusyEndRef = useRef(false);
-  const suppressNextSmoothScrollRef = useRef(false);
   const messagesCountRef = useRef(messages.length);
   useEffect(() => {
     messagesCountRef.current = messages.length;
@@ -3809,10 +3854,8 @@ export function TaskChat({
     }
     // Two rAFs covers: (1) the scroll-induced isScrolling burst, (2) any
     // atBottomStateChange that fires immediately after the scroll lands.
-    // Note: ~32ms total. A user wheel/touch scroll arriving in this
-    // window will be absorbed (their atBottom=false is ignored). Trade
-    // is intentional — the alternative is letting layout reflow during
-    // streaming auto-scroll wrongly disable auto-stick.
+    // Real wheel/touch/scrollbar input detaches through the capture handlers
+    // directly, so this guard suppresses only callbacks caused by our scroll.
     programmaticScrollClearTimerRef.current = requestAnimationFrame(() => {
       programmaticScrollClearTimerRef.current = requestAnimationFrame(() => {
         programmaticScrollRef.current = false;
@@ -3832,60 +3875,141 @@ export function TaskChat({
     };
   }, []);
 
+  const alignMountedTailToBottom = useCallback(() => {
+    const bottomOrigin = bottomOriginListRef.current;
+    if (bottomOrigin) {
+      markProgrammaticScroll();
+      bottomOrigin.scrollToBottom("auto");
+      return;
+    }
+    const viewport = messagesViewportRef.current;
+    if (!viewport) return;
+    markProgrammaticScroll();
+    viewport.scrollTo({
+      top: viewport.scrollHeight,
+      behavior: "auto",
+    });
+  }, [markProgrammaticScroll]);
+
   const scrollMessagesToBottom = useCallback(
     (behavior: ScrollBehavior = "smooth") => {
-      const handle = virtuosoRef.current;
-      // Virtuoso accepts only "auto" | "smooth"; coerce "instant" → "auto".
-      const vBehavior: "auto" | "smooth" =
-        behavior === "smooth" ? "smooth" : "auto";
       markProgrammaticScroll();
-      if (!handle) {
-        const viewport = messagesViewportRef.current;
-        if (!viewport) return;
-        viewport.scrollTo({
-          top: viewport.scrollHeight,
-          behavior: vBehavior,
-        });
+      const bottomOrigin = bottomOriginListRef.current;
+      if (bottomOrigin) {
+        bottomOrigin.scrollToBottom(behavior);
         return;
       }
-      // Scroll the scroller itself, rather than aligning the last data item.
-      // The latter stops *before* Virtuoso's Footer, which contains both the
-      // live Thinking indicator and the spacer that keeps content above the
-      // floating composer. Browsers clamp this deliberately oversized offset
-      // to the real scroll extent, including that Footer.
-      scrollVirtuosoToBottom(handle, vBehavior);
+      const viewport = messagesViewportRef.current;
+      if (!viewport) return;
+      viewport.scrollTo({
+        top: viewport.scrollHeight,
+        behavior,
+      });
     },
     [markProgrammaticScroll],
   );
 
-  const enableAutoStickToBottom = useCallback(
+  // Every automatic bottom movement goes through this one coalescing gate.
+  // A ResizeObserver notification caused by the scroll itself therefore
+  // cannot start a second independent scroll loop.
+  const bottomScrollRafRef = useRef<number | null>(null);
+  const explicitBottomPendingRef = useRef(false);
+  const pendingBottomBehaviorRef = useRef<ScrollBehavior>("auto");
+  const scheduleBottomScroll = useCallback(
     (behavior: ScrollBehavior = "smooth") => {
-      autoStickToBottomRef.current = true;
-      scrollMessagesToBottom(behavior);
-      requestAnimationFrame(() => setShowScrollToBottom(false));
+      if (!taskChatShouldDriveBottom(followStateRef.current)) return;
+      if (behavior === "smooth") pendingBottomBehaviorRef.current = "smooth";
+      if (bottomScrollRafRef.current !== null) return;
+      bottomScrollRafRef.current = requestAnimationFrame(() => {
+        bottomScrollRafRef.current = null;
+        if (!taskChatShouldDriveBottom(followStateRef.current)) return;
+        const nextBehavior = pendingBottomBehaviorRef.current;
+        pendingBottomBehaviorRef.current = "auto";
+        if (followStateRef.current === "following") {
+          alignMountedTailToBottom();
+          return;
+        }
+        scrollMessagesToBottom(nextBehavior);
+      });
     },
-    [scrollMessagesToBottom],
+    [alignMountedTailToBottom, scrollMessagesToBottom],
   );
+  const requestBottom = useCallback(
+    (
+      behavior: ScrollBehavior = "smooth",
+      waitForConfirmation = false,
+    ) => {
+      const nextState = waitForConfirmation
+        ? "reattaching"
+        : nextTaskChatFollowState(
+            followStateRef.current,
+            "request-bottom",
+          );
+      followStateRef.current = nextState;
+      explicitBottomPendingRef.current = waitForConfirmation;
+      setTranscriptFooterState((current) =>
+        current.inputAreaHeight === inputAreaHeight
+          ? current
+          : { ...current, inputAreaHeight },
+      );
+      scheduleBottomScroll(behavior);
+      if (!waitForConfirmation) setShowScrollToBottom(false);
+    },
+    [inputAreaHeight, scheduleBottomScroll],
+  );
+  const beginBottomReattachment = useCallback(
+    (behavior: ScrollBehavior = "auto") => {
+      followStateRef.current = "reattaching";
+      setTranscriptFooterState((current) =>
+        current.inputAreaHeight === inputAreaHeight
+          ? current
+          : { ...current, inputAreaHeight },
+      );
+      scheduleBottomScroll(behavior);
+      setShowScrollToBottom(false);
+    },
+    [inputAreaHeight, scheduleBottomScroll],
+  );
+  useEffect(() => () => {
+    if (bottomScrollRafRef.current !== null) {
+      cancelAnimationFrame(bottomScrollRafRef.current);
+      bottomScrollRafRef.current = null;
+    }
+  }, []);
 
-  // Auto-stick state is driven by Virtuoso callbacks. To distinguish
-  // "user actively scrolled away" from "layout reflow nudged us off
-  // bottom" (e.g. composer grew by a line, banner appeared), we only
-  // disable auto-stick when atBottom flips while isScrolling is true —
-  // i.e. there's a live user-driven scroll in progress. Re-enabling
-  // happens unconditionally when atBottom becomes true.
-  // `isScrolling` alone cannot identify the source: Virtuoso sets it for
-  // both a wheel/drag from the user and our own scrollToIndex calls. Record
-  // a short-lived user gesture before the scroll begins so an upward scroll
-  // reliably opts out of follow-output before any height re-measure arrives.
+  // Virtuoso geometry callbacks do not carry intent. Track real wheel,
+  // touch, and scrollbar gestures separately so layout reflow can neither
+  // detach a follower nor reattach a reader who is browsing history.
   const userScrollGestureUntilRef = useRef(0);
+  const userMovedTowardBottomUntilRef = useRef(0);
+  const lastObservedScrollTopRef = useRef(0);
   const disengageAutoStick = useCallback(() => {
-    autoStickToBottomRef.current = false;
+    explicitBottomPendingRef.current = false;
+    followStateRef.current = nextTaskChatFollowState(
+      followStateRef.current,
+      "user-left-bottom",
+    );
+    if (bottomScrollRafRef.current !== null) {
+      cancelAnimationFrame(bottomScrollRafRef.current);
+      bottomScrollRafRef.current = null;
+    }
   }, []);
   const handleChatWheelCapture = useCallback((event: React.WheelEvent) => {
+    if (event.deltaY === 0) return;
+    const gestureUntil = Date.now() + 1_000;
+    userScrollGestureUntilRef.current = gestureUntil;
     // Negative delta means the user is heading into history. Detach
     // immediately instead of waiting for Virtuoso's atBottom callback,
     // whose ordering can be behind a height-change notification.
-    if (event.deltaY < 0) disengageAutoStick();
+    if (event.deltaY < 0) {
+      userMovedTowardBottomUntilRef.current = 0;
+      disengageAutoStick();
+      return;
+    }
+    // A detached reader may resume following only if this real downward
+    // gesture subsequently reaches the bottom. Layout-only atBottom events
+    // never set this token.
+    userMovedTowardBottomUntilRef.current = gestureUntil;
   }, [disengageAutoStick]);
   const handleChatPointerDownCapture = useCallback((event: React.PointerEvent) => {
     if (event.button !== 0) return;
@@ -3899,70 +4023,94 @@ export function TaskChat({
     // Covers touch scrolling and scrollbar-thumb drags, neither of which is
     // represented by a negative wheel delta.
     userScrollGestureUntilRef.current = Date.now() + 1_000;
-  }, []);
-  const handleIsScrolling = useCallback((scrolling: boolean) => {
-    if (scrolling && Date.now() < userScrollGestureUntilRef.current) {
+    userMovedTowardBottomUntilRef.current = 0;
+    disengageAutoStick();
+  }, [disengageAutoStick]);
+  const recordUserScrollDirection = useCallback(() => {
+    const viewport = messagesViewportRef.current;
+    if (!viewport) return;
+    const previousScrollTop = lastObservedScrollTopRef.current;
+    const nextScrollTop = viewport.scrollTop;
+    lastObservedScrollTopRef.current = nextScrollTop;
+    if (
+      programmaticScrollRef.current ||
+      Date.now() >= userScrollGestureUntilRef.current
+    ) {
+      return;
+    }
+    if (nextScrollTop > previousScrollTop + 0.5) {
+      userMovedTowardBottomUntilRef.current =
+        userScrollGestureUntilRef.current;
+    } else if (nextScrollTop < previousScrollTop - 0.5) {
+      userMovedTowardBottomUntilRef.current = 0;
       disengageAutoStick();
     }
   }, [disengageAutoStick]);
 
-  // The tail-signature autoscroll path used to fire scrollMessagesToBottom
-  // on every streaming token. With Virtuoso, `followOutput` already
-  // handles "follow new content while at bottom", and running BOTH causes
-  // the two scroll commands to fight each other (visible chunkiness).
-  // We keep the signature memo only because the chat-switch effect reads
-  // autoScrollTailSignatureRef to seed prevAutoScrollTailRef.
+  // Appended transcript data enters the same coalesced bottom controller as
+  // dynamic row growth. It is ignored immediately when the reader detaches.
   const autoScrollTailSignature = useMemo(
     () => getAutoScrollTailSignature(messages),
     [messages],
   );
-  const prevAutoScrollTailRef = useRef(autoScrollTailSignature);
-  const autoScrollTailSignatureRef = useRef(autoScrollTailSignature);
   useEffect(() => {
-    autoScrollTailSignatureRef.current = autoScrollTailSignature;
-  }, [autoScrollTailSignature]);
+    scheduleBottomScroll("auto");
+  }, [autoScrollTailSignature, scheduleBottomScroll]);
 
-  // Pin to bottom once per chat. Markdown messages have wildly variable
-  // heights (code blocks, mermaid, images) that only stabilize after
-  // their content actually renders — sometimes 5–10 frames after Virtuoso
-  // mounts the row. A single scrollToIndex on mount lands at whatever
-  // position Virtuoso ESTIMATED, which is usually wrong. Solution: retry
-  // the scroll across ~12 animation frames (~200ms) so we keep snapping
-  // to the (continuously updating) real bottom until heights settle.
+  // Pin once on chat switch. Height corrections while this request is still
+  // reattaching are handled by the same controller below.
   const initialPinChatIdRef = useRef<string | null>(null);
-  // While true, the Virtuoso list is rendered invisibly so the user
-  // doesn't see the "first row → snap to last row" flash. Revealed as
-  // soon as either (a) atBottomStateChange confirms we landed at the
-  // bottom, or (b) a hard fallback timeout fires.
-  const { chatPositioning, notifyPositionedAtBottom } = useChatPositioning({
+  useChatPositioning({
     activeChatId,
     hasMessages: messages.length > 0,
-    scrollMessagesToBottom,
+    requestBottom: beginBottomReattachment,
     initialPinChatIdRef,
-    suppressNextSmoothScrollRef,
-    prevAutoScrollTailRef,
-    autoScrollTailSignatureRef,
-    autoStickToBottomRef,
     setShowScrollToBottom,
   });
 
-  // Defined after useChatPositioning so notifyPositionedAtBottom is in scope
-  // for the useCallback's dependency array.
+  // Footer height is outside the measured transcript rows. Commit its new
+  // geometry only while following; detached readers keep the old extent so a
+  // queued send cannot shift their history position by shrinking the composer.
+  useEffect(() => {
+    if (followStateRef.current === "detached") return;
+    setTranscriptFooterState((current) =>
+      current.inputAreaHeight === inputAreaHeight
+        ? current
+        : { ...current, inputAreaHeight },
+    );
+    scheduleBottomScroll("auto");
+  }, [inputAreaHeight, scheduleBottomScroll]);
+
   const handleAtBottomStateChange = useCallback((atBottom: boolean) => {
-    if (atBottom) {
-      autoStickToBottomRef.current = true;
-      // Chat-switch reveal: as soon as Virtuoso confirms we're at bottom,
-      // fade the list in (vs waiting the hard fallback timeout).
-      notifyPositionedAtBottom();
-    } else if (shouldDisengageTaskChatAutoStick({
-      atBottom,
-      userGestureActive: Date.now() < userScrollGestureUntilRef.current,
-      programmaticScroll: programmaticScrollRef.current,
-    })) {
-      autoStickToBottomRef.current = false;
+    const bottomConfirmed = shouldConfirmTaskChatBottom({
+        state: followStateRef.current,
+        atBottom,
+        userMovedTowardBottom:
+          Date.now() < userMovedTowardBottomUntilRef.current,
+        programmaticScroll: programmaticScrollRef.current,
+      });
+    if (bottomConfirmed) {
+      followStateRef.current = nextTaskChatFollowState(
+        followStateRef.current,
+        "bottom-confirmed",
+      );
+      explicitBottomPendingRef.current = false;
+    } else {
+      if (shouldDisengageTaskChatAutoStick({
+        atBottom,
+        userGestureActive: Date.now() < userScrollGestureUntilRef.current,
+        programmaticScroll: programmaticScrollRef.current,
+      })) {
+        disengageAutoStick();
+      }
     }
-    setShowScrollToBottom(!atBottom && messagesCountRef.current > 0);
-  }, [notifyPositionedAtBottom]);
+    setShowScrollToBottom(
+      (followStateRef.current === "detached" ||
+        (followStateRef.current === "reattaching" &&
+          explicitBottomPendingRef.current)) &&
+        messagesCountRef.current > 0,
+    );
+  }, [disengageAutoStick]);
 
   // Auto-scroll slash menu to keep selected item visible
   useEffect(() => {
@@ -4111,7 +4259,7 @@ export function TaskChat({
       readMemoryIds,
       hiddenMessageCount,
       attachmentCounters: { ...attachCountersRef.current },
-      isBusy,
+      isBusy: runtimeBusyRef.current.get(activeChatId) ?? isBusy,
       selectedModel,
       permissionLevel,
       modelOptions,
@@ -4175,11 +4323,15 @@ export function TaskChat({
   const restoreChatState = useCallback((chatId: string) => {
     setShowMemoryPanel(false);
     const cached = perChatStateRef.current.get(chatId);
+    const restoredMessages = resolveMessages(chatId, cached?.messages);
     if (cached) {
-      setMessages(cached.messages);
-      setReadMemoryIds(cached.readMemoryIds ?? collectReadMemoryIds(cached.messages));
+      setMessages(restoredMessages);
+      setReadMemoryIds(cached.readMemoryIds ?? collectReadMemoryIds(restoredMessages));
       updateHiddenMessageCount(cached.hiddenMessageCount);
-      updateBusy(cached.isBusy);
+      updateBusy(
+        resolveRestoredBusy(runtimeBusyRef.current.get(chatId), cached.isBusy),
+        chatId,
+      );
       setSelectedModel(cached.selectedModel);
       setPermissionLevel(cached.permissionLevel);
       setModelOptions(cached.modelOptions);
@@ -4210,10 +4362,13 @@ export function TaskChat({
       setRemoteOwnerName(cached.remoteOwnerName);
       setContextUsage(cached.contextUsage);
     } else {
-      setMessages([]);
+      setMessages(restoredMessages);
       setReadMemoryIds([]);
       updateHiddenMessageCount(0);
-      updateBusy(false);
+      updateBusy(
+        resolveRestoredBusy(runtimeBusyRef.current.get(chatId), undefined),
+        chatId,
+      );
       setSelectedModel("");
       setPermissionLevel("");
       setModelOptions([]);
@@ -4255,7 +4410,6 @@ export function TaskChat({
       prev.forEach((att) => { if (att.previewUrl) URL.revokeObjectURL(att.previewUrl); });
       return [];
     });
-    const restoredMessages = perChatStateRef.current.get(chatId)?.messages ?? [];
     attachCountersRef.current =
       cached?.attachmentCounters ?? buildAttachmentCounters(restoredMessages);
     // Point wsRef to this chat's WebSocket
@@ -4277,7 +4431,7 @@ export function TaskChat({
       const hasChips = el.querySelector("[data-command],[data-file]") !== null;
       setHasContent(text.length > 0 || hasChips);
     }
-  }, [updateBusy, updateHiddenMessageCount]);
+  }, [resolveMessages, updateBusy, updateHiddenMessageCount]);
 
   // Initial chat list load is encapsulated in useInitialChatLoad.
   useInitialChatLoad({
@@ -4347,6 +4501,7 @@ export function TaskChat({
     onChatListChanged: (evtProjectId, evtTaskId) => {
       if (!canManageSessions) return;
       if (evtProjectId !== projectId || evtTaskId !== taskId) return;
+      const refreshGeneration = ++chatListRefreshGenerationRef.current;
       void (async () => {
         let fresh: ChatSessionResponse[];
         let freshArchived: ChatSessionResponse[];
@@ -4359,12 +4514,12 @@ export function TaskChat({
           console.error("Failed to refetch chats after ChatListChanged:", err);
           return;
         }
+        if (refreshGeneration !== chatListRefreshGenerationRef.current) return;
         setArchivedChats(freshArchived);
         const current = getActiveChatId();
         const currentChat = current
           ? chatsRef.current.find((chat) => chat.id === current)
           : undefined;
-        const currentWs = current ? wsMapRef.current.get(current) : undefined;
         const currentWasArchived = current
           ? freshArchived.some((chat) => chat.id === current)
           : false;
@@ -4375,15 +4530,12 @@ export function TaskChat({
         // later navigation hydrates session.json again. Explicit archive and
         // delete flows close their socket separately, so preserving an open,
         // non-archived active session here is safe.
-        const preserveLiveCurrent =
-          !!current &&
-          !!currentChat &&
-          !fresh.some((chat) => chat.id === current) &&
-          !currentWasArchived &&
-          currentWs?.readyState === WebSocket.OPEN;
-        const visibleFresh = preserveLiveCurrent
-          ? [currentChat, ...fresh]
-          : fresh;
+        const visibleFresh = preserveActiveSessionInRefresh(
+          fresh,
+          current,
+          currentChat,
+          currentWasArchived,
+        );
         const freshIds = new Set(visibleFresh.map((chat) => chat.id));
         wsMapRef.current.forEach((ws, chatId) => {
           if (freshIds.has(chatId)) return;
@@ -4391,9 +4543,15 @@ export function TaskChat({
           ws.close();
           wsMapRef.current.delete(chatId);
           perChatStateRef.current.delete(chatId);
+          runtimeBusyRef.current.delete(chatId);
+          forgetMessages(chatId);
           cancelPendingReconnectRef.current(chatId);
         });
 
+        // Keep the imperative list snapshot in lockstep with React state.
+        // Switch handlers and the next radio refresh both read this ref, so
+        // waiting for the post-render effect would reopen the reorder race.
+        chatsRef.current = visibleFresh;
         setChats(visibleFresh);
 
         // If a tray/notification deep-link was waiting on this chat to
@@ -4419,7 +4577,9 @@ export function TaskChat({
           return;
         }
 
-        if (current && freshIds.has(current)) return;
+        // An ordinary activity refresh may reorder the list, but it never owns
+        // selection. Explicit switch/delete/archive flows update activeChatId.
+        if (current) return;
 
         const next = visibleFresh[0];
         if (next) {
@@ -4847,20 +5007,15 @@ export function TaskChat({
               applyConfigOptionsSnapshot(evt.config_options ?? []);
               break;
             case "busy":
-              updateBusy(true);
+              updateBusy(evt.value, chatId);
               break;
             case "complete":
-              updateBusy(false);
+              updateBusy(false, chatId);
               break;
             case "plan_update": {
               const entries = normalizePlanEntries(evt.entries);
-              const shouldOpen = shouldOpenPlan(entries);
               setPlanEntries(entries);
-              setShowPlan(shouldOpen);
-              if (shouldOpen) {
-                setShowPlanFile(false);
-                setShowPendingQueue(false);
-              }
+              setShowPlan((current) => nextPlanVisibility(current, entries));
               break;
             }
             case "queue_update":
@@ -5051,6 +5206,7 @@ export function TaskChat({
     const editableEl = editableRef.current;
     return () => {
       if (draftSaveTimerRef.current) clearTimeout(draftSaveTimerRef.current);
+      if (composerEmptyTimerRef.current) clearTimeout(composerEmptyTimerRef.current);
       const chatId = getActiveChatId();
       if (chatId) saveChatDraft(chatId, editableEl?.innerHTML ?? "");
     };
@@ -5275,7 +5431,8 @@ export function TaskChat({
         case "complete":
           // Snapshot this before the WorkSummary compaction changes the list
           // height and Virtuoso emits transient atBottom=false callbacks.
-          preserveBottomOnBusyEndRef.current = autoStickToBottomRef.current;
+          preserveBottomOnBusyEndRef.current =
+            followStateRef.current === "following";
           setAutoExpandSectionId((prev) => {
             if (prev) {
               setExpandedSections((s) => {
@@ -5300,7 +5457,8 @@ export function TaskChat({
           break;
         case "busy":
           if (!msg.value) {
-            preserveBottomOnBusyEndRef.current = autoStickToBottomRef.current;
+            preserveBottomOnBusyEndRef.current =
+              followStateRef.current === "following";
           }
           updateBusy(msg.value);
           if (!msg.value) {
@@ -5343,7 +5501,12 @@ export function TaskChat({
         }
         case "user_message": {
           setMessages((prev) => reduceHistoryMessages(prev, msg));
-          enableAutoStickToBottom("smooth");
+          // A queued message may start while the user is reading history.
+          // Keep that exact viewport unless they were already following the
+          // tail (an explicitly sent idle prompt enables following earlier).
+          if (followStateRef.current === "following") {
+            scheduleBottomScroll("smooth");
+          }
           break;
         }
         case "auth_required": {
@@ -5457,13 +5620,10 @@ export function TaskChat({
         case "plan_update": {
           const entries = normalizePlanEntries(msg.entries);
           setPlanEntries(entries);
-          // Auto-expand while in progress, auto-collapse when all done
-          const shouldOpen = shouldOpenPlan(entries);
-          setShowPlan(shouldOpen);
-          if (shouldOpen) {
-            setShowPlanFile(false);
-            setShowPendingQueue(false);
-          }
+          // Preserve the user's panel choice. Streaming plan updates may
+          // collapse completed work, but never grow the composer and displace
+          // the just-sent message without an explicit click.
+          setShowPlan((current) => nextPlanVisibility(current, entries));
           break;
         }
         case "plan_file_update":
@@ -5556,7 +5716,7 @@ export function TaskChat({
           break;
       }
     },
-    [agentLabel, onConnectedProp, enableAutoStickToBottom, getActiveChatId, onChatBecameIdle, updateBusy, pruneActiveChatMessages, setAutoExpandSectionId, applyConfigOptionsSnapshot],
+    [agentLabel, onConnectedProp, scheduleBottomScroll, getActiveChatId, onChatBecameIdle, updateBusy, pruneActiveChatMessages, setAutoExpandSectionId, applyConfigOptionsSnapshot],
   );
 
   /** Buffer a server message into the per-chat cache (for non-active chats) */
@@ -5677,6 +5837,7 @@ export function TaskChat({
           ];
           if (msg.type === "terminal_execute") {
             state.isBusy = true;
+            runtimeBusyRef.current.set(chatId, true);
             setSessionActivity((previous) =>
               updateSessionRunning(previous, chatId, true, getActiveChatId()),
             );
@@ -5690,6 +5851,7 @@ export function TaskChat({
             state.messages = pruned.messages;
             state.hiddenMessageCount = pruned.hiddenMessageCount;
             state.isBusy = false;
+            runtimeBusyRef.current.set(chatId, false);
             setSessionActivity((previous) =>
               updateSessionRunning(previous, chatId, false, getActiveChatId()),
             );
@@ -5712,6 +5874,7 @@ export function TaskChat({
           break;
         case "busy":
           state.isBusy = msg.value;
+          runtimeBusyRef.current.set(chatId, msg.value);
           setSessionActivity((previous) =>
             updateSessionRunning(previous, chatId, msg.value, getActiveChatId()),
           );
@@ -5728,7 +5891,7 @@ export function TaskChat({
         case "plan_update": {
           const entries = normalizePlanEntries(msg.entries);
           state.planEntries = entries;
-          state.showPlan = shouldOpenPlan(entries);
+          state.showPlan = nextPlanVisibility(state.showPlan, entries);
           break;
         }
         case "plan_file_update":
@@ -5958,6 +6121,8 @@ export function TaskChat({
           wsMapRef.current.delete(chatId);
         }
         cancelPendingReconnectRef.current(chatId);
+        runtimeBusyRef.current.delete(chatId);
+        forgetMessages(chatId);
         setArchivedChats((previous) =>
           previous.some((chat) => chat.id === archived.id)
             ? previous
@@ -5981,7 +6146,7 @@ export function TaskChat({
       }
       setShowChatMenu(false);
     },
-    [activeChatId, chats, connectChatWs, projectId, restoreChatState, sessionActivity, setActiveChatId, taskId],
+    [activeChatId, chats, connectChatWs, forgetMessages, projectId, restoreChatState, sessionActivity, setActiveChatId, taskId],
   );
 
   const handleRestoreChat = useCallback(
@@ -6041,6 +6206,8 @@ export function TaskChat({
         }
         cancelPendingReconnectRef.current(chatId);
         perChatStateRef.current.delete(chatId);
+        runtimeBusyRef.current.delete(chatId);
+        forgetMessages(chatId);
         setSessionActivity((previous) => removeSessionActivity(previous, chatId));
         const remaining = chats.filter((chat) => chat.id !== chatId);
         if (deletingArchived) {
@@ -6071,7 +6238,7 @@ export function TaskChat({
       }
       setShowChatMenu(false);
     },
-    [activeChatId, archivedChats, chats, connectChatWs, projectId, restoreChatState, setActiveChatId, taskId],
+    [activeChatId, archivedChats, chats, connectChatWs, forgetMessages, projectId, restoreChatState, setActiveChatId, taskId],
   );
 
   // ─── Chat fork ─────────────────────────────────────────────────────────
@@ -6156,15 +6323,41 @@ export function TaskChat({
   // ─── User actions ────────────────────────────────────────────────────────
 
   /** Check if the editable has any content (text, chips, or attachments) */
-  const checkContent = useCallback(() => {
+  const checkContent = useCallback((settleEmpty = false) => {
     const el = editableRef.current;
-    if (!el) {
-      setHasContent(attachments.length > 0);
+    const hasDomContent = Boolean(
+      el &&
+        ((el.textContent?.trim().length ?? 0) > 0 ||
+          el.querySelector("[data-command],[data-file]") !== null),
+    );
+    const update = composerPresenceUpdate(
+      hasDomContent,
+      attachments.length > 0,
+      settleEmpty,
+    );
+
+    if (composerEmptyTimerRef.current) {
+      clearTimeout(composerEmptyTimerRef.current);
+      composerEmptyTimerRef.current = null;
+    }
+
+    if (update === "present") {
+      setHasContent(true);
       return;
     }
-    const text = el.textContent?.trim() || "";
-    const hasChips = el.querySelector("[data-command],[data-file]") !== null;
-    setHasContent(text.length > 0 || hasChips || attachments.length > 0);
+    if (update === "absent") {
+      setHasContent(false);
+      return;
+    }
+
+    composerEmptyTimerRef.current = setTimeout(() => {
+      composerEmptyTimerRef.current = null;
+      const current = editableRef.current;
+      const stillEmpty =
+        !current?.textContent?.trim() &&
+        current?.querySelector("[data-command],[data-file]") === null;
+      if (stillEmpty && attachments.length === 0) setHasContent(false);
+    }, 200);
   }, [attachments.length]);
 
   /** Convert a File to an Attachment and add to state */
@@ -6519,8 +6712,15 @@ export function TaskChat({
       const text = buildGroveMetaTag(metaType, metaData, systemPrompt);
 
       // 3. Send over WebSocket
-      enableAutoStickToBottom("auto");
       const msgType = isBusy ? "queue_message" : "prompt";
+      if (
+        shouldFollowTaskChatSend(
+          isBusy,
+          followStateRef.current === "following",
+        )
+      ) {
+        requestBottom("auto");
+      }
       ws.send(
         JSON.stringify({
           type: msgType,
@@ -6535,7 +6735,7 @@ export function TaskChat({
     return () => {
       window.removeEventListener("grove-send-comment-to-chat", handleSendComment);
     };
-  }, [activeChatId, isBusy, buildPromptConfig, enableAutoStickToBottom]);
+  }, [activeChatId, isBusy, buildPromptConfig, requestBottom]);
 
   const handleSend = useCallback(async () => {
     const el = editableRef.current;
@@ -6621,6 +6821,7 @@ export function TaskChat({
       const wrapped = `\x1b[200~${finalPrompt}\x1b[201~\r`;
       const ok = sendInputToTerminal(prefix, wrapped);
       if (!ok) return; // PTY not connected yet — keep the draft, user retries
+      promoteChatForLocalActivity(activeChatId);
       el.innerHTML = "";
       clearChatDraft(activeChatId);
       setHasContent(false);
@@ -6651,10 +6852,11 @@ export function TaskChat({
     // Shell mode → send terminal_execute directly (bypasses AI)
     if (isTerminalMode) {
       if (!prompt || isBusy) return;
-      enableAutoStickToBottom("auto");
+      requestBottom("auto");
       wsRef.current.send(
         JSON.stringify({ type: "terminal_execute", command: prompt }),
       );
+      promoteChatForLocalActivity(activeChatId);
       el.innerHTML = "";
       clearChatDraft(activeChatId);
       setHasContent(false);
@@ -6732,7 +6934,9 @@ export function TaskChat({
 
     if (isBusy) {
       // Queue message on server when agent is busy
-      enableAutoStickToBottom("auto");
+      if (followStateRef.current === "following") {
+        requestBottom("auto");
+      }
       wsRef.current.send(
         JSON.stringify({
           type: "queue_message",
@@ -6745,6 +6949,7 @@ export function TaskChat({
           config: buildPromptConfig(),
         }),
       );
+      promoteChatForLocalActivity(activeChatId);
       el.innerHTML = "";
       clearChatDraft(activeChatId);
       setHasContent(false);
@@ -6756,14 +6961,10 @@ export function TaskChat({
       setShowFileMenu(false);
       setIsTerminalMode(false);
       setIsInputExpanded(false);
-      setShowPendingQueue(true);
-      setShowPlan(false);
-      setShowPlanFile(false);
-      setShowMemoryPanel(false);
       onUserMessageSent?.();
       el.focus();
     } else {
-      enableAutoStickToBottom("auto");
+      requestBottom("auto");
       wsRef.current.send(
         JSON.stringify({
           type: "prompt",
@@ -6772,6 +6973,7 @@ export function TaskChat({
           config: buildPromptConfig(),
         }),
       );
+      promoteChatForLocalActivity(activeChatId);
       el.innerHTML = "";
       clearChatDraft(activeChatId);
       setHasContent(false);
@@ -6789,7 +6991,7 @@ export function TaskChat({
       onUserMessageSent?.();
       el.focus();
     }
-  }, [isTerminalMode, isBusy, attachments, activeChatId, isConnected, projectId, taskId, enableAutoStickToBottom, onUserMessageSent, buildPromptConfig, isTerminalLaunchMode, agentPtyWsUrl]);
+  }, [isTerminalMode, isBusy, attachments, activeChatId, isConnected, projectId, taskId, requestBottom, onUserMessageSent, buildPromptConfig, isTerminalLaunchMode, agentPtyWsUrl, promoteChatForLocalActivity]);
 
   const sendPreviewComments = useCallback((comments: PreviewCommentDraft[]) => {
     if (
@@ -6803,7 +7005,14 @@ export function TaskChat({
     }
 
     const text = formatPreviewCommentPrompt(comments);
-    enableAutoStickToBottom("auto");
+    if (
+      shouldFollowTaskChatSend(
+        isBusy,
+        followStateRef.current === "following",
+      )
+    ) {
+      requestBottom("auto");
+    }
     wsRef.current.send(
       JSON.stringify({
         type: isBusy ? "queue_message" : "prompt",
@@ -6821,7 +7030,6 @@ export function TaskChat({
     setShowPreviewComments(false);
     setShowSlashMenu(false);
     setShowFileMenu(false);
-    setShowPendingQueue(isBusy);
     setShowPlan(false);
     setShowPlanFile(false);
     setShowMemoryPanel(false);
@@ -6831,7 +7039,7 @@ export function TaskChat({
     activeChatId,
     buildPromptConfig,
     clearPreviewCommentDrafts,
-    enableAutoStickToBottom,
+    requestBottom,
     isBusy,
     isTerminalMode,
     onUserMessageSent,
@@ -6846,7 +7054,14 @@ export function TaskChat({
     ) {
       return;
     }
-    enableAutoStickToBottom("auto");
+    if (
+      shouldFollowTaskChatSend(
+        isBusy,
+        followStateRef.current === "following",
+      )
+    ) {
+      requestBottom("auto");
+    }
     wsRef.current.send(
       JSON.stringify({
         type: isBusy ? "queue_message" : "prompt",
@@ -6858,13 +7073,12 @@ export function TaskChat({
     );
     setShowSlashMenu(false);
     setShowFileMenu(false);
-    setShowPendingQueue(isBusy);
     // Part B: 删乐观 updateBusy — 等后端事件
     onUserMessageSent?.();
   }, [
     activeChatId,
     buildPromptConfig,
-    enableAutoStickToBottom,
+    requestBottom,
     isBusy,
     isTerminalMode,
     onUserMessageSent,
@@ -7042,15 +7256,9 @@ export function TaskChat({
   );
   useCommand(
     "chat.scrollToBottom",
-    () => {
-      virtuosoRef.current?.scrollToIndex({
-        index: "LAST",
-        align: "end",
-        behavior: "smooth",
-      });
-    },
+    () => requestBottom("auto", true),
     { enabled: () => !!activeChatId },
-    [activeChatId],
+    [activeChatId, requestBottom],
   );
   useCommand(
     "chat.attachment.add",
@@ -7119,7 +7327,14 @@ export function TaskChat({
   const sendFormResponse = useCallback(
     (text: string) => {
       if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-      enableAutoStickToBottom("auto");
+      if (
+        shouldFollowTaskChatSend(
+          isBusy,
+          followStateRef.current === "following",
+        )
+      ) {
+        requestBottom("auto");
+      }
       wsRef.current.send(
         JSON.stringify(
           isBusy
@@ -7139,7 +7354,7 @@ export function TaskChat({
       );
       onUserMessageSent?.();
     },
-    [isBusy, enableAutoStickToBottom, buildPromptConfig, onUserMessageSent],
+    [isBusy, requestBottom, buildPromptConfig, onUserMessageSent],
   );
 
   const resolveAskForm = useCallback((id: string) => {
@@ -7445,7 +7660,9 @@ export function TaskChat({
       }
       return;
     }
-    checkContent();
+    // A text expansion briefly passes through an empty editor while removing
+    // its trigger. Do not let that midpoint re-render contentEditable.
+    checkContent(true);
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) {
       setShowSlashMenu(false);
@@ -8356,28 +8573,34 @@ export function TaskChat({
     () => buildConversationTurns(messages, renderItems),
     [messages, renderItems],
   );
+  const bottomOriginTurns = useMemo<BottomOriginTurn[]>(
+    () =>
+      conversationTurns
+        .map((turn) => ({
+          key: String(turn.messageIndex),
+          messageIndex: turn.messageIndex,
+          renderStart: turn.renderStart,
+          renderEnd: turn.renderEnd,
+        }))
+        .reverse(),
+    [conversationTurns],
+  );
   const shouldVirtualizeChat = shouldVirtualizeTaskChat(
     conversationTurns.length,
-    TASK_CHAT_RECENT_TURN_HOT_ZONE,
+    TASK_CHAT_DIRECT_TURN_LIMIT,
   );
-  const recentTurnStartRenderIndex =
-    conversationTurns[
-      Math.max(0, conversationTurns.length - TASK_CHAT_RECENT_TURN_HOT_ZONE)
-    ]?.renderIndex ?? 0;
-  const virtualizedRenderItems = shouldVirtualizeChat
-    ? renderItems.slice(0, recentTurnStartRenderIndex)
-    : renderItems;
+  const virtualWindowScope = `${activeChatId ?? "none"}:${hiddenMessageCount}`;
   const rowHeightCachePrefix = `${activeChatId ?? "none"}:${hiddenMessageCount}`;
   const rowHeightCacheScope = `${rowHeightCachePrefix}:${measurementWidth}`;
   const measuredHeightKey = useCallback(
-    (item: RenderItem) => `${rowHeightCacheScope}:${renderItemKey(item)}`,
+    (item: RenderItem) =>
+      taskChatHeightCacheKey(rowHeightCacheScope, renderItemKey(item)),
     [rowHeightCacheScope],
   );
   const recordMeasuredRowHeight = useCallback(
-    (key: string, height: number, width: number) => {
-      const scopedKey = `${rowHeightCachePrefix}:${width}:${key}`;
-      if (measuredRowHeights.get(scopedKey) === height) return;
-      measuredRowHeights.set(scopedKey, height);
+    (key: string, height: number) => {
+      if (measuredRowHeights.get(key) === height) return false;
+      measuredRowHeights.set(key, height);
       // Keep the cache bounded across chat switches and width generations.
       // Map iteration is insertion ordered, so discard the oldest samples.
       while (measuredRowHeights.size > 5_000) {
@@ -8385,8 +8608,9 @@ export function TaskChat({
         if (oldestKey === undefined) break;
         measuredRowHeights.delete(oldestKey);
       }
+      return true;
     },
-    [measuredRowHeights, rowHeightCachePrefix],
+    [measuredRowHeights],
   );
   const recordMeasuredRowHeightRef = useRef(recordMeasuredRowHeight);
   useEffect(() => {
@@ -8409,7 +8633,15 @@ export function TaskChat({
         const height = Math.ceil(rect.height);
         const width = Math.round(rect.width);
         if (height > 0 && width > 0) {
-          recordMeasuredRowHeightRef.current(measuredKey, height, width);
+          const changed = recordMeasuredRowHeightRef.current(
+            measuredKey,
+            height,
+          );
+          // The actively growing assistant row is not necessarily the final
+          // RenderItem: tool/file/work summaries can already follow it. Every
+          // mounted row resize therefore enters the one bottom gate. Detached
+          // readers are rejected by scheduleBottomScroll before any scroll.
+          if (changed) scheduleBottomScroll("auto");
         }
       };
       measure(element);
@@ -8421,7 +8653,7 @@ export function TaskChat({
       }
       rowResizeObserverRef.current.observe(element);
     },
-    [],
+    [scheduleBottomScroll],
   );
   useEffect(
     () => () => {
@@ -8429,12 +8661,6 @@ export function TaskChat({
       rowResizeObserverRef.current = null;
     },
     [],
-  );
-  const virtualizedHeightEstimates = taskChatHeightEstimates(
-    virtualizedRenderItems,
-    measuredHeightKey,
-    measuredRowHeights,
-    TASK_CHAT_DEFAULT_ITEM_HEIGHT,
   );
   // Keep the scroller mounted while the pane width and cold/hot boundary
   // settle. Virtuoso remeasures mounted rows through ResizeObserver, while our
@@ -8460,33 +8686,41 @@ export function TaskChat({
   const [activeConversationTurnMessageIndex, handleConversationRangeChanged] =
     useDeferredVirtuosoRangeValue(
       resolveActiveConversationTurnMessageIndex,
-      conversationTurns[0]?.messageIndex ?? null,
+      conversationTurns[conversationTurns.length - 1]?.messageIndex ?? null,
     );
+  const [bottomOriginActiveTurn, setBottomOriginActiveTurn] = useState<{
+    chatId: string | null;
+    messageIndex: number;
+  } | null>(null);
+  const minimapActiveMessageIndex = shouldVirtualizeChat
+    ? bottomOriginActiveTurn?.chatId === activeChatId
+      ? bottomOriginActiveTurn.messageIndex
+      : conversationTurns[conversationTurns.length - 1]?.messageIndex ?? null
+    : activeConversationTurnMessageIndex;
   const viewportAnchorRef = useRef<TaskChatScrollAnchor | null>(null);
-  const navigateToConversationTurn = useCallback((turn: ConversationTurn) => {
-    // User navigation should detach follow-output, otherwise a running agent
-    // would immediately pull the viewport back to the newest response.
-    autoStickToBottomRef.current = false;
+  const scrollToConversationTurn = useCallback((turn: ConversationTurn) => {
+    if (bottomOriginListRef.current) {
+      markProgrammaticScroll();
+      bottomOriginListRef.current.scrollToTurn(String(turn.messageIndex), "start");
+      return;
+    }
     const mountedRow = messagesViewportRef.current?.querySelector<HTMLElement>(
       `[data-item-index="${turn.renderIndex}"]`,
     );
     if (mountedRow) {
-      mountedRow.scrollIntoView({ block: "start", behavior: "smooth" });
+      mountedRow.scrollIntoView({ block: "start", behavior: "auto" });
       return;
     }
-    const handle = virtuosoRef.current;
-    if (handle) {
-      handle.scrollToIndex({
-        index: turn.renderIndex,
-        align: "start",
-        behavior: "smooth",
-      });
-      return;
-    }
-    messagesViewportRef.current
-      ?.querySelector<HTMLElement>(`[data-item-index="${turn.renderIndex}"]`)
-      ?.scrollIntoView({ block: "start", behavior: "smooth" });
-  }, []);
+  }, [markProgrammaticScroll]);
+  const navigateToConversationTurn = useCallback((turn: ConversationTurn) => {
+    // User navigation should detach follow-output, otherwise a running agent
+    // would immediately pull the viewport back to the newest response.
+    disengageAutoStick();
+    scrollToConversationTurn(turn);
+  }, [
+    disengageAutoStick,
+    scrollToConversationTurn,
+  ]);
   const visibleConversationRangeRafRef = useRef<number | null>(null);
   useEffect(() => {
     return () => {
@@ -8576,6 +8810,7 @@ export function TaskChat({
   const handleDirectListScroll = useCallback(() => {
     const viewport = messagesViewportRef.current;
     if (!viewport) return;
+    recordUserScrollDirection();
     if (
       !programmaticScrollRef.current &&
       Date.now() < userScrollGestureUntilRef.current
@@ -8590,25 +8825,62 @@ export function TaskChat({
   }, [
     disengageAutoStick,
     handleAtBottomStateChange,
+    recordUserScrollDirection,
     scheduleVisibleConversationRangeUpdate,
   ]);
   const handleVirtualizedListScroll = useCallback(() => {
+    recordUserScrollDirection();
+    const viewport = messagesViewportRef.current;
+    if (viewport) {
+      const distanceFromBottom =
+        viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+      handleAtBottomStateChange(distanceFromBottom <= 48);
+    }
     scheduleVisibleConversationRangeUpdate();
-  }, [scheduleVisibleConversationRangeUpdate]);
-  const lastMessageType = messages[messages.length - 1]?.type;
+  }, [
+    handleAtBottomStateChange,
+    recordUserScrollDirection,
+    scheduleVisibleConversationRangeUpdate,
+  ]);
+  const assignBottomOriginScroller = useCallback((element: HTMLDivElement | null) => {
+    messagesViewportRef.current = element;
+    lastObservedScrollTopRef.current = element?.scrollTop ?? 0;
+  }, []);
+  const handleBottomOriginLayoutChange = useCallback(() => {
+    scheduleBottomScroll("auto");
+  }, [scheduleBottomScroll]);
+  const shouldShowTranscriptThinking = shouldShowGenericThinking(isBusy, messages);
+  useEffect(() => {
+    setTranscriptFooterState((current) =>
+      current.showThinking === shouldShowTranscriptThinking
+        ? current
+        : { ...current, showThinking: shouldShowTranscriptThinking },
+    );
+    if (followStateRef.current !== "detached") {
+      scheduleBottomScroll("auto");
+    }
+  }, [scheduleBottomScroll, shouldShowTranscriptThinking]);
 
-  // Data-layer chat search — works across the full conversation, not just
-  // what's currently rendered by Virtuoso. Navigation calls
-  // virtuosoRef.scrollToIndex; highlights are re-applied each time
-  // Virtuoso renders a different range (renderToken bumps).
+  const ensureVirtualItemAvailable = useCallback(() => true, []);
+  const scrollBottomOriginToRenderItem = useCallback((renderIndex: number) => {
+    markProgrammaticScroll();
+    bottomOriginListRef.current?.scrollToRenderItem(renderIndex);
+  }, [markProgrammaticScroll]);
+
+  // Data-layer chat search scans the full conversation. The turn list mounts
+  // the containing turn before visible-DOM highlighting is applied.
   const chatSearch = useChatSearch({
     items: renderItems,
     query: chatSearchOpen ? chatSearchQuery : "",
     enabled: chatSearchOpen,
     extractText: extractRenderItemText,
-    virtuosoRef,
     scrollerRef: messagesViewportRef,
     renderToken,
+    ensureItemAvailable: ensureVirtualItemAvailable,
+    navigationVersion: bottomOriginTurns.length,
+    scrollToItem: shouldVirtualizeChat
+      ? scrollBottomOriginToRenderItem
+      : undefined,
   });
 
   // Only bump renderToken (which forces useChatSearch to re-apply
@@ -8643,62 +8915,6 @@ export function TaskChat({
     [chatSearchOpen],
   );
 
-  // followOutput callback. Use "auto" during streaming because smooth
-  // scrollToIndex can fail to keep up with rapid height changes and cause
-  // React-Virtuoso to glitch and render a blank white page.
-  const handleFollowOutput = useCallback((isAtBottom: boolean) => {
-    return isAtBottom ? ("auto" as const) : (false as const);
-  }, []);
-
-  // Typewriter reveals text inside MessageItem, so the data array does not
-  // change and followOutput alone cannot observe the growth. Re-anchor the
-  // scroller's real end (including the Footer), rather than the last data row.
-  const heightChangeReanchorRafRef = useRef<number | null>(null);
-  useEffect(() => {
-    return () => {
-      if (heightChangeReanchorRafRef.current !== null) {
-        cancelAnimationFrame(heightChangeReanchorRafRef.current);
-        heightChangeReanchorRafRef.current = null;
-      }
-    };
-  }, [activeChatId]);
-
-  const handleTotalListHeightChanged = useCallback(() => {
-    if (!isBusy || !autoStickToBottomRef.current) return;
-    if (heightChangeReanchorRafRef.current !== null) return;
-
-    heightChangeReanchorRafRef.current = requestAnimationFrame(() => {
-      heightChangeReanchorRafRef.current = null;
-      if (!autoStickToBottomRef.current) return;
-      markProgrammaticScroll();
-      const handle = virtuosoRef.current;
-      if (handle) scrollVirtuosoToBottom(handle, "auto");
-    });
-  }, [isBusy, markProgrammaticScroll]);
-
-  // Up to 50 turns use a normal scroll container, so keep its tail anchored
-  // while the active turn is growing. Idle/manual layout changes are excluded;
-  // the busy -> idle compaction has its own intent-preserving effect below.
-  useEffect(() => {
-    if (shouldVirtualizeChat || typeof ResizeObserver === "undefined") return;
-    const content = directListContentRef.current;
-    if (!content) return;
-    let rafId: number | null = null;
-    const observer = new ResizeObserver(() => {
-      if (!isBusy) return;
-      if (!autoStickToBottomRef.current || rafId !== null) return;
-      rafId = requestAnimationFrame(() => {
-        rafId = null;
-        if (autoStickToBottomRef.current) scrollMessagesToBottom("auto");
-      });
-    });
-    observer.observe(content);
-    return () => {
-      observer.disconnect();
-      if (rafId !== null) cancelAnimationFrame(rafId);
-    };
-  }, [activeChatId, isBusy, scrollMessagesToBottom, shouldVirtualizeChat]);
-
   const wasBusyRef = useRef(false);
   useEffect(() => {
     let firstFrame: number | null = null;
@@ -8711,21 +8927,21 @@ export function TaskChat({
     // a compact WorkSummary. That can remove a large amount of height in one
     // commit. Preserve the tail only for readers who were already following
     // it; someone who intentionally scrolled into history remains detached.
-    if (turnJustCompleted && preserveCompletedTail) {
-      autoStickToBottomRef.current = true;
+    if (
+      turnJustCompleted &&
+      preserveCompletedTail &&
+      followStateRef.current === "following"
+    ) {
+      followStateRef.current = "reattaching";
       firstFrame = requestAnimationFrame(() => {
-        secondFrame = requestAnimationFrame(() => {
-          if (autoStickToBottomRef.current) {
-            scrollMessagesToBottom("auto");
-          }
-        });
+        secondFrame = requestAnimationFrame(() => scheduleBottomScroll("auto"));
       });
     }
     return () => {
       if (firstFrame !== null) cancelAnimationFrame(firstFrame);
       if (secondFrame !== null) cancelAnimationFrame(secondFrame);
     };
-  }, [isBusy, scrollMessagesToBottom]);
+  }, [isBusy, scheduleBottomScroll]);
 
   // A layout generation changes when the direct/virtual renderer swaps.
   // Preserve either the complete tail or an exact row + pixel-offset anchor
@@ -8750,7 +8966,7 @@ export function TaskChat({
     const target = taskChatLayoutTransitionTarget(
       previous.key,
       virtualizationLayoutKey,
-      autoStickToBottomRef.current,
+      followStateRef.current === "following",
       viewportAnchorRef.current,
     );
     if (target.kind === "none") return;
@@ -8766,18 +8982,17 @@ export function TaskChat({
         ) ?? [],
       ).find((row) => row.dataset.renderKey === key) ?? null;
     const restoreAnchorOffset = (attempt: number): void => {
-      if (target.kind !== "anchor" || autoStickToBottomRef.current) return;
+      if (
+        target.kind !== "anchor" ||
+        followStateRef.current !== "detached"
+      ) return;
       const viewport = messagesViewportRef.current;
       if (!viewport) return;
       const row = findAnchorRow(target.anchor.key);
       if (!row) {
         if (attempt === 0) {
           markProgrammaticScroll();
-          virtuosoRef.current?.scrollToIndex({
-            index: target.anchor.index,
-            align: "start",
-            behavior: "auto",
-          });
+          bottomOriginListRef.current?.scrollToRenderItem(target.anchor.index);
         }
         if (attempt < 4) {
           scheduleFrame(() => restoreAnchorOffset(attempt + 1));
@@ -8796,7 +9011,9 @@ export function TaskChat({
     scheduleFrame(() => {
       scheduleFrame(() => {
         if (target.kind === "bottom") {
-          if (autoStickToBottomRef.current) scrollMessagesToBottom("auto");
+          if (followStateRef.current === "following") {
+            requestBottom("auto");
+          }
           return;
         }
         restoreAnchorOffset(0);
@@ -8808,7 +9025,7 @@ export function TaskChat({
   }, [
     activeChatId,
     markProgrammaticScroll,
-    scrollMessagesToBottom,
+    requestBottom,
     virtualizationLayoutKey,
   ]);
 
@@ -8825,11 +9042,10 @@ export function TaskChat({
   }, []);
 
   const renderChatItem = (idx: number, item: RenderItem) => {
-    const rowClassName = `mx-auto flow-root w-full max-w-[920px] px-4 pt-3 sm:px-6 ${
-      idx >= recentTurnStartRenderIndex ? "task-chat-hot-row" : ""
-    }`;
+    const rowClassName =
+      "mx-auto flow-root w-full max-w-[920px] px-4 pt-3 sm:px-6";
     const dataItemIndex = idx;
-    const measureKey = renderItemKey(item);
+    const measureKey = measuredHeightKey(item);
     if (item.kind === "single") {
       return (
         <MeasuredTaskChatRow
@@ -8920,31 +9136,12 @@ export function TaskChat({
     );
   };
 
-  // In long chats, only turns older than the recent hot zone are Virtuoso
-  // data items. The latest 50 turns live in the stable Footer and therefore
-  // stay mounted with real browser-measured heights while old history remains
-  // windowed. In short chats the normal scroll container renders everything.
-  const hotRows = shouldVirtualizeChat
-    ? renderItems.slice(recentTurnStartRenderIndex).map((item, offset) => {
-        const idx = recentTurnStartRenderIndex + offset;
-        return (
-          <Fragment key={renderItemKey(item)}>
-            {renderChatItem(idx, item)}
-          </Fragment>
-        );
-      })
-    : null;
   // Keep the Header/Footer component types stable. Updating context changes
   // their content without unmounting Virtuoso's measured boundary elements.
   const virtuosoContext: TaskChatVirtuosoContext = {
     hiddenMessageCount,
-    hotRows,
-    inputAreaHeight,
-    showThinking:
-      isBusy &&
-      lastMessageType !== "assistant" &&
-      lastMessageType !== "thinking" &&
-      lastMessageType !== "terminal_output",
+    inputAreaHeight: transcriptFooterState.inputAreaHeight,
+    showThinking: transcriptFooterState.showThinking,
   };
 
   // ─── Collapsed mode ──────────────────────────────────────────────────────
@@ -9602,7 +9799,7 @@ export function TaskChat({
         >
           <ConversationMinimap
             turns={conversationTurns}
-            activeMessageIndex={activeConversationTurnMessageIndex}
+            activeMessageIndex={minimapActiveMessageIndex}
             onNavigate={navigateToConversationTurn}
           />
           {/* Terminal launch mode: agent CLI runs in xterm.js (PTY).
@@ -9627,77 +9824,59 @@ export function TaskChat({
               />
             </div>
           ) : (
-          /* Messages — virtualized via react-virtuoso so multi-thousand
-              message conversations stay snappy. Virtuoso owns the scroll
-              container; we hand it the renderItems array and let it
-              mount/unmount rows as the viewport moves. */
+          /* Long histories use complete conversation turns laid out from the
+              newest tail. Dynamic heights above the reader cannot perturb
+              the newest messages, and older history is admitted ten turns
+              at a time. */
           <ChatListErrorBoundary
             resetKey={activeChatId}
             projectId={projectId}
             taskId={taskId}
           >
           {shouldVirtualizeChat ? (
-          <Virtuoso
-            // Force-remount per chat so each chat starts with a clean
-            // scroll position (no carry-over from the previous chat).
-            // Initial bottom-pinning is handled imperatively below in
-            // the activeChatId/renderItems.length effect — Virtuoso's
-            // initialTopMostItemIndex is unreliable when data loads
-            // async after mount.
+          <BottomOriginTurnList
             key={virtualizationLayoutKey}
-            ref={virtuosoRef}
-            data={virtualizedRenderItems}
-            heightEstimates={virtualizedHeightEstimates}
-            context={virtuosoContext}
-            scrollerRef={(ref) => {
-              messagesViewportRef.current = ref as HTMLDivElement | null;
-            }}
-            className="relative z-0 h-full min-h-0 flex-1 overscroll-none"
-            // Hide the list while we're scrolling it to the bottom on
-            // chat switch — otherwise the user sees "first row visible,
-            // then snap to last row" which is jarring.
-            style={{
-              opacity: chatPositioning ? 0 : 1,
-              transition: chatPositioning ? "none" : "opacity 120ms ease-out",
-            }}
-            // Do not let an unusually tall first chat row (for example, a
-            // pasted source file) become the estimate for every unmeasured
-            // row. A stable baseline prevents multi-pass fill/jump cycles.
-            defaultItemHeight={TASK_CHAT_DEFAULT_ITEM_HEIGHT}
-            increaseViewportBy={TASK_CHAT_WINDOWED_VIEWPORT}
-            // The latest 50 turns are rendered directly in the Footer. This
-            // overscan applies only to the older, genuinely virtualized rows.
-            minOverscanItemCount={TASK_CHAT_MIN_OVERSCAN_ITEMS}
-            // Commit dynamic row measurements in the ResizeObserver callback
-            // instead of one frame later. A very tall row can otherwise leave
-            // the render window before its real height reaches the size tree,
-            // causing the same scroll correction to repeat on every visit.
-            skipAnimationFrameInResizeObserver
-            followOutput={handleFollowOutput}
-            atBottomStateChange={handleAtBottomStateChange}
-            atBottomThreshold={48}
-            isScrolling={handleIsScrolling}
-            totalListHeightChanged={handleTotalListHeightChanged}
-            itemContent={renderChatItem}
-            computeItemKey={(_idx, item) => renderItemKey(item)}
-            itemsRendered={handleItemsRendered}
-            rangeChanged={handleConversationRangeChanged}
+            ref={bottomOriginListRef}
+            scopeKey={`${virtualWindowScope}:${measurementWidth}`}
+            turnsNewestFirst={bottomOriginTurns}
+            initialTurnCount={TASK_CHAT_INITIAL_VIRTUAL_TURNS}
+            loadBatchSize={TASK_CHAT_PREPEND_TURNS}
+            topContent={<TaskChatVirtuosoHeader context={virtuosoContext} />}
+            bottomContent={<TaskChatVirtuosoFooter context={virtuosoContext} />}
+            renderTurn={(turn) =>
+              renderItems
+                .slice(turn.renderStart, turn.renderEnd)
+                .map((item, offset) => {
+                  const renderIndex = turn.renderStart + offset;
+                  return (
+                    <Fragment key={renderItemKey(item)}>
+                      {renderChatItem(renderIndex, item)}
+                    </Fragment>
+                  );
+                })
+            }
+            scrollerRef={assignBottomOriginScroller}
             onScroll={handleVirtualizedListScroll}
-            components={TASK_CHAT_VIRTUOSO_COMPONENTS}
+            onVisibleTurnChange={(turn) => {
+              if (!turn) return;
+              setBottomOriginActiveTurn((current) =>
+                current?.chatId === activeChatId &&
+                current.messageIndex === turn.messageIndex
+                  ? current
+                  : { chatId: activeChatId, messageIndex: turn.messageIndex },
+              );
+            }}
+            onItemsRendered={handleItemsRendered}
+            onLayoutChange={handleBottomOriginLayoutChange}
           />
           ) : (
             <div
               key={virtualizationLayoutKey}
               ref={(element) => {
                 messagesViewportRef.current = element;
+                lastObservedScrollTopRef.current = element?.scrollTop ?? 0;
               }}
               className="relative z-0 h-full min-h-0 overflow-y-auto overflow-x-hidden overscroll-none"
-              style={{
-                opacity: chatPositioning ? 0 : 1,
-                transition: chatPositioning
-                  ? "none"
-                  : "opacity 120ms ease-out",
-              }}
               onScroll={handleDirectListScroll}
             >
               <div ref={directListContentRef} className="min-h-full">
@@ -10281,8 +10460,7 @@ export function TaskChat({
                     <button
                       type="button"
                       onClick={() => {
-                        enableAutoStickToBottom("smooth");
-                        setShowScrollToBottom(false);
+                        requestBottom("auto", true);
                       }}
                       className="pointer-events-auto group inline-flex h-8 items-center gap-1.5 rounded-full border border-[color-mix(in_srgb,var(--color-border)_72%,transparent)] bg-[color-mix(in_srgb,var(--color-bg)_86%,transparent)] px-3 text-xs font-medium text-[var(--color-text-muted)] shadow-[0_1px_2px_rgba(0,0,0,0.08),0_6px_20px_rgba(0,0,0,0.10)] backdrop-blur-xl transition-[color,background-color,border-color,box-shadow,transform] duration-150 hover:-translate-y-px hover:border-[color-mix(in_srgb,var(--color-highlight)_24%,var(--color-border))] hover:bg-[var(--color-bg)] hover:text-[var(--color-text)] hover:shadow-[0_2px_4px_rgba(0,0,0,0.10),0_8px_24px_rgba(0,0,0,0.14)] active:translate-y-0 select-none"
                     >
