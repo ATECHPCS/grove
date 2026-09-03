@@ -554,9 +554,11 @@ pub enum RunClaim {
 /// Atomically claim one Automation execution.
 ///
 /// SQLite access is serialized through Grove's shared connection, and the
-/// active-run lookup plus insert live in one transaction. `single_flight`
+/// occupied-run lookup plus insert live in one transaction. `single_flight`
 /// therefore prevents manual, scheduled and event triggers from starting the
-/// same Automation concurrently without a Memory-specific lock or table.
+/// same Automation concurrently while an attempt is queued, running, waiting,
+/// or cancelling. A failed attempt remains recoverable in its own Session, but
+/// does not reserve the execution slot for every future trigger.
 #[allow(clippy::too_many_arguments)]
 pub fn claim_run(
     automation_id: &str,
@@ -578,7 +580,7 @@ pub fn claim_run(
             .query_row(
                 &format!(
                     "SELECT {RUN_COLUMNS} FROM automation_runs
-                     WHERE automation_id = ?1 AND status NOT IN ('success','cancelled')
+                     WHERE automation_id = ?1 AND status IN ('queued','running','waiting','cancelling')
                      ORDER BY triggered_at DESC LIMIT 1"
                 ),
                 params![automation_id],
@@ -1129,7 +1131,7 @@ pub fn has_active_run(automation_id: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM automation_runs
-            WHERE automation_id = ?1 AND status NOT IN ('success','cancelled')
+            WHERE automation_id = ?1 AND status IN ('queued','running','waiting','cancelling')
          )",
         params![automation_id],
         |row| row.get(0),
@@ -1374,5 +1376,91 @@ mod tests {
             chat_run_transition(&complete),
             ChatRunTransition::TurnComplete
         );
+    }
+
+    #[test]
+    fn failed_run_does_not_reserve_single_flight_slot() {
+        let _lock = super::super::database::test_lock().blocking_lock();
+        let temp = tempfile::tempdir().unwrap();
+        super::super::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        let automation_id = format!("auto-{}", uuid::Uuid::new_v4().simple());
+        let project_id = format!("project-{}", uuid::Uuid::new_v4().simple());
+        let now = chrono::Utc::now().timestamp();
+        let agent_config = AgentConfigSelection::default();
+        let automation = Automation {
+            id: automation_id.clone(),
+            project: project_id.clone(),
+            name: "Memory organization".to_string(),
+            enabled: true,
+            handler_key: MEMORY_ORGANIZATION_HANDLER.to_string(),
+            agent_config: agent_config.clone(),
+            task_mode: TargetMode::New,
+            task_id: None,
+            task_template: None,
+            session_mode: TargetMode::New,
+            chat_id: None,
+            session_template: None,
+            prompt: "Organize Memory".to_string(),
+            schedule_cron: "0 2 * * *".to_string(),
+            event_triggers: Vec::new(),
+            last_run_at: None,
+            last_run_status: None,
+            last_run_error: None,
+            next_run_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        insert(&automation).unwrap();
+
+        let first_run_id = match claim_run(
+            &automation_id,
+            "manual",
+            None,
+            &automation.prompt,
+            None,
+            &agent_config,
+            &serde_json::json!({}),
+            "project_run",
+            now,
+            true,
+        )
+        .unwrap()
+        {
+            RunClaim::Created(run_id) => run_id,
+            RunClaim::Existing(_) => panic!("unexpected existing run"),
+        };
+        mark_run_failed(&first_run_id, "agent_run", "failed").unwrap();
+        assert!(!has_active_run(&automation_id).unwrap());
+        let failed_overview =
+            super::super::memory::get_overview(&project_id, &automation_id).unwrap();
+        assert_eq!(failed_overview.failed_run_count, 1);
+        assert_eq!(failed_overview.active_run_count, 0);
+
+        let second_run_id = match claim_run(
+            &automation_id,
+            "manual",
+            None,
+            &automation.prompt,
+            None,
+            &agent_config,
+            &serde_json::json!({}),
+            "project_run",
+            now + 1,
+            true,
+        )
+        .unwrap()
+        {
+            RunClaim::Created(run_id) => run_id,
+            RunClaim::Existing(_) => panic!("failed run should not occupy single-flight slot"),
+        };
+        assert_ne!(second_run_id, first_run_id);
+        assert!(has_active_run(&automation_id).unwrap());
+        let running_overview =
+            super::super::memory::get_overview(&project_id, &automation_id).unwrap();
+        assert_eq!(running_overview.failed_run_count, 1);
+        assert_eq!(running_overview.active_run_count, 1);
+
+        super::super::set_grove_dir_override(None);
     }
 }

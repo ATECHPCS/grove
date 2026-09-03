@@ -1612,7 +1612,7 @@ pub fn get_overview(project_id: &str, automation_id: &str) -> Result<MemoryOverv
                     COALESCE(SUM(CASE WHEN status IN ('failed', 'timeout', 'interrupted') THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN status IN ('queued', 'running') THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN status = 'waiting' THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN status NOT IN ('success', 'cancelled') THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status IN ('queued', 'running', 'waiting', 'cancelling') THEN 1 ELSE 0 END), 0),
                     MAX(CASE WHEN status = 'success' THEN completed_at END)
              FROM automation_runs WHERE automation_id = ?1",
             params![automation_id],
