@@ -3078,7 +3078,7 @@ fn tool_contents_to_data(
     content: &[acp::ToolCallContent],
     terminals: Option<&Arc<Mutex<HashMap<String, TerminalState>>>>,
 ) -> Vec<ToolCallContentData> {
-    content
+    let output: Vec<ToolCallContentData> = content
         .iter()
         .filter_map(|item| match item {
             acp::ToolCallContent::Content(value) => {
@@ -3135,7 +3135,81 @@ fn tool_contents_to_data(
             }
             _ => None,
         })
+        .collect();
+    expand_embedded_mcp_results(output)
+}
+
+/// Some ACP agents expose an MCP CallToolResult as one JSON-encoded text block
+/// instead of preserving its typed content blocks. Recover image/audio blocks
+/// here so every Grove surface receives real media rather than a wall of base64.
+fn expand_embedded_mcp_results(output: Vec<ToolCallContentData>) -> Vec<ToolCallContentData> {
+    output
+        .into_iter()
+        .flat_map(|item| match item {
+            ToolCallContentData::Content {
+                content: ContentBlockData::Text { ref text },
+            } => parse_embedded_mcp_content(text)
+                .map(|blocks| {
+                    blocks
+                        .into_iter()
+                        .map(|content| ToolCallContentData::Content { content })
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![item]),
+            _ => vec![item],
+        })
         .collect()
+}
+
+fn parse_embedded_mcp_content(text: &str) -> Option<Vec<ContentBlockData>> {
+    let root = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let result = root.get("result").unwrap_or(&root);
+    let content = result.get("content")?.as_array()?;
+
+    // Only reinterpret the JSON when it contains actual media. Ordinary tool
+    // JSON often has a `content` array too and must remain readable text.
+    let contains_media = content.iter().any(|block| {
+        matches!(
+            block.get("type").and_then(serde_json::Value::as_str),
+            Some("image" | "audio")
+        )
+    });
+    if !contains_media {
+        return None;
+    }
+
+    let blocks: Vec<ContentBlockData> = content
+        .iter()
+        .filter_map(|block| match block.get("type")?.as_str()? {
+            "text" => Some(ContentBlockData::Text {
+                text: block.get("text")?.as_str()?.to_string(),
+            }),
+            "image" => Some(ContentBlockData::Image {
+                data: block.get("data")?.as_str()?.to_string(),
+                mime_type: block
+                    .get("mimeType")
+                    .or_else(|| block.get("mime_type"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("image/png")
+                    .to_string(),
+                uri: None,
+                label: None,
+            }),
+            "audio" => Some(ContentBlockData::Audio {
+                data: block.get("data")?.as_str()?.to_string(),
+                mime_type: block
+                    .get("mimeType")
+                    .or_else(|| block.get("mime_type"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("audio/mpeg")
+                    .to_string(),
+                label: None,
+            }),
+            _ => None,
+        })
+        .collect();
+
+    (!blocks.is_empty()).then_some(blocks)
 }
 
 fn tool_output_to_data(
@@ -3150,9 +3224,9 @@ fn tool_output_to_data(
     }
     protocol_output_text(protocol_output)
         .map(|text| {
-            vec![ToolCallContentData::Content {
+            expand_embedded_mcp_results(vec![ToolCallContentData::Content {
                 content: ContentBlockData::Text { text },
-            }]
+            }])
         })
         .unwrap_or_default()
 }
@@ -3164,16 +3238,16 @@ pub fn legacy_tool_output_to_data(
     if let Some(content) = content {
         if let Ok(values) = serde_json::from_value::<Vec<ToolCallContentData>>(content.clone()) {
             if !values.is_empty() || raw_output.is_none() {
-                return Some(values);
+                return Some(expand_embedded_mcp_results(values));
             }
         }
     }
 
     raw_output.and_then(|value| {
         protocol_output_text(Some(value)).map(|text| {
-            vec![ToolCallContentData::Content {
+            expand_embedded_mcp_results(vec![ToolCallContentData::Content {
                 content: ContentBlockData::Text { text },
-            }]
+            }])
         })
     })
 }
@@ -10181,6 +10255,56 @@ mod tests {
         assert!(matches!(
             &converted[2],
             ToolCallContentData::Terminal { terminal_id, .. } if terminal_id == "terminal-7"
+        ));
+    }
+
+    #[test]
+    fn embedded_mcp_image_result_becomes_structured_tool_media() {
+        let output = vec![ToolCallContentData::Content {
+            content: ContentBlockData::Text {
+                text: serde_json::json!({
+                    "result": {
+                        "content": [
+                            { "type": "text", "text": "{\"mode\":\"viewport\"}" },
+                            { "type": "image", "data": "aW1hZ2U=", "mimeType": "image/png" }
+                        ]
+                    }
+                })
+                .to_string(),
+            },
+        }];
+
+        let expanded = expand_embedded_mcp_results(output);
+        assert_eq!(expanded.len(), 2);
+        assert!(matches!(
+            &expanded[0],
+            ToolCallContentData::Content {
+                content: ContentBlockData::Text { text }
+            } if text == "{\"mode\":\"viewport\"}"
+        ));
+        assert!(matches!(
+            &expanded[1],
+            ToolCallContentData::Content {
+                content: ContentBlockData::Image { data, mime_type, .. }
+            } if data == "aW1hZ2U=" && mime_type == "image/png"
+        ));
+    }
+
+    #[test]
+    fn ordinary_json_content_array_remains_text() {
+        let text = r#"{"content":[{"type":"text","text":"plain"}]}"#;
+        let output = vec![ToolCallContentData::Content {
+            content: ContentBlockData::Text {
+                text: text.to_string(),
+            },
+        }];
+
+        let expanded = expand_embedded_mcp_results(output);
+        assert!(matches!(
+            &expanded[..],
+            [ToolCallContentData::Content {
+                content: ContentBlockData::Text { text: preserved }
+            }] if preserved == text
         ));
     }
 
