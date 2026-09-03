@@ -104,7 +104,16 @@ pub struct CheckResult {
     pub errors: Vec<String>,
 }
 
-pub fn check_environment() -> CheckResult {
+fn missing_tui_multiplexer_error(tmux_ok: bool, zellij_ok: bool) -> Option<&'static str> {
+    (!tmux_ok && !zellij_ok)
+        .then_some("TUI mode requires tmux or zellij. Please install at least one.")
+}
+
+/// Check dependencies required specifically by the TUI.
+///
+/// Other Grove surfaces (Web, GUI, MCP, ACP) do not require a terminal
+/// multiplexer, so this check must only be called from the TUI entry point.
+pub fn check_tui_environment() -> CheckResult {
     let mut errors = Vec::new();
 
     // 检查 git
@@ -112,9 +121,13 @@ pub fn check_environment() -> CheckResult {
         errors.push("git is not installed. Please install git first.".to_string());
     }
 
-    // 检查 tmux 和 zellij — 不强制要求，只检查版本
-    // 用户可以在 Settings 页面查看状态并安装
+    // TUI sessions require at least one supported terminal multiplexer.
     let tmux_ok = check_tmux_available();
+    let zellij_ok = check_zellij_available();
+
+    if let Some(error) = missing_tui_multiplexer_error(tmux_ok, zellij_ok) {
+        errors.push(error.to_string());
+    }
 
     // 如果 tmux 可用但版本太旧，给出警告（非致命）
     if tmux_ok {
@@ -211,5 +224,18 @@ fn check_tmux() -> TmuxCheck {
         TmuxCheck::Ok
     } else {
         TmuxCheck::VersionTooOld(version.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::missing_tui_multiplexer_error;
+
+    #[test]
+    fn tui_requires_at_least_one_multiplexer() {
+        assert!(missing_tui_multiplexer_error(false, false).is_some());
+        assert!(missing_tui_multiplexer_error(true, false).is_none());
+        assert!(missing_tui_multiplexer_error(false, true).is_none());
+        assert!(missing_tui_multiplexer_error(true, true).is_none());
     }
 }
