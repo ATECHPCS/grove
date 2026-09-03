@@ -19,9 +19,23 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::api::error::ApiError;
-use crate::api::state::{ExtensionSession, EXTENSION_SESSION};
+use crate::api::state::{CompanionInfo, ExtensionSession, EXTENSION_SESSION};
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+const COMPANION_PROTOCOL_VERSION: u32 = 2;
+const COMPANION_HANDSHAKE_GRACE: Duration = Duration::from_secs(1);
+const REQUIRED_COMPANION_CAPABILITIES: &[&str] = &[
+    "browser.open.wait",
+    "browser.snapshot.scoped_refs",
+    "browser.interact.wait",
+    "browser.extract",
+    "browser.screenshot.viewport",
+    "browser.reload",
+    "browser.navigate",
+    "browser.close",
+    "browser.wait",
+];
 
 // ─── Companion extension package (download + Chrome launcher) ────────────────
 //
@@ -60,13 +74,15 @@ where
 }
 
 /// REST endpoint: GET /api/v1/extension/status
-/// Lightweight probe — returns whether the Chrome companion extension is
-/// currently connected over WebSocket. Pure read of EXTENSION_SESSION,
-/// doesn't go through the WS bridge, so it's cheap enough to call on
-/// page mount without polling.
+/// Reports transport connection and protocol compatibility separately. An old
+/// Companion can still hold a WebSocket open, but must not be presented as
+/// usable by Browser MCP when it cannot understand the current commands.
 pub async fn get_extension_status() -> Json<serde_json::Value> {
-    let connected = match EXTENSION_SESSION.read() {
-        Ok(guard) => guard.is_some(),
+    let status = match EXTENSION_SESSION.read() {
+        Ok(guard) => match guard.as_ref() {
+            Some(session) => companion_status(session),
+            None => disconnected_companion_status(),
+        },
         Err(poisoned) => {
             // Lock poisoning means some writer panicked while holding the lock.
             // Don't silently report `connected=false` — surface it so the
@@ -75,10 +91,67 @@ pub async fn get_extension_status() -> Json<serde_json::Value> {
                 "[grove] WARN: EXTENSION_SESSION RwLock poisoned: {}",
                 poisoned
             );
-            false
+            disconnected_companion_status()
         }
     };
-    Json(json!({ "connected": connected }))
+    Json(status)
+}
+
+fn disconnected_companion_status() -> serde_json::Value {
+    json!({
+        "connected": false,
+        "handshakeStatus": "disconnected",
+        "compatible": false,
+        "updateRequired": false,
+        "updateAvailable": false,
+        "installedVersion": serde_json::Value::Null,
+        "requiredVersion": env!("CARGO_PKG_VERSION"),
+        "protocolVersion": serde_json::Value::Null,
+        "requiredProtocolVersion": COMPANION_PROTOCOL_VERSION,
+        "capabilities": [],
+    })
+}
+
+fn companion_status(session: &ExtensionSession) -> serde_json::Value {
+    let info = match session.companion_info.lock() {
+        Ok(info) => info,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let handshake_received = info.protocol_version.is_some();
+    let handshake_status = if handshake_received {
+        "ready"
+    } else if session.connected_at.elapsed() < COMPANION_HANDSHAKE_GRACE {
+        "pending"
+    } else {
+        "legacy"
+    };
+    let missing_capabilities: Vec<&str> = REQUIRED_COMPANION_CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|capability| !info.capabilities.contains(*capability))
+        .collect();
+    let compatible = handshake_received
+        && info.protocol_version == Some(COMPANION_PROTOCOL_VERSION)
+        && missing_capabilities.is_empty();
+    let update_available =
+        handshake_received && info.extension_version.as_deref() != Some(env!("CARGO_PKG_VERSION"));
+    let update_required = handshake_status == "legacy" || (handshake_received && !compatible);
+    let mut capabilities: Vec<&str> = info.capabilities.iter().map(String::as_str).collect();
+    capabilities.sort_unstable();
+
+    json!({
+        "connected": true,
+        "handshakeStatus": handshake_status,
+        "compatible": compatible,
+        "updateRequired": update_required,
+        "updateAvailable": update_available,
+        "installedVersion": info.extension_version,
+        "requiredVersion": env!("CARGO_PKG_VERSION"),
+        "protocolVersion": info.protocol_version,
+        "requiredProtocolVersion": COMPANION_PROTOCOL_VERSION,
+        "capabilities": capabilities,
+        "missingCapabilities": missing_capabilities,
+    })
 }
 
 /// REST endpoint: GET /api/v1/extension/tabs
@@ -176,6 +249,8 @@ async fn handle_ws(socket: WebSocket) {
     let session = ExtensionSession {
         sender: tx,
         pending_requests: std::sync::Mutex::new(HashMap::new()),
+        companion_info: std::sync::Mutex::new(CompanionInfo::default()),
+        connected_at: std::time::Instant::now(),
     };
 
     // Take the slot atomically. `std::sync::RwLockWriteGuard` is !Send, so the
@@ -224,13 +299,19 @@ async fn handle_ws(socket: WebSocket) {
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
                     if let Some(msg_type) = parsed.get("type").and_then(|v| v.as_str()) {
                         match msg_type {
+                            "COMPANION_HELLO" => update_companion_info(&parsed),
                             "ALL_TABS_RESPONSE"
                             | "PROXY_FETCH_RESPONSE"
                             | "BROWSER_OPEN_RESPONSE"
                             | "BROWSER_SNAPSHOT_RESPONSE"
                             | "BROWSER_INTERACT_RESPONSE"
                             | "BROWSER_EXTRACT_RESPONSE"
-                            | "BROWSER_SCREENSHOT_RESPONSE" => {
+                            | "BROWSER_SCREENSHOT_RESPONSE"
+                            | "BROWSER_RELOAD_RESPONSE"
+                            | "BROWSER_NAVIGATE_RESPONSE"
+                            | "BROWSER_CLOSE_RESPONSE"
+                            | "BROWSER_WAIT_RESPONSE"
+                            | "UNSUPPORTED_COMMAND_RESPONSE" => {
                                 if let Some(req_id) = parsed.get("id").and_then(|v| v.as_str()) {
                                     resolve_pending_request(
                                         req_id,
@@ -274,6 +355,39 @@ async fn handle_ws(socket: WebSocket) {
     }
     ws_write_task.abort();
     ws_read_task.abort();
+}
+
+fn update_companion_info(message: &serde_json::Value) {
+    let extension_version = message
+        .get("extensionVersion")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+    let protocol_version = message
+        .get("protocolVersion")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok());
+    let capabilities = message
+        .get("capabilities")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Ok(session_guard) = EXTENSION_SESSION.read() {
+        if let Some(session) = &*session_guard {
+            let mut info = match session.companion_info.lock() {
+                Ok(info) => info,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            info.extension_version = extension_version;
+            info.protocol_version = protocol_version;
+            info.capabilities = capabilities;
+        }
+    }
 }
 
 /// Resolves a pending REST thread's oneshot channel when the WS replies
@@ -370,6 +484,8 @@ async fn send_extension_command(
     payload: serde_json::Value,
     timeout_ms: u64,
 ) -> Result<serde_json::Value, String> {
+    ensure_companion_command_supported(cmd_type)?;
+
     let req_id = format!("req-{}", REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
     let (tx, rx) = oneshot::channel();
 
@@ -411,6 +527,62 @@ async fn send_extension_command(
     }
 }
 
+fn required_capability(cmd_type: &str) -> Option<&'static str> {
+    match cmd_type {
+        "BROWSER_OPEN" => Some("browser.open.wait"),
+        "BROWSER_SNAPSHOT" => Some("browser.snapshot.scoped_refs"),
+        "BROWSER_INTERACT" => Some("browser.interact.wait"),
+        "BROWSER_EXTRACT" => Some("browser.extract"),
+        "BROWSER_SCREENSHOT" => Some("browser.screenshot.viewport"),
+        "BROWSER_RELOAD" => Some("browser.reload"),
+        "BROWSER_NAVIGATE" => Some("browser.navigate"),
+        "BROWSER_CLOSE" => Some("browser.close"),
+        "BROWSER_WAIT" => Some("browser.wait"),
+        _ => None,
+    }
+}
+
+fn ensure_companion_command_supported(cmd_type: &str) -> Result<(), String> {
+    let Some(required_capability) = required_capability(cmd_type) else {
+        return Ok(());
+    };
+    let session_guard = EXTENSION_SESSION
+        .read()
+        .map_err(|_| "Server lock error".to_string())?;
+    let Some(session) = &*session_guard else {
+        return Err("Browser Companion Extension is offline or not connected".to_string());
+    };
+    let info = match session.companion_info.lock() {
+        Ok(info) => info,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Some(protocol_version) = info.protocol_version else {
+        if session.connected_at.elapsed() < COMPANION_HANDSHAKE_GRACE {
+            return Err(
+                "COMPANION_HANDSHAKE_PENDING: Browser Companion is connected but still reporting its capabilities; retry the MCP call"
+                    .to_string(),
+            );
+        }
+        return Err(format!(
+            "COMPANION_UPDATE_REQUIRED: connected Companion does not support the Grove browser protocol; update it to v{} from Settings > Browser Control and reload it in Chrome",
+            env!("CARGO_PKG_VERSION")
+        ));
+    };
+    if protocol_version != COMPANION_PROTOCOL_VERSION {
+        return Err(format!(
+            "COMPANION_UPDATE_REQUIRED: Companion protocol v{protocol_version} is incompatible with required protocol v{COMPANION_PROTOCOL_VERSION}; update Companion to v{} from Settings > Browser Control",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    if !info.capabilities.contains(required_capability) {
+        return Err(format!(
+            "COMPANION_UPDATE_REQUIRED: connected Companion is missing capability {required_capability}; update it to v{} from Settings > Browser Control",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    Ok(())
+}
+
 /// REST endpoint POST /api/v1/extension/command
 #[derive(Debug, serde::Deserialize)]
 pub struct ExtensionCommandRequest {
@@ -443,14 +615,18 @@ pub async fn handle_extension_command(
 pub async fn browser_open(
     url: &str,
     group_name: Option<&str>,
+    wait_for: Option<serde_json::Value>,
+    timeout_ms: u64,
 ) -> Result<serde_json::Value, String> {
     send_extension_command(
         "BROWSER_OPEN",
         json!({
             "url": url,
-            "groupName": group_name
+            "groupName": group_name,
+            "waitFor": wait_for,
+            "timeoutMs": timeout_ms
         }),
-        3000,
+        timeout_ms.saturating_add(1_000),
     )
     .await
 }
@@ -475,6 +651,8 @@ pub async fn browser_interact(
     action: &str,
     target: &str,
     value: Option<&str>,
+    wait_for: Option<serde_json::Value>,
+    timeout_ms: u64,
 ) -> Result<serde_json::Value, String> {
     send_extension_command(
         "BROWSER_INTERACT",
@@ -482,9 +660,76 @@ pub async fn browser_interact(
             "tabId": tab_id,
             "action": action,
             "target": target,
-            "value": value
+            "value": value,
+            "waitFor": wait_for,
+            "timeoutMs": timeout_ms
         }),
-        3000,
+        timeout_ms.saturating_add(1_000),
+    )
+    .await
+}
+
+/// Reload an existing tab and wait for the requested browser/page condition.
+pub async fn browser_reload(
+    tab_id: u32,
+    bypass_cache: bool,
+    wait_for: Option<serde_json::Value>,
+    timeout_ms: u64,
+) -> Result<serde_json::Value, String> {
+    send_extension_command(
+        "BROWSER_RELOAD",
+        json!({
+            "tabId": tab_id,
+            "bypassCache": bypass_cache,
+            "waitFor": wait_for,
+            "timeoutMs": timeout_ms,
+        }),
+        timeout_ms.saturating_add(1_000),
+    )
+    .await
+}
+
+/// Navigate an existing tab without creating a duplicate tab.
+pub async fn browser_navigate(
+    tab_id: u32,
+    action: &str,
+    url: Option<&str>,
+    wait_for: Option<serde_json::Value>,
+    timeout_ms: u64,
+) -> Result<serde_json::Value, String> {
+    send_extension_command(
+        "BROWSER_NAVIGATE",
+        json!({
+            "tabId": tab_id,
+            "action": action,
+            "url": url,
+            "waitFor": wait_for,
+            "timeoutMs": timeout_ms,
+        }),
+        timeout_ms.saturating_add(1_000),
+    )
+    .await
+}
+
+/// Close an existing browser tab.
+pub async fn browser_close(tab_id: u32) -> Result<serde_json::Value, String> {
+    send_extension_command("BROWSER_CLOSE", json!({ "tabId": tab_id }), 3_000).await
+}
+
+/// Wait for a condition in an existing browser tab without performing an action.
+pub async fn browser_wait(
+    tab_id: u32,
+    wait_for: serde_json::Value,
+    timeout_ms: u64,
+) -> Result<serde_json::Value, String> {
+    send_extension_command(
+        "BROWSER_WAIT",
+        json!({
+            "tabId": tab_id,
+            "waitFor": wait_for,
+            "timeoutMs": timeout_ms,
+        }),
+        timeout_ms.saturating_add(1_000),
     )
     .await
 }
@@ -508,15 +753,25 @@ pub async fn browser_extract(
     .await
 }
 
-/// Captures a viewport-wide screenshot of a specific tab as a base64 PNG.
-/// `tab_id` is the Chrome tab id returned by `browser_open`.
-pub async fn browser_screenshot(tab_id: u32) -> Result<serde_json::Value, String> {
+/// Screenshot command forwarded to the Chrome Companion.
+pub struct BrowserScreenshotRequest {
+    pub tab_id: u32,
+    pub wait_for: Option<serde_json::Value>,
+    pub timeout_ms: u64,
+}
+
+/// Capture the visible viewport of a specific tab.
+pub async fn browser_screenshot(
+    request: BrowserScreenshotRequest,
+) -> Result<serde_json::Value, String> {
     send_extension_command(
         "BROWSER_SCREENSHOT",
         json!({
-            "tabId": tab_id,
+            "tabId": request.tab_id,
+            "waitFor": request.wait_for,
+            "timeoutMs": request.timeout_ms,
         }),
-        5000,
+        request.timeout_ms.saturating_add(5_000),
     )
     .await
 }
@@ -934,6 +1189,16 @@ fn macos_default_browser_bundle_id() -> Option<String> {
 mod tests {
     use super::*;
 
+    fn test_session(info: CompanionInfo, connected_at: std::time::Instant) -> ExtensionSession {
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        ExtensionSession {
+            sender,
+            pending_requests: std::sync::Mutex::new(HashMap::new()),
+            companion_info: std::sync::Mutex::new(info),
+            connected_at,
+        }
+    }
+
     #[test]
     fn manifest_present_accepts_a_real_build() {
         assert!(manifest_present([
@@ -960,5 +1225,62 @@ mod tests {
         // Chrome loads the manifest from the directory root, so a nested one
         // does not make the embed loadable.
         assert!(!manifest_present(["nested/manifest.json"]));
+    }
+
+    #[test]
+    fn companion_manifest_version_tracks_grove_version() {
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../grove-extension/public/manifest.json"
+        ))
+        .expect("companion manifest should be valid JSON");
+        assert_eq!(
+            manifest.get("version").and_then(|value| value.as_str()),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn legacy_connection_is_reported_as_update_required() {
+        let session = test_session(
+            CompanionInfo::default(),
+            std::time::Instant::now() - COMPANION_HANDSHAKE_GRACE - Duration::from_millis(1),
+        );
+        let status = companion_status(&session);
+        assert_eq!(status["connected"], true);
+        assert_eq!(status["handshakeStatus"], "legacy");
+        assert_eq!(status["compatible"], false);
+        assert_eq!(status["updateRequired"], true);
+    }
+
+    #[test]
+    fn compatible_older_companion_is_usable_but_gets_update_reminder() {
+        let info = CompanionInfo {
+            extension_version: Some("0.12.1".to_string()),
+            protocol_version: Some(COMPANION_PROTOCOL_VERSION),
+            capabilities: REQUIRED_COMPANION_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_string())
+                .collect(),
+        };
+        let status = companion_status(&test_session(info, std::time::Instant::now()));
+        assert_eq!(status["compatible"], true);
+        assert_eq!(status["updateRequired"], false);
+        assert_eq!(status["updateAvailable"], true);
+    }
+
+    #[test]
+    fn missing_capability_requires_an_update() {
+        let info = CompanionInfo {
+            extension_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            protocol_version: Some(COMPANION_PROTOCOL_VERSION),
+            capabilities: Default::default(),
+        };
+        let status = companion_status(&test_session(info, std::time::Instant::now()));
+        assert_eq!(status["compatible"], false);
+        assert_eq!(status["updateRequired"], true);
+        assert_eq!(
+            status["missingCapabilities"].as_array().map(Vec::len),
+            Some(REQUIRED_COMPANION_CAPABILITIES.len())
+        );
     }
 }

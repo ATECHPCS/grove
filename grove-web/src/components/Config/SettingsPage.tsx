@@ -60,7 +60,7 @@ import {
   loadCustomAgentPersonas as loadCustomAgentPersonasIcon,
   setMarketplaceIcons,
 } from "../../utils/agentIcon";
-import { getExtensionStatus } from "../../api/extension";
+import { getExtensionStatusDetails, type ExtensionStatus } from "../../api/extension";
 import { formatShortcut } from "../AI/utils";
 import { useKeyboardScope } from "../../keyboard";
 
@@ -331,16 +331,43 @@ export function SettingsPage({ config }: SettingsPageProps) {
   // Browser Control state
   const [browserControlEnabled, setBrowserControlEnabled] = useState(true);
   const [browserControlAutoGroups, setBrowserControlAutoGroups] = useState(true);
-  // Extension connection state — fetched ONCE on mount; user must refresh the
-  // Settings page after plugging in / removing the extension to see the badge
-  // update. Polling was removed (it was the source of the GET /extension/tabs
-  // every 5s in DevTools).
-  const [extensionConnected, setExtensionConnected] = useState(false);
+  // Status polling is deliberately limited to the cheap in-process status
+  // endpoint. It never queries Chrome tabs, and lets update/reload state change
+  // while the installation dialog is open.
+  const [extensionStatus, setExtensionStatus] = useState<ExtensionStatus | null>(null);
   useEffect(() => {
     let cancelled = false;
-    getExtensionStatus().then((c) => { if (!cancelled) setExtensionConnected(c); });
-    return () => { cancelled = true; };
+    const refresh = () => {
+      getExtensionStatusDetails()
+        .then((status) => { if (!cancelled) setExtensionStatus(status); })
+        .catch(() => { if (!cancelled) setExtensionStatus(null); });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, []);
+  const extensionConnected = extensionStatus?.connected ?? false;
+  const extensionCurrent = extensionStatus?.compatible && !extensionStatus.updateAvailable;
+  const extensionNeedsUpdate = extensionStatus?.updateRequired || extensionStatus?.updateAvailable;
+  const extensionStatusLabel = !extensionConnected
+    ? "Disconnected"
+    : extensionStatus?.handshakeStatus === "pending"
+      ? "Checking…"
+      : extensionStatus?.updateRequired
+        ? "Update required"
+        : extensionStatus?.updateAvailable
+          ? "Update available"
+          : extensionStatus?.compatible
+            ? "Connected"
+            : "Incompatible";
+  const extensionStatusColor = extensionCurrent
+    ? "success"
+    : extensionConnected
+      ? "warning"
+      : "error";
   const [installDialogOpen, setInstallDialogOpen] = useState(false);
 
   // Anchor the language picker to the trigger button. Wrapped in
@@ -1791,29 +1818,35 @@ env_vars = [
                 </div>
                 <div className="flex items-center gap-2 px-3 py-1 bg-[var(--color-bg-tertiary)] rounded-full border border-[var(--color-border)]">
                   <div
-                    className={`w-2 h-2 rounded-full ${extensionConnected ? 'animate-pulse' : ''}`}
+                    className={`w-2 h-2 rounded-full ${extensionCurrent ? 'animate-pulse' : ''}`}
                     style={{
-                      background: `var(--color-${extensionConnected ? 'success' : 'error'})`,
-                      boxShadow: `0 0 8px color-mix(in srgb, var(--color-${extensionConnected ? 'success' : 'error'}) 50%, transparent)`,
+                      background: `var(--color-${extensionStatusColor})`,
+                      boxShadow: `0 0 8px color-mix(in srgb, var(--color-${extensionStatusColor}) 50%, transparent)`,
                     }}
                   />
                   <span className="text-xs font-medium text-[var(--color-text)] select-none">
-                    {extensionConnected ? 'Connected' : 'Disconnected'}
+                    {extensionStatusLabel}
                   </span>
                 </div>
               </div>
               <div className="flex items-center justify-between text-xs pt-2 border-t border-[var(--color-border)]">
                 <span className="text-[var(--color-text-muted)] select-none">
-                  {extensionConnected
-                    ? "Companion is installed and connected."
-                    : "Not installed? The bundled installer walks you through it — pick a folder and Grove handles the rest."}
+                  {extensionStatus?.updateRequired
+                    ? `Connected Companion is incompatible${extensionStatus.installedVersion ? ` (v${extensionStatus.installedVersion})` : ""}. Install v${extensionStatus.requiredVersion}, then click Reload in chrome://extensions/.`
+                    : extensionStatus?.updateAvailable
+                      ? `Companion v${extensionStatus.installedVersion ?? "unknown"} is connected; v${extensionStatus.requiredVersion} is bundled with Grove. Update and reload it in Chrome.`
+                      : extensionStatus?.compatible
+                        ? `Companion v${extensionStatus.installedVersion} is installed, compatible, and connected.`
+                        : extensionConnected
+                          ? "Companion connected; checking protocol compatibility…"
+                          : "Not installed? The bundled installer walks you through it — pick a folder and Grove handles the rest."}
                 </span>
                 <button
                   type="button"
                   onClick={() => setInstallDialogOpen(true)}
                   className="flex items-center gap-1 text-[var(--color-highlight)] hover:underline"
                 >
-                  {extensionConnected ? "Reinstall" : "Install Companion"}
+                  {extensionNeedsUpdate ? "Update Companion" : extensionConnected ? "Reinstall" : "Install Companion"}
                 </button>
               </div>
             </div>

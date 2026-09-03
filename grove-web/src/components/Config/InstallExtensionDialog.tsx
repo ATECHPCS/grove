@@ -7,7 +7,7 @@
  *         chrome://extensions/ (Chromium browsers forward to their own
  *         protocol automatically).
  *
- * Step 2: "Load Unpacked" — always shows the chosen install path with
+ * Step 2: "Load / Reload" — always shows the chosen install path with
  *         click-to-copy and a "Reveal in Finder" button, plus three short
  *         lines explaining the Chrome flow. Footer reflects connection
  *         status independently — no main-content swap on connect, so the
@@ -18,7 +18,7 @@
  *   - POST /api/v1/extension/install               → unpack to user path
  *   - POST /api/v1/extension/open-chrome           → default browser launch
  *   - POST /api/v1/extension/reveal-path           → file manager on dir
- *   - extension WS handshake (drives `useExtensionConnection`)
+ *   - extension WS handshake (drives version and compatibility status)
  */
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
@@ -37,7 +37,8 @@ import {
   openChromeExtensions,
   revealCompanionPath,
   browseInstallFolder,
-  getExtensionStatus,
+  getExtensionStatusDetails,
+  type ExtensionStatus,
 } from "../../api/extension";
 
 interface Props {
@@ -57,15 +58,23 @@ export function InstallExtensionDialog({ onClose }: Props) {
   const [chromeWarning, setChromeWarning] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [revealError, setRevealError] = useState<string | null>(null);
-  // Extension connection — fetched on dialog mount only. No polling. If the
-  // user plugs in the extension AFTER opening this dialog, closing + reopening
-  // the dialog refreshes the badge (the parent conditionally mounts us).
-  const [connected, setConnected] = useState(false);
+  const [extensionStatus, setExtensionStatus] = useState<ExtensionStatus | null>(null);
   useEffect(() => {
     let cancelled = false;
-    getExtensionStatus().then((c) => { if (!cancelled) setConnected(c); });
-    return () => { cancelled = true; };
+    const refresh = () => {
+      getExtensionStatusDetails()
+        .then((status) => { if (!cancelled) setExtensionStatus(status); })
+        .catch(() => { if (!cancelled) setExtensionStatus(null); });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, []);
+  const connected = !!(extensionStatus?.connected && extensionStatus.compatible);
+  const current = connected && !extensionStatus.updateAvailable;
 
   const handleInstall = async () => {
     setInstalling(true);
@@ -156,9 +165,9 @@ export function InstallExtensionDialog({ onClose }: Props) {
 
         {/* Step indicator */}
         <div className="flex items-center gap-3 border-b border-[var(--color-border)] px-5 py-3">
-          <StepDot id={1} active={step === 1} done={step > 1 || connected} label="Install" />
+          <StepDot id={1} active={step === 1} done={step > 1 || current} label="Install" />
           <div className="h-px flex-1 bg-[var(--color-border)]" />
-          <StepDot id={2} active={step === 2} done={connected} label="Load Unpacked" />
+          <StepDot id={2} active={step === 2} done={current} label="Load / Reload" />
         </div>
 
         {/* Body */}
@@ -174,6 +183,7 @@ export function InstallExtensionDialog({ onClose }: Props) {
             <Step2LoadUnpacked
               path={installPath}
               connected={connected}
+              current={current}
               copied={copied}
               chromeWarning={chromeWarning}
               revealError={revealError}
@@ -195,19 +205,23 @@ export function InstallExtensionDialog({ onClose }: Props) {
         <div className="flex items-center justify-between border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-5 py-3">
           <div className="flex items-center gap-2">
             <div
-              className={`h-2 w-2 rounded-full ${connected ? "animate-pulse" : ""}`}
+              className={`h-2 w-2 rounded-full ${current ? "animate-pulse" : ""}`}
               style={{
-                background: `var(--color-${connected ? "success" : "error"})`,
+                background: `var(--color-${current ? "success" : connected ? "warning" : "error"})`,
                 boxShadow: `0 0 8px color-mix(in srgb, var(--color-${
-                  connected ? "success" : "error"
+                  current ? "success" : connected ? "warning" : "error"
                 }) 50%, transparent)`,
               }}
             />
             <span className="text-xs font-medium text-[var(--color-text)]">
-              {connected ? "Companion connected" : "Waiting for companion…"}
+              {current
+                ? "Current Companion connected"
+                : connected
+                  ? "Update installed — reload Companion in Chrome"
+                  : "Waiting for companion…"}
             </span>
           </div>
-          {connected ? (
+          {current ? (
             <button
               type="button"
               onClick={onClose}
@@ -318,6 +332,7 @@ function Step1Install({
 function Step2LoadUnpacked({
   path,
   connected,
+  current,
   copied,
   chromeWarning,
   revealError,
@@ -326,7 +341,8 @@ function Step2LoadUnpacked({
   onReopenChrome,
 }: {
   path: string;
-  connected: boolean;
+  connected: boolean | null | undefined;
+  current: boolean | null | undefined;
   copied: boolean;
   chromeWarning: string | null;
   revealError: string | null;
@@ -346,7 +362,7 @@ function Step2LoadUnpacked({
           <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--color-text-muted)]">
             Installed at
           </span>
-          {connected && (
+          {current && (
             <span className="inline-flex items-center gap-1 rounded-full bg-[color-mix(in_srgb,var(--color-success)_12%,transparent)] px-2 py-0.5 text-[10px] font-semibold text-[var(--color-success)]">
               <Check className="h-2.5 w-2.5" /> Loaded in Chrome
             </span>
@@ -395,7 +411,11 @@ function Step2LoadUnpacked({
             2
           </span>
           <span className="text-[var(--color-text)]">
-            Click <span className="font-mono font-semibold">Load unpacked</span>.
+            {connected ? (
+              <>Find <span className="font-semibold">Grove Companion</span> and click its <span className="font-mono font-semibold">Reload</span> button.</>
+            ) : (
+              <>Click <span className="font-mono font-semibold">Load unpacked</span>.</>
+            )}
           </span>
         </li>
         <li className="flex gap-3">
@@ -403,7 +423,9 @@ function Step2LoadUnpacked({
             3
           </span>
           <span className="text-[var(--color-text)]">
-            Paste the path above (Cmd/Ctrl + Shift + G in macOS file picker).
+            {connected
+              ? "Wait for the status below to confirm the current version is connected."
+              : <>Paste the path above (Cmd/Ctrl + Shift + G in macOS file picker).</>}
           </span>
         </li>
       </ol>

@@ -7,9 +7,10 @@
 //! pre-ACP probing via `session_exists` missed all ACP-only tasks and
 //! wasted work on stale tmux sessions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::RwLock;
+use std::time::Instant;
 
 use once_cell::sync::Lazy;
 
@@ -63,10 +64,19 @@ pub fn ensure_task_active(project_key: &str, task_id: &str, worktree_path: &str)
 
 /// Global session for the connected browser companion extension.
 /// Manages the WebSocket channel and handles async request-response mapping.
+#[derive(Debug, Default)]
+pub struct CompanionInfo {
+    pub extension_version: Option<String>,
+    pub protocol_version: Option<u32>,
+    pub capabilities: HashSet<String>,
+}
+
 pub struct ExtensionSession {
     pub sender: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
     pub pending_requests:
         std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>,
+    pub companion_info: std::sync::Mutex<CompanionInfo>,
+    pub connected_at: Instant,
 }
 
 pub static EXTENSION_SESSION: Lazy<RwLock<Option<ExtensionSession>>> =

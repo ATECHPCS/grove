@@ -15,6 +15,20 @@ export interface ExtensionTab {
   favIconUrl?: string;
 }
 
+export interface ExtensionStatus {
+  connected: boolean;
+  handshakeStatus: 'disconnected' | 'pending' | 'legacy' | 'ready';
+  compatible: boolean;
+  updateRequired: boolean;
+  updateAvailable: boolean;
+  installedVersion: string | null;
+  requiredVersion: string;
+  protocolVersion: number | null;
+  requiredProtocolVersion: number;
+  capabilities: string[];
+  missingCapabilities?: string[];
+}
+
 /**
  * List currently open browser tabs (via the connected Chrome companion).
  * Throws when the extension is offline / backend is unreachable; callers
@@ -27,13 +41,17 @@ export async function listExtensionTabs(): Promise<ExtensionTab[]> {
 /**
  * Probe whether the Chrome companion extension is reachable. Hits a
  * lightweight backend endpoint that only checks the in-process EXTENSION_SESSION
- * — no WebSocket round-trip to the browser extension. Callers should fetch
- * once on mount (or before opening a related UI flow); polling is wasted work.
+ * — no WebSocket round-trip to the browser extension. It returns true only
+ * when the connected Companion has completed a compatible protocol handshake.
  */
+export async function getExtensionStatusDetails(): Promise<ExtensionStatus> {
+  return apiClient.get<ExtensionStatus>('/api/v1/extension/status');
+}
+
 export async function getExtensionStatus(): Promise<boolean> {
   try {
-    const resp = await apiClient.get<{ connected: boolean }>('/api/v1/extension/status');
-    return !!resp.connected;
+    const resp = await getExtensionStatusDetails();
+    return resp.connected && resp.compatible;
   } catch {
     return false;
   }
