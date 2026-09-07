@@ -28,6 +28,7 @@ mod notification_state;
 mod operations;
 mod plugins;
 mod session;
+mod speech;
 mod stats;
 mod storage;
 mod symbols;

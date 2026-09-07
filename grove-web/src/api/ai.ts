@@ -1,7 +1,7 @@
 // AI Settings API (providers + audio)
 
 import { apiClient, getApiHost } from './client';
-import type { AudioSettings, ProviderProfile, VoiceControlSettings } from '../components/AI/types';
+import type { AudioSettings, ProviderProfile, SpeakingProfile, SpeakingProviderSchema, SpeakingVoicePage, SpeakingVoiceQuery, VoiceControlSettings } from '../components/AI/types';
 
 // ─── Provider Types ─────────────────────────────────────────────────────────
 
@@ -13,6 +13,7 @@ export interface ProviderResponse {
   api_key: string; // masked
   model: string;
   status: string;
+  supports_speaking?: boolean;
 }
 
 interface ProvidersListResponse {
@@ -104,7 +105,98 @@ function serverToProvider(s: ProviderResponse): ProviderProfile {
     apiKey: s.api_key,
     model: s.model,
     status: s.status as ProviderProfile['status'],
+    // Compatibility with a backend process that predates capability
+    // advertisement. New provider types remain server-driven.
+    supportsSpeaking: s.supports_speaking ?? s.type.toLowerCase() === 'elevenlabs',
   };
+}
+
+// ─── Agent Voice API ───────────────────────────────────────────────────────
+
+export async function listSpeakingProfiles(): Promise<SpeakingProfile[]> {
+  const response = await apiClient.get<{ profiles: SpeakingProfile[] }>('/api/v1/ai/speaking-profiles');
+  return response.profiles;
+}
+
+export async function createSpeakingProfile(
+  data: Omit<SpeakingProfile, 'id'>,
+): Promise<SpeakingProfile> {
+  return apiClient.post('/api/v1/ai/speaking-profiles', data);
+}
+
+export async function updateSpeakingProfile(
+  id: string,
+  data: Omit<SpeakingProfile, 'id'>,
+): Promise<SpeakingProfile> {
+  return apiClient.put(`/api/v1/ai/speaking-profiles/${id}`, data);
+}
+
+export async function deleteSpeakingProfile(id: string): Promise<void> {
+  await apiClient.delete(`/api/v1/ai/speaking-profiles/${id}`);
+}
+
+export async function listSpeakingVoices(providerId: string, query: SpeakingVoiceQuery = {}): Promise<SpeakingVoicePage> {
+  const params = new URLSearchParams();
+  if (query.search) params.set('search', query.search);
+  if (query.voiceType) params.set('voice_type', query.voiceType);
+  if (query.language) params.set('language', query.language);
+  if (query.voiceId) params.set('voice_id', query.voiceId);
+  if (query.nextPageToken) params.set('next_page_token', query.nextPageToken);
+  params.set('page_size', String(query.pageSize ?? 50));
+  const response = await apiClient.get<{ voices: Record<string, unknown> | Array<Record<string, unknown>> }>(
+    `/api/v1/ai/speaking-providers/${providerId}/voices?${params.toString()}`,
+  );
+  const page = Array.isArray(response.voices) ? {} : response.voices;
+  const raw = Array.isArray(response.voices)
+    ? response.voices
+    : Array.isArray(page.voices) ? page.voices as Array<Record<string, unknown>> : [];
+  return {
+    voices: raw.map((voice) => {
+      const labels = typeof voice.labels === 'object' && voice.labels ? voice.labels as Record<string, unknown> : {};
+      const sharing = typeof voice.sharing === 'object' && voice.sharing ? voice.sharing as Record<string, unknown> : {};
+      const isOwner = voice.is_owner === true;
+      const source = typeof voice.source === 'string' ? voice.source : isOwner
+        ? 'Personal'
+        : sharing.status === 'copied' || voice.is_bookmarked === true
+          ? 'Saved'
+          : voice.category === 'premade'
+            ? 'Default'
+            : 'Workspace';
+      return {
+        voiceId: String(voice.voice_id ?? voice.voiceId ?? ''),
+        name: String(voice.name ?? 'Untitled Voice'),
+        category: typeof voice.category === 'string' ? voice.category : undefined,
+        description: typeof voice.description === 'string' ? voice.description : undefined,
+        previewUrl: typeof voice.previewUrl === 'string' ? voice.previewUrl : typeof voice.preview_url === 'string' ? voice.preview_url : undefined,
+        language: typeof voice.language === 'string' ? voice.language : typeof labels.language === 'string' ? labels.language : undefined,
+        locale: typeof voice.locale === 'string' ? voice.locale : typeof labels.locale === 'string' ? labels.locale : undefined,
+        accent: typeof voice.accent === 'string' ? voice.accent : typeof labels.accent === 'string' ? labels.accent : undefined,
+        gender: typeof voice.gender === 'string' ? voice.gender : typeof labels.gender === 'string' ? labels.gender : undefined,
+        age: typeof voice.age === 'string' ? voice.age : typeof labels.age === 'string' ? labels.age : undefined,
+        useCase: typeof voice.useCase === 'string' ? voice.useCase : typeof voice.use_case === 'string' ? voice.use_case : typeof labels.use_case === 'string' ? labels.use_case : undefined,
+        supportedModelIds: Array.isArray(voice.supportedModelIds)
+          ? voice.supportedModelIds.filter((value): value is string => typeof value === 'string')
+          : Array.isArray(voice.high_quality_base_model_ids)
+            ? voice.high_quality_base_model_ids.filter((value): value is string => typeof value === 'string')
+            : undefined,
+        source,
+      };
+    }).filter((voice) => voice.voiceId),
+    hasMore: page.hasMore === true || page.has_more === true,
+    nextPageToken: typeof page.nextPageToken === 'string' ? page.nextPageToken : typeof page.next_page_token === 'string' ? page.next_page_token : undefined,
+    totalCount: typeof page.totalCount === 'number' ? page.totalCount : typeof page.total_count === 'number' ? page.total_count : undefined,
+  };
+}
+
+export async function getSpeakingProviderSchema(providerId: string): Promise<SpeakingProviderSchema> {
+  return apiClient.get(`/api/v1/ai/speaking-providers/${providerId}/schema`);
+}
+
+export async function previewSpeakingProfile(
+  id: string,
+  text: string,
+): Promise<{ mimeType: string; audioBase64: string }> {
+  return apiClient.post(`/api/v1/ai/speaking-profiles/${id}/preview`, { text });
 }
 
 // ─── Audio API ──────────────────────────────────────────────────────────────

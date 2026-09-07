@@ -234,6 +234,27 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             status        TEXT NOT NULL DEFAULT 'draft'
         );
 
+        -- Provider capability discovery is refreshed only by an explicit
+        -- connection test. Settings pages read this cache and never call a
+        -- third-party API merely because they were opened.
+        CREATE TABLE IF NOT EXISTS ai_provider_capabilities (
+            provider_id  TEXT PRIMARY KEY REFERENCES ai_providers(id) ON DELETE CASCADE,
+            schema_json  TEXT NOT NULL,
+            refreshed_at TEXT NOT NULL
+        );
+
+        -- Agent Voice speaking profiles. Provider-specific voice settings stay
+        -- in config_json so the shared Speak runtime does not depend on any
+        -- one TTS vendor's schema.
+        CREATE TABLE IF NOT EXISTS speaking_profiles (
+            id                   TEXT PRIMARY KEY,
+            name                 TEXT NOT NULL,
+            provider_id          TEXT NOT NULL REFERENCES ai_providers(id) ON DELETE CASCADE,
+            config_json          TEXT NOT NULL DEFAULT '{}',
+            max_characters       INTEGER NOT NULL DEFAULT 280,
+            max_duration_seconds INTEGER NOT NULL DEFAULT 30
+        );
+
         -- Audio Config (global, single row)
         CREATE TABLE IF NOT EXISTS audio_config (
             id                  INTEGER PRIMARY KEY CHECK (id = 1),

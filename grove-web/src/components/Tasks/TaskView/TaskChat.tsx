@@ -66,8 +66,10 @@ import {
   Database,
   Archive,
   ArchiveRestore,
+  AudioWaveform,
 } from "lucide-react";
 import { iconUrlForFile } from "../../ui/iconUrl";
+import { VoiceIdentityIcon } from "../../AI/components/VoiceIdentityIcon";
 import {
   Button,
   ImageLightbox,
@@ -104,7 +106,24 @@ import {
   usePersonaRegistry,
 } from "../../../utils/agentIcon";
 import type { MentionItem, FilteredMentionItem } from "../../../utils/fileMention";
-import { getMentionCandidates } from "../../../api";
+import { getMentionCandidates, listSpeakingProfiles } from "../../../api";
+import type { SpeakingProfile } from "../../AI/types";
+import {
+  cancelAgentVoiceForSession,
+  clearPendingAgentVoiceInstruction,
+  enqueueAgentVoiceAudio,
+  hasPendingAgentVoiceInstruction,
+  loadAgentVoiceState,
+  markAgentVoiceInstructionPending,
+  saveAgentVoiceState,
+  shouldPlayAgentVoiceAudio,
+  subscribeAgentVoicePlayback,
+  unlockAgentVoiceAudio,
+  type AgentVoiceAudioEvent,
+  type AgentVoiceErrorEvent,
+  type AgentVoicePlaybackStatus,
+  type AgentVoiceSessionState,
+} from "../../../utils/agentVoice";
 import type {
   SessionConfigOption,
   SessionConfigSelectValue,
@@ -2680,6 +2699,15 @@ export function TaskChat({
   const [showThoughtLevelMenu, setShowThoughtLevelMenu] = useState(false);
   const [showModelMenu, setShowModelMenu] = useState(false);
   const [showPermMenu, setShowPermMenu] = useState(false);
+  const [showAgentVoiceMenu, setShowAgentVoiceMenu] = useState(false);
+  const agentVoiceMenuRef = useRef<HTMLDivElement>(null);
+  const [speakingProfiles, setSpeakingProfiles] = useState<SpeakingProfile[]>([]);
+  const [speakingProfilesLoaded, setSpeakingProfilesLoaded] = useState(false);
+  const [agentVoiceState, setAgentVoiceState] = useState<AgentVoiceSessionState>({
+    enabled: false,
+    speakingProfileId: null,
+  });
+  const [agentVoicePlayback, setAgentVoicePlayback] = useState<AgentVoicePlaybackStatus>("idle");
   const [planEntries, setPlanEntries] = useState<PlanEntry[]>([]);
   const [showPlan, setShowPlan] = useState(false);
   // Latest ACP `usage_update` for the current chat. `null` until the agent
@@ -3112,6 +3140,103 @@ export function TaskChat({
     chats.find((c) => c.id === activeChatId) ??
     archivedChats.find((c) => c.id === activeChatId);
   const isViewingArchived = archivedChats.some((chat) => chat.id === activeChatId);
+
+  const refreshSpeakingProfiles = useCallback(() => {
+    void listSpeakingProfiles()
+      .then((profiles) => {
+        setSpeakingProfiles(profiles);
+        setSpeakingProfilesLoaded(true);
+      })
+      .catch((error) => console.error("[Agent Voice] failed to load Speaking Profiles", error));
+  }, []);
+
+  useEffect(() => {
+    refreshSpeakingProfiles();
+    window.addEventListener("grove:speaking-profiles-changed", refreshSpeakingProfiles);
+    return () => window.removeEventListener("grove:speaking-profiles-changed", refreshSpeakingProfiles);
+  }, [refreshSpeakingProfiles]);
+
+  useEffect(() => {
+    if (!activeChatId) {
+      setAgentVoiceState({ enabled: false, speakingProfileId: null });
+      setAgentVoicePlayback("idle");
+      return;
+    }
+    setAgentVoiceState(loadAgentVoiceState(projectId, taskId, activeChatId));
+    setShowAgentVoiceMenu(false);
+  }, [activeChatId, projectId, taskId]);
+
+  useEffect(() => {
+    if (!activeChatId) return;
+    return subscribeAgentVoicePlayback(activeChatId, setAgentVoicePlayback);
+  }, [activeChatId]);
+
+  useEffect(() => {
+    const close = (event: MouseEvent) => {
+      if (!agentVoiceMenuRef.current?.contains(event.target as Node)) {
+        setShowAgentVoiceMenu(false);
+      }
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, []);
+
+  const sendAgentVoiceState = useCallback((
+    chatId: string,
+    state: AgentVoiceSessionState,
+    notifyAgent = false,
+  ) => {
+    const socket = wsMapRef.current.get(chatId);
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({
+      type: "agent_voice_state",
+      enabled: state.enabled,
+      profile_id: state.speakingProfileId,
+      notify_agent: notifyAgent,
+    }));
+  }, []);
+
+  const updateAgentVoiceState = useCallback((next: AgentVoiceSessionState) => {
+    if (!activeChatId) return;
+    if (!next.enabled || next.speakingProfileId !== agentVoiceState.speakingProfileId) {
+      cancelAgentVoiceForSession(activeChatId);
+    }
+    saveAgentVoiceState(projectId, taskId, activeChatId, next);
+    markAgentVoiceInstructionPending(projectId, taskId, activeChatId);
+    setAgentVoiceState(next);
+    sendAgentVoiceState(activeChatId, next);
+    if (next.enabled) {
+      void unlockAgentVoiceAudio().catch((error) => console.error("[Agent Voice] audio unlock failed", error));
+    }
+  }, [activeChatId, agentVoiceState.speakingProfileId, projectId, sendAgentVoiceState, taskId]);
+  const activeSpeakingProfile = speakingProfiles.find(
+    (profile) => profile.id === agentVoiceState.speakingProfileId,
+  );
+
+  useEffect(() => {
+    if (
+      !speakingProfilesLoaded
+      || !agentVoiceState.enabled
+      || !agentVoiceState.speakingProfileId
+      || activeSpeakingProfile
+    ) return;
+    queueMicrotask(() => updateAgentVoiceState({ enabled: false, speakingProfileId: null }));
+  }, [activeSpeakingProfile, agentVoiceState.enabled, agentVoiceState.speakingProfileId, speakingProfilesLoaded, updateAgentVoiceState]);
+
+  useEffect(() => {
+    const handleDeleted = (event: Event) => {
+      const deletedId = (event as CustomEvent<{ id?: string }>).detail?.id;
+      if (!deletedId || deletedId !== agentVoiceState.speakingProfileId || !activeChatId) return;
+      const next = { enabled: false, speakingProfileId: null };
+      saveAgentVoiceState(projectId, taskId, activeChatId, next);
+      markAgentVoiceInstructionPending(projectId, taskId, activeChatId);
+      setAgentVoiceState(next);
+      sendAgentVoiceState(activeChatId, next);
+      cancelAgentVoiceForSession(activeChatId);
+    };
+    window.addEventListener("grove:speaking-profile-deleted", handleDeleted);
+    return () => window.removeEventListener("grove:speaking-profile-deleted", handleDeleted);
+  }, [activeChatId, agentVoiceState.speakingProfileId, projectId, sendAgentVoiceState, taskId]);
   const isReadOnlyHistory = finished || isViewingArchived;
   // Terminal-mode chat: agent CLI runs under a PTY (no ACP). Messages area
   // becomes xterm.js; chatbox input writes to PTY stdin instead of session/prompt.
@@ -4682,6 +4807,7 @@ export function TaskChat({
       ws.onopen = () => {
         // Successful connect — reset backoff so the next disconnect retries fast.
         reconnectAttemptRef.current.delete(chatId);
+        sendAgentVoiceState(chatId, loadAgentVoiceState(projectId, taskId, chatId));
       };
 
       ws.onmessage = (event) => {
@@ -4691,6 +4817,24 @@ export function TaskChat({
         if (wsMapRef.current.get(chatId) !== ws) return;
         try {
           const data = JSON.parse(event.data);
+          if (data?.type === "agent_voice_audio") {
+            const audioEvent = data as AgentVoiceAudioEvent;
+            const voiceState = loadAgentVoiceState(projectId, taskId, audioEvent.chat_id);
+            // A synthesis response can already be in flight when the user
+            // disables Agent Voice or switches profiles. Local Session state
+            // remains authoritative, so discard that stale delivery here.
+            if (shouldPlayAgentVoiceAudio(audioEvent, voiceState)) {
+              enqueueAgentVoiceAudio(audioEvent);
+            }
+            return;
+          }
+          if (data?.type === "agent_voice_error") {
+            const voiceError = data as AgentVoiceErrorEvent;
+            setMessages((previous) =>
+              appendSystemMessage(previous, `Agent Voice: ${voiceError.message}`),
+            );
+            return;
+          }
           // Permanent-failure check: if backend says "Resume session failed"
           // (commit 5ec92be), the saved_id is stale and retries with the same
           // id will keep failing. Mark this chat as intentionally closing so
@@ -4794,7 +4938,7 @@ export function TaskChat({
         }
       };
     },
-    [projectId, taskId, getActiveChatId],
+    [projectId, taskId, getActiveChatId, sendAgentVoiceState],
   );
 
 
@@ -6849,6 +6993,18 @@ export function TaskChat({
       return;
     }
 
+    // A persisted Session can reopen with Agent Voice already enabled, but a
+    // browser refresh creates a new AudioContext that is locked until the next
+    // user gesture. Sending a real message is that gesture, so unlock here as
+    // well as when the user explicitly selects a Speaking Profile.
+    if (agentVoiceState.enabled) {
+      try {
+        await unlockAgentVoiceAudio();
+      } catch (error) {
+        console.error("[Agent Voice] audio unlock failed", error);
+      }
+    }
+
     // Shell mode → send terminal_execute directly (bypasses AI)
     if (isTerminalMode) {
       if (!prompt || isBusy) return;
@@ -6929,8 +7085,21 @@ export function TaskChat({
             label: att.label,
             mime_type: att.mimeType,
             ...(att.type === "image" && att.uri ? { uri: att.uri } : {}),
-          }),
+        }),
     }));
+
+    const hasPendingVoiceInstruction = hasPendingAgentVoiceInstruction(
+      projectId,
+      taskId,
+      activeChatId,
+    );
+    if (hasPendingVoiceInstruction) {
+      sendAgentVoiceState(
+        activeChatId,
+        loadAgentVoiceState(projectId, taskId, activeChatId),
+        true,
+      );
+    }
 
     if (isBusy) {
       // Queue message on server when agent is busy
@@ -6949,6 +7118,9 @@ export function TaskChat({
           config: buildPromptConfig(),
         }),
       );
+      if (hasPendingVoiceInstruction) {
+        clearPendingAgentVoiceInstruction(projectId, taskId, activeChatId);
+      }
       promoteChatForLocalActivity(activeChatId);
       el.innerHTML = "";
       clearChatDraft(activeChatId);
@@ -6973,6 +7145,9 @@ export function TaskChat({
           config: buildPromptConfig(),
         }),
       );
+      if (hasPendingVoiceInstruction) {
+        clearPendingAgentVoiceInstruction(projectId, taskId, activeChatId);
+      }
       promoteChatForLocalActivity(activeChatId);
       el.innerHTML = "";
       clearChatDraft(activeChatId);
@@ -6991,7 +7166,7 @@ export function TaskChat({
       onUserMessageSent?.();
       el.focus();
     }
-  }, [isTerminalMode, isBusy, attachments, activeChatId, isConnected, projectId, taskId, requestBottom, onUserMessageSent, buildPromptConfig, isTerminalLaunchMode, agentPtyWsUrl, promoteChatForLocalActivity]);
+  }, [isTerminalMode, isBusy, attachments, activeChatId, isConnected, projectId, taskId, requestBottom, onUserMessageSent, buildPromptConfig, isTerminalLaunchMode, agentPtyWsUrl, promoteChatForLocalActivity, agentVoiceState.enabled, sendAgentVoiceState]);
 
   const sendPreviewComments = useCallback((comments: PreviewCommentDraft[]) => {
     if (
@@ -10625,6 +10800,112 @@ export function TaskChat({
                         />
                       )}
                     </div>
+                    {!isTerminalLaunchMode && !isViewingArchived && (
+                      <div className="relative shrink-0" ref={agentVoiceMenuRef}>
+                        <div className={`inline-flex h-7 items-center overflow-hidden rounded-full border border-transparent bg-[var(--color-bg)] transition-colors ${agentVoiceState.enabled ? "text-[var(--color-text)]" : "text-[var(--color-text-muted)]"}`}>
+                          <button
+                            type="button"
+                            onClick={() => setShowAgentVoiceMenu((visible) => !visible)}
+                            disabled={!isConnected}
+                            aria-pressed={agentVoiceState.enabled}
+                            aria-label={agentVoiceState.enabled
+                              ? `Agent Voice enabled with ${activeSpeakingProfile?.name ?? "selected profile"}`
+                              : "Configure Agent Voice for this Session"}
+                            className={`inline-flex h-full min-w-0 items-center justify-center gap-1.5 transition-colors hover:bg-[var(--color-bg-tertiary)] disabled:opacity-45 ${agentVoiceState.enabled ? "max-w-36 px-2" : "w-7 px-0"}`}
+                            title={agentVoiceState.enabled
+                              ? `Agent Voice: ${activeSpeakingProfile?.name ?? "On"}`
+                              : "Agent Voice"}
+                          >
+                            {agentVoicePlayback === "queued" ? (
+                              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[var(--color-highlight)]" />
+                            ) : agentVoicePlayback === "playing" ? (
+                              <AudioWaveform className="h-3.5 w-3.5 shrink-0 animate-pulse text-[var(--color-highlight)]" strokeWidth={2} />
+                            ) : agentVoiceState.enabled && activeSpeakingProfile ? (
+                              <VoiceIdentityIcon kind="profile" id={activeSpeakingProfile.id} size="xs" />
+                            ) : (
+                              <AudioWaveform className="h-3.5 w-3.5" strokeWidth={1.8} />
+                            )}
+                            {agentVoiceState.enabled && (
+                              <span className="min-w-0 truncate text-xs font-medium">
+                                {agentVoicePlayback === "queued" ? "Preparing…" : activeSpeakingProfile?.name ?? "Voice"}
+                              </span>
+                            )}
+                          </button>
+                          {agentVoicePlayback === "playing" && activeChatId && (
+                            <button
+                              type="button"
+                              aria-label="Stop Agent Voice playback"
+                              title="Stop speaking"
+                              onClick={() => {
+                                cancelAgentVoiceForSession(activeChatId);
+                                setShowAgentVoiceMenu(false);
+                              }}
+                              className="flex h-4 w-7 shrink-0 items-center justify-center border-l border-[var(--color-border)] text-[var(--color-text-muted)] transition-colors hover:text-[var(--color-error)]"
+                            >
+                              <Square className="h-2.5 w-2.5 fill-current" />
+                            </button>
+                          )}
+                        </div>
+                        {showAgentVoiceMenu && (
+                          <div className="absolute bottom-full left-0 z-50 mb-2 w-72 overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-bg)] shadow-xl">
+                            <div className="border-b border-[var(--color-border)] px-3 py-2.5">
+                              <div className="text-xs font-semibold text-[var(--color-text)]">Agent Voice</div>
+                              <div className="mt-0.5 text-[10px] text-[var(--color-text-muted)]">Session-specific voice output</div>
+                            </div>
+                            <div className="max-h-64 overflow-y-auto p-1.5">
+                              {speakingProfiles.length === 0 ? (
+                                <div className="px-3 py-4 text-center">
+                                  <div className="mx-auto flex h-8 w-8 items-center justify-center rounded-full bg-[var(--color-bg-secondary)] text-[var(--color-text-muted)]">
+                                    <AudioWaveform className="h-4 w-4" strokeWidth={1.8} />
+                                  </div>
+                                  <div className="mt-2 text-xs font-medium text-[var(--color-text)]">No Speaking Profiles</div>
+                                  <div className="mt-1 text-[10px] leading-4 text-[var(--color-text-muted)]">Create a voice setup before enabling Agent Voice.</div>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setShowAgentVoiceMenu(false);
+                                      window.sessionStorage.setItem("grove:ai-settings-tab", "agent_voice");
+                                      window.dispatchEvent(new CustomEvent("grove:open-ai-settings"));
+                                    }}
+                                    className="mt-3 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-3 py-1.5 text-[11px] font-medium text-[var(--color-text)] transition-colors hover:border-[var(--color-highlight)] hover:text-[var(--color-highlight)]"
+                                  >
+                                    Configure Agent Voice
+                                  </button>
+                                </div>
+                              ) : speakingProfiles.map((profile) => (
+                                <button
+                                  key={profile.id}
+                                  type="button"
+                                  onClick={() => {
+                                    updateAgentVoiceState({ enabled: true, speakingProfileId: profile.id });
+                                    setShowAgentVoiceMenu(false);
+                                  }}
+                                  className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition-colors ${agentVoiceState.enabled && profile.id === agentVoiceState.speakingProfileId ? "bg-[var(--color-highlight)]/10 text-[var(--color-highlight)]" : "text-[var(--color-text)] hover:bg-[var(--color-bg-secondary)]"}`}
+                                >
+                                  <VoiceIdentityIcon kind="profile" id={profile.id} size="xs" />
+                                  <span className="min-w-0 flex-1 truncate">{profile.name}</span>
+                                  <span className="text-[10px] text-[var(--color-text-muted)]">{profile.maxCharacters} chars</span>
+                                </button>
+                              ))}
+                            </div>
+                            {agentVoiceState.enabled && (
+                              <div className="border-t border-[var(--color-border)] p-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    updateAgentVoiceState({ enabled: false, speakingProfileId: agentVoiceState.speakingProfileId });
+                                    setShowAgentVoiceMenu(false);
+                                  }}
+                                  className="w-full rounded-lg px-2.5 py-2 text-left text-xs text-[var(--color-text-muted)] hover:bg-[var(--color-bg-secondary)] hover:text-[var(--color-text)]"
+                                >
+                                  Turn off for this Session
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
                     {isTerminalMode && (
                       <div className="inline-flex items-center gap-1 rounded-full bg-[color-mix(in_srgb,var(--color-warning)_10%,transparent)] px-2 py-1 text-[10px] font-medium text-[var(--color-warning)]">
                         <Terminal className="w-3 h-3" />

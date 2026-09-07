@@ -791,6 +791,31 @@ pub fn create_api_router() -> Router {
             "/ai/providers/{id}/verify",
             post(handlers::ai::verify_provider),
         )
+        .route(
+            "/ai/speaking-profiles",
+            get(handlers::ai::list_speaking_profiles).post(handlers::ai::create_speaking_profile),
+        )
+        .route(
+            "/ai/speaking-profiles/{id}",
+            put(handlers::ai::update_speaking_profile)
+                .delete(handlers::ai::delete_speaking_profile),
+        )
+        .route(
+            "/ai/speaking-profiles/{id}/preview",
+            post(handlers::ai::preview_speaking_profile),
+        )
+        .route(
+            "/ai/speaking-providers/{provider_id}/voices",
+            get(handlers::ai::list_speaking_voices),
+        )
+        .route(
+            "/ai/speaking-providers/{provider_id}/schema",
+            get(handlers::ai::get_speaking_provider_schema),
+        )
+        .route(
+            "/ai/agent-voice/runtime/ws",
+            get(handlers::ai::agent_voice_runtime_ws),
+        )
         // AI Settings API — Audio
         .route("/ai/transcribe", post(handlers::ai::transcribe))
         .route(

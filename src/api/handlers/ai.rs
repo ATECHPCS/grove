@@ -1,7 +1,9 @@
 //! AI Settings API handlers (providers + audio + transcribe)
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Multipart, Path, Query};
 use axum::http::StatusCode;
+use axum::response::Response;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +23,7 @@ pub struct ProviderDto {
     pub api_key: String,
     pub model: String,
     pub status: String,
+    pub supports_speaking: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +72,7 @@ fn provider_to_dto(p: &ai::ProviderProfile) -> ProviderDto {
         api_key: mask_api_key(&p.api_key),
         model: p.model.clone(),
         status: p.status.clone(),
+        supports_speaking: crate::speech::supports_provider(p),
     }
 }
 
@@ -117,6 +121,19 @@ pub async fn update_provider(
         .find(|p| p.id == id)
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    let capability_source_changed = req
+        .provider_type
+        .as_ref()
+        .is_some_and(|value| value != &profile.provider_type)
+        || req
+            .base_url
+            .as_ref()
+            .is_some_and(|value| value != &profile.base_url)
+        || req
+            .api_key
+            .as_ref()
+            .is_some_and(|value| value != &profile.api_key);
+
     if let Some(name) = req.name {
         profile.name = name;
     }
@@ -138,6 +155,9 @@ pub async fn update_provider(
 
     let dto = provider_to_dto(profile);
     ai::save_providers(&data).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if capability_source_changed {
+        ai::clear_provider_capability_schema(&id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
 
     Ok(Json(dto))
 }
@@ -173,20 +193,51 @@ pub async fn verify_provider(Path(id): Path<String>) -> Result<Json<VerifyRespon
         .find(|p| p.id == id)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Blocking HTTP call — run off the async runtime
-    let url = format!("{}/models", profile.base_url.trim_end_matches('/'));
-    let api_key = profile.api_key.clone();
-    let (status, message) = tokio::task::spawn_blocking(move || {
+    // Blocking HTTP call — run off the async runtime. Speaking providers use
+    // their adapter because authentication and discovery endpoints differ
+    // from the OpenAI-compatible provider contract.
+    let profile_snapshot = profile.clone();
+    let (status, message, discovered_schema) = tokio::task::spawn_blocking(move || {
+        if profile_snapshot
+            .provider_type
+            .eq_ignore_ascii_case("ElevenLabs")
+        {
+            return match crate::speech::verify_provider(&profile_snapshot) {
+                Ok(()) => match crate::speech::discover_provider_schema(&profile_snapshot) {
+                    Ok(schema) => (
+                        "verified".to_string(),
+                        "Connection successful; models refreshed".to_string(),
+                        Some(schema),
+                    ),
+                    Err(error) => ("failed".to_string(), error, None),
+                },
+                Err(error) => ("failed".to_string(), error, None),
+            };
+        }
+        let url = format!("{}/models", profile_snapshot.base_url.trim_end_matches('/'));
         let result = ureq::get(&url)
-            .set("Authorization", &format!("Bearer {}", api_key))
+            .set(
+                "Authorization",
+                &format!("Bearer {}", profile_snapshot.api_key),
+            )
             .timeout(std::time::Duration::from_secs(10))
             .call();
         match result {
-            Ok(resp) if resp.status() == 200 => {
-                ("verified".to_string(), "Connection successful".to_string())
-            }
-            Ok(resp) => ("failed".to_string(), format!("HTTP {}", resp.status())),
-            Err(e) => ("failed".to_string(), format!("Connection failed: {}", e)),
+            Ok(resp) if resp.status() == 200 => (
+                "verified".to_string(),
+                "Connection successful".to_string(),
+                None,
+            ),
+            Ok(resp) => (
+                "failed".to_string(),
+                format!("HTTP {}", resp.status()),
+                None,
+            ),
+            Err(e) => (
+                "failed".to_string(),
+                format!("Connection failed: {}", e),
+                None,
+            ),
         }
     })
     .await
@@ -194,8 +245,246 @@ pub async fn verify_provider(Path(id): Path<String>) -> Result<Json<VerifyRespon
 
     profile.status = status.clone();
     ai::save_providers(&data).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(schema) = discovered_schema {
+        ai::save_provider_capability_schema(&id, &schema)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
 
     Ok(Json(VerifyResponse { status, message }))
+}
+
+// ─── Agent Voice / Speaking Profile Handlers ───────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveSpeakingProfileRequest {
+    pub name: String,
+    pub provider_id: String,
+    #[serde(default)]
+    pub config: serde_json::Value,
+    pub max_characters: u32,
+    pub max_duration_seconds: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SpeakingProfilesResponse {
+    pub profiles: Vec<ai::SpeakingProfile>,
+}
+
+pub async fn list_speaking_profiles() -> Json<SpeakingProfilesResponse> {
+    Json(SpeakingProfilesResponse {
+        profiles: ai::load_speaking_profiles(),
+    })
+}
+
+fn checked_speaking_profile(
+    id: String,
+    req: SaveSpeakingProfileRequest,
+) -> Result<ai::SpeakingProfile, StatusCode> {
+    if req.name.trim().is_empty()
+        || req.max_characters == 0
+        || req.max_characters > 2_000
+        || req.max_duration_seconds == 0
+        || req.max_duration_seconds > 300
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let provider = ai::get_provider(&req.provider_id).ok_or(StatusCode::BAD_REQUEST)?;
+    let profile = ai::SpeakingProfile {
+        id,
+        name: req.name.trim().to_string(),
+        provider_id: req.provider_id,
+        config: req.config,
+        max_characters: req.max_characters,
+        max_duration_seconds: req.max_duration_seconds,
+    };
+    crate::speech::validate_profile(&provider, &profile).map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(profile)
+}
+
+pub async fn create_speaking_profile(
+    Json(req): Json<SaveSpeakingProfileRequest>,
+) -> Result<Json<ai::SpeakingProfile>, StatusCode> {
+    let profile = checked_speaking_profile(ai::generate_provider_id(), req)?;
+    ai::save_speaking_profile(&profile).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(profile))
+}
+
+pub async fn update_speaking_profile(
+    Path(id): Path<String>,
+    Json(req): Json<SaveSpeakingProfileRequest>,
+) -> Result<Json<ai::SpeakingProfile>, StatusCode> {
+    if ai::get_speaking_profile(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .is_none()
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let profile = checked_speaking_profile(id, req)?;
+    ai::save_speaking_profile(&profile).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(profile))
+}
+
+pub async fn delete_speaking_profile(Path(id): Path<String>) -> Result<StatusCode, StatusCode> {
+    if ai::delete_speaking_profile(&id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct SpeakingVoicesResponse {
+    pub voices: serde_json::Value,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SpeakingVoicesQuery {
+    pub search: Option<String>,
+    pub voice_type: Option<String>,
+    pub language: Option<String>,
+    pub voice_id: Option<String>,
+    pub next_page_token: Option<String>,
+    pub page_size: Option<u32>,
+}
+
+pub async fn list_speaking_voices(
+    Path(provider_id): Path<String>,
+    Query(query): Query<SpeakingVoicesQuery>,
+) -> Result<Json<SpeakingVoicesResponse>, (StatusCode, String)> {
+    let provider = ai::get_provider(&provider_id).ok_or((
+        StatusCode::NOT_FOUND,
+        "Speaking Provider not found".to_string(),
+    ))?;
+    let options = crate::speech::VoiceListOptions {
+        search: query.search,
+        voice_type: query.voice_type,
+        language: query.language,
+        voice_id: query.voice_id,
+        next_page_token: query.next_page_token,
+        page_size: query.page_size.unwrap_or(50),
+    };
+    let voices =
+        tokio::task::spawn_blocking(move || crate::speech::list_voices(&provider, &options))
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(SpeakingVoicesResponse { voices }))
+}
+
+pub async fn get_speaking_provider_schema(
+    Path(provider_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let provider = ai::get_provider(&provider_id).ok_or((
+        StatusCode::NOT_FOUND,
+        "Speaking Provider not found".to_string(),
+    ))?;
+    tokio::task::spawn_blocking(move || crate::speech::provider_schema(&provider))
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_GATEWAY, error))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SpeakingPreviewRequest {
+    #[serde(default = "default_speaking_preview_text")]
+    pub text: String,
+}
+
+fn default_speaking_preview_text() -> String {
+    "This is how Agent Voice will sound.".to_string()
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakingPreviewResponse {
+    pub mime_type: String,
+    pub audio_base64: String,
+}
+
+pub async fn preview_speaking_profile(
+    Path(id): Path<String>,
+    Json(req): Json<SpeakingPreviewRequest>,
+) -> Result<Json<SpeakingPreviewResponse>, (StatusCode, String)> {
+    use base64::Engine;
+
+    let profile = ai::get_speaking_profile(&id)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "Speaking Profile not found".to_string(),
+        ))?;
+    let provider = ai::get_provider(&profile.provider_id).ok_or((
+        StatusCode::BAD_REQUEST,
+        "Speaking Provider not found".to_string(),
+    ))?;
+    let text = req.text.trim().to_string();
+    if text.is_empty() || text.chars().count() > profile.max_characters as usize {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Preview must be 1 to {} characters", profile.max_characters),
+        ));
+    }
+    let (bytes, mime_type) = tokio::task::spawn_blocking(move || {
+        crate::speech::synthesize_preview(&provider, &profile, &text)
+    })
+    .await
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(SpeakingPreviewResponse {
+        mime_type,
+        audio_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AgentVoiceRuntimeMessage {
+    AgentVoiceState {
+        chat_id: String,
+        enabled: bool,
+        #[serde(default)]
+        profile_id: Option<String>,
+    },
+}
+
+/// App-level Agent Voice channel. It is intentionally independent from any
+/// TaskChat/ACP socket so navigation cannot interrupt playback or delivery.
+pub async fn agent_voice_runtime_ws(ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(handle_agent_voice_runtime_ws)
+}
+
+async fn handle_agent_voice_runtime_ws(socket: WebSocket) {
+    use futures::{SinkExt, StreamExt};
+
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let mut events = crate::speech::subscribe_events();
+    loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Ok(event) => {
+                    let Ok(json) = serde_json::to_string(&event) else { continue };
+                    if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+            message = ws_rx.next() => match message {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(AgentVoiceRuntimeMessage::AgentVoiceState { chat_id, enabled, profile_id }) =
+                        serde_json::from_str::<AgentVoiceRuntimeMessage>(&text)
+                    {
+                        crate::speech::register_session(&chat_id, enabled, profile_id);
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None => break,
+                _ => {}
+            },
+        }
+    }
 }
 
 // ─── Audio DTOs ─────────────────────────────────────────────────────────────

@@ -164,6 +164,13 @@ export {
   saveAudioProject,
   transcribeAudio,
   getVoiceControlSettings,
+  listSpeakingProfiles,
+  createSpeakingProfile,
+  updateSpeakingProfile,
+  deleteSpeakingProfile,
+  listSpeakingVoices,
+  getSpeakingProviderSchema,
+  previewSpeakingProfile,
   saveVoiceControlSettings,
   executeVoiceControl,
 } from './ai';

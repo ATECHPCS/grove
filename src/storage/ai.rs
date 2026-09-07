@@ -58,12 +58,42 @@ pub fn load_providers() -> ProvidersData {
 pub fn save_providers(data: &ProvidersData) -> Result<()> {
     let conn = crate::storage::database::connection();
     let tx = conn.unchecked_transaction()?;
-    tx.execute("DELETE FROM ai_providers", [])?;
+    let existing_ids = {
+        let mut stmt = tx.prepare("SELECT id FROM ai_providers")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.filter_map(|row| row.ok()).collect::<Vec<_>>()
+    };
+    let incoming_ids = data
+        .providers
+        .iter()
+        .map(|provider| provider.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
     for p in &data.providers {
         tx.execute(
-            "INSERT INTO ai_providers (id, name, provider_type, base_url, api_key, model, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![p.id, p.name, p.provider_type, p.base_url, p.api_key, p.model, p.status],
+            "INSERT INTO ai_providers (id, name, provider_type, base_url, api_key, model, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
+               provider_type = excluded.provider_type,
+               base_url = excluded.base_url,
+               api_key = excluded.api_key,
+               model = excluded.model,
+               status = excluded.status",
+            params![
+                p.id,
+                p.name,
+                p.provider_type,
+                p.base_url,
+                p.api_key,
+                p.model,
+                p.status
+            ],
         )?;
+    }
+    for id in existing_ids {
+        if !incoming_ids.contains(id.as_str()) {
+            tx.execute("DELETE FROM ai_providers WHERE id = ?1", params![id])?;
+        }
     }
     tx.commit()?;
     Ok(())
@@ -71,6 +101,146 @@ pub fn save_providers(data: &ProvidersData) -> Result<()> {
 
 pub fn generate_provider_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+// ─── Speaking Profiles ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakingProfile {
+    pub id: String,
+    pub name: String,
+    pub provider_id: String,
+    #[serde(default)]
+    pub config: serde_json::Value,
+    pub max_characters: u32,
+    pub max_duration_seconds: u32,
+}
+
+pub fn load_speaking_profiles() -> Vec<SpeakingProfile> {
+    let conn = crate::storage::database::connection();
+    let mut stmt = match conn.prepare(
+        "SELECT id, name, provider_id, config_json, max_characters, max_duration_seconds
+         FROM speaking_profiles ORDER BY rowid",
+    ) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match stmt.query_map([], |row| {
+        let config_json: String = row.get(3)?;
+        Ok(SpeakingProfile {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            provider_id: row.get(2)?,
+            config: serde_json::from_str(&config_json)
+                .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
+            max_characters: row.get::<_, u32>(4)?,
+            max_duration_seconds: row.get::<_, u32>(5)?,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+    rows.filter_map(|row| row.ok()).collect()
+}
+
+pub fn get_speaking_profile(id: &str) -> Result<Option<SpeakingProfile>> {
+    let conn = crate::storage::database::connection();
+    let mut stmt = conn.prepare(
+        "SELECT id, name, provider_id, config_json, max_characters, max_duration_seconds
+         FROM speaking_profiles WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query(params![id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let config_json: String = row.get(3)?;
+    Ok(Some(SpeakingProfile {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        provider_id: row.get(2)?,
+        config: serde_json::from_str(&config_json)
+            .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
+        max_characters: row.get(4)?,
+        max_duration_seconds: row.get(5)?,
+    }))
+}
+
+pub fn save_speaking_profile(profile: &SpeakingProfile) -> Result<()> {
+    let conn = crate::storage::database::connection();
+    conn.execute(
+        "INSERT INTO speaking_profiles
+         (id, name, provider_id, config_json, max_characters, max_duration_seconds)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(id) DO UPDATE SET
+           name = excluded.name,
+           provider_id = excluded.provider_id,
+           config_json = excluded.config_json,
+           max_characters = excluded.max_characters,
+           max_duration_seconds = excluded.max_duration_seconds",
+        params![
+            profile.id,
+            profile.name,
+            profile.provider_id,
+            profile.config.to_string(),
+            profile.max_characters,
+            profile.max_duration_seconds,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn delete_speaking_profile(id: &str) -> Result<bool> {
+    let conn = crate::storage::database::connection();
+    Ok(conn.execute("DELETE FROM speaking_profiles WHERE id = ?1", params![id])? > 0)
+}
+
+pub fn get_provider(id: &str) -> Option<ProviderProfile> {
+    load_providers()
+        .providers
+        .into_iter()
+        .find(|provider| provider.id == id)
+}
+
+pub fn load_provider_capability_schema(provider_id: &str) -> Option<serde_json::Value> {
+    let conn = crate::storage::database::connection();
+    let json = conn
+        .query_row(
+            "SELECT schema_json FROM ai_provider_capabilities WHERE provider_id = ?1",
+            params![provider_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+pub fn save_provider_capability_schema(
+    provider_id: &str,
+    schema: &serde_json::Value,
+) -> Result<()> {
+    let conn = crate::storage::database::connection();
+    conn.execute(
+        "INSERT INTO ai_provider_capabilities (provider_id, schema_json, refreshed_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(provider_id) DO UPDATE SET
+           schema_json = excluded.schema_json,
+           refreshed_at = excluded.refreshed_at",
+        params![
+            provider_id,
+            schema.to_string(),
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn clear_provider_capability_schema(provider_id: &str) -> Result<()> {
+    let conn = crate::storage::database::connection();
+    conn.execute(
+        "DELETE FROM ai_provider_capabilities WHERE provider_id = ?1",
+        params![provider_id],
+    )?;
+    Ok(())
 }
 
 // ─── Audio Settings ─────────────────────────────────────────────────────────
@@ -488,4 +658,70 @@ pub fn save_audio_project(project_hash: &str, data: &AudioSettingsProject) -> Re
 
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_updates_preserve_profiles_and_delete_cascades() {
+        let _lock = crate::storage::database::test_lock().blocking_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        let mut provider = ProviderProfile {
+            id: "eleven".to_string(),
+            name: "ElevenLabs".to_string(),
+            provider_type: "ElevenLabs".to_string(),
+            base_url: "https://api.elevenlabs.io".to_string(),
+            api_key: "secret".to_string(),
+            model: "eleven_multilingual_v2".to_string(),
+            status: "verified".to_string(),
+        };
+        save_providers(&ProvidersData {
+            providers: vec![provider.clone()],
+        })
+        .expect("save provider");
+        let capability_schema = serde_json::json!({
+            "providerType": "elevenlabs",
+            "fields": [{ "key": "modelId", "options": [{ "value": "eleven_flash_v2_5" }] }]
+        });
+        save_provider_capability_schema(&provider.id, &capability_schema)
+            .expect("save provider capabilities");
+        let profile = SpeakingProfile {
+            id: "profile".to_string(),
+            name: "Narrator".to_string(),
+            provider_id: provider.id.clone(),
+            config: serde_json::json!({ "voiceId": "voice" }),
+            max_characters: 280,
+            max_duration_seconds: 30,
+        };
+        save_speaking_profile(&profile).expect("save profile");
+
+        provider.name = "Updated ElevenLabs".to_string();
+        save_providers(&ProvidersData {
+            providers: vec![provider],
+        })
+        .expect("update provider");
+        assert_eq!(
+            get_speaking_profile("profile")
+                .expect("load profile")
+                .expect("profile remains")
+                .name,
+            "Narrator"
+        );
+        assert_eq!(
+            load_provider_capability_schema("eleven"),
+            Some(capability_schema)
+        );
+
+        save_providers(&ProvidersData { providers: vec![] }).expect("delete provider");
+        assert!(get_speaking_profile("profile")
+            .expect("load deleted profile")
+            .is_none());
+        assert!(load_provider_capability_schema("eleven").is_none());
+
+        crate::storage::set_grove_dir_override(None);
+    }
 }

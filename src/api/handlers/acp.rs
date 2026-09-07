@@ -113,6 +113,17 @@ enum ClientMessage {
         config_id: String,
         value: ConfigOptionValue,
     },
+    /// Frontend-owned Session Agent Voice state. It is persisted in browser
+    /// localStorage and mirrored into the application-level voice runtime.
+    AgentVoiceState {
+        enabled: bool,
+        #[serde(default)]
+        profile_id: Option<String>,
+        /// Socket reconnects restore delivery routing without changing the
+        /// Agent's instructions. Only an explicit UI state change sets this.
+        #[serde(default)]
+        notify_agent: bool,
+    },
 }
 
 /// Server-to-client messages (serialized AcpUpdate)
@@ -1074,25 +1085,28 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
     }
 
     let handle_for_input = handle.clone();
+    let voice_chat_id = history_chat_id.clone();
 
     // Task: Forward ACP updates to WebSocket
     let mut updates_to_ws = tokio::spawn(async move {
         loop {
-            match update_rx.recv().await {
-                Ok(update) => {
-                    let is_ended = matches!(update, AcpUpdate::SessionEnded);
-                    let msg: ServerMessage = update.into();
-                    if let Ok(json) = serde_json::to_string(&msg) {
-                        if ws_sender.send(Message::Text(json.into())).await.is_err() {
+            tokio::select! {
+                update = update_rx.recv() => match update {
+                    Ok(update) => {
+                        let is_ended = matches!(update, AcpUpdate::SessionEnded);
+                        let msg: ServerMessage = update.into();
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if ws_sender.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        if is_ended {
                             break;
                         }
                     }
-                    if is_ended {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                },
             }
         }
         // Always attempt a clean WS close so the browser's `onclose` fires
@@ -1107,6 +1121,7 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
     });
 
     // Task: Forward WebSocket messages to ACP
+    let voice_chat_id_for_input = voice_chat_id.clone();
     let mut ws_to_acp = tokio::spawn(async move {
         while let Some(msg) = ws_receiver.next().await {
             match msg {
@@ -1264,6 +1279,28 @@ async fn handle_acp_ws(socket: WebSocket, session_key: String, config: AcpStartC
                                             "Failed to change session setting: {error}"
                                         ),
                                     });
+                                }
+                            }
+                            ClientMessage::AgentVoiceState {
+                                enabled,
+                                profile_id,
+                                notify_agent,
+                            } => {
+                                if let Some(chat_id) = voice_chat_id_for_input.as_deref() {
+                                    crate::speech::register_session(
+                                        chat_id,
+                                        enabled,
+                                        profile_id.clone(),
+                                    );
+                                    if notify_agent {
+                                        handle_for_input.set_pending_session_instruction(
+                                            "agent_voice",
+                                            crate::speech::session_instruction(
+                                                enabled,
+                                                profile_id.as_deref(),
+                                            ),
+                                        );
+                                    }
                                 }
                             }
                         }

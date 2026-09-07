@@ -210,6 +210,11 @@ pub struct AcpSessionHandle {
     /// 让前端继续显示 banner;避免"刷新后看起来连上了但消息发不出去"。
     /// 进入 retry 时设置,authenticate 成功 → SessionReady 真正发出后清除。
     pub pending_auth: Mutex<Option<PendingAuthState>>,
+    /// Session-scoped instruction update waiting to be merged into the next
+    /// real user prompt. Revision prevents a newer update being cleared when
+    /// an older prompt completes.
+    pending_session_instruction: Mutex<Option<(u64, String, String)>>,
+    session_instruction_revision: std::sync::atomic::AtomicU64,
 }
 
 /// `pending_auth` 内容:重发 AuthRequired 所需的全部字段
@@ -4360,6 +4365,8 @@ pub async fn get_or_start_session(
                     logout_capable: std::sync::atomic::AtomicBool::new(false),
                     pending_auth_retry: Mutex::new(None),
                     pending_auth: Mutex::new(None),
+                    pending_session_instruction: Mutex::new(None),
+                    session_instruction_revision: std::sync::atomic::AtomicU64::new(0),
                     fork_capable: std::sync::atomic::AtomicBool::new(false),
                     import_capable: std::sync::atomic::AtomicBool::new(false),
                     delete_capable: std::sync::atomic::AtomicBool::new(false),
@@ -6276,16 +6283,31 @@ async fn drive_session(
                 // `<grove-meta>` envelope is presentation metadata: the UI
                 // decides how to render it, but history.jsonl remains a
                 // faithful protocol transcript.
-                let wire_text =
-                    if let Some((kind, instruction)) = pending_session_bootstrap.as_ref() {
+                let pending_dynamic_instruction = handle.pending_session_instruction_snapshot();
+                let wire_text = match (
+                    pending_session_bootstrap.as_ref(),
+                    pending_dynamic_instruction.as_ref(),
+                ) {
+                    (None, None) => text.clone(),
+                    (bootstrap, dynamic) => {
+                        let kind = dynamic
+                            .map(|(_, kind, _)| kind.as_str())
+                            .or_else(|| bootstrap.map(|(kind, _)| *kind))
+                            .unwrap_or("session_update");
+                        let mut sections = Vec::new();
+                        if let Some((_, instruction)) = bootstrap {
+                            sections.push(instruction.as_str());
+                        }
+                        if let Some((_, _, instruction)) = dynamic {
+                            sections.push(instruction.as_str());
+                        }
                         crate::agent_graph::inject::build_session_instruction_prompt(
                             kind,
-                            instruction,
+                            &sections.join("\n\n"),
                             &text,
                         )
-                    } else {
-                        text.clone()
-                    };
+                    }
+                };
                 handle.emit(AcpUpdate::UserMessage {
                     text: wire_text.clone(),
                     attachments: attachments.clone(),
@@ -6510,6 +6532,9 @@ async fn drive_session(
                 match result {
                     Ok(resp) => {
                         pending_session_bootstrap = None;
+                        if let Some((revision, _, _)) = pending_dynamic_instruction {
+                            handle.clear_pending_session_instruction(revision);
+                        }
                         // Prompt 成功 = agent 当前认账户已登录,任何 stale 的
                         // pending_auth(用户在 grove 外部完成登录后回来)清掉,
                         // 否则 WS 重连仍会重发假 banner。pending_auth_retry 同理 —
@@ -7027,6 +7052,34 @@ async fn connect_remote_agent(
 // === 公开 API ===
 
 impl AcpSessionHandle {
+    pub fn set_pending_session_instruction(&self, kind: &str, instruction: String) {
+        let revision = self
+            .session_instruction_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if let Ok(mut pending) = self.pending_session_instruction.lock() {
+            *pending = Some((revision, kind.to_string(), instruction));
+        }
+    }
+
+    fn pending_session_instruction_snapshot(&self) -> Option<(u64, String, String)> {
+        self.pending_session_instruction
+            .lock()
+            .ok()
+            .and_then(|pending| pending.clone())
+    }
+
+    fn clear_pending_session_instruction(&self, revision: u64) {
+        if let Ok(mut pending) = self.pending_session_instruction.lock() {
+            if pending
+                .as_ref()
+                .is_some_and(|(current, _, _)| *current == revision)
+            {
+                *pending = None;
+            }
+        }
+    }
+
     pub fn pending_elicitation_snapshot(&self) -> Option<ElicitationRequestSnapshot> {
         self.pending_elicitation
             .lock()
@@ -8565,6 +8618,8 @@ pub fn new_handle_for_test(
         logout_capable: std::sync::atomic::AtomicBool::new(false),
         pending_auth_retry: Mutex::new(None),
         pending_auth: Mutex::new(None),
+        pending_session_instruction: Mutex::new(None),
+        session_instruction_revision: std::sync::atomic::AtomicU64::new(0),
         fork_capable: std::sync::atomic::AtomicBool::new(false),
         import_capable: std::sync::atomic::AtomicBool::new(false),
         delete_capable: std::sync::atomic::AtomicBool::new(false),
@@ -9451,6 +9506,28 @@ async fn drain_stderr_to_file(stderr: tokio::process::ChildStderr, path: PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_session_instruction_keeps_latest_toggle_until_matching_turn_completes() {
+        let key = format!("session-instruction-test-{}", uuid::Uuid::new_v4());
+        let (handle, _updates, _guard) = new_handle_for_test(&key, "project", "task", "chat");
+
+        handle.set_pending_session_instruction("agent_voice", "enabled".to_string());
+        let enabled = handle
+            .pending_session_instruction_snapshot()
+            .expect("enabled instruction");
+        handle.set_pending_session_instruction("agent_voice", "disabled".to_string());
+
+        handle.clear_pending_session_instruction(enabled.0);
+        let current = handle
+            .pending_session_instruction_snapshot()
+            .expect("newer instruction must remain");
+        assert_eq!(current.1, "agent_voice");
+        assert_eq!(current.2, "disabled");
+
+        handle.clear_pending_session_instruction(current.0);
+        assert!(handle.pending_session_instruction_snapshot().is_none());
+    }
 
     #[tokio::test]
     async fn editing_a_queued_message_while_busy_preserves_its_position() {

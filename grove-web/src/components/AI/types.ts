@@ -1,4 +1,4 @@
-export type TabId = "audio" | "providers" | "voice_control";
+export type TabId = "audio" | "voice_control" | "providers" | "agent_voice";
 
 export type ProviderStatus = "verified" | "draft" | "failed";
 
@@ -10,6 +10,75 @@ export type ProviderProfile = {
   apiKey: string;
   model: string;
   status: ProviderStatus;
+  supportsSpeaking?: boolean;
+};
+
+export type SpeakingProfileConfig = Record<string, string | number | boolean>;
+
+export type SpeakingProviderField = {
+  key: string;
+  label: string;
+  description?: string;
+  type: "voice" | "text" | "number" | "range" | "boolean" | "select";
+  defaultValue: string | number | boolean;
+  required?: boolean;
+  min?: number;
+  max?: number;
+  step?: number;
+  options?: Array<{
+    value: string;
+    label: string;
+    description?: string;
+    badge?: string;
+    metadata?: string[];
+    disabledFieldKeys?: string[];
+  }>;
+};
+
+export type SpeakingProviderSchema = {
+  providerType: string;
+  fields: SpeakingProviderField[];
+};
+
+export type SpeakingProfile = {
+  id: string;
+  name: string;
+  providerId: string;
+  config: SpeakingProfileConfig;
+  maxCharacters: number;
+  maxDurationSeconds: number;
+};
+
+export type SpeakingVoice = {
+  voiceId: string;
+  name: string;
+  category?: string;
+  description?: string;
+  previewUrl?: string;
+  language?: string;
+  locale?: string;
+  accent?: string;
+  gender?: string;
+  age?: string;
+  useCase?: string;
+  supportedModelIds?: string[];
+  source?: string;
+};
+
+export type SpeakingVoicePage = {
+  voices: SpeakingVoice[];
+  hasMore: boolean;
+  nextPageToken?: string;
+  totalCount?: number;
+};
+
+export type SpeakingVoiceQuery = {
+  search?: string;
+  voiceType?: string;
+  language?: string;
+  voiceId?: string;
+  nextPageToken?: string;
+  pageSize?: number;
 };
 
 export type ReplacementRule = { from: string; to: string };

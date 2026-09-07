@@ -22,7 +22,7 @@ import { WelcomePage } from "./components/Welcome";
 import { DiffReviewPage } from "./components/Review";
 import { HelpOverlay } from "./components/Tasks/HelpOverlay";
 import { SkillsPage } from "./components/Skills";
-import { AIPage, GlobalAudioRecorder, GlobalVoiceControlRecorder } from "./components/AI";
+import { AIPage, GlobalAgentVoiceRuntime, GlobalAudioRecorder, GlobalVoiceControlRecorder } from "./components/AI";
 import { AutomationPage } from "./components/Automation/AutomationPage";
 import { MemoryPage } from "./components/Memory";
 import { ProjectStatsPage } from "./components/Stats/ProjectStatsPage";
@@ -369,6 +369,12 @@ function AppContent() {
     const open = () => setShowHelp(true);
     window.addEventListener("grove:open-help", open);
     return () => window.removeEventListener("grove:open-help", open);
+  }, []);
+
+  useEffect(() => {
+    const open = () => setActiveItem("ai");
+    window.addEventListener("grove:open-ai-settings", open);
+    return () => window.removeEventListener("grove:open-ai-settings", open);
   }, []);
 
   // Mobile virtual-keyboard tracker: exposes the keyboard height as a global
@@ -1721,6 +1727,7 @@ function App() {
                   <CommandPaletteProvider>
                     <PreviewCommentProvider>
                       <OptionalPerfProfiler id="App">
+                        <GlobalAgentVoiceRuntime />
                         <AppContent />
                       </OptionalPerfProfiler>
                     </PreviewCommentProvider>

@@ -332,7 +332,7 @@ impl AgentGraphMcpService {
             description: &input.description,
         })
         .map_err(memory_mcp_error)?;
-        memory_json_success(&AppendMemoryLogOutput { saved: true })
+        structured_json_success(&AppendMemoryLogOutput { saved: true })
     }
 
     #[tool(
@@ -362,7 +362,7 @@ impl AgentGraphMcpService {
             memory_bounded_limit(input.limit, 10, 50, "limit")?,
         )
         .map_err(memory_mcp_error)?;
-        memory_json_success(&map_memory_page(page, MemoryRecallItem::from))
+        structured_json_success(&map_memory_page(page, MemoryRecallItem::from))
     }
 
     #[tool(
@@ -389,7 +389,7 @@ impl AgentGraphMcpService {
                 None,
             )
         })?;
-        memory_json_success(&MemoryReadOutput::from(result))
+        structured_json_success(&MemoryReadOutput::from(result))
     }
 
     #[tool(
@@ -410,7 +410,7 @@ impl AgentGraphMcpService {
             memory_bounded_limit(input.limit, 10, 50, "limit")?,
         )
         .map_err(memory_mcp_error)?;
-        memory_json_success(&map_memory_page(page, RelatedMemoryItem::from))
+        structured_json_success(&map_memory_page(page, RelatedMemoryItem::from))
     }
 
     #[tool(
@@ -431,7 +431,7 @@ impl AgentGraphMcpService {
             memory_bounded_limit(input.limit, 20, 100, "limit")?,
         )
         .map_err(memory_mcp_error)?;
-        memory_json_success(&map_memory_page(page, MemoryLogItem::from))
+        structured_json_success(&map_memory_page(page, MemoryLogItem::from))
     }
 
     #[tool(
@@ -528,6 +528,20 @@ impl AgentGraphMcpService {
             Ok(out) => json_success(&out),
             Err(e) => Ok(tool_error(e)),
         }
+    }
+
+    #[tool(
+        name = "speak",
+        description = "Send one concise voice touchpoint to the user for this Session. Use only when Agent Voice has been enabled by the Session instruction. Speak a short standalone update or reminder, not the full response; always provide the complete response in normal text as well.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<crate::speech::SpeakResult>()
+    )]
+    async fn grove_agent_speak_tool(
+        &self,
+        Parameters(input): Parameters<crate::speech::SpeakInput>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let (_, _, chat) = caller_session_from_parts(&parts)?;
+        structured_json_success(&crate::speech::speak(&chat.id, &input.text))
     }
 
     #[tool(
@@ -1315,9 +1329,10 @@ fn json_success<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpErr
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
-/// Memory tools advertise output schemas, so return the same JSON as both
-/// human-readable text and MCP structured content.
-fn memory_json_success<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpError> {
+/// Tools that advertise an output schema must return structured content.
+/// `CallToolResult::structured` also supplies the JSON text representation for
+/// clients that render the human-readable content block.
+fn structured_json_success<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let value = serde_json::to_value(value)
         .map_err(|error| McpError::internal_error(error.to_string(), None))?;
     Ok(CallToolResult::structured(value))
@@ -1491,6 +1506,22 @@ mod tests {
         let mut fields = std::collections::HashSet::new();
         collect(&serde_json::Value::Object(schema.clone()), &mut fields);
         fields
+    }
+
+    #[test]
+    fn schema_backed_success_includes_structured_content() {
+        let result = structured_json_success(&crate::speech::SpeakResult { success: true })
+            .expect("structured result");
+
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("success"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(!result.content.is_empty());
     }
 
     #[test]
@@ -1763,7 +1794,7 @@ mod tests {
         assert!(names.contains(&"browser_screenshot".to_string()));
         assert!(names.contains(&"set_title".to_string()));
         assert!(names.contains(&"ask_form".to_string()));
-        assert_eq!(names.len(), 21);
+        assert_eq!(names.len(), 22);
     }
 
     #[test]
@@ -1975,6 +2006,7 @@ mod tests {
             "graph_reply",
             "graph_contacts",
             "graph_capability",
+            "speak",
         ] {
             assert!(list_body.contains(tool), "tools/list missing {tool}");
         }
