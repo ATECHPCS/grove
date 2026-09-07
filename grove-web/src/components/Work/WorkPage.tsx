@@ -18,6 +18,15 @@ interface WorkPageProps {
   /** Called once `initialChatId` has been consumed, so the caller can
    *  clear navigationData and this effect doesn't refire. */
   onNavigationConsumed?: () => void;
+  /** Whether the page is the currently visible surface. WorkPage joins
+   *  TasksPage in the keep-alive club: App keeps it mounted (display:none)
+   *  once visited, so Work ⇄ Tasks switches don't unmount/remount a whole
+   *  TaskChat stack in one commit (that teardown + hidden→shown reflow was
+   *  the multi-second gap entering a task from Work). While hidden, the
+   *  keyboard scope, context keys and page commands must drop — same
+   *  contract as TasksPage's `pageVisible`. Defaults to true for
+   *  backwards compatibility. */
+  pageVisible?: boolean;
 }
 
 /**
@@ -28,8 +37,13 @@ interface WorkPageProps {
  * Local Task is resolved synchronously (backend version preferred, else
  * synthesized from project metadata), so the page mounts straight into the
  * workspace with zero flash or loading intermediate.
+ *
+ * Lifecycle: keep-alive, mirroring TasksPage. App mounts it on first visit
+ * and then only flips `display` — the Local Task workspace survives nav
+ * switches, and `pageVisible=false` is the signal to drop keyboard scope,
+ * context keys and page commands while hidden.
  */
-export function WorkPage({ initialChatId, onNavigationConsumed }: WorkPageProps) {
+export function WorkPage({ initialChatId, onNavigationConsumed, pageVisible = true }: WorkPageProps) {
   const { selectedProject, refreshSelectedProject } = useProject();
 
   const [operationMessage, setOperationMessage] = useState<string | null>(null);
@@ -81,14 +95,17 @@ export function WorkPage({ initialChatId, onNavigationConsumed }: WorkPageProps)
     useCommandPalette();
 
   useEffect(() => {
-    // Work is always in workspace mode
+    // Work is always in workspace mode — but only own the shared context while
+    // visible. Both pages stay mounted now, so writing while hidden would
+    // clobber the surface the user is actually looking at.
+    if (!pageVisible) return;
     setContextInWorkspace(true);
     setPageContext("workspace");
     return () => {
       setContextInWorkspace(false);
       setPageContext("default");
     };
-  }, [setContextInWorkspace, setPageContext]);
+  }, [pageVisible, setContextInWorkspace, setPageContext]);
 
   const handleAddPanel = (type: PanelType) => {
     taskViewRef.current?.addPanel(type);
@@ -120,9 +137,13 @@ export function WorkPage({ initialChatId, onNavigationConsumed }: WorkPageProps)
   });
 
   useEffect(() => {
+    // registerPageCommands is a single shared slot — gate on visibility and
+    // re-take the slot every time the page becomes visible (TasksPage does
+    // the same now that both pages are keep-alive).
+    if (!pageVisible) return;
     registerPageCommands(() => buildCommands(pageOptionsRef.current));
     return () => unregisterPageCommands();
-  }, [registerPageCommands, unregisterPageCommands]);
+  }, [pageVisible, registerPageCommands, unregisterPageCommands]);
 
   if (!selectedProject) {
     return (
@@ -150,6 +171,7 @@ export function WorkPage({ initialChatId, onNavigationConsumed }: WorkPageProps)
       <div className="flex-1 relative overflow-hidden">
         <TaskView
           ref={taskViewRef}
+          isActive={pageVisible}
           projectId={selectedProject.id}
           task={localTask}
           projectName={selectedProject.name}

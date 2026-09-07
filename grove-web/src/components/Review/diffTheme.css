@@ -1419,6 +1419,14 @@ td.diff-code.diff-line-highlighted::before {
   z-index: 100;
 }
 
+.diff-version-footer {
+  padding: 6px 12px;
+  font-size: 11px;
+  color: var(--color-text-muted);
+  border-top: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+
 .diff-version-option {
   display: flex;
   align-items: center;

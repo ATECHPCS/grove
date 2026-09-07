@@ -10,7 +10,9 @@
 //! Calls `https://api.z.ai/api/monitor/usage/quota/limit`. The response is a
 //! Chinese-style wrapper with `{code, msg, success, data}`; we require
 //! `code == 200 && success == true`. `data.limits[]` may contain
-//! `TOKENS_LIMIT` and/or `TIME_LIMIT` entries — we expose both.
+//! `TOKENS_LIMIT` and/or `TIME_LIMIT` entries — we expose both. Plans migrated
+//! to credit-based quotas (observed 2026-09) report `CREDIT_LIMIT` entries
+//! instead — 5h rolling + monthly — exposed as "Credits" windows.
 
 use super::super::{
     clamp_percent, iso_to_seconds_remaining, AgentUsage, ExtraInfo, UsageWindow, HTTP_TIMEOUT_ZAI,
@@ -113,6 +115,10 @@ fn build_usage(data: DataBlock, limits: Vec<LimitEntry>) -> Result<AgentUsage, S
         let label = match entry.entry_type.as_deref() {
             Some("TOKENS_LIMIT") => "Tokens",
             Some("TIME_LIMIT") => "Calls",
+            // Credit-based plans (current GLM coding plans) report everything
+            // as CREDIT_LIMIT — skipping it used to yield zero windows and
+            // hid the whole quota badge.
+            Some("CREDIT_LIMIT") => "Credits",
             _ => continue,
         };
         let num = entry.number.unwrap_or(0);
@@ -145,7 +151,11 @@ fn build_usage(data: DataBlock, limits: Vec<LimitEntry>) -> Result<AgentUsage, S
         // Use the full window label as the extras key so multiple TOKENS_LIMIT
         // entries (e.g. 5h + weekly) don't collide on a shared "Tokens" label.
         // Push whenever any of usage / currentValue / remaining is present.
-        let used = entry.usage.or(entry.current_value);
+        // Credit-plan payloads: `usage` is the total allowance, `currentValue`
+        // the consumed amount (212 used + 1787 left ≈ 2000 total). Prefer
+        // `currentValue` as "used"; older shapes that only set `usage` still
+        // fall through.
+        let used = entry.current_value.or(entry.usage);
         let remaining = entry.remaining;
         if used.is_some() || remaining.is_some() {
             let used_str = used
@@ -178,6 +188,9 @@ fn window_parts(
         // enough and avoids parsing label text on the frontend.
         4 => (num, "month", Some(i64::from(num) * 30 * 86400)),
         5 => (num, "minute", Some(i64::from(num) * 60)),
+        // Credit plans use unit=6 for the monthly bucket (observed live:
+        // CREDIT_LIMIT unit=6 number=1 alongside the 5-hour rolling window).
+        6 => (num, "month", Some(i64::from(num) * 30 * 86400)),
         _ if entry_type == Some("TOKENS_LIMIT") && num == 1 => (num, "week", Some(7 * 86400)),
         _ => (num, "unit", None),
     }
@@ -261,5 +274,40 @@ mod tests {
         assert_eq!(usage.windows[0].label, "Tokens (5 hours)");
         assert_eq!(usage.windows[0].percentage_remaining, 99.0);
         assert_eq!(usage.windows[0].total_window_seconds, Some(5 * 3600));
+    }
+
+    /// Live payload shape observed 2026-09: credit-based plans report both
+    /// windows as CREDIT_LIMIT (5h rolling + monthly) with usage/currentValue/
+    /// remaining breakdowns. Every entry must surface as a window — the old
+    /// parser skipped the unknown type and the badge disappeared entirely.
+    #[test]
+    fn parses_credit_limit_windows() {
+        let mut e5 = limit("CREDIT_LIMIT", Some(3), 5, 10.0);
+        e5.usage = Some(2000.0);
+        e5.current_value = Some(212.0);
+        e5.remaining = Some(1787.0);
+        let mut emonth = limit("CREDIT_LIMIT", Some(6), 1, 18.0);
+        emonth.usage = Some(10000.0);
+        emonth.current_value = Some(1849.0);
+        emonth.remaining = Some(8150.0);
+        let data = DataBlock {
+            limits: None,
+            plan_name: None,
+            plan: Some("lite".to_string()),
+            plan_type: None,
+            package_name: None,
+        };
+        let usage = build_usage(data, vec![e5, emonth]).unwrap();
+
+        assert_eq!(usage.windows.len(), 2);
+        assert_eq!(usage.windows[0].label, "Credits (5 hours)");
+        assert_eq!(usage.windows[0].percentage_remaining, 90.0);
+        assert_eq!(usage.windows[0].total_window_seconds, Some(5 * 3600));
+        assert_eq!(usage.windows[1].label, "Credits (1 month)");
+        assert_eq!(usage.windows[1].percentage_remaining, 82.0);
+        assert_eq!(usage.windows[1].total_window_seconds, Some(30 * 86400));
+        assert_eq!(usage.extras.len(), 2);
+        assert_eq!(usage.extras[0].value, "212 used / 1787 left");
+        assert_eq!(usage.extras[1].value, "1849 used / 8150 left");
     }
 }

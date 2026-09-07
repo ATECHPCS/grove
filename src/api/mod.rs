@@ -20,7 +20,7 @@ use axum::{
     http::{header, Response, StatusCode, Uri},
     middleware::{self, Next},
     response::IntoResponse,
-    routing::{delete, get, patch, post, put},
+    routing::{any, delete, get, patch, post, put},
     Router,
 };
 use rust_embed::Embed;
@@ -37,6 +37,14 @@ use auth::ServerAuth;
 #[derive(Embed)]
 #[folder = "grove-web/dist"]
 pub(crate) struct FrontendAssets;
+
+async fn api_not_found() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"message":"API route not found"}"#,
+    )
+}
 
 /// Create the API router
 pub fn create_api_router() -> Router {
@@ -1028,6 +1036,9 @@ pub fn create_api_router() -> Router {
             "/tray/resolve-permission",
             post(handlers::walkie_talkie::tray_resolve_permission),
         )
+        // Tray popover restart detection: fetched on every radio-WS (re)connect;
+        // a changed boot id retires stale Running / NEEDS YOU cards.
+        .route("/tray/boot", get(handlers::walkie_talkie::get_tray_boot))
         // Desktop tray mirrors its accumulated panel state here so a phone that
         // connects later seeds the full Running / NEEDS YOU / Done view.
         .route(
@@ -1165,6 +1176,7 @@ pub fn create_router(
         let base = Router::new()
             .nest("/api/v1", protected_api)
             .nest("/api/v1", auth_router)
+            .route("/api/{*path}", any(api_not_found))
             .layer(middleware::from_fn(csrf::csrf_middleware));
 
         // GUI-only loopback endpoints: only registered in gui builds (server binds

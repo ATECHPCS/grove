@@ -255,198 +255,56 @@ pub fn gix_recent_log(
     Ok(out)
 }
 
-/// gix 版 `git log <target>..HEAD -<count>` (in-process, 无 fork)。
+/// CLI 版 `git log <target>..HEAD -<count>`（newest first）。
 ///
-/// 通过双向 BFS 找到 HEAD 与 target 的 merge-base（最近公共祖先），再只
-/// walk HEAD 到 merge-base 之间的 commits。复杂度取决于两条分支的深度差
-/// 而非 target 的总历史长度，对于 "1 个 commit 的 branch vs 上万 commit 的
-/// master" 场景从 ~2s 降到毫秒级。
-pub fn gix_log_target_to_head(
-    repo: &gix::Repository,
-    target: &str,
-    count: usize,
-) -> Result<Vec<GixLogEntry>> {
-    use gix::bstr::BStr;
-    use std::collections::{HashSet, VecDeque};
+/// 评审页的 commit 列表走 git 自身的优化路径。gix 的 rev-walk 在没有
+/// commit-graph 的大仓库（如 37 万 commits 的 rpc_idl）上拿不到
+/// `Info.commit_time`，基于时间的提前截断全部失效，只能靠 visit 上限硬停
+/// —— 又慢（逐个解码 commit 对象）又算不准（排除集有 cap 时会多算）。
+/// `git log` 毫秒级且语义精确，即便无 commit-graph。
+pub fn log_target_to_head(path: &str, target: &str, count: usize) -> Result<Vec<GixLogEntry>> {
+    let range = format!("{}..HEAD", target);
+    let out = git_cmd(
+        path,
+        &[
+            "log",
+            "--max-count",
+            &count.to_string(),
+            "--pretty=%H%x1f%T%x1f%ct%x1f%an%x1f%s",
+            &range,
+        ],
+    )?;
 
-    let head_id: gix::ObjectId = repo
-        .head_id()
-        .map_err(|e| GroveError::git(format!("HEAD not found: {}", e)))?
-        .detach();
-    let target_id = repo
-        .rev_parse_single(BStr::new(target.as_bytes()))
-        .map_err(|e| GroveError::git(format!("target ref {} not found: {}", target, e)))?
-        .detach();
-
-    if head_id == target_id {
-        return Ok(Vec::new());
-    }
-
-    // --- bidirectional BFS to find merge-base ---
-    // Expand the smaller frontier first to minimise total work.
-    let mut head_seen: HashSet<gix::ObjectId> = HashSet::new();
-    let mut target_seen: HashSet<gix::ObjectId> = HashSet::new();
-    let mut head_queue: VecDeque<gix::ObjectId> = VecDeque::new();
-    let mut target_queue: VecDeque<gix::ObjectId> = VecDeque::new();
-
-    head_seen.insert(head_id);
-    head_queue.push_back(head_id);
-    target_seen.insert(target_id);
-    target_queue.push_back(target_id);
-
-    let mut merge_base: Option<gix::ObjectId> = None;
-    const EXPAND_PER_ROUND: usize = 64;
-    const MAX_ROUNDS: usize = 10_000;
-
-    for _round in 0..MAX_ROUNDS {
-        let (expand_queue, expand_seen, other_seen) = if head_queue.len() <= target_queue.len() {
-            (&mut head_queue, &mut head_seen, &target_seen)
-        } else {
-            (&mut target_queue, &mut target_seen, &head_seen)
-        };
-
-        let mut next_batch: VecDeque<gix::ObjectId> = VecDeque::new();
-        let batch = expand_queue.len().min(EXPAND_PER_ROUND);
-        for _ in 0..batch {
-            let Some(oid) = expand_queue.pop_front() else {
-                break;
-            };
-            let Ok(object) = repo.find_object(oid) else {
-                continue;
-            };
-            let Ok(commit) = object.try_into_commit() else {
-                continue;
-            };
-            for parent_id in commit.parent_ids() {
-                let pid: gix::ObjectId = parent_id.detach();
-                if expand_seen.contains(&pid) {
-                    continue;
-                }
-                if other_seen.contains(&pid) {
-                    merge_base = Some(pid);
-                    break;
-                }
-                expand_seen.insert(pid);
-                next_batch.push_back(pid);
-            }
-            if merge_base.is_some() {
-                break;
-            }
-        }
-        expand_queue.extend(next_batch);
-
-        if merge_base.is_some() {
-            break;
-        }
-        if head_queue.is_empty() && target_queue.is_empty() {
-            break;
-        }
-    }
-
-    if let Some(mb) = merge_base {
-        if mb == head_id {
-            return Ok(Vec::new());
-        }
-        // The BFS may have discovered mb via the head-side frontier (mb only
-        // ended up in `head_seen`, never in `target_seen`). Or via the
-        // target-side, in which case we broke before inserting it into
-        // `target_seen`. Either way, force mb into the exclusion set and
-        // re-enqueue it so the closure expansion below walks its ancestors.
-        // Without this, mb itself (and any of its ancestors reached from the
-        // head side) would be misreported as HEAD-only commits — off-by-one
-        // at the merge boundary.
-        if target_seen.insert(mb) {
-            target_queue.push_back(mb);
-        }
-    }
-
-    // Expand target_seen into a (bounded) ancestor closure so we can use it as the
-    // exclusion set while walking HEAD. Walking by commit-time order means a
-    // merge-base ancestor with newer commit-time may be visited before mb itself,
-    // so a single `stop_at` break is insufficient — we must skip every commit
-    // reachable from target.
-    const ANCESTOR_CAP: usize = 50_000;
-    while target_seen.len() < ANCESTOR_CAP {
-        let Some(oid) = target_queue.pop_front() else {
-            break;
-        };
-        let Ok(object) = repo.find_object(oid) else {
+    let mut entries = Vec::new();
+    for line in out.lines().filter(|l| !l.is_empty()) {
+        let parts: Vec<&str> = line.split('\x1f').collect();
+        if parts.len() != 5 {
             continue;
-        };
-        let Ok(commit) = object.try_into_commit() else {
-            continue;
-        };
-        for parent_id in commit.parent_ids() {
-            let pid: gix::ObjectId = parent_id.detach();
-            if target_seen.insert(pid) {
-                target_queue.push_back(pid);
-            }
         }
+        let committer_time = parts[2].parse::<i64>().unwrap_or(0);
+        let time_ago = chrono::DateTime::<chrono::Utc>::from_timestamp(committer_time, 0)
+            .map(crate::model::format_relative_time)
+            .unwrap_or_default();
+        entries.push(GixLogEntry {
+            hash: parts[0].to_string(),
+            tree_id: parts[1].to_string(),
+            committer_time,
+            author: parts[3].to_string(),
+            message: parts[4].to_string(),
+            time_ago,
+        });
     }
-
-    // Once a commit is older than mb's commit-time, no later candidate in the
-    // commit-time-ordered walk can be a HEAD-only commit either (HEAD-only
-    // commits all post-date mb). This lets us short-circuit the HEAD walk well
-    // before VISIT_CAP on huge histories.
-    let mb_time = merge_base.and_then(|mb| {
-        repo.find_object(mb)
-            .ok()
-            .and_then(|o| o.try_into_commit().ok())
-            .and_then(|c| c.committer().ok().map(|sig| sig.time.seconds))
-    });
-
-    walk_head_excluding(repo, head_id, &target_seen, count, mb_time)
+    Ok(entries)
 }
 
-/// Walk from `head` collecting up to `count` commits, skipping any commit in
-/// `excluded`. If `min_committer_time` is set, stop once we hit a commit with
-/// strictly older committer-time — by then no later commit-time-ordered entry
-/// can still be HEAD-only.
-fn walk_head_excluding(
-    repo: &gix::Repository,
-    head_id: gix::ObjectId,
-    excluded: &std::collections::HashSet<gix::ObjectId>,
-    count: usize,
-    min_committer_time: Option<gix::date::SecondsSinceUnixEpoch>,
-) -> Result<Vec<GixLogEntry>> {
-    let walk = repo
-        .rev_walk([head_id])
-        .use_commit_graph(true)
-        .all()
-        .map_err(|e| GroveError::git(format!("rev_walk failed: {}", e)))?;
-
-    let mut out = Vec::with_capacity(count.min(64));
-    const VISIT_CAP: usize = 100_000;
-    for (visited, info) in walk.enumerate() {
-        if out.len() >= count {
-            break;
-        }
-        if visited >= VISIT_CAP {
-            break;
-        }
-        let info = match info {
-            Ok(i) => i,
-            Err(_) => continue,
-        };
-        if let Some(min_t) = min_committer_time {
-            if info.commit_time.is_some_and(|t| t < min_t) {
-                break;
-            }
-        }
-        if excluded.contains(&info.id) {
-            continue;
-        }
-        let Ok(object) = repo.find_object(info.id) else {
-            continue;
-        };
-        let Ok(commit) = object.try_into_commit() else {
-            continue;
-        };
-        if let Some(entry) = extract_log_entry(&commit) {
-            out.push(entry);
-        }
-    }
-    Ok(out)
+/// CLI 版 `git rev-list --count <target>..HEAD>`。与 `log_target_to_head`
+/// 同一套语义，精确计数。
+pub fn count_target_to_head(path: &str, target: &str) -> Result<u32> {
+    let range = format!("{}..HEAD", target);
+    let out = git_cmd(path, &["rev-list", "--count", &range])?;
+    out.trim()
+        .parse::<u32>()
+        .map_err(|e| GroveError::git(format!("rev-list --count parse failed: {}", e)))
 }
 
 /// 获取仓库的 default branch（main/master 等）
@@ -624,14 +482,39 @@ pub fn list_remotes(repo_path: &str) -> Result<Vec<String>> {
     })
 }
 
+/// 检查 `ancestor` ref 是否是 `descendant` ref 的祖先（含相等）。
+/// 使用 git merge-base --is-ancestor 检查
+pub fn ref_is_ancestor(repo_path: &str, ancestor: &str, descendant: &str) -> Result<bool> {
+    // exit code 0 = is ancestor, non-zero = not ancestor (or ref missing)
+    Ok(git_cmd_check(
+        repo_path,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+    ))
+}
+
 /// 检查分支是否已合并到 target
 /// 使用 git merge-base --is-ancestor 检查
 pub fn is_merged(repo_path: &str, branch: &str, target: &str) -> Result<bool> {
-    // exit code 0 = is ancestor (merged), non-zero = not merged
-    Ok(git_cmd_check(
-        repo_path,
-        &["merge-base", "--is-ancestor", branch, target],
-    ))
+    ref_is_ancestor(repo_path, branch, target)
+}
+
+/// Review/diff 使用的有效 base ref。
+///
+/// 大仓库常见场景：本地 target 分支（如 master）长期不更新，而任务分支
+/// 基于最新 origin/master 创建 —— 此时 `target..HEAD` 会把远端领先的
+/// commits 全部算进来，commit 列表和 diff 都被撑爆。当本地 target 是
+/// `origin/<target>` 的祖先（落后或相等）时改用远端 ref；本地更新或已
+/// 分叉时维持本地 target。无 origin / ref 不存在时原样返回。
+pub fn effective_review_base(worktree_path: &str, target: &str) -> String {
+    if target.is_empty() || target.starts_with("origin/") {
+        return target.to_string();
+    }
+    let remote_ref = format!("origin/{}", target);
+    if ref_is_ancestor(worktree_path, target, &remote_ref).unwrap_or(false) {
+        remote_ref
+    } else {
+        target.to_string()
+    }
 }
 
 /// 检查 branch 和 target 之间是否没有代码差异（用于检测 squash merge）
@@ -1595,5 +1478,82 @@ mod tests {
             git_unquote(r#""03-Proxy\345\261\202\350\256\276\350\256\241.md""#),
             "03-Proxy层设计.md"
         );
+    }
+
+    fn init_test_repo() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        git_cmd(&path, &["init", "-b", "main"]).unwrap();
+        git_cmd(&path, &["config", "user.email", "test@example.com"]).unwrap();
+        git_cmd(&path, &["config", "user.name", "test"]).unwrap();
+        (dir, path)
+    }
+
+    fn commit_file(path: &str, name: &str) {
+        std::fs::write(std::path::Path::new(path).join(name), "x\n").unwrap();
+        git_cmd(path, &["add", "."]).unwrap();
+        git_cmd(path, &["commit", "-m", &format!("add {}", name)]).unwrap();
+    }
+
+    #[test]
+    fn test_target_to_head_log_matches_count() {
+        let (_dir, path) = init_test_repo();
+        commit_file(&path, "a.txt");
+        commit_file(&path, "b.txt");
+        git_cmd(&path, &["checkout", "-b", "feat"]).unwrap();
+        commit_file(&path, "c.txt");
+        commit_file(&path, "d.txt");
+
+        // feat 比 main 多 2 个 commit
+        let entries = log_target_to_head(&path, "main", 100).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].message, "add d.txt", "newest first");
+        assert_eq!(entries[0].tree_id.len(), 40, "tree_id 用于 skip_versions");
+        assert!(!entries[0].time_ago.is_empty());
+        assert_eq!(
+            count_target_to_head(&path, "main").unwrap(),
+            2,
+            "count 应与 log 条数一致"
+        );
+
+        // cap 只影响 log 条数，不影响计数
+        assert_eq!(log_target_to_head(&path, "main", 1).unwrap().len(), 1);
+
+        // HEAD == target 时两者都为空
+        assert!(log_target_to_head(&path, "feat", 100).unwrap().is_empty());
+        assert_eq!(count_target_to_head(&path, "feat").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_effective_review_base_without_origin() {
+        let (_dir, path) = init_test_repo();
+        commit_file(&path, "a.txt");
+
+        // 无 origin remote：原样返回本地 target
+        assert_eq!(effective_review_base(&path, "main"), "main");
+        // 已是远端 ref：原样返回
+        assert_eq!(effective_review_base(&path, "origin/main"), "origin/main");
+        assert_eq!(effective_review_base(&path, ""), "");
+    }
+
+    #[test]
+    fn test_effective_review_base_prefers_ahead_origin() {
+        let (_dir, path) = init_test_repo();
+        commit_file(&path, "a.txt");
+        // 造一个 origin remote（同仓库，纯本地），origin/main 领先本地 main
+        git_cmd(&path, &["clone", &path, &format!("{}.origin", path)]).unwrap();
+        let origin_path = format!("{}.origin", path);
+        git_cmd(&origin_path, &["config", "user.email", "test@example.com"]).unwrap();
+        git_cmd(&origin_path, &["config", "user.name", "test"]).unwrap();
+        commit_file(&origin_path, "remote.txt");
+        git_cmd(&path, &["remote", "add", "origin", &origin_path]).unwrap();
+        git_cmd(&path, &["fetch", "origin"]).unwrap();
+
+        // 本地 main 是 origin/main 的祖先 → base 应切到远端 ref
+        assert_eq!(effective_review_base(&path, "main"), "origin/main");
+
+        // 本地领先远端时维持本地 ref
+        commit_file(&path, "local-ahead.txt");
+        assert_eq!(effective_review_base(&path, "main"), "main");
     }
 }

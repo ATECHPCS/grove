@@ -678,6 +678,17 @@ function AppContent() {
     setActiveItem(saved ?? "dashboard");
   }
 
+  // Keep-alive gating for WorkPage — mirrors TasksPage's always-mounted
+  // contract: once visited, WorkPage stays mounted (display:none) so Work ⇄
+  // Tasks switches don't unmount/remount a whole TaskChat stack in one commit
+  // (that teardown + hidden→shown reflow was the multi-second gap entering a
+  // task from Work). Mounted lazily on first visit so users who never open
+  // Work don't pay for the Local Task chat at startup.
+  const [workEverVisited, setWorkEverVisited] = useState(false);
+  if (activeItem === "work" && !workEverVisited) {
+    setWorkEverVisited(true);
+  }
+
   // Tray popover navigation. Rust emits `tray:navigate` with a route and
   // optional project/task/chat ids. Listener is registered ONCE; refs
   // hold the latest projects + selectProject so re-mounts don't drop
@@ -1230,14 +1241,8 @@ function AppContent() {
         return <DashboardPage onNavigate={handleNavigate} />;
       case "projects":
         return <ProjectsPage onNavigate={setActiveItem} key={"projects-" + (navigationData?.tab ?? "coding")} initialTab={navigationData?.tab as "coding" | "studio" | undefined} />;
-      case "work":
-        return (
-          <WorkPage
-            key="work"
-            initialChatId={navigationData?.chatId as string | undefined}
-            onNavigationConsumed={() => setNavigationData(null)}
-          />
-        );
+      // NOTE: "work" is NOT rendered here — WorkPage is keep-alive (mirroring
+      // TasksPage) and lives in its own display:none host in the layout below.
       case "resource":
         return <ResourcePage />;
       case "automation":
@@ -1464,7 +1469,7 @@ function AppContent() {
           />
         </MobileDrawer>
 
-        <main className={`relative min-h-0 flex-1 ${(activeItem === "tasks" && tasksMode !== "blitz") || activeItem === "work" ? "overflow-hidden" : "overflow-y-auto"}`}>
+        <main className={`relative min-h-0 flex-1 ${(activeItem === "tasks" && tasksMode !== "blitz") || activeItem === "work" || activeItem === "ai" ? "overflow-hidden" : "overflow-y-auto"}`}>
           {/* TasksPage always mounted on mobile too */}
           <div
             className="h-full p-3"
@@ -1481,8 +1486,22 @@ function AppContent() {
               exitWorkspaceSignal={tasksExitSignal}
             />
           </div>
-          <div className={activeItem === "work" ? "h-full p-3" : isFullWidthPage ? "min-h-full p-3" : "max-w-5xl mx-auto p-3"}
-               style={{ display: activeItem === "tasks" && tasksMode !== "blitz" ? "none" : undefined }}>
+          {/* WorkPage keep-alive on mobile too — same lazy-mount + display-flip
+              contract as the desktop host above. */}
+          <div
+            className="h-full p-3"
+            style={{ display: activeItem === "work" ? "block" : "none" }}
+          >
+            {workEverVisited && (
+              <WorkPage
+                pageVisible={activeItem === "work"}
+                initialChatId={navigationData?.chatId as string | undefined}
+                onNavigationConsumed={() => setNavigationData(null)}
+              />
+            )}
+          </div>
+          <div className={activeItem === "work" || activeItem === "ai" ? "h-full p-3" : isFullWidthPage ? "min-h-full p-3" : "max-w-5xl mx-auto p-3"}
+               style={{ display: (activeItem === "tasks" && tasksMode !== "blitz") || activeItem === "work" ? "none" : undefined }}>
             <AnimatePresence mode="wait">
               {tasksMode === "blitz" ? (
                 <motion.div
@@ -1506,7 +1525,7 @@ function AppContent() {
               ) : (
                 <motion.div
                   key="zen-content"
-                  className={activeItem === "work" ? "w-full h-full" : "w-full min-h-full"}
+                  className={activeItem === "work" || activeItem === "ai" ? "w-full h-full" : "w-full min-h-full"}
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
                   exit={{ opacity: 0 }}
@@ -1651,8 +1670,22 @@ function AppContent() {
                   exitWorkspaceSignal={tasksExitSignal}
                 />
               </div>
-              {activeItem !== "tasks" && (
-                <div className={isFullWidthPage ? `h-full transition-[padding] duration-300 ease-out ${activeItem === "work" ? '' : 'p-6'} ${activeItem === "work" && effectiveSidebarMode === "island" && shouldAvoidTrafficLightsInIsland ? 'ide-traffic-light-clearance' : ''}` : "max-w-5xl mx-auto p-6"}>
+              {/* WorkPage keep-alive — mirrors the TasksPage host above: mounts
+                  on first visit, then only `display` flips across nav switches. */}
+              <div
+                className={`h-full ${activeItem === "work" && effectiveSidebarMode === "island" && shouldAvoidTrafficLightsInIsland ? 'ide-traffic-light-clearance' : ''}`}
+                style={{ display: activeItem === "work" ? "block" : "none" }}
+              >
+                {workEverVisited && (
+                  <WorkPage
+                    pageVisible={activeItem === "work"}
+                    initialChatId={navigationData?.chatId as string | undefined}
+                    onNavigationConsumed={() => setNavigationData(null)}
+                  />
+                )}
+              </div>
+              {activeItem !== "tasks" && activeItem !== "work" && (
+                <div className={isFullWidthPage ? "h-full transition-[padding] duration-300 ease-out p-6" : "max-w-5xl mx-auto p-6"}>
                   {renderContent()}
                 </div>
               )}

@@ -83,6 +83,9 @@ export function AutomationPage({
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<Automation | null>(null);
   const [triggeringId, setTriggeringId] = useState<string | null>(null);
+  // Row whose enable/disable PUT is in flight. The toggle itself flips
+  // optimistically; this only drives the disabled/dim affordance.
+  const [togglingId, setTogglingId] = useState<string | null>(null);
   const [deletingTarget, setDeletingTarget] = useState<Automation | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   // Single-expand model — opening a card collapses the previous one so the
@@ -186,7 +189,13 @@ export function AutomationPage({
   }
 
   async function handleToggleEnabled(a: Automation) {
-    if (!projectId) return;
+    if (!projectId || togglingId) return;
+    setTogglingId(a.id);
+    // Optimistic flip — the toggle must react on click, not when the PUT
+    // round-trips. `refresh()` reconciles with the server row afterwards.
+    setAutomations((prev) =>
+      prev.map((x) => (x.id === a.id ? { ...x, enabled: !a.enabled } : x)),
+    );
     try {
       const payload: AutomationUpsert = {
         name: a.name,
@@ -206,6 +215,11 @@ export function AutomationPage({
       void refresh();
     } catch (e) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
+      // Revert to whatever the server actually has — the optimistic flip
+      // must never survive a failed request.
+      void refresh();
+    } finally {
+      setTogglingId(null);
     }
   }
 
@@ -353,6 +367,7 @@ export function AutomationPage({
                     expanded={expandedId === a.id}
                     refreshTick={runsRefreshTick}
                     triggering={triggeringId === a.id}
+                    toggling={togglingId === a.id}
                     onToggleExpand={() =>
                       setExpandedId((prev) => (prev === a.id ? null : a.id))
                     }
@@ -498,6 +513,8 @@ interface CardProps {
   expanded: boolean;
   refreshTick: number;
   triggering: boolean;
+  /** Enable/disable PUT in flight for this row — dims and locks the toggle. */
+  toggling?: boolean;
   onToggleExpand: () => void;
   onEdit: () => void;
   onTrigger: () => void;
@@ -517,6 +534,7 @@ function AutomationCard({
   expanded,
   refreshTick,
   triggering,
+  toggling = false,
   onToggleExpand,
   onEdit,
   onTrigger,
@@ -565,7 +583,11 @@ function AutomationCard({
             <LockKeyhole className="w-4 h-4" />
           </div>
         ) : (
-          <ToggleSwitch value={automation.enabled} onChange={onToggleEnabled} />
+          <ToggleSwitch
+            value={automation.enabled}
+            onChange={onToggleEnabled}
+            disabled={toggling}
+          />
         )}
 
         <div className="flex-1 min-w-0">
@@ -1206,16 +1228,19 @@ function ModeChip({ text }: { text: string }) {
 function ToggleSwitch({
   value,
   onChange,
+  disabled = false,
 }: {
   value: boolean;
   onChange: () => void;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onChange}
-      title={value ? "Disable" : "Enable"}
-      className="mt-1 flex-shrink-0"
+      disabled={disabled}
+      title={disabled ? "Saving…" : value ? "Disable" : "Enable"}
+      className={`mt-1 flex-shrink-0 ${disabled ? "cursor-wait opacity-50" : ""}`}
     >
       <span
         className={`relative inline-flex w-9 h-5 rounded-full transition-colors ${

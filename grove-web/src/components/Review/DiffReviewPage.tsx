@@ -112,6 +112,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     (window as unknown as Record<string, unknown>).__GROVE_REMOTE__ !== true;
   const { isMobile } = useIsMobile();
   const [diffData, setDiffData] = useState<DiffStatsResult | null>(null);
+  const [commitsMeta, setCommitsMeta] = useState<{ total: number; list: number; truncated: boolean } | null>(null);
   const [taskPath, setTaskPath] = useState<string | null>(null);
   useEffect(() => {
     const ac = new AbortController();
@@ -997,6 +998,11 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
     [versionList],
   );
 
+  // Truncation hint when the backend caps the commit list (huge base..HEAD range)
+  const versionFooter = commitsMeta?.truncated
+    ? `Showing latest ${commitsMeta.list} of ${commitsMeta.total} commits`
+    : undefined;
+
   // Refetch diff for a given from/to ref pair
   // gen: if provided, discard response when fetchGenRef has advanced past this gen
   const refetchDiff = useCallback(async ({ fromRef, toRef, keepSelection = false, gen, silent = false }: RefetchDiffOptions = {}) => {
@@ -1378,6 +1384,7 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
           const opts = buildVersionOpts(commitsData);
           if (!cancelled) {
             setVersions(opts);
+            setCommitsMeta(commitsData ? { total: commitsData.total, list: commitsData.commits.length, truncated: !!commitsData.truncated } : null);
             const { from: finalFrom, to: finalTo, changed } = reconcileVersionSelection(
               opts,
               fromVersion,
@@ -2130,9 +2137,9 @@ export function DiffReviewPage({ projectId, taskId, embedded, navigateToFile, is
           )}
           {viewMode === 'diff' && fromOptions.length > 0 && toOptions.length > 0 && (
             <div className="diff-version-range">
-              <VersionSelector options={fromOptions} selected={fromVersion} onChange={handleFromVersionChange} />
+              <VersionSelector options={fromOptions} selected={fromVersion} onChange={handleFromVersionChange} footer={versionFooter} />
               <span className="diff-version-arrow">&rarr;</span>
-              <VersionSelector options={toOptions} selected={toVersion} onChange={handleToVersionChange} />
+              <VersionSelector options={toOptions} selected={toVersion} onChange={handleToVersionChange} footer={versionFooter} />
             </div>
           )}
           <span style={{ fontWeight: 600, color: 'var(--color-text)' }}>

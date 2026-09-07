@@ -65,6 +65,7 @@ type ChatStatusEvent = Extract<RadioEvent, { type: "chat_status" }>;
 // ─── Retention + persistence ────────────────────────────────────────────────
 
 const TRAY_CHATS_LS_KEY = "grove.tray.chats.v1";
+const TRAY_BOOT_ID_LS_KEY = "grove.tray.bootId.v1";
 const LS_WRITE_DEBOUNCE_MS = 200;
 
 /** Returns the retention window in ms, or `null` for "forever". */
@@ -450,6 +451,59 @@ export function TrayPopover({ platform }: { platform: TrayPlatform }) {
   }, [chats, platform.seedFromSnapshot]);
 
   useRadioEvents({
+    onConnected: () => {
+      // Backend restart detection. The radio WS (re)connects after every
+      // backend boot; a changed boot id means every in-memory ACP session died
+      // with the old process, so any Running / NEEDS YOU card carried across
+      // (live state or restored from localStorage) is provably stale — retire
+      // it into Done. The chat_status stream is push-only, so a client that
+      // was disconnected during the restart never receives an `idle` for those
+      // chats; this boot-id check is the only reliable signal. A same-id
+      // reconnect (laptop sleep, network blip) keeps state untouched.
+      void (async () => {
+        let bootId: string | null = null;
+        try {
+          const resp = await apiClient.get<{ boot_id?: string }>("/api/v1/tray/boot");
+          bootId = resp.boot_id ?? null;
+        } catch {
+          return; // Endpoint unreachable — keep state, retry on next reconnect.
+        }
+        if (!bootId) return;
+        let lastBootId: string | null = null;
+        try {
+          lastBootId = window.localStorage.getItem(TRAY_BOOT_ID_LS_KEY);
+        } catch {
+          // Private mode / quota — null reads as "changed", which is the
+          // conservative direction.
+        }
+        if (lastBootId === bootId) return;
+        const ts = Date.now();
+        setChatsPruned((prev) => {
+          const next = new Map(prev);
+          let changed = false;
+          for (const [id, c] of prev) {
+            if (c.status !== "running" && c.status !== "permission") continue;
+            const startedAt = c.running_started_at ?? c.entered_state_at;
+            next.set(id, {
+              ...c,
+              status: "done",
+              entered_state_at: ts,
+              done_duration_ms: Math.max(0, ts - startedAt),
+              pending_options: null,
+              pending_description: null,
+            });
+            changed = true;
+          }
+          return changed ? next : prev;
+        });
+        try {
+          window.localStorage.setItem(TRAY_BOOT_ID_LS_KEY, bootId);
+        } catch {
+          // Private mode — in-memory state is already reset; the next mount
+          // just re-runs the reset against whatever was restored.
+        }
+      })();
+    },
     onChatStatus: (
       projectId,
       taskId,

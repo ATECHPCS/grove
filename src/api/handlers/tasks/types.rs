@@ -203,6 +203,9 @@ pub struct CommitsResponse {
     /// matches HEAD's tree (at least 1, since commits[0] IS HEAD).
     /// When working tree is dirty: 0 (all commits become versions, Latest = working tree).
     pub skip_versions: u32,
+    /// True when `total` exceeds the entries returned — `commits` is capped at
+    /// MAX_VERSION_COMMITS for very long ranges.
+    pub truncated: bool,
 }
 
 /// Review comment reply entry
