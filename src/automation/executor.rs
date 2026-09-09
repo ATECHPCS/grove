@@ -75,6 +75,16 @@ impl RunOutcome {
             resolved_chat_id,
         }
     }
+
+    pub fn skipped() -> Self {
+        Self {
+            run_id: String::new(),
+            status: "skipped".to_string(),
+            error: None,
+            resolved_task_id: None,
+            resolved_chat_id: None,
+        }
+    }
 }
 
 fn now() -> i64 {
@@ -293,6 +303,14 @@ async fn run_handler(automation: &Automation, trigger: consumer::TriggerContext)
             automation.handler_key
         ));
     };
+    match handler.should_run(consumer::TriggerCheckContext {
+        automation,
+        trigger: &trigger,
+    }) {
+        Ok(true) => {}
+        Ok(false) => return RunOutcome::skipped(),
+        Err(error) => return RunOutcome::failed(format!("check Automation trigger: {error}")),
+    }
     let single_flight =
         handler.concurrency_policy(automation) == consumer::ConcurrencyPolicy::SingleFlight;
     let agent_snapshot = automation

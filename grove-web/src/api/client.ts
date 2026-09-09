@@ -325,6 +325,16 @@ class ApiClient {
       } as ApiError;
     }
 
+    const contentType = response.headers.get('content-type') ?? '';
+    if (!contentType.toLowerCase().includes('application/json')) {
+      throw {
+        status: response.status,
+        message: path.startsWith('/api/')
+          ? 'Expected JSON from the Grove API, but the running backend returned a page. Restart Grove to load the current backend routes.'
+          : 'Expected JSON response',
+      } as ApiError;
+    }
+
     return response.json();
   }
 

@@ -9,11 +9,13 @@ import {
   Server,
   ShieldAlert,
   Terminal,
+  Trash2,
   X,
 } from "lucide-react";
 import { Button, DrawerShell } from "../ui";
-import { updatePluginSdk, type Plugin } from "../../api/plugins";
+import { deletePlugin, updatePluginSdk, type Plugin } from "../../api/plugins";
 import { ExtensionIdentityIcon } from "../Skills/ExtensionIdentityIcon";
+import { ConfirmDialog } from "../Dialogs";
 
 const HIGH_RISK_PERMISSIONS = new Set(["exec", "project:write", "chat:read", "chat:write", "inject"]);
 
@@ -30,10 +32,13 @@ function formatTime(value: string) {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
 }
 
-export function PluginDetailDialog({ plugin, onClose }: { plugin: Plugin; onClose: () => void }) {
+export function PluginDetailDialog({ plugin, onClose, onDeleted }: { plugin: Plugin; onClose: () => void; onDeleted?: () => void | Promise<void> }) {
   const [sdkState, setSdkState] = useState<"idle" | "running" | "done" | "error">("idle");
   const [sdkMessage, setSdkMessage] = useState<string | null>(null);
   const [sdkStatus, setSdkStatus] = useState(plugin.sdk_status);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteState, setDeleteState] = useState<"idle" | "running" | "error">("idle");
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const updateSdk = async () => {
     setSdkState("running");
@@ -46,6 +51,20 @@ export function PluginDetailDialog({ plugin, onClose }: { plugin: Plugin; onClos
     } catch (cause) {
       setSdkState("error");
       setSdkMessage(cause instanceof Error ? cause.message : "Update failed");
+    }
+  };
+
+  const uninstall = async () => {
+    setDeleteState("running");
+    setDeleteError(null);
+    try {
+      await deletePlugin(plugin.id);
+      setConfirmDelete(false);
+      await onDeleted?.();
+      onClose();
+    } catch (cause) {
+      setDeleteState("error");
+      setDeleteError(cause instanceof Error ? cause.message : "Could not uninstall plugin");
     }
   };
 
@@ -158,7 +177,27 @@ export function PluginDetailDialog({ plugin, onClose }: { plugin: Plugin; onClos
             </section>
           )}
         </div>
+        <footer className="flex shrink-0 items-center justify-between gap-4 border-t border-[var(--color-border)] bg-[var(--color-bg-secondary)]/55 px-6 py-4">
+          <div className="min-w-0 text-xs text-[var(--color-text-muted)]">
+            {deleteError || (plugin.source === "dev" ? "The development folder will remain on disk." : "Uninstall removes Grove's managed plugin files and data.")}
+          </div>
+          <Button variant="danger" onClick={() => setConfirmDelete(true)} disabled={deleteState === "running"}>
+            <Trash2 className="mr-1.5 h-4 w-4" />
+            {plugin.source === "dev" ? "Remove" : "Uninstall"}
+          </Button>
+        </footer>
       </div>
+      <ConfirmDialog
+        isOpen={confirmDelete}
+        title={plugin.source === "dev" ? "Remove development plugin" : "Uninstall plugin"}
+        message={plugin.source === "dev" ? `Remove ${plugin.name} from Grove? Its development folder will remain untouched.` : `Uninstall ${plugin.name}? Grove's managed plugin files, runtime, Skills, and plugin data will be removed.`}
+        confirmLabel={deleteState === "running" ? "Removing…" : plugin.source === "dev" ? "Remove" : "Uninstall"}
+        cancelLabel="Cancel"
+        actionsDisabled={deleteState === "running"}
+        variant="danger"
+        onConfirm={() => void uninstall()}
+        onCancel={() => { if (deleteState !== "running") setConfirmDelete(false); }}
+      />
     </DrawerShell>
   );
 }

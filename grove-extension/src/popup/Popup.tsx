@@ -3,6 +3,7 @@ import { Radio, RefreshCw, CheckCircle2, AlertCircle, XCircle } from 'lucide-rea
 
 const PORT_RANGE_START = 3001;
 const PORT_RANGE_END = 3010;
+const GROVE_LOOPBACK_HOST = '127.0.0.1';
 
 export default function Popup() {
   const [grovePort, setGrovePort] = useState(3001);
@@ -23,9 +24,14 @@ export default function Popup() {
 
     // 2. Perform initial automatic port discovery
     autoDiscoverPort();
+    void refreshConnectionStatus();
+    const statusTimer = window.setInterval(() => {
+      void refreshConnectionStatus();
+    }, 1000);
 
     return () => {
       mediaQuery.removeEventListener('change', themeHandler);
+      window.clearInterval(statusTimer);
     };
   }, []);
 
@@ -50,7 +56,7 @@ export default function Popup() {
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 600); // 600ms quick timeout
-      const resp = await fetch(`http://localhost:${port}/api/v1/auth/info`, {
+      const resp = await fetch(`http://${GROVE_LOOPBACK_HOST}:${port}/api/v1/auth/info`, {
         signal: controller.signal
       });
       clearTimeout(timeoutId);
@@ -60,72 +66,84 @@ export default function Popup() {
     }
   };
 
-  const autoDiscoverPort = async () => {
-    setIsScanning(true);
-
-    // A. Read cached port from chrome.storage
-    if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-      const data = await chrome.storage.local.get('grove_port');
-      if (data.grove_port) {
-        const isAlive = await pingPort(data.grove_port);
-        if (isAlive) {
-          setGrovePort(data.grove_port);
-          setIsConnected(true);
-          setIsScanning(false);
-          return;
-        }
-      }
-    }
-
-    // B. Scan ports 3001 to 3010 in parallel
-    const scanPromises: Promise<number | null>[] = [];
-    for (let port = PORT_RANGE_START; port <= PORT_RANGE_END; port++) {
-      scanPromises.push(
-        pingPort(port).then(isAlive => isAlive ? port : null)
-      );
-    }
-
-    const results = await Promise.all(scanPromises);
-    const foundPort = results.find(p => p !== null);
-
-    if (foundPort) {
-      setGrovePort(foundPort);
-      setIsConnected(true);
-      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-        await chrome.storage.local.set({ grove_port: foundPort });
-      }
-    } else {
+  const refreshConnectionStatus = async () => {
+    try {
+      const status = await chrome.runtime.sendMessage({ type: 'GROVE_CONNECTION_STATUS' }) as {
+        connected?: boolean;
+        port?: number;
+      } | undefined;
+      setIsConnected(status?.connected === true);
+      if (typeof status?.port === 'number') setGrovePort(status.port);
+    } catch {
       setIsConnected(false);
     }
+  };
 
-    setIsScanning(false);
+  const requestBackgroundConnection = async (port: number) => {
+    await chrome.storage.local.set({ grove_port: port });
+    await chrome.runtime.sendMessage({ type: 'GROVE_PORT_DISCOVERED', port });
+  };
+
+  const autoDiscoverPort = async () => {
+    setIsScanning(true);
+    try {
+      // A. Read cached port from chrome.storage
+      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+        const data = await chrome.storage.local.get('grove_port');
+        if (data.grove_port) {
+          const isAlive = await pingPort(data.grove_port);
+          if (isAlive) {
+            setGrovePort(data.grove_port);
+            await requestBackgroundConnection(data.grove_port);
+            return;
+          }
+        }
+      }
+
+      // B. Scan ports 3001 to 3010 in parallel
+      const scanPromises: Promise<number | null>[] = [];
+      for (let port = PORT_RANGE_START; port <= PORT_RANGE_END; port++) {
+        scanPromises.push(
+          pingPort(port).then(isAlive => isAlive ? port : null)
+        );
+      }
+
+      const results = await Promise.all(scanPromises);
+      const foundPort = results.find(p => p !== null);
+
+      if (foundPort) {
+        setGrovePort(foundPort);
+        await requestBackgroundConnection(foundPort);
+      } else {
+        setIsConnected(false);
+      }
+    } catch (error) {
+      console.error('[Grove Popup] Port discovery failed:', error);
+      setIsConnected(false);
+    } finally {
+      // Runtime messaging can reject when Chrome is restarting the MV3
+      // background worker. Never leave the popup permanently in Scanning.
+      setIsScanning(false);
+    }
   };
 
   const handleManualConnect = async () => {
     setIsConnecting(true);
     setConnectFailed(false);
-    const isAlive = await pingPort(grovePort);
-
-    if (isAlive) {
-      setIsConnected(true);
-      setConnectFailed(false);
-      // Notify background service worker immediately
-      if (typeof chrome !== 'undefined' && chrome.runtime) {
-        chrome.runtime.sendMessage({
-          type: 'GROVE_PORT_DISCOVERED',
-          port: grovePort
-        });
-      }
-      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-        await chrome.storage.local.set({ grove_port: grovePort });
-      }
-    } else {
-      // 💥 Triggers satisfying shake animation and visual error feedback
+    try {
+      const isAlive = await pingPort(grovePort);
+      if (!isAlive) throw new Error(`Grove is not reachable on port ${grovePort}`);
+      setIsConnected(false);
+      await requestBackgroundConnection(grovePort);
+      await refreshConnectionStatus();
+    } catch (error) {
+      console.error('[Grove Popup] Manual connection failed:', error);
       setIsConnected(false);
       setConnectFailed(true);
       setTimeout(() => setConnectFailed(false), 1500); // Reset feedback after 1.5s
+    } finally {
+      setIsConnecting(false);
     }
-    setIsConnecting(false);
   };
 
   return (
@@ -158,6 +176,9 @@ export default function Popup() {
           />
           <span style={{ fontWeight: 600, fontSize: '14px', letterSpacing: '0.3px', color: theme.text }}>
             Grove Companion
+          </span>
+          <span style={{ fontSize: '9px', color: theme.textMuted, fontFamily: 'monospace' }}>
+            v{chrome.runtime.getManifest().version}
           </span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -363,7 +384,7 @@ export default function Popup() {
         paddingTop: '10px',
         marginTop: 'auto'
       }}>
-        <span>Grove Companion v0.0.1</span>
+        <span>Grove Companion v{chrome.runtime.getManifest().version}</span>
         <button
           onClick={autoDiscoverPort}
           disabled={isScanning}

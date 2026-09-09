@@ -327,8 +327,15 @@ fn load_history_capped(
 }
 
 /// Path-based, byte-capped history load. Split out so the tail-cap read is
-/// unit-testable without going through `grove_dir()`.
+/// unit-testable without going through `grove_dir()`. Delegates to the
+/// `Option`-based `load_history_from_path` (upstream) with an explicit cap.
 fn load_history_from_path_capped(path: &Path, max_bytes: u64) -> Vec<AcpUpdate> {
+    load_history_from_path(path, Some(max_bytes))
+}
+
+/// `max_read_bytes = None` reads the whole file — the compaction path relies on
+/// this so it never truncates old events; `Some(n)` caps the tail read at `n`.
+fn load_history_from_path(path: &Path, max_read_bytes: Option<u64>) -> Vec<AcpUpdate> {
     let mut file = match fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
@@ -336,10 +343,12 @@ fn load_history_from_path_capped(path: &Path, max_bytes: u64) -> Vec<AcpUpdate> 
 
     let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut skip_partial_first_line = false;
-    if file_len > max_bytes {
-        let start = file_len - max_bytes;
-        if file.seek(SeekFrom::Start(start)).is_ok() {
-            skip_partial_first_line = true;
+    if let Some(max_read_bytes) = max_read_bytes {
+        if file_len > max_read_bytes {
+            let start = file_len - max_read_bytes;
+            if file.seek(SeekFrom::Start(start)).is_ok() {
+                skip_partial_first_line = true;
+            }
         }
     }
 
@@ -596,7 +605,11 @@ pub fn clear_history(project: &str, task_id: &str, chat_id: &str) {
 
 /// Turn 结束后 compact history.jsonl：合并碎片化的 chunk 事件
 pub fn compact_history(project: &str, task_id: &str, chat_id: &str) {
-    let events = load_history(project, task_id, chat_id);
+    // Compaction rewrites the source file, so it must never use the bounded
+    // tail reader intended for UI replay. Doing so permanently discarded the
+    // oldest events once history.jsonl exceeded MAX_HISTORY_READ_BYTES.
+    let path = history_file_path(project, task_id, chat_id);
+    let events = load_history_from_path(&path, None);
     if events.is_empty() {
         return;
     }
@@ -866,6 +879,48 @@ pub fn compact_events(events: Vec<AcpUpdate>) -> Vec<AcpUpdate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_history_reader_keeps_events_before_the_bounded_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let first = AcpUpdate::UserMessage {
+            text: "first prompt".to_string(),
+            attachments: Vec::new(),
+            sender: None,
+            terminal: false,
+        };
+        let second = AcpUpdate::MessageChunk {
+            text: "x".repeat(256),
+        };
+        let third = AcpUpdate::Complete {
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+            start_ts: None,
+            end_ts: None,
+            cost: None,
+        };
+        let contents = [first.clone(), second, third.clone()]
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&path, contents).unwrap();
+
+        let tail = load_history_from_path(&path, Some(128));
+        assert!(!tail.iter().any(|event| matches!(
+            event,
+            AcpUpdate::UserMessage { text, .. } if text == "first prompt"
+        )));
+
+        let full = load_history_from_path(&path, None);
+        assert!(matches!(
+            full.first(),
+            Some(AcpUpdate::UserMessage { text, .. }) if text == "first prompt"
+        ));
+        assert!(matches!(full.last(), Some(AcpUpdate::Complete { .. })));
+    }
 
     #[test]
     fn compact_preserves_v1_tool_replacement_events() {

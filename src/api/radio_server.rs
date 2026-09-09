@@ -162,6 +162,10 @@ fn create_radio_router(expected_token: Arc<String>) -> Router {
             get(super::handlers::walkie_talkie::get_tray_chats),
         )
         .route(
+            "/api/v1/tray/boot",
+            get(super::handlers::walkie_talkie::get_tray_boot),
+        )
+        .route(
             "/api/v1/tray/resolve-permission",
             post(super::handlers::walkie_talkie::tray_resolve_permission),
         )

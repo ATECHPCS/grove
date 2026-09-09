@@ -271,6 +271,17 @@ pub fn subscribe_radio_events() -> broadcast::Receiver<RadioEvent> {
     RADIO_EVENTS.subscribe()
 }
 
+/// Opaque per-process boot id (unix millis at first use). A tray client that
+/// sees this value change knows the backend — and with it every in-memory ACP
+/// session — restarted, so any Running / NEEDS YOU card it kept across the
+/// restart is provably stale and must be retired.
+static BOOT_ID: Lazy<String> = Lazy::new(|| {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+});
+
 // ─── Client → Server Messages ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -1261,6 +1272,15 @@ pub async fn radio_status() -> axum::response::Json<serde_json::Value> {
 }
 
 // ─── Tray Phone Panel Endpoints (served by radio_server) ───────────────────
+
+/// GET /api/v1/tray/boot — Per-process boot id for tray restart detection.
+/// The tray popover fetches this on every radio-WS (re)connect: a changed id
+/// means the backend restarted, so its stale Running / NEEDS YOU entries get
+/// retired (the radio events themselves are push-only — a client that was
+/// disconnected during the restart never sees an `idle` for those chats).
+pub async fn get_tray_boot() -> axum::response::Json<serde_json::Value> {
+    axum::response::Json(serde_json::json!({ "boot_id": BOOT_ID.clone() }))
+}
 
 /// GET /api/v1/tray/chats — Seed state for a freshly connected phone. Returns
 /// the desktop tray's mirrored panel (full Running / NEEDS YOU / Done with

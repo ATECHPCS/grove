@@ -93,6 +93,8 @@ export interface CommitsResponse {
   total: number;
   /** Number of leading commits to skip when building version options */
   skip_versions: number;
+  /** True when total exceeds commits.length (list capped at MAX_VERSION_COMMITS) */
+  truncated?: boolean;
 }
 
 export interface CommentReply {

@@ -304,6 +304,24 @@ mod tests {
     }
 
     #[test]
+    fn session_instruction_reuses_meta_envelope_and_preserves_real_user_message() {
+        let prompt = build_session_instruction_prompt(
+            "agent_voice",
+            "Agent Voice is enabled for this Session.",
+            "Give me the latest status",
+        );
+        let envelope = parse_envelope(&prompt);
+
+        assert_eq!(envelope["type"], "grove_session_init");
+        assert_eq!(envelope["data"]["kind"], "agent_voice");
+        assert_eq!(
+            envelope["system-prompt"],
+            "Agent Voice is enabled for this Session."
+        );
+        assert!(prompt.ends_with("\n\nGive me the latest status"));
+    }
+
+    #[test]
     fn persona_instruction_is_framed_without_acknowledgement_turn() {
         let prompt = build_persona_instruction("Senior Engineer", "Be precise.");
         assert!(prompt.contains("Senior Engineer"));

@@ -43,6 +43,8 @@ export function renderItemKey(item: RenderItem): string {
 export type ConversationTurn = {
   messageIndex: number;
   renderIndex: number;
+  renderStart: number;
+  renderEnd: number;
   user: string;
   assistant: string;
   isStreaming: boolean;
@@ -124,6 +126,8 @@ export function buildConversationTurns(
       current = {
         messageIndex,
         renderIndex,
+        renderStart: renderIndex,
+        renderEnd: renderItems.length,
         user: compactConversationText(message.content) || "Attachment",
         assistant: "",
         isStreaming: false,
@@ -147,6 +151,12 @@ export function buildConversationTurns(
     );
     if (!message.complete) current.isStreaming = true;
   });
+  turns.forEach((turn, index) => {
+    turn.renderEnd = turns[index + 1]?.renderIndex ?? renderItems.length;
+  });
+  if (turns[0] && turns[0].renderIndex > 0) {
+    turns[0].renderStart = 0;
+  }
   return turns;
 }
 

@@ -1,12 +1,14 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { ChevronDown, Check } from "lucide-react";
+import { ChevronDown, Check, LoaderCircle, Search } from "lucide-react";
 
 export interface ComboboxOption {
   id: string;
   label: string;
   value: string;
+  description?: string;
+  icon?: ReactNode;
 }
 
 interface ComboboxProps {
@@ -19,6 +21,18 @@ interface ComboboxProps {
   label?: string;
   disabled?: boolean;
   size?: "default" | "compact";
+  searchable?: boolean;
+  searchValue?: string;
+  onSearchChange?: (value: string) => void;
+  searchPlaceholder?: string;
+  emptyText?: string;
+  loading?: boolean;
+  hasMore?: boolean;
+  onLoadMore?: () => void;
+  clearSearchOnSelect?: boolean;
+  dropdownMinWidth?: number;
+  dropdownMaxHeight?: number;
+  triggerClassName?: string;
 }
 
 interface DropdownPosition {
@@ -40,12 +54,25 @@ export function Combobox({
   label,
   disabled = false,
   size = "default",
+  searchable = false,
+  searchValue,
+  onSearchChange,
+  searchPlaceholder = "Search...",
+  emptyText = "No options found",
+  loading = false,
+  hasMore = false,
+  onLoadMore,
+  clearSearchOnSelect = true,
+  dropdownMinWidth,
+  dropdownMaxHeight = 240,
+  triggerClassName = "",
 }: ComboboxProps) {
   const [isOpen, setIsOpen] = useState(false);
   // Initialize custom mode from initial props (lazy state initializer)
   const [isCustomMode, setIsCustomMode] = useState(() => allowCustom && !!(value && !options.find((opt) => opt.value === value)));
   const [customValue, setCustomValue] = useState(() => (value && !options.find((opt) => opt.value === value)) ? value : "");
   const [dropdownPosition, setDropdownPosition] = useState<DropdownPosition | null>(null);
+  const [localSearch, setLocalSearch] = useState("");
   const containerRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -61,10 +88,13 @@ export function Combobox({
       const rect = triggerRef.current.getBoundingClientRect();
       const gap = 4;
       const viewportPadding = 8;
-      const preferredMaxHeight = 240;
+      const preferredMaxHeight = dropdownMaxHeight;
       const availableBelow = window.innerHeight - rect.bottom - gap - viewportPadding;
       const availableAbove = rect.top - gap - viewportPadding;
-      const opensUp = availableBelow < preferredMaxHeight && availableAbove > availableBelow;
+      const minimumUsefulHeight = Math.min(240, preferredMaxHeight);
+      const opensUp = availableBelow < minimumUsefulHeight && availableAbove > availableBelow;
+      const width = Math.min(Math.max(rect.width, dropdownMinWidth ?? 0), window.innerWidth - viewportPadding * 2);
+      const left = Math.min(rect.left, window.innerWidth - viewportPadding - width);
       const maxHeight = Math.max(
         96,
         Math.min(preferredMaxHeight, opensUp ? availableAbove : availableBelow)
@@ -73,13 +103,13 @@ export function Combobox({
       setDropdownPosition({
         top: opensUp ? null : rect.bottom + gap,
         bottom: opensUp ? window.innerHeight - rect.top + gap : null,
-        left: rect.left,
-        width: rect.width,
+        left: Math.max(viewportPadding, left),
+        width,
         maxHeight,
         opensUp,
       });
     }
-  }, []);
+  }, [dropdownMaxHeight, dropdownMinWidth]);
 
   // Update position when opening
   useEffect(() => {
@@ -128,6 +158,10 @@ export function Combobox({
     } else {
       setIsCustomMode(false);
       onChange(option.value);
+      if (clearSearchOnSelect) {
+        setLocalSearch("");
+        onSearchChange?.("");
+      }
       setIsOpen(false);
     }
   };
@@ -155,6 +189,10 @@ export function Combobox({
   const allOptions = allowCustom
     ? [...options, { id: "custom", label: "Custom...", value: "" }]
     : options;
+  const effectiveSearch = searchValue ?? localSearch;
+  const visibleOptions = searchable && !onSearchChange && effectiveSearch
+    ? allOptions.filter((option) => `${option.label} ${option.description ?? ""}`.toLowerCase().includes(effectiveSearch.toLowerCase()))
+    : allOptions;
 
   // Render dropdown using portal
   const renderDropdown = () => {
@@ -177,25 +215,58 @@ export function Combobox({
             maxHeight: dropdownPosition.maxHeight,
             zIndex: 9999,
           }}
-          className="py-1 bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-lg shadow-lg overflow-y-auto"
+          className="flex flex-col bg-[var(--color-bg-secondary)] border border-[var(--color-border)] rounded-lg shadow-lg overflow-hidden"
         >
-          {allOptions.map((option) => (
-            <button
-              key={option.id}
-              onClick={() => handleSelect(option)}
-              className={`w-full flex items-center justify-between transition-colors ${size === "compact" ? "px-2.5 py-1.5 text-xs" : "px-3 py-2 text-sm"}
-                ${option.value === value
-                  ? "bg-[var(--color-highlight)]/10 text-[var(--color-highlight)]"
-                  : "text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)]"
-                }
-                ${option.id === "custom" ? "border-t border-[var(--color-border)] mt-1 pt-2" : ""}`}
-            >
-              <span>{option.label}</span>
-              {option.value === value && option.id !== "custom" && (
-                <Check className="w-4 h-4" />
-              )}
-            </button>
-          ))}
+          {searchable && (
+            <div className="shrink-0 border-b border-[var(--color-border)] p-2">
+              <div className="flex h-9 items-center gap-2 rounded-lg bg-[var(--color-bg)] px-2.5">
+                <Search className="h-3.5 w-3.5 shrink-0 text-[var(--color-text-muted)]" />
+                <input
+                  autoFocus
+                  value={effectiveSearch}
+                  onChange={(event) => {
+                    setLocalSearch(event.target.value);
+                    onSearchChange?.(event.target.value);
+                  }}
+                  onKeyDown={(event) => { if (event.key === "Escape") setIsOpen(false); }}
+                  placeholder={searchPlaceholder}
+                  className="min-w-0 flex-1 bg-transparent text-xs text-[var(--color-text)] outline-none placeholder:text-[var(--color-text-muted)]"
+                />
+              </div>
+            </div>
+          )}
+          <div
+            className="min-h-0 flex-1 overflow-y-auto py-1"
+            onScroll={(event) => {
+              const target = event.currentTarget;
+              if (hasMore && !loading && target.scrollHeight - target.scrollTop - target.clientHeight < 48) onLoadMore?.();
+            }}
+          >
+            {visibleOptions.map((option) => (
+              <button
+                key={option.id}
+                onClick={() => handleSelect(option)}
+                className={`w-full flex items-center justify-between gap-3 text-left transition-colors ${size === "compact" ? "px-2.5 py-1.5 text-xs" : "px-3 py-2 text-sm"}
+                  ${option.value === value
+                    ? "bg-[var(--color-highlight)]/10 text-[var(--color-highlight)]"
+                    : "text-[var(--color-text)] hover:bg-[var(--color-bg-tertiary)]"
+                  }
+                  ${option.id === "custom" ? "border-t border-[var(--color-border)] mt-1 pt-2" : ""}`}
+              >
+                <span className="flex min-w-0 items-center gap-2">
+                  {option.icon && <span className="shrink-0">{option.icon}</span>}
+                  <span className="min-w-0">
+                    <span className="block truncate">{option.label}</span>
+                    {option.description && <span className="mt-0.5 block truncate text-[10px] text-[var(--color-text-muted)]">{option.description}</span>}
+                  </span>
+                </span>
+                {option.value === value && option.id !== "custom" && <Check className="h-4 w-4 shrink-0" />}
+              </button>
+            ))}
+            {!loading && visibleOptions.length === 0 && <p className="px-3 py-6 text-center text-xs text-[var(--color-text-muted)]">{emptyText}</p>}
+            {loading && <div className="flex items-center justify-center gap-2 px-3 py-3 text-xs text-[var(--color-text-muted)]"><LoaderCircle className="h-3.5 w-3.5 animate-spin" />Loading...</div>}
+            {hasMore && !loading && <button type="button" onClick={onLoadMore} className="w-full px-3 py-2 text-xs font-medium text-[var(--color-highlight)] hover:bg-[var(--color-bg-tertiary)]">Load more</button>}
+          </div>
         </motion.div>
       </AnimatePresence>,
       document.body
@@ -225,7 +296,7 @@ export function Combobox({
               className={`flex-1 bg-[var(--color-bg-secondary)] border border-[var(--color-highlight)] rounded-lg
                 text-[var(--color-text)] placeholder-[var(--color-text-muted)]
                 focus:outline-none focus:ring-1 focus:ring-[var(--color-highlight)]
-                transition-all duration-200 ${size === "compact" ? "min-w-0 px-2.5 py-1.5 text-xs" : "px-3 py-2 text-sm"}`}
+                transition-all duration-200 ${size === "compact" ? "min-w-0 px-2.5 py-1.5 text-xs" : "px-3 py-2 text-sm"} ${triggerClassName}`}
             />
             <button
               disabled={disabled}
@@ -251,10 +322,11 @@ export function Combobox({
               ${isOpen
                 ? "border-[var(--color-highlight)] ring-1 ring-[var(--color-highlight)]"
                 : "border-[var(--color-border)] hover:border-[var(--color-text-muted)]"
-              }`}
+              } ${triggerClassName}`}
           >
-            <span className={`min-w-0 truncate ${selectedOption || isCustomValue ? "text-[var(--color-text)]" : "text-[var(--color-text-muted)]"}`}>
-              {displayValue}
+            <span className={`flex min-w-0 items-center gap-2 ${selectedOption || isCustomValue ? "text-[var(--color-text)]" : "text-[var(--color-text-muted)]"}`}>
+              {selectedOption?.icon && <span className="shrink-0">{selectedOption.icon}</span>}
+              <span className="min-w-0 truncate">{displayValue}</span>
             </span>
             <motion.div
               animate={{ rotate: isOpen ? 180 : 0 }}

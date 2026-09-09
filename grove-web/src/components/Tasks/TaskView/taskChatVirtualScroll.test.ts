@@ -1,33 +1,71 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   firstVisibleTaskChatRow,
-  scrollVirtuosoToBottom,
+  nextTaskChatFollowState,
+  shouldConfirmTaskChatBottom,
   shouldDisengageTaskChatAutoStick,
+  shouldFollowTaskChatSend,
   shouldVirtualizeTaskChat,
+  taskChatPrependTurnWindowStart,
+  taskChatRenderIndex,
+  taskChatVirtuosoIndex,
+  taskChatWindowStartForLastTurns,
+  taskChatWindowStartForRenderIndex,
+  taskChatHeightCacheKey,
   taskChatHeightEstimates,
   taskChatLayoutTransitionTarget,
+  taskChatShouldDriveBottom,
   taskChatVirtualizationLayoutKey,
 } from "./taskChatVirtualScroll";
 
 describe("scrollVirtuosoToBottom", () => {
-  it("targets the full scroller extent instead of the last data item", () => {
-    const scrollTo = vi.fn();
-
-    scrollVirtuosoToBottom({ scrollTo }, "auto");
-
-    expect(scrollTo).toHaveBeenCalledWith({
-      top: Number.MAX_SAFE_INTEGER,
-      behavior: "auto",
-    });
+  it("models follow, detach, and explicit reattachment without ambiguity", () => {
+    expect(nextTaskChatFollowState("following", "user-left-bottom")).toBe(
+      "detached",
+    );
+    expect(nextTaskChatFollowState("detached", "request-bottom")).toBe(
+      "reattaching",
+    );
+    expect(nextTaskChatFollowState("following", "request-bottom")).toBe(
+      "following",
+    );
+    expect(
+      nextTaskChatFollowState("reattaching", "bottom-confirmed"),
+    ).toBe("following");
+    expect(taskChatShouldDriveBottom("following")).toBe(true);
+    expect(taskChatShouldDriveBottom("reattaching")).toBe(true);
+    expect(taskChatShouldDriveBottom("detached")).toBe(false);
   });
 
-  it("keeps chats within the recent-turn limit out of Virtuoso", () => {
-    expect(shouldVirtualizeTaskChat(43, 50)).toBe(false);
-    expect(shouldVirtualizeTaskChat(50, 50)).toBe(false);
-    expect(shouldVirtualizeTaskChat(51, 50)).toBe(true);
+  it("switches renderers solely at the configured performance threshold", () => {
+    for (const threshold of [0, 1, 10, 50]) {
+      expect(shouldVirtualizeTaskChat(threshold, threshold)).toBe(false);
+      expect(shouldVirtualizeTaskChat(threshold + 1, threshold)).toBe(true);
+    }
   });
 
-  it("preserves bottom-following across the 50-to-51 renderer swap", () => {
+  it("anchors windows on complete turns regardless of render item volume", () => {
+    const turnStarts = [0, 2, 5, 70, 74, 140];
+    expect(taskChatWindowStartForLastTurns(turnStarts, 2)).toBe(74);
+    expect(taskChatWindowStartForLastTurns(turnStarts, 20)).toBe(0);
+    expect(taskChatPrependTurnWindowStart(turnStarts, 74, 2)).toBe(5);
+    expect(taskChatPrependTurnWindowStart(turnStarts, 5, 20)).toBe(0);
+  });
+
+  it("expands navigation to the containing complete turn", () => {
+    const turnStarts = [0, 2, 5, 70, 74, 140];
+    expect(taskChatWindowStartForRenderIndex(turnStarts, 139, 1)).toBe(70);
+    expect(taskChatWindowStartForRenderIndex(turnStarts, 72, 0)).toBe(70);
+    expect(taskChatWindowStartForRenderIndex(turnStarts, 1, 0)).toBe(0);
+  });
+
+  it("maps stable transcript indexes to positive Virtuoso indexes", () => {
+    const base = 1_000_000;
+    expect(taskChatVirtuosoIndex(137, base)).toBe(1_000_137);
+    expect(taskChatRenderIndex(1_000_137, base)).toBe(137);
+  });
+
+  it("preserves bottom-following when a genuinely long chat becomes virtual", () => {
     expect(
       taskChatLayoutTransitionTarget("direct", "virtual:72", true, null),
     ).toEqual({ kind: "bottom" });
@@ -72,6 +110,79 @@ describe("scrollVirtuosoToBottom", () => {
     ).toBe(false);
   });
 
+  it("never reattaches a detached reader from a layout-only bottom event", () => {
+    expect(
+      shouldConfirmTaskChatBottom({
+        state: "detached",
+        atBottom: true,
+        userMovedTowardBottom: false,
+        programmaticScroll: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldConfirmTaskChatBottom({
+        state: "detached",
+        atBottom: true,
+        userMovedTowardBottom: true,
+        programmaticScroll: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("reattaches only from an explicit request or a downward user arrival", () => {
+    expect(
+      shouldConfirmTaskChatBottom({
+        state: "reattaching",
+        atBottom: true,
+        userMovedTowardBottom: false,
+        programmaticScroll: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldConfirmTaskChatBottom({
+        state: "detached",
+        atBottom: true,
+        userMovedTowardBottom: true,
+        programmaticScroll: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("preserves history reading through queue/layout updates, then resumes at bottom", () => {
+    let state = nextTaskChatFollowState("following", "user-left-bottom");
+    expect(state).toBe("detached");
+    expect(shouldFollowTaskChatSend(true, state === "following")).toBe(false);
+
+    const layoutOnlyBottom = shouldConfirmTaskChatBottom({
+      state,
+      atBottom: true,
+      userMovedTowardBottom: false,
+      programmaticScroll: false,
+    });
+    if (layoutOnlyBottom) {
+      state = nextTaskChatFollowState(state, "bottom-confirmed");
+    }
+    expect(state).toBe("detached");
+
+    const userReachedBottom = shouldConfirmTaskChatBottom({
+      state,
+      atBottom: true,
+      userMovedTowardBottom: true,
+      programmaticScroll: false,
+    });
+    if (userReachedBottom) {
+      state = nextTaskChatFollowState(state, "bottom-confirmed");
+    }
+    expect(state).toBe("following");
+    expect(taskChatShouldDriveBottom(state)).toBe(true);
+  });
+
+  it("does not move a detached reader when a message is only queued", () => {
+    expect(shouldFollowTaskChatSend(false, false)).toBe(true);
+    expect(shouldFollowTaskChatSend(true, true)).toBe(true);
+    expect(shouldFollowTaskChatSend(true, false)).toBe(false);
+  });
+
   it("keeps the virtual scroller mounted as the cold boundary advances", () => {
     const base = {
       chatId: "chat-a",
@@ -85,13 +196,18 @@ describe("scrollVirtuosoToBottom", () => {
     // output. Advancing it appends data and must not create a new React key.
   });
 
-  it("reuses measured hot-row heights as Virtuoso estimates", () => {
+  it("uses the same scoped key for measured and estimated row heights", () => {
     const items = [{ key: "a" }, { key: "b" }, { key: "c" }];
+    const scope = "chat-a:0:920";
+    const measured = new Map([
+      [taskChatHeightCacheKey(scope, "a"), 84],
+      [taskChatHeightCacheKey(scope, "c"), 340],
+    ]);
     expect(
       taskChatHeightEstimates(
         items,
-        (item) => item.key,
-        new Map([["a", 84], ["c", 340]]),
+        (item) => taskChatHeightCacheKey(scope, item.key),
+        measured,
         120,
       ),
     ).toEqual([84, 120, 340]);

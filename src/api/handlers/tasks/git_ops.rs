@@ -243,11 +243,16 @@ pub async fn get_diff(
         .ok_or(StatusCode::NOT_FOUND)?;
 
     let diff_entries = if let Some(to_ref) = query.to_ref.as_deref() {
-        let from = query.from_ref.as_deref().unwrap_or(&task.target);
+        let default_base = git::effective_review_base(&task.worktree_path, &task.target);
+        let from = query.from_ref.as_deref().unwrap_or(&default_base);
         git::diff_stat_range(&task.worktree_path, from, to_ref).unwrap_or_default()
     } else {
-        let target = query.from_ref.as_deref().unwrap_or(&task.target);
-        git::diff_stat(&task.worktree_path, target).unwrap_or_default()
+        let base = query
+            .from_ref
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| git::effective_review_base(&task.worktree_path, &task.target));
+        git::diff_stat(&task.worktree_path, &base).unwrap_or_default()
     };
 
     let mut total_additions = 0u32;
@@ -300,18 +305,19 @@ pub async fn get_commits(
         })
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let Ok(mut repo) = gix::open(&task.worktree_path) else {
-        return Ok(Json(CommitsResponse {
-            commits: Vec::new(),
-            total: 0,
-            skip_versions: 0,
-        }));
-    };
-    repo.object_cache_size_if_unset(64 * 1024 * 1024);
+    // Base 走 origin fallback：本地 target 落后于 origin/<target> 的大仓库
+    // 里，两点间的 commit 列表会被远端领先的 commits 撑爆。
+    let base = git::effective_review_base(&task.worktree_path, &task.target);
 
-    let log_entries =
-        git::gix_log_target_to_head(&repo, &task.target, usize::MAX).unwrap_or_default();
-    let total = log_entries.len() as u32;
+    // Version 下拉最多列 500 条 —— 评审用不到更细的粒度，列全只会拖慢
+    // 接口与前端渲染。真实总数单独计数（git rev-list --count）。
+    const MAX_VERSION_COMMITS: usize = 500;
+    let log_entries = git::log_target_to_head(&task.worktree_path, &base, MAX_VERSION_COMMITS)
+        .unwrap_or_default();
+    let total = git::count_target_to_head(&task.worktree_path, &base)
+        .unwrap_or(log_entries.len() as u32)
+        .max(log_entries.len() as u32);
+    let truncated = total as usize > log_entries.len();
 
     // skip_versions: 顶部连续多少条 commit 的 tree 与 HEAD 的 tree 相同。
     // gix log 返回的第一条就是 HEAD,其 tree_id 即可作为基准 —— 无需再查。
@@ -341,6 +347,7 @@ pub async fn get_commits(
         commits,
         total,
         skip_versions,
+        truncated,
     }))
 }
 
@@ -360,7 +367,8 @@ pub async fn get_single_file_diff(
         })
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let from_ref = query.from_ref.as_deref().or(Some(&task.target));
+    let default_base = git::effective_review_base(&task.worktree_path, &task.target);
+    let from_ref = query.from_ref.as_deref().or(Some(&default_base));
     let to_ref = query.to_ref.as_deref();
 
     let result =

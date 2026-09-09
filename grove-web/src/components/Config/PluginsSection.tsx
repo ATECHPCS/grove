@@ -5,7 +5,6 @@ import { listPlugins, deletePlugin, revealPluginFolder, type Plugin } from "../.
 import { AddPluginDialog } from "./AddPluginDialog";
 import { PluginDetailDialog } from "./PluginDetailDialog";
 import { PluginIcon } from "../Plugins/PluginIcon";
-import { PLUGINS_CHANGED_EVENT } from "../Plugins/pluginPanelCommands";
 
 /** Permissions that let a plugin modify files, run commands, or drive the agent
  *  — shown with a warning treatment so they don't sit flush with read-only ones.
@@ -42,8 +41,6 @@ export function PluginsSection() {
       .then(setPlugins)
       .catch(() => setPlugins([]))
       .finally(() => setLoading(false));
-    // Tell any open task workspace to re-sync its panels + plugin keybindings.
-    window.dispatchEvent(new CustomEvent(PLUGINS_CHANGED_EVENT));
   }, []);
 
   useEffect(() => {
@@ -220,7 +217,7 @@ export function PluginsSection() {
         />
       )}
       {detailPlugin && (
-        <PluginDetailDialog plugin={detailPlugin} onClose={() => setDetailPlugin(null)} />
+        <PluginDetailDialog plugin={detailPlugin} onClose={() => setDetailPlugin(null)} onDeleted={reload} />
       )}
     </div>
   );

@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ShortcutHandler } from "@tauri-apps/plugin-global-shortcut";
 import { Sidebar } from "./components/Layout/Sidebar";
 import { PluginFrame } from "./components/Plugins/PluginFrame";
-import { listPlugins, type Plugin } from "./api/plugins";
+import { listPlugins, PLUGINS_CHANGED_EVENT, type Plugin } from "./api/plugins";
 import { MobileHeader } from "./components/Layout/MobileHeader";
 import { MobileDrawer } from "./components/Layout/MobileDrawer";
 import { NotificationPopover } from "./components/Layout/NotificationPopover";
@@ -24,7 +24,7 @@ import { StatusBoard } from "./components/StatusBoard/StatusBoard";
 import { OfficeFloor } from "./components/GrooveOffice/OfficeFloor";
 import { HelpOverlay } from "./components/Tasks/HelpOverlay";
 import { SkillsPage } from "./components/Skills";
-import { AIPage, GlobalAudioRecorder, GlobalVoiceControlRecorder } from "./components/AI";
+import { AIPage, GlobalAgentVoiceRuntime, GlobalAudioRecorder, GlobalVoiceControlRecorder } from "./components/AI";
 import { AutomationPage } from "./components/Automation/AutomationPage";
 import { MemoryPage } from "./components/Memory";
 import { ProjectStatsPage } from "./components/Stats/ProjectStatsPage";
@@ -278,21 +278,33 @@ function AppContent() {
   const [hasExitedWelcome, setHasExitedWelcome] = useState(false);
   const [navigationData, setNavigationData] = useState<Record<string, unknown> | null>(null);
 
-  // Installed plugins that contribute a top-level sidebar page. Loaded once;
+  // Installed plugins that contribute a top-level sidebar page.
   // the sidebar renders a nav entry per plugin (id `plugin:<id>`) and
   // renderContent renders the plugin full-page when one is active.
   const [sidebarPlugins, setSidebarPlugins] = useState<Plugin[]>([]);
   useEffect(() => {
     let cancelled = false;
-    listPlugins()
-      .then((ps) => {
-        if (!cancelled) setSidebarPlugins(ps.filter((p) => p.contributes?.sidebar));
-      })
-      .catch(() => {
-        if (!cancelled) setSidebarPlugins([]);
-      });
+    const load = () => {
+      listPlugins()
+        .then((ps) => {
+          if (cancelled) return;
+          const nextSidebarPlugins = ps.filter((p) => p.contributes?.sidebar);
+          setSidebarPlugins(nextSidebarPlugins);
+          setActiveItem((current) => {
+            if (!current.startsWith("plugin:")) return current;
+            const pluginId = current.slice("plugin:".length);
+            return nextSidebarPlugins.some((plugin) => plugin.id === pluginId) ? current : "skills";
+          });
+        })
+        .catch(() => {
+          if (!cancelled) setSidebarPlugins([]);
+        });
+    };
+    load();
+    window.addEventListener(PLUGINS_CHANGED_EVENT, load);
     return () => {
       cancelled = true;
+      window.removeEventListener(PLUGINS_CHANGED_EVENT, load);
     };
   }, []);
   const { selectedProject, currentProjectId, isLoading, selectProject, selectProjectById, projects, addProject, createNewProject, cloneProject, refreshProjects, refreshSelectedProject } = useProject();
@@ -361,6 +373,12 @@ function AppContent() {
     const open = () => setShowHelp(true);
     window.addEventListener("grove:open-help", open);
     return () => window.removeEventListener("grove:open-help", open);
+  }, []);
+
+  useEffect(() => {
+    const open = () => setActiveItem("ai");
+    window.addEventListener("grove:open-ai-settings", open);
+    return () => window.removeEventListener("grove:open-ai-settings", open);
   }, []);
 
   // Mobile virtual-keyboard tracker: exposes the keyboard height as a global
@@ -665,6 +683,17 @@ function AppContent() {
     setHasExitedWelcome(true);
     const saved = readLastProjectView(currentProjectId);
     setActiveItem(saved ?? "dashboard");
+  }
+
+  // Keep-alive gating for WorkPage — mirrors TasksPage's always-mounted
+  // contract: once visited, WorkPage stays mounted (display:none) so Work ⇄
+  // Tasks switches don't unmount/remount a whole TaskChat stack in one commit
+  // (that teardown + hidden→shown reflow was the multi-second gap entering a
+  // task from Work). Mounted lazily on first visit so users who never open
+  // Work don't pay for the Local Task chat at startup.
+  const [workEverVisited, setWorkEverVisited] = useState(false);
+  if (activeItem === "work" && !workEverVisited) {
+    setWorkEverVisited(true);
   }
 
   // Tray popover navigation. Rust emits `tray:navigate` with a route and
@@ -1265,14 +1294,8 @@ function AppContent() {
         return <DashboardPage onNavigate={handleNavigate} />;
       case "projects":
         return <ProjectsPage onNavigate={setActiveItem} key={"projects-" + (navigationData?.tab ?? "coding")} initialTab={navigationData?.tab as "coding" | "studio" | undefined} />;
-      case "work":
-        return (
-          <WorkPage
-            key="work"
-            initialChatId={navigationData?.chatId as string | undefined}
-            onNavigationConsumed={() => setNavigationData(null)}
-          />
-        );
+      // NOTE: "work" is NOT rendered here — WorkPage is keep-alive (mirroring
+      // TasksPage) and lives in its own display:none host in the layout below.
       case "resource":
         return <ResourcePage />;
       case "automation":
@@ -1510,7 +1533,7 @@ function AppContent() {
           />
         </MobileDrawer>
 
-        <main className={`relative min-h-0 flex-1 ${(activeItem === "tasks" && tasksMode !== "blitz") || activeItem === "work" ? "overflow-hidden" : "overflow-y-auto"}`}>
+        <main className={`relative min-h-0 flex-1 ${(activeItem === "tasks" && tasksMode !== "blitz") || activeItem === "work" || activeItem === "ai" ? "overflow-hidden" : "overflow-y-auto"}`}>
           {/* TasksPage always mounted on mobile too */}
           <div
             className="h-full p-3"
@@ -1527,8 +1550,22 @@ function AppContent() {
               exitWorkspaceSignal={tasksExitSignal}
             />
           </div>
-          <div className={activeItem === "work" ? "h-full p-3" : isFullWidthPage ? "min-h-full p-3" : "max-w-5xl mx-auto p-3"}
-               style={{ display: activeItem === "tasks" && tasksMode !== "blitz" ? "none" : undefined }}>
+          {/* WorkPage keep-alive on mobile too — same lazy-mount + display-flip
+              contract as the desktop host above. */}
+          <div
+            className="h-full p-3"
+            style={{ display: activeItem === "work" ? "block" : "none" }}
+          >
+            {workEverVisited && (
+              <WorkPage
+                pageVisible={activeItem === "work"}
+                initialChatId={navigationData?.chatId as string | undefined}
+                onNavigationConsumed={() => setNavigationData(null)}
+              />
+            )}
+          </div>
+          <div className={activeItem === "work" || activeItem === "ai" ? "h-full p-3" : isFullWidthPage ? "min-h-full p-3" : "max-w-5xl mx-auto p-3"}
+               style={{ display: (activeItem === "tasks" && tasksMode !== "blitz") || activeItem === "work" ? "none" : undefined }}>
             <AnimatePresence mode="wait">
               {tasksMode === "blitz" ? (
                 <motion.div
@@ -1552,7 +1589,7 @@ function AppContent() {
               ) : (
                 <motion.div
                   key="zen-content"
-                  className={activeItem === "work" ? "w-full h-full" : "w-full min-h-full"}
+                  className={activeItem === "work" || activeItem === "ai" ? "w-full h-full" : "w-full min-h-full"}
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
                   exit={{ opacity: 0 }}
@@ -1698,8 +1735,22 @@ function AppContent() {
                   exitWorkspaceSignal={tasksExitSignal}
                 />
               </div>
-              {activeItem !== "tasks" && (
-                <div className={isFullWidthPage ? `h-full transition-[padding] duration-300 ease-out ${activeItem === "work" ? '' : 'p-6'} ${activeItem === "work" && effectiveSidebarMode === "island" && shouldAvoidTrafficLightsInIsland ? 'ide-traffic-light-clearance' : ''}` : "max-w-5xl mx-auto p-6"}>
+              {/* WorkPage keep-alive — mirrors the TasksPage host above: mounts
+                  on first visit, then only `display` flips across nav switches. */}
+              <div
+                className={`h-full ${activeItem === "work" && effectiveSidebarMode === "island" && shouldAvoidTrafficLightsInIsland ? 'ide-traffic-light-clearance' : ''}`}
+                style={{ display: activeItem === "work" ? "block" : "none" }}
+              >
+                {workEverVisited && (
+                  <WorkPage
+                    pageVisible={activeItem === "work"}
+                    initialChatId={navigationData?.chatId as string | undefined}
+                    onNavigationConsumed={() => setNavigationData(null)}
+                  />
+                )}
+              </div>
+              {activeItem !== "tasks" && activeItem !== "work" && (
+                <div className={isFullWidthPage ? "h-full transition-[padding] duration-300 ease-out p-6" : "max-w-5xl mx-auto p-6"}>
                   {renderContent()}
                 </div>
               )}
@@ -1796,6 +1847,7 @@ function App() {
                   <CommandPaletteProvider>
                     <PreviewCommentProvider>
                       <OptionalPerfProfiler id="App">
+                        <GlobalAgentVoiceRuntime />
                         <AppContent />
                       </OptionalPerfProfiler>
                     </PreviewCommentProvider>

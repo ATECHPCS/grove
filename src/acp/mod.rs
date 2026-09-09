@@ -115,6 +115,9 @@ pub struct AcpSessionHandle {
     pending_queue: Mutex<Vec<QueuedMessage>>,
     /// 队列暂停标志（用户正在编辑队列消息时暂停 auto-send）
     queue_paused: std::sync::atomic::AtomicBool,
+    /// Serializes end-of-turn and edit-resume queue drains. Without this,
+    /// both paths can observe an idle session and dequeue separate messages.
+    queue_drain_lock: Mutex<()>,
     /// 队列合并发送模式（Separate = 逐条发送；Compact = 合并成一条）
     queue_mode: Mutex<QueueMode>,
     /// 当前 agent mode id（用于 PlanFileUpdate 检测和 QueuedConfig 快照）。
@@ -211,6 +214,11 @@ pub struct AcpSessionHandle {
     /// 让前端继续显示 banner;避免"刷新后看起来连上了但消息发不出去"。
     /// 进入 retry 时设置,authenticate 成功 → SessionReady 真正发出后清除。
     pub pending_auth: Mutex<Option<PendingAuthState>>,
+    /// Session-scoped instruction update waiting to be merged into the next
+    /// real user prompt. Revision prevents a newer update being cleared when
+    /// an older prompt completes.
+    pending_session_instruction: Mutex<Option<(u64, String, String)>>,
+    session_instruction_revision: std::sync::atomic::AtomicU64,
 }
 
 /// `pending_auth` 内容:重发 AuthRequired 所需的全部字段
@@ -3121,7 +3129,7 @@ fn tool_contents_to_data(
     content: &[acp::ToolCallContent],
     terminals: Option<&Arc<Mutex<HashMap<String, TerminalState>>>>,
 ) -> Vec<ToolCallContentData> {
-    content
+    let output: Vec<ToolCallContentData> = content
         .iter()
         .filter_map(|item| match item {
             acp::ToolCallContent::Content(value) => {
@@ -3178,7 +3186,81 @@ fn tool_contents_to_data(
             }
             _ => None,
         })
+        .collect();
+    expand_embedded_mcp_results(output)
+}
+
+/// Some ACP agents expose an MCP CallToolResult as one JSON-encoded text block
+/// instead of preserving its typed content blocks. Recover image/audio blocks
+/// here so every Grove surface receives real media rather than a wall of base64.
+fn expand_embedded_mcp_results(output: Vec<ToolCallContentData>) -> Vec<ToolCallContentData> {
+    output
+        .into_iter()
+        .flat_map(|item| match item {
+            ToolCallContentData::Content {
+                content: ContentBlockData::Text { ref text },
+            } => parse_embedded_mcp_content(text)
+                .map(|blocks| {
+                    blocks
+                        .into_iter()
+                        .map(|content| ToolCallContentData::Content { content })
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![item]),
+            _ => vec![item],
+        })
         .collect()
+}
+
+fn parse_embedded_mcp_content(text: &str) -> Option<Vec<ContentBlockData>> {
+    let root = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let result = root.get("result").unwrap_or(&root);
+    let content = result.get("content")?.as_array()?;
+
+    // Only reinterpret the JSON when it contains actual media. Ordinary tool
+    // JSON often has a `content` array too and must remain readable text.
+    let contains_media = content.iter().any(|block| {
+        matches!(
+            block.get("type").and_then(serde_json::Value::as_str),
+            Some("image" | "audio")
+        )
+    });
+    if !contains_media {
+        return None;
+    }
+
+    let blocks: Vec<ContentBlockData> = content
+        .iter()
+        .filter_map(|block| match block.get("type")?.as_str()? {
+            "text" => Some(ContentBlockData::Text {
+                text: block.get("text")?.as_str()?.to_string(),
+            }),
+            "image" => Some(ContentBlockData::Image {
+                data: block.get("data")?.as_str()?.to_string(),
+                mime_type: block
+                    .get("mimeType")
+                    .or_else(|| block.get("mime_type"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("image/png")
+                    .to_string(),
+                uri: None,
+                label: None,
+            }),
+            "audio" => Some(ContentBlockData::Audio {
+                data: block.get("data")?.as_str()?.to_string(),
+                mime_type: block
+                    .get("mimeType")
+                    .or_else(|| block.get("mime_type"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("audio/mpeg")
+                    .to_string(),
+                label: None,
+            }),
+            _ => None,
+        })
+        .collect();
+
+    (!blocks.is_empty()).then_some(blocks)
 }
 
 fn tool_output_to_data(
@@ -3193,9 +3275,9 @@ fn tool_output_to_data(
     }
     protocol_output_text(protocol_output)
         .map(|text| {
-            vec![ToolCallContentData::Content {
+            expand_embedded_mcp_results(vec![ToolCallContentData::Content {
                 content: ContentBlockData::Text { text },
-            }]
+            }])
         })
         .unwrap_or_default()
 }
@@ -3207,16 +3289,16 @@ pub fn legacy_tool_output_to_data(
     if let Some(content) = content {
         if let Ok(values) = serde_json::from_value::<Vec<ToolCallContentData>>(content.clone()) {
             if !values.is_empty() || raw_output.is_none() {
-                return Some(values);
+                return Some(expand_embedded_mcp_results(values));
             }
         }
     }
 
     raw_output.and_then(|value| {
         protocol_output_text(Some(value)).map(|text| {
-            vec![ToolCallContentData::Content {
+            expand_embedded_mcp_results(vec![ToolCallContentData::Content {
                 content: ContentBlockData::Text { text },
-            }]
+            }])
         })
     })
 }
@@ -4319,6 +4401,7 @@ pub async fn get_or_start_session(
                     ),
                     pending_queue: Mutex::new(Vec::new()),
                     queue_paused: std::sync::atomic::AtomicBool::new(false),
+                    queue_drain_lock: Mutex::new(()),
                     queue_mode: Mutex::new(QueueMode::default()),
                     current_mode_id: Mutex::new(None),
                     current_model_id: Mutex::new(None),
@@ -4343,6 +4426,8 @@ pub async fn get_or_start_session(
                     logout_capable: std::sync::atomic::AtomicBool::new(false),
                     pending_auth_retry: Mutex::new(None),
                     pending_auth: Mutex::new(None),
+                    pending_session_instruction: Mutex::new(None),
+                    session_instruction_revision: std::sync::atomic::AtomicU64::new(0),
                     fork_capable: std::sync::atomic::AtomicBool::new(false),
                     import_capable: std::sync::atomic::AtomicBool::new(false),
                     delete_capable: std::sync::atomic::AtomicBool::new(false),
@@ -6342,16 +6427,31 @@ async fn drive_session(
                 // `<grove-meta>` envelope is presentation metadata: the UI
                 // decides how to render it, but history.jsonl remains a
                 // faithful protocol transcript.
-                let wire_text =
-                    if let Some((kind, instruction)) = pending_session_bootstrap.as_ref() {
+                let pending_dynamic_instruction = handle.pending_session_instruction_snapshot();
+                let wire_text = match (
+                    pending_session_bootstrap.as_ref(),
+                    pending_dynamic_instruction.as_ref(),
+                ) {
+                    (None, None) => text.clone(),
+                    (bootstrap, dynamic) => {
+                        let kind = dynamic
+                            .map(|(_, kind, _)| kind.as_str())
+                            .or_else(|| bootstrap.map(|(kind, _)| *kind))
+                            .unwrap_or("session_update");
+                        let mut sections = Vec::new();
+                        if let Some((_, instruction)) = bootstrap {
+                            sections.push(instruction.as_str());
+                        }
+                        if let Some((_, _, instruction)) = dynamic {
+                            sections.push(instruction.as_str());
+                        }
                         crate::agent_graph::inject::build_session_instruction_prompt(
                             kind,
-                            instruction,
+                            &sections.join("\n\n"),
                             &text,
                         )
-                    } else {
-                        text.clone()
-                    };
+                    }
+                };
                 handle.emit(AcpUpdate::UserMessage {
                     text: wire_text.clone(),
                     attachments: attachments.clone(),
@@ -6576,6 +6676,9 @@ async fn drive_session(
                 match result {
                     Ok(resp) => {
                         pending_session_bootstrap = None;
+                        if let Some((revision, _, _)) = pending_dynamic_instruction {
+                            handle.clear_pending_session_instruction(revision);
+                        }
                         // Prompt 成功 = agent 当前认账户已登录,任何 stale 的
                         // pending_auth(用户在 grove 外部完成登录后回来)清掉,
                         // 否则 WS 重连仍会重发假 banner。pending_auth_retry 同理 —
@@ -6697,37 +6800,7 @@ async fn drive_session(
                     }
                 }
 
-                let auth_pending = handle
-                    .pending_auth
-                    .lock()
-                    .map(|state| state.is_some())
-                    .unwrap_or(false);
-                if !auth_pending
-                    && !handle
-                        .queue_paused
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    if let Some((send_msg, original_msgs)) = handle.pop_queue_for_auto_send() {
-                        // M5: emit QueueUpdate only after successful enqueue.
-                        // On failure, re-insert the original (pre-merge) messages at
-                        // front, preserving their order, so nothing is lost.
-                        let text = send_msg.text.clone();
-                        let attachments = send_msg.attachments.clone();
-                        let sender = send_msg.sender.clone();
-                        let terminal = send_msg.terminal;
-                        let config = send_msg.config.clone();
-                        if handle.try_enqueue_prompt(text, attachments, sender, terminal, config) {
-                            handle.emit(AcpUpdate::QueueUpdate {
-                                messages: handle.get_queue(),
-                            });
-                        } else {
-                            let mut q = handle.pending_queue.lock().unwrap();
-                            for (i, msg) in original_msgs.into_iter().enumerate() {
-                                q.insert(i, msg);
-                            }
-                        }
-                    }
-                }
+                handle.drain_queue_if_ready();
             }
             AcpCommand::Cancel => {
                 // Agent 空闲时收到 Cancel,忽略
@@ -7123,6 +7196,34 @@ async fn connect_remote_agent(
 // === 公开 API ===
 
 impl AcpSessionHandle {
+    pub fn set_pending_session_instruction(&self, kind: &str, instruction: String) {
+        let revision = self
+            .session_instruction_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if let Ok(mut pending) = self.pending_session_instruction.lock() {
+            *pending = Some((revision, kind.to_string(), instruction));
+        }
+    }
+
+    fn pending_session_instruction_snapshot(&self) -> Option<(u64, String, String)> {
+        self.pending_session_instruction
+            .lock()
+            .ok()
+            .and_then(|pending| pending.clone())
+    }
+
+    fn clear_pending_session_instruction(&self, revision: u64) {
+        if let Ok(mut pending) = self.pending_session_instruction.lock() {
+            if pending
+                .as_ref()
+                .is_some_and(|(current, _, _)| *current == revision)
+            {
+                *pending = None;
+            }
+        }
+    }
+
     pub fn pending_elicitation_snapshot(&self) -> Option<ElicitationRequestSnapshot> {
         self.pending_elicitation
             .lock()
@@ -8220,6 +8321,54 @@ impl AcpSessionHandle {
             .is_ok()
     }
 
+    /// Drain one auto-send unit only when the session is genuinely ready.
+    ///
+    /// The end-of-turn path and `resume_queue` can race around the Busy(false)
+    /// edge. The lock plus the eager busy reservation ensures exactly one of
+    /// them dequeues; the next command-loop iteration replaces the reservation
+    /// with the authoritative Busy updates from the actual prompt.
+    fn drain_queue_if_ready(&self) {
+        let Ok(_drain_guard) = self.queue_drain_lock.lock() else {
+            return;
+        };
+        if self.queue_paused.load(std::sync::atomic::Ordering::Relaxed)
+            || self.is_busy.load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .pending_auth
+                .lock()
+                .map(|state| state.is_some())
+                .unwrap_or(true)
+        {
+            return;
+        }
+        let Some((send_msg, original_msgs)) = self.pop_queue_for_auto_send() else {
+            return;
+        };
+
+        // Reserve the idle slot before enqueueing so a concurrent resume or
+        // end-of-turn drain cannot remove the next queued message as well.
+        self.is_busy
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if self.try_enqueue_prompt(
+            send_msg.text.clone(),
+            send_msg.attachments.clone(),
+            send_msg.sender.clone(),
+            send_msg.terminal,
+            send_msg.config.clone(),
+        ) {
+            self.emit(AcpUpdate::QueueUpdate {
+                messages: self.get_queue(),
+            });
+        } else {
+            self.is_busy
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            let mut q = self.pending_queue.lock().unwrap();
+            for (i, msg) in original_msgs.into_iter().enumerate() {
+                q.insert(i, msg);
+            }
+        }
+    }
+
     /// Re-dispatch the prompt that failed with `auth_required`. If producers
     /// filled the bounded command channel while authentication was completing,
     /// retain the prompt at the front of the visible queue instead of dropping it.
@@ -8312,28 +8461,12 @@ impl AcpSessionHandle {
         }
     }
 
-    /// 恢复队列 auto-send，如果队列非空则立即尝试发送第一条
+    /// 恢复队列 auto-send。Agent 忙时保持原队列不动，等待 turn-end drain；
+    /// Agent 已空闲时补偿编辑期间被跳过的 drain。
     pub fn resume_queue(&self) {
         self.queue_paused
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        // 尝试发送队列中的第一条消息（如果 agent 空闲会被处理）
-        if let Some(next_msg) = self.pop_queue_front() {
-            // M5: try_enqueue_prompt 在 cmd_tx 满 / closed 时会失败 — 失败时
-            // 把消息回插队首，避免出队但未送达的"幽灵丢失"。
-            let text = next_msg.text.clone();
-            let attachments = next_msg.attachments.clone();
-            let sender = next_msg.sender.clone();
-            let terminal = next_msg.terminal;
-            let config = next_msg.config.clone();
-            if self.try_enqueue_prompt(text, attachments, sender, terminal, config) {
-                self.emit(AcpUpdate::QueueUpdate {
-                    messages: self.get_queue(),
-                });
-            } else {
-                let mut q = self.pending_queue.lock().unwrap();
-                q.insert(0, next_msg);
-            }
-        }
+        self.drain_queue_if_ready();
     }
 
     /// 用户直接执行终端命令（Shell 模式，不经过 AI agent）
@@ -8606,6 +8739,7 @@ pub fn new_handle_for_test(
         replay_user_messages: std::sync::atomic::AtomicBool::new(false),
         pending_queue: Mutex::new(Vec::new()),
         queue_paused: std::sync::atomic::AtomicBool::new(false),
+        queue_drain_lock: Mutex::new(()),
         queue_mode: Mutex::new(QueueMode::default()),
         current_mode_id: Mutex::new(None),
         current_model_id: Mutex::new(None),
@@ -8630,6 +8764,8 @@ pub fn new_handle_for_test(
         logout_capable: std::sync::atomic::AtomicBool::new(false),
         pending_auth_retry: Mutex::new(None),
         pending_auth: Mutex::new(None),
+        pending_session_instruction: Mutex::new(None),
+        session_instruction_revision: std::sync::atomic::AtomicU64::new(0),
         fork_capable: std::sync::atomic::AtomicBool::new(false),
         import_capable: std::sync::atomic::AtomicBool::new(false),
         delete_capable: std::sync::atomic::AtomicBool::new(false),
@@ -9517,6 +9653,58 @@ async fn drain_stderr_to_file(stderr: tokio::process::ChildStderr, path: PathBuf
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn pending_session_instruction_keeps_latest_toggle_until_matching_turn_completes() {
+        let key = format!("session-instruction-test-{}", uuid::Uuid::new_v4());
+        let (handle, _updates, _guard) = new_handle_for_test(&key, "project", "task", "chat");
+
+        handle.set_pending_session_instruction("agent_voice", "enabled".to_string());
+        let enabled = handle
+            .pending_session_instruction_snapshot()
+            .expect("enabled instruction");
+        handle.set_pending_session_instruction("agent_voice", "disabled".to_string());
+
+        handle.clear_pending_session_instruction(enabled.0);
+        let current = handle
+            .pending_session_instruction_snapshot()
+            .expect("newer instruction must remain");
+        assert_eq!(current.1, "agent_voice");
+        assert_eq!(current.2, "disabled");
+
+        handle.clear_pending_session_instruction(current.0);
+        assert!(handle.pending_session_instruction_snapshot().is_none());
+    }
+
+    #[tokio::test]
+    async fn editing_a_queued_message_while_busy_preserves_its_position() {
+        let key = format!("queue-edit-order-test-{}", uuid::Uuid::new_v4());
+        let (handle, _updates, _guard) = new_handle_for_test(&key, "project", "task", "chat");
+        let first = QueuedMessage::new("first".to_string(), Vec::new(), None, false, None);
+        let first_id = first.id.clone();
+        let second = QueuedMessage::new("second".to_string(), Vec::new(), None, false, None);
+        let second_id = second.id.clone();
+        handle.queue_message(first);
+        handle.queue_message(second);
+        handle
+            .is_busy
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        handle.pause_queue();
+        let (found, _) = handle.update_queued_message_by_id(&first_id, "first edited".to_string());
+        assert!(found);
+        handle.resume_queue();
+
+        let queue = handle.get_queue();
+        assert_eq!(
+            queue
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first_id.as_str(), second_id.as_str()]
+        );
+        assert_eq!(queue[0].text, "first edited");
+    }
+
     #[test]
     fn only_agent_memory_mcp_tools_use_the_short_watchdog() {
         assert!(is_short_memory_tool("mcp.grove_agent.memory_append_log"));
@@ -10292,6 +10480,56 @@ mod tests {
         assert!(matches!(
             &converted[2],
             ToolCallContentData::Terminal { terminal_id, .. } if terminal_id == "terminal-7"
+        ));
+    }
+
+    #[test]
+    fn embedded_mcp_image_result_becomes_structured_tool_media() {
+        let output = vec![ToolCallContentData::Content {
+            content: ContentBlockData::Text {
+                text: serde_json::json!({
+                    "result": {
+                        "content": [
+                            { "type": "text", "text": "{\"mode\":\"viewport\"}" },
+                            { "type": "image", "data": "aW1hZ2U=", "mimeType": "image/png" }
+                        ]
+                    }
+                })
+                .to_string(),
+            },
+        }];
+
+        let expanded = expand_embedded_mcp_results(output);
+        assert_eq!(expanded.len(), 2);
+        assert!(matches!(
+            &expanded[0],
+            ToolCallContentData::Content {
+                content: ContentBlockData::Text { text }
+            } if text == "{\"mode\":\"viewport\"}"
+        ));
+        assert!(matches!(
+            &expanded[1],
+            ToolCallContentData::Content {
+                content: ContentBlockData::Image { data, mime_type, .. }
+            } if data == "aW1hZ2U=" && mime_type == "image/png"
+        ));
+    }
+
+    #[test]
+    fn ordinary_json_content_array_remains_text() {
+        let text = r#"{"content":[{"type":"text","text":"plain"}]}"#;
+        let output = vec![ToolCallContentData::Content {
+            content: ContentBlockData::Text {
+                text: text.to_string(),
+            },
+        }];
+
+        let expanded = expand_embedded_mcp_results(output);
+        assert!(matches!(
+            &expanded[..],
+            [ToolCallContentData::Content {
+                content: ContentBlockData::Text { text: preserved }
+            }] if preserved == text
         ));
     }
 

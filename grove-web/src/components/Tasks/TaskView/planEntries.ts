@@ -61,3 +61,17 @@ export function shouldOpenPlan(entries: PlanEntry[]): boolean {
     !entries.every((entry) => entry.status === "completed")
   );
 }
+
+/**
+ * Plan updates may close an expanded panel once all work is complete, but
+ * must not open it on their own. Auto-opening grows the floating composer by
+ * several rows while the Agent is streaming; bottom-follow then pushes the
+ * user's just-sent message above the viewport and keeps pulling the reader
+ * back down. The Todo pill remains available for an explicit open.
+ */
+export function nextPlanVisibility(
+  currentlyOpen: boolean,
+  entries: PlanEntry[],
+): boolean {
+  return currentlyOpen && shouldOpenPlan(entries);
+}

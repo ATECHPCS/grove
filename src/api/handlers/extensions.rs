@@ -27,6 +27,8 @@ pub struct ExtensionSummary {
     pub manifest: Value,
     pub install_status: String,
     pub installed_agents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_plugin_id: Option<String>,
 }
 
 /// GET /api/v1/extensions/explore
@@ -71,6 +73,7 @@ pub async fn explore(Query(query): Query<ExploreQuery>) -> impl IntoResponse {
             }
             .into(),
             installed_agents: agents,
+            installed_plugin_id: None,
         });
     }
 
@@ -79,7 +82,7 @@ pub async fn explore(Query(query): Query<ExploreQuery>) -> impl IntoResponse {
     let sources = skills::load_sources();
     for artifact in extensions::list_artifacts().unwrap_or_default() {
         let mut agents = Vec::new();
-        let installed = if artifact.kind == "mcp" {
+        let installed_plugin = if artifact.kind == "mcp" {
             agents = mcp_installs
                 .iter()
                 .filter(|i| i.repo_key == artifact.repo_key && i.repo_path == artifact.repo_path)
@@ -87,13 +90,13 @@ pub async fn explore(Query(query): Query<ExploreQuery>) -> impl IntoResponse {
                 .collect();
             agents.sort();
             agents.dedup();
-            !agents.is_empty()
+            None
         } else {
             let source = sources
                 .sources
                 .iter()
                 .find(|s| s.name == artifact.source_name);
-            plugins.iter().any(|p| {
+            plugins.iter().find(|p| {
                 p.name == artifact.name
                     && ((!artifact.repo_path.is_empty()
                         && std::path::Path::new(&p.local_path).ends_with(&artifact.repo_path))
@@ -102,6 +105,11 @@ pub async fn explore(Query(query): Query<ExploreQuery>) -> impl IntoResponse {
                                 && p.subpath.as_deref().unwrap_or("") == artifact.repo_path
                         }))
             })
+        };
+        let installed = if artifact.kind == "mcp" {
+            !agents.is_empty()
+        } else {
+            installed_plugin.is_some()
         };
         out.push(ExtensionSummary {
             kind: artifact.kind,
@@ -120,6 +128,7 @@ pub async fn explore(Query(query): Query<ExploreQuery>) -> impl IntoResponse {
             }
             .into(),
             installed_agents: agents,
+            installed_plugin_id: installed_plugin.map(|plugin| plugin.id.clone()),
         });
     }
     // Direct Add/Develop Plugin flows predate unified Sources. Surface those
@@ -142,11 +151,16 @@ pub async fn explore(Query(query): Query<ExploreQuery>) -> impl IntoResponse {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        let version = manifest
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or(&plugin.version)
+            .to_string();
         out.push(ExtensionSummary {
             kind: "plugin".into(),
             name: plugin.name.clone(),
             description,
-            version: Some(plugin.version.clone()),
+            version: Some(version),
             source: format!("plugin:{}", plugin.name),
             repo_key: plugin.id.clone(),
             repo_path: String::new(),
@@ -154,6 +168,7 @@ pub async fn explore(Query(query): Query<ExploreQuery>) -> impl IntoResponse {
             manifest,
             install_status: "installed".into(),
             installed_agents: Vec::new(),
+            installed_plugin_id: Some(plugin.id.clone()),
         });
     }
 

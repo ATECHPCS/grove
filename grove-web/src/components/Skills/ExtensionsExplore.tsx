@@ -16,6 +16,7 @@ import {
 import { MultiSelectFilter } from "./MultiSelectFilter";
 import { AgentIcon } from "./AgentIcon";
 import { ExtensionIdentityIcon } from "./ExtensionIdentityIcon";
+import { resolveInstalledPlugin } from "./installedPlugin";
 
 type InstallationFilter = "installed" | "partial" | "not_installed";
 type CatalogView = "all" | "installed" | "available" | "development" | "attention";
@@ -77,9 +78,7 @@ export function ExtensionsExplore({ agents, sources, installed, projectPath, ref
   useEffect(() => { void Promise.resolve().then(reload); }, [reload, refreshToken]);
 
   const records = useMemo<CatalogRecord[]>(() => items.map((item) => {
-    const plugin = item.kind === "plugin"
-      ? plugins.find((candidate) => candidate.name === item.name || candidate.local_path.endsWith(item.repo_path))
-      : undefined;
+    const plugin = resolveInstalledPlugin(item, plugins);
     return { item, plugin };
   }), [items, plugins]);
 
@@ -211,7 +210,7 @@ export function ExtensionsExplore({ agents, sources, installed, projectPath, ref
         onClose={() => setSelectedSkill(null)} onInstalled={async () => { await onInstalled(); await reload(); }} />
       {selectedMcp && <McpInstallDialog artifact={selectedMcp} agents={agentOptions} projectPath={projectPath}
         onClose={() => setSelectedMcp(null)} onSaved={async () => { setSelectedMcp(null); await reload(); }} />}
-      {selectedPlugin && <PluginDetailDialog plugin={selectedPlugin} onClose={() => setSelectedPlugin(null)} />}
+      {selectedPlugin && <PluginDetailDialog plugin={selectedPlugin} onClose={() => setSelectedPlugin(null)} onDeleted={async () => { setSelectedPlugin(null); await onInstalled(); await reload(); }} />}
       {selectedPluginArtifact && <PluginArtifactDrawer item={selectedPluginArtifact} busy={busyKey === `${selectedPluginArtifact.repo_key}/${selectedPluginArtifact.repo_path}`} onClose={() => setSelectedPluginArtifact(null)} onInstall={async () => { await installPlugin(selectedPluginArtifact); setSelectedPluginArtifact(null); }} />}
     </div>
   );

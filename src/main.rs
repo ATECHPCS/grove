@@ -29,6 +29,7 @@ mod notification_state;
 mod operations;
 mod plugins;
 mod session;
+mod speech;
 mod stats;
 mod storage;
 mod symbols;
@@ -232,7 +233,7 @@ fn ensure_storage_version() {
 #[cfg(not(windows))]
 fn run_tui() -> io::Result<()> {
     // 环境检查
-    let result = check::check_environment();
+    let result = check::check_tui_environment();
     if !result.ok {
         eprintln!("Grove requires the following dependencies:\n");
         for err in &result.errors {

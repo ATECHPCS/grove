@@ -300,6 +300,7 @@ export function MemoryPage() {
           />
         ) : (
           <RunsTab
+            key={`${projectId}:${config?.project_id === projectId ? config.organization.id : "loading"}`}
             projectId={projectId}
             config={config}
             refreshTick={refreshTick}
@@ -456,33 +457,35 @@ function OverviewTab({
           title: "Memory organization is waiting for you.",
           description: "Open the Run to provide input, guidance, or permission.",
         }
-      : overview.failed_run_count > 0 && overview.active_run_count > 0
+      : !draft.enabled
         ? {
-            label: "Failed",
-            tone: "error" as const,
-            title: "The current Memory organization attempt failed.",
-            description: "Open the Run to review the error, retry, or cancel it.",
+            label: "Disabled",
+            tone: "muted" as const,
+            title: "Memory is disabled for this project.",
+            description: "Enable Memory to collect short-term observations and organize them over time.",
           }
-    : !draft.enabled
-      ? {
-          label: "Disabled",
-          tone: "muted" as const,
-          title: "Memory is disabled for this project.",
-          description: "Enable Memory to collect short-term observations and organize them over time.",
-        }
-      : overview.log_count > 0
-        ? {
-            label: `${formatNumber(overview.log_count)} pending`,
-            tone: "pending" as const,
-            title: `${formatNumber(overview.log_count)} ${plural(overview.log_count, "Memory Log is", "Memory Logs are")} waiting to be organized.`,
-            description: `${lastOrganizedText(overview.last_organized_at)} · ${config?.organization.enabled ? "Automatic organization is enabled." : "Automatic organization is paused."}`,
-          }
-        : {
-            label: "Up to date",
-            tone: "success" as const,
-            title: "No Memory Logs are waiting to be organized.",
-            description: `${lastOrganizedText(overview.last_organized_at)} · ${config?.organization.enabled ? "Automatic organization is enabled." : "Run an organization when you are ready."}`,
-          };
+        : overview.log_count > 0
+          ? {
+              label: `${formatNumber(overview.log_count)} pending`,
+              tone: "pending" as const,
+              title: `${formatNumber(overview.log_count)} ${plural(overview.log_count, "Memory Log is", "Memory Logs are")} waiting to be organized.`,
+              description: overview.failed_run_count > 0
+                ? `A previous attempt failed, but these Logs are ready for a new organization run. · ${lastOrganizedText(overview.last_organized_at)}`
+                : `${lastOrganizedText(overview.last_organized_at)} · ${config?.organization.enabled ? "Automatic organization is enabled." : "Automatic organization is paused."}`,
+            }
+          : overview.failed_run_count > 0
+            ? {
+                label: "Failed",
+                tone: "error" as const,
+                title: "A Memory organization attempt failed.",
+                description: "Open the Run to review the error, or start a new organization attempt.",
+              }
+            : {
+                label: "Up to date",
+                tone: "success" as const,
+                title: "No Memory Logs are waiting to be organized.",
+                description: `${lastOrganizedText(overview.last_organized_at)} · ${config?.organization.enabled ? "Automatic organization is enabled." : "Run an organization when you are ready."}`,
+              };
 
   const categoryCounts = [...snapshotEntities.reduce((counts, entity) => {
     for (const key of new Set(entity.tags.map((tag) => tag.key))) {
@@ -1351,7 +1354,7 @@ function OrganizeMemoryButton({
       {agentRunning
         ? "Organization running"
         : runOpen
-          ? (overview.waiting_run_count > 0 ? "Organization waiting" : "Organization failed")
+          ? (overview.waiting_run_count > 0 ? "Organization waiting" : "Organization stopping")
           : blockedByUnsavedChanges
             ? "Save changes first"
             : overview.log_count > 0
@@ -1385,12 +1388,25 @@ function RunsTab({
   const [deleting, setDeleting] = useState(false);
   const [finishingRunId, setFinishingRunId] = useState<string | null>(null);
   const historySequenceRef = useRef(0);
-  const autoOpenedRunRef = useRef<string | null>(null);
+  const loadGenerationRef = useRef(0);
   const load = useCallback(async () => {
-    if (!config) { setRuns([]); setLoading(false); return; }
-    try { setRuns(await listAutomationRuns(projectId, config.organization.id)); }
-    catch (reason) { setError(errorMessage(reason)); }
-    finally { setLoading(false); }
+    const generation = ++loadGenerationRef.current;
+    if (!config || config.project_id !== projectId) {
+      setRuns([]);
+      setError(null);
+      setLoading(Boolean(config && config.project_id !== projectId));
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const nextRuns = await listAutomationRuns(projectId, config.organization.id);
+      if (generation === loadGenerationRef.current) setRuns(nextRuns);
+    } catch (reason) {
+      if (generation === loadGenerationRef.current) setError(errorMessage(reason));
+    } finally {
+      if (generation === loadGenerationRef.current) setLoading(false);
+    }
   }, [projectId, config]);
   useEffect(() => { void Promise.resolve().then(load); }, [load, refreshTick]);
 
@@ -1443,16 +1459,6 @@ function RunsTab({
     setHistory([]);
     setHistoryUsage(null);
   };
-  useEffect(() => {
-    const activeRun = runs.find((run) => !isTerminal(run.status));
-    if (!activeRun || expanded !== null || autoOpenedRunRef.current === activeRun.id) return;
-    autoOpenedRunRef.current = activeRun.id;
-    setExpanded(activeRun.id);
-    historySequenceRef.current = liveUpdates[liveUpdates.length - 1]?.sequence ?? 0;
-    setHistoryLoading(true);
-    setHistory([]);
-    setHistoryUsage(null);
-  }, [expanded, liveUpdates, runs]);
   useEffect(() => {
     if (!expanded) return;
     let disposed = false;

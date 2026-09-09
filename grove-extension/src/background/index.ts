@@ -4,6 +4,19 @@
 
 console.log('[Grove Background] Started.');
 
+const COMPANION_PROTOCOL_VERSION = 2;
+const COMPANION_CAPABILITIES = [
+  'browser.open.wait',
+  'browser.snapshot.scoped_refs',
+  'browser.interact.wait',
+  'browser.extract',
+  'browser.screenshot.viewport',
+  'browser.reload',
+  'browser.navigate',
+  'browser.close',
+  'browser.wait',
+] as const;
+
 // ==========================================
 // ⚡ Development Auto-Reload Protocol
 // ==========================================
@@ -37,9 +50,14 @@ if (import.meta.env.DEV) {
 // serialize-and-eval boundary. Helper functions live as `const` inside the
 // outer function so the engine ships them all together.
 
-function a11yTreeInjected(): { success: boolean; a11yTree?: string; error?: string } {
+function a11yTreeInjected(): { success: boolean; a11yTree?: string; snapshotId?: string; error?: string } {
   try {
+    const snapshotId = `s${crypto.randomUUID().replaceAll('-', '').slice(0, 8)}`;
+    document.documentElement.dataset.groveSnapshotId = snapshotId;
     let nextRefId = 1;
+    document.querySelectorAll('[data-grove-ref]').forEach((el) => {
+      el.removeAttribute('data-grove-ref');
+    });
     const isInteractive = (el: HTMLElement): boolean => {
       const tag = el.tagName.toLowerCase();
       if (['button', 'input', 'select', 'textarea', 'a'].includes(tag)) return true;
@@ -48,11 +66,8 @@ function a11yTreeInjected(): { success: boolean; a11yTree?: string; error?: stri
       return false;
     };
     const assignRef = (el: HTMLElement): string => {
-      let ref = el.getAttribute('data-grove-ref');
-      if (!ref) {
-        ref = `@e${nextRefId++}`;
-        el.setAttribute('data-grove-ref', ref);
-      }
+      const ref = `@${snapshotId}e${nextRefId++}`;
+      el.setAttribute('data-grove-ref', ref);
       return ref;
     };
     const walk = (node: Node, depth: number): string => {
@@ -89,7 +104,7 @@ function a11yTreeInjected(): { success: boolean; a11yTree?: string; error?: stri
       }
       return out;
     };
-    return { success: true, a11yTree: walk(document.body, 0) };
+    return { success: true, snapshotId, a11yTree: walk(document.body, 0) };
   } catch (err) {
     return { success: false, error: (err as Error).message };
   }
@@ -102,7 +117,12 @@ function simulateInteractInjected(
 ): { success: boolean; error?: string } {
   try {
     let el: HTMLElement | null;
-    if (target.startsWith('@e')) {
+    if (target.startsWith('@')) {
+      const expectedSnapshot = target.match(/^@(s[0-9a-f]+)e\d+$/)?.[1];
+      const currentSnapshot = document.documentElement.dataset.groveSnapshotId;
+      if (expectedSnapshot && expectedSnapshot !== currentSnapshot) {
+        return { success: false, error: `STALE_ELEMENT_REFERENCE: ${target}` };
+      }
       el = document.querySelector(`[data-grove-ref="${target}"]`) as HTMLElement | null;
     } else {
       el = document.querySelector(target) as HTMLElement | null;
@@ -135,6 +155,34 @@ function simulateInteractInjected(
         else inputEl.value = value || '';
         inputEl.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
         inputEl.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+        return { success: true };
+      }
+      case 'clear': {
+        const inputEl = el as HTMLInputElement | HTMLTextAreaElement;
+        inputEl.focus();
+        const proto = inputEl instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(inputEl, '');
+        else inputEl.value = '';
+        inputEl.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+        inputEl.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+        return { success: true };
+      }
+      case 'select': {
+        const select = el as HTMLSelectElement;
+        const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+        if (setter) setter.call(select, value || '');
+        else select.value = value || '';
+        select.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+        select.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+        return { success: true };
+      }
+      case 'scroll': {
+        const delta = Number(value || 0);
+        if (Number.isFinite(delta) && delta !== 0) el.scrollBy({ top: delta, behavior: 'instant' });
+        else el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
         return { success: true };
       }
       case 'focus': {
@@ -173,7 +221,12 @@ function extractContentInjected(
   try {
     let el: HTMLElement | null = null;
     if (target) {
-      if (target.startsWith('@e')) {
+      if (target.startsWith('@')) {
+        const expectedSnapshot = target.match(/^@(s[0-9a-f]+)e\d+$/)?.[1];
+        const currentSnapshot = document.documentElement.dataset.groveSnapshotId;
+        if (expectedSnapshot && expectedSnapshot !== currentSnapshot) {
+          return { success: false, error: `STALE_ELEMENT_REFERENCE: ${target}` };
+        }
         el = document.querySelector(`[data-grove-ref="${target}"]`) as HTMLElement | null;
       } else {
         el = document.querySelector(target) as HTMLElement | null;
@@ -219,20 +272,212 @@ function extractContentInjected(
   }
 }
 
+type BrowserWaitCondition = {
+  condition: 'load' | 'url' | 'selector' | 'text' | 'delay';
+  target?: string;
+  state?: string;
+  value?: string;
+};
+
+type BrowserTabSummary = {
+  tabId: number;
+  url: string;
+  title: string;
+  status: string;
+};
+
+function chromeErrorMessage(fallback: string): string {
+  return chrome.runtime.lastError?.message || fallback;
+}
+
+function getTabSummary(tabId: number): Promise<BrowserTabSummary> {
+  return new Promise((resolve, reject) => {
+    chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError || !tab) {
+        reject(new Error(`TAB_NOT_FOUND: ${chromeErrorMessage(String(tabId))}`));
+        return;
+      }
+      resolve({
+        tabId,
+        url: tab.url || '',
+        title: tab.title || '',
+        status: tab.status || 'unknown',
+      });
+    });
+  });
+}
+
+/** Register listeners before triggering navigation so fast pages cannot finish
+ * between the Chrome API callback and listener installation. */
+function navigateAndWait(
+  tabId: number,
+  trigger: () => void,
+  timeoutMs: number,
+): Promise<BrowserTabSummary> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let sawNavigationEvent = false;
+    const finish = (error?: Error, tab?: BrowserTabSummary) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      chrome.tabs.onRemoved.removeListener(onRemoved);
+      if (error) reject(error);
+      else if (tab) resolve(tab);
+      else reject(new Error('PAGE_LOAD_FAILED: no tab result'));
+    };
+    const onUpdated = (
+      updatedTabId: number,
+      changeInfo: chrome.tabs.TabChangeInfo,
+    ) => {
+      if (updatedTabId !== tabId) return;
+      if (changeInfo.status === 'loading' || changeInfo.url) {
+        sawNavigationEvent = true;
+      }
+      if (changeInfo.status !== 'complete') return;
+      void getTabSummary(tabId).then((tab) => finish(undefined, tab), (error) => finish(error));
+    };
+    const onRemoved = (removedTabId: number) => {
+      if (removedTabId === tabId) finish(new Error(`TAB_NOT_FOUND: ${tabId} was closed`));
+    };
+    const timer = setTimeout(() => {
+      finish(new Error(
+        `PAGE_LOAD_TIMEOUT: tab ${tabId} did not complete within ${timeoutMs}ms; side_effect_started=true`,
+      ));
+    }, timeoutMs);
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.onRemoved.addListener(onRemoved);
+    trigger();
+
+    // Chrome occasionally coalesces loading+complete for cached pages. Check
+    // after a short grace period, but never synchronously accept the old
+    // pre-navigation `complete` state.
+    setTimeout(() => {
+      if (settled || sawNavigationEvent) return;
+      void getTabSummary(tabId).then((tab) => {
+        if (tab.status === 'complete') finish(undefined, tab);
+      }, (error) => finish(error));
+    }, 150);
+  });
+}
+
+function checkDomWaitConditionInjected(
+  condition: BrowserWaitCondition,
+): { success: boolean; matched?: boolean; error?: string } {
+  try {
+    const resolveTarget = (target?: string): HTMLElement | null => {
+      if (!target) return document.body;
+      if (target.startsWith('@')) {
+        const expectedSnapshot = target.match(/^@(s[0-9a-f]+)e\d+$/)?.[1];
+        const currentSnapshot = document.documentElement.dataset.groveSnapshotId;
+        if (expectedSnapshot && expectedSnapshot !== currentSnapshot) {
+          throw new Error(`STALE_ELEMENT_REFERENCE: ${target}`);
+        }
+      }
+      return target.startsWith('@')
+        ? document.querySelector(`[data-grove-ref="${target}"]`)
+        : document.querySelector(target);
+    };
+    const el = resolveTarget(condition.target) as HTMLElement | null;
+    if (condition.condition === 'selector') {
+      const state = condition.state || 'visible';
+      if (state === 'attached') return { success: true, matched: !!el };
+      if (state === 'detached') return { success: true, matched: !el };
+      if (!el) return { success: true, matched: state === 'hidden' };
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      const visible =
+        style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        Number(style.opacity || '1') > 0 &&
+        rect.width > 0 &&
+        rect.height > 0;
+      return { success: true, matched: state === 'hidden' ? !visible : visible };
+    }
+    if (condition.condition === 'text') {
+      const actual = el?.textContent || '';
+      const expected = condition.value || '';
+      const state = condition.state || 'contains';
+      if (state === 'equals') return { success: true, matched: actual.trim() === expected };
+      if (state === 'matches') {
+        return { success: true, matched: new RegExp(expected).test(actual) };
+      }
+      if (state === 'hidden') return { success: true, matched: !actual.includes(expected) };
+      return { success: true, matched: actual.includes(expected) };
+    }
+    return { success: false, error: `Unsupported DOM wait condition: ${condition.condition}` };
+  } catch (error) {
+    return { success: false, error: (error as Error).message };
+  }
+}
+
+async function waitForCondition(
+  tabId: number,
+  condition: BrowserWaitCondition | undefined,
+  timeoutMs: number,
+): Promise<{ condition: string; durationMs: number }> {
+  const startedAt = Date.now();
+  const selected = condition || { condition: 'load' as const };
+  if (selected.condition === 'delay') {
+    const duration = Math.max(0, Math.min(Number(selected.value || 0), timeoutMs));
+    await new Promise((resolve) => setTimeout(resolve, duration));
+    return { condition: 'delay', durationMs: Date.now() - startedAt };
+  }
+  for (;;) {
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error(
+        `WAIT_TIMEOUT: ${selected.condition} condition was not satisfied within ${timeoutMs}ms`,
+      );
+    }
+    if (selected.condition === 'load') {
+      const tab = await getTabSummary(tabId);
+      if (tab.status === 'complete') {
+        return { condition: 'load', durationMs: Date.now() - startedAt };
+      }
+    } else if (selected.condition === 'url') {
+      const tab = await getTabSummary(tabId);
+      const expected = selected.value || '';
+      const state = selected.state || 'contains';
+      const matched = state === 'equals'
+        ? tab.url === expected
+        : state === 'matches'
+          ? new RegExp(expected).test(tab.url)
+          : tab.url.includes(expected);
+      if (matched) return { condition: 'url', durationMs: Date.now() - startedAt };
+    } else {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: checkDomWaitConditionInjected,
+        args: [selected],
+      });
+      const result = results[0]?.result;
+      if (!result?.success) throw new Error(`WAIT_FAILED: ${result?.error || 'no_result'}`);
+      if (result.matched) {
+        return { condition: selected.condition, durationMs: Date.now() - startedAt };
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
 // ==========================================
 // 🔌 Connection to Local Grove App (WebSocket)
 // ==========================================
 const PORT_RANGE_START = 3001;
 const PORT_RANGE_END = 3010;
+const GROVE_LOOPBACK_HOST = '127.0.0.1';
+const GROVE_CONNECT_TIMEOUT_MS = 4000;
 let activePort = 3001;
 let groveWs: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let keepAliveTimer: ReturnType<typeof setInterval> | null = null;
 
 async function pingPort(port: number): Promise<boolean> {
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 800); // 800ms quick timeout for localhost
-    const resp = await fetch(`http://localhost:${port}/api/v1/auth/info`, {
+    const timeoutId = setTimeout(() => controller.abort(), 800); // 800ms quick loopback timeout
+    const resp = await fetch(`http://${GROVE_LOOPBACK_HOST}:${port}/api/v1/auth/info`, {
       signal: controller.signal
     });
     clearTimeout(timeoutId);
@@ -295,14 +540,25 @@ async function connectToGrove() {
     reconnectTimer = null;
   }
   if (connectInFlight) return;
+  if (
+    groveWs?.readyState === WebSocket.OPEN ||
+    groveWs?.readyState === WebSocket.CONNECTING
+  ) return;
   connectInFlight = true;
   try {
     const port = await findGrovePort();
-    const url = `ws://localhost:${port}/api/v1/extension/ws`;
+    const url = `ws://${GROVE_LOOPBACK_HOST}:${port}/api/v1/extension/ws`;
     console.log(`[Grove Background] Connecting to ${url}`);
 
     const myWs = new WebSocket(url);
     groveWs = myWs;
+    const connectTimeout = setTimeout(() => {
+      if (groveWs !== myWs || myWs.readyState !== WebSocket.CONNECTING) return;
+      console.warn(
+        `[Grove Background] Connection to Grove timed out after ${GROVE_CONNECT_TIMEOUT_MS}ms.`,
+      );
+      myWs.close();
+    }, GROVE_CONNECT_TIMEOUT_MS);
     // All event handlers below close over `myWs` and bail out if a newer
     // connection has replaced it (`groveWs !== myWs`). Without this, a
     // late-firing handler from a closed-mid-handshake socket can stomp on
@@ -310,7 +566,22 @@ async function connectToGrove() {
 
     myWs.onopen = () => {
       if (groveWs !== myWs) return;
+      clearTimeout(connectTimeout);
       console.log(`[Grove Background] Connected to Grove Local Server on port ${port}.`);
+      myWs.send(JSON.stringify({
+        type: 'COMPANION_HELLO',
+        extensionVersion: chrome.runtime.getManifest().version,
+        protocolVersion: COMPANION_PROTOCOL_VERSION,
+        capabilities: COMPANION_CAPABILITIES,
+      }));
+      if (keepAliveTimer) clearInterval(keepAliveTimer);
+      // Chrome MV3 workers may be suspended after 30s without WebSocket
+      // traffic. A 20s ping follows Chrome's documented keepalive pattern.
+      keepAliveTimer = setInterval(() => {
+        if (groveWs === myWs && myWs.readyState === WebSocket.OPEN) {
+          myWs.send(JSON.stringify({ type: 'ping' }));
+        }
+      }, 20_000);
     };
 
     myWs.onmessage = async (event) => {
@@ -326,6 +597,12 @@ async function connectToGrove() {
 
     myWs.onclose = () => {
       if (groveWs !== myWs) return;
+      clearTimeout(connectTimeout);
+      if (keepAliveTimer) {
+        clearInterval(keepAliveTimer);
+        keepAliveTimer = null;
+      }
+      groveWs = null;
       console.log('[Grove Background] Connection to Grove lost. Retrying port discovery in 5s...');
       reconnectTimer = setTimeout(connectToGrove, 5000);
     };
@@ -465,11 +742,34 @@ async function handleGroveMessage(msg: any) {
               payload.groupError = 'failed to assign tab to group';
             }
           }
-          groveWs?.send(JSON.stringify({
-            type: 'BROWSER_OPEN_RESPONSE',
-            id: msg.id,
-            data: payload,
-          }));
+          try {
+            const timeoutMs = Math.max(100, Math.min(Number(msg.timeoutMs || 15000), 60000));
+            const startedAt = Date.now();
+            await waitForCondition(tab.id, { condition: 'load' }, timeoutMs);
+            const wait = msg.waitFor
+              ? await waitForCondition(
+                  tab.id,
+                  msg.waitFor,
+                  Math.max(100, timeoutMs - (Date.now() - startedAt)),
+                )
+              : { condition: 'load', durationMs: Date.now() - startedAt };
+            groveWs?.send(JSON.stringify({
+              type: 'BROWSER_OPEN_RESPONSE',
+              id: msg.id,
+              data: { ...payload, tab: await getTabSummary(tab.id), wait },
+            }));
+          } catch (error) {
+            groveWs?.send(JSON.stringify({
+              type: 'BROWSER_OPEN_RESPONSE',
+              id: msg.id,
+              data: {
+                ...payload,
+                success: false,
+                error: (error as Error).message,
+                sideEffectStarted: true,
+              },
+            }));
+          }
         } else {
           groveWs?.send(JSON.stringify({
             type: 'BROWSER_OPEN_RESPONSE',
@@ -478,6 +778,122 @@ async function handleGroveMessage(msg: any) {
           }));
         }
       });
+      break;
+    }
+
+    case 'BROWSER_RELOAD': {
+      const tabId = msg.tabId;
+      const timeoutMs = Math.max(100, Math.min(Number(msg.timeoutMs || 15000), 60000));
+      const startedAt = Date.now();
+      try {
+        await getTabSummary(tabId);
+        const tab = await navigateAndWait(tabId, () => {
+          chrome.tabs.reload(tabId, { bypassCache: !!msg.bypassCache });
+        }, timeoutMs);
+        const wait = msg.waitFor
+          ? await waitForCondition(
+              tabId,
+              msg.waitFor,
+              Math.max(100, timeoutMs - (Date.now() - startedAt)),
+            )
+          : { condition: 'load', durationMs: 0 };
+        groveWs?.send(JSON.stringify({
+          type: 'BROWSER_RELOAD_RESPONSE',
+          id: msg.id,
+          data: { success: true, tab, wait, refsInvalidated: true },
+        }));
+      } catch (error) {
+        groveWs?.send(JSON.stringify({
+          type: 'BROWSER_RELOAD_RESPONSE',
+          id: msg.id,
+          data: { success: false, error: (error as Error).message },
+        }));
+      }
+      break;
+    }
+
+    case 'BROWSER_NAVIGATE': {
+      const tabId = msg.tabId;
+      const timeoutMs = Math.max(100, Math.min(Number(msg.timeoutMs || 15000), 60000));
+      const startedAt = Date.now();
+      try {
+        await getTabSummary(tabId);
+        if (!['goto', 'back', 'forward'].includes(msg.action)) {
+          throw new Error(`INVALID_ACTION: ${msg.action}`);
+        }
+        if (msg.action === 'goto' && !msg.url) {
+          throw new Error('INVALID_INPUT: url is required for goto');
+        }
+        const tab = await navigateAndWait(tabId, () => {
+          if (msg.action === 'goto') chrome.tabs.update(tabId, { url: msg.url });
+          else if (msg.action === 'back') chrome.tabs.goBack(tabId);
+          else chrome.tabs.goForward(tabId);
+        }, timeoutMs);
+        const wait = msg.waitFor
+          ? await waitForCondition(
+              tabId,
+              msg.waitFor,
+              Math.max(100, timeoutMs - (Date.now() - startedAt)),
+            )
+          : { condition: 'load', durationMs: 0 };
+        groveWs?.send(JSON.stringify({
+          type: 'BROWSER_NAVIGATE_RESPONSE',
+          id: msg.id,
+          data: { success: true, tab, wait, refsInvalidated: true },
+        }));
+      } catch (error) {
+        groveWs?.send(JSON.stringify({
+          type: 'BROWSER_NAVIGATE_RESPONSE',
+          id: msg.id,
+          data: { success: false, error: (error as Error).message },
+        }));
+      }
+      break;
+    }
+
+    case 'BROWSER_CLOSE': {
+      const tabId = msg.tabId;
+      try {
+        await getTabSummary(tabId);
+        await new Promise<void>((resolve, reject) => {
+          chrome.tabs.remove(tabId, () => {
+            if (chrome.runtime.lastError) reject(new Error(`TAB_CLOSE_FAILED: ${chrome.runtime.lastError.message}`));
+            else resolve();
+          });
+        });
+        groveWs?.send(JSON.stringify({
+          type: 'BROWSER_CLOSE_RESPONSE',
+          id: msg.id,
+          data: { success: true, tabId, closed: true },
+        }));
+      } catch (error) {
+        groveWs?.send(JSON.stringify({
+          type: 'BROWSER_CLOSE_RESPONSE',
+          id: msg.id,
+          data: { success: false, error: (error as Error).message },
+        }));
+      }
+      break;
+    }
+
+    case 'BROWSER_WAIT': {
+      const tabId = msg.tabId;
+      const timeoutMs = Math.max(100, Math.min(Number(msg.timeoutMs || 15000), 60000));
+      try {
+        await getTabSummary(tabId);
+        const wait = await waitForCondition(tabId, msg.waitFor, timeoutMs);
+        groveWs?.send(JSON.stringify({
+          type: 'BROWSER_WAIT_RESPONSE',
+          id: msg.id,
+          data: { success: true, wait, tab: await getTabSummary(tabId) },
+        }));
+      } catch (error) {
+        groveWs?.send(JSON.stringify({
+          type: 'BROWSER_WAIT_RESPONSE',
+          id: msg.id,
+          data: { success: false, error: (error as Error).message },
+        }));
+      }
       break;
     }
 
@@ -524,7 +940,13 @@ async function handleGroveMessage(msg: any) {
           func: simulateInteractInjected,
           args: [msg.action, msg.target, msg.value],
         });
-        const data = results[0]?.result ?? { success: false, error: 'no_result' };
+        const interaction = results[0]?.result ?? { success: false, error: 'no_result' };
+        const data = interaction.success && msg.waitFor
+          ? {
+              ...interaction,
+              wait: await waitForCondition(tabId, msg.waitFor, Number(msg.timeoutMs || 15000)),
+            }
+          : interaction;
         groveWs?.send(JSON.stringify({ type: 'BROWSER_INTERACT_RESPONSE', id: msg.id, data }));
       } catch (err: any) {
         groveWs?.send(JSON.stringify({
@@ -574,48 +996,43 @@ async function handleGroveMessage(msg: any) {
         }));
         return;
       }
-      // captureVisibleTab 只能截 window 内当前 active 的 tab。先 activate 目标
-      // tab 再截，否则会截到用户当前看着的 tab、内容完全错位。
-      chrome.tabs.get(tabId, (tab) => {
-        if (chrome.runtime.lastError || !tab) {
-          groveWs?.send(JSON.stringify({
-            type: 'BROWSER_SCREENSHOT_RESPONSE',
-            id: msg.id,
-            data: { success: false, error: `tab_not_found: ${chrome.runtime.lastError?.message ?? tabId}` }
-          }));
-          return;
-        }
-        chrome.tabs.update(tabId, { active: true }, () => {
-          if (chrome.runtime.lastError) {
-            groveWs?.send(JSON.stringify({
-              type: 'BROWSER_SCREENSHOT_RESPONSE',
-              id: msg.id,
-              data: { success: false, error: `activate_failed: ${chrome.runtime.lastError.message}` }
-            }));
-            return;
-          }
-          chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' }, (dataUrl) => {
-            if (chrome.runtime.lastError || !dataUrl) {
-              groveWs?.send(JSON.stringify({
-                type: 'BROWSER_SCREENSHOT_RESPONSE',
-                id: msg.id,
-                data: { success: false, error: chrome.runtime.lastError?.message || 'Capture failed' }
-              }));
-            } else {
-              groveWs?.send(JSON.stringify({
-                type: 'BROWSER_SCREENSHOT_RESPONSE',
-                id: msg.id,
-                data: { success: true, screenshot: dataUrl }
-              }));
-            }
+      try {
+        const tab = await getTabSummary(tabId);
+        const timeoutMs = Math.max(100, Math.min(Number(msg.timeoutMs || 15000), 60000));
+        if (msg.waitFor) await waitForCondition(tabId, msg.waitFor, timeoutMs);
+        const chromeTab = await new Promise<chrome.tabs.Tab>((resolve, reject) => {
+          chrome.tabs.get(tabId, (value) => {
+            if (chrome.runtime.lastError || !value) reject(new Error(chromeErrorMessage('TAB_NOT_FOUND')));
+            else resolve(value);
           });
         });
-      });
+        await chrome.tabs.update(tabId, { active: true });
+        const screenshot = await chrome.tabs.captureVisibleTab(chromeTab.windowId, { format: 'png' });
+        groveWs?.send(JSON.stringify({
+          type: 'BROWSER_SCREENSHOT_RESPONSE', id: msg.id,
+          data: { success: true, screenshot, mode: 'viewport', format: 'png', tab, activatedTab: true },
+        }));
+      } catch (error) {
+        groveWs?.send(JSON.stringify({
+          type: 'BROWSER_SCREENSHOT_RESPONSE', id: msg.id,
+          data: { success: false, error: (error as Error).message },
+        }));
+      }
       break;
     }
 
     default:
       console.warn('[Grove Background] Unknown message type:', msg.type);
+      if (msg.id) {
+        groveWs?.send(JSON.stringify({
+          type: 'UNSUPPORTED_COMMAND_RESPONSE',
+          id: msg.id,
+          data: {
+            success: false,
+            error: `UNSUPPORTED_COMMAND: Grove Companion does not recognize ${String(msg.type)}`,
+          },
+        }));
+      }
   }
 }
 
@@ -644,7 +1061,9 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.alarms.create('grove-keepalive', { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== 'grove-keepalive') return;
-  if (!groveWs || groveWs.readyState !== WebSocket.OPEN) {
+  if (groveWs?.readyState === WebSocket.OPEN) {
+    groveWs.send(JSON.stringify({ type: 'ping' }));
+  } else {
     connectToGrove();
   }
 });
@@ -655,25 +1074,37 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // Promise inconsistently across versions, and `sendResponse` only stays valid
 // when the listener returns `true`. Here we don't respond to the sender, so we
 // kick off the async work in a void IIFE and return synchronously.
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'GROVE_CONNECTION_STATUS') {
+    sendResponse({
+      connected: groveWs?.readyState === WebSocket.OPEN,
+      connecting: connectInFlight || groveWs?.readyState === WebSocket.CONNECTING,
+      port: activePort,
+    });
+    return;
+  }
   if (message?.type === 'GROVE_PORT_DISCOVERED') {
     void (async () => {
       const discoveredPort = message.port;
-      if (discoveredPort === activePort) return;
+      if (
+        discoveredPort === activePort &&
+        (connectInFlight ||
+          groveWs?.readyState === WebSocket.OPEN ||
+          groveWs?.readyState === WebSocket.CONNECTING)
+      ) return;
       console.log(
-        `[Grove Background] Discovered a new active port from page: ${discoveredPort}. Switching connection...`,
+        `[Grove Background] Connecting to Grove port discovered by popup/page: ${discoveredPort}.`,
       );
       activePort = discoveredPort;
       if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
         await chrome.storage.local.set({ grove_port: discoveredPort });
       }
-      // Closing the current socket triggers onclose → connectToGrove() reads
-      // the newly saved port and connects to it.
-      if (groveWs) {
-        groveWs.close();
-      } else {
-        connectToGrove();
+      if (groveWs && groveWs.readyState !== WebSocket.CLOSED) {
+        const previous = groveWs;
+        groveWs = null;
+        previous.close();
       }
+      connectToGrove();
     })();
     return;
   }

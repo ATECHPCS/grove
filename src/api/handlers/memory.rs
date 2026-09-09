@@ -456,7 +456,7 @@ fn ensure_no_active_run(project_id: &str) -> Result<(), (StatusCode, String)> {
     if automations::has_active_run(&config.organization_automation_id).map_err(internal)? {
         return Err((
             StatusCode::CONFLICT,
-            "Wait for the active Memory organization run to finish or cancel it first".into(),
+            "Wait for the running or waiting Memory organization attempt to finish or cancel it first".into(),
         ));
     }
     Ok(())

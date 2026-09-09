@@ -14,19 +14,25 @@
   container-name: task-chat-message-pane;
 }
 
+/* Virtuoso maintains its own scroll anchor while measured Markdown rows are
+   mounted and unmounted. Native browser anchoring would apply a second,
+   independent scrollTop correction and can make a single height update jump
+   twice (or oscillate). Keep one owner for virtualized transcript geometry. */
+.task-chat-virtual-scroller {
+  overflow-anchor: none;
+}
+
 @container task-chat-message-pane (max-width: 1000px) {
   .conversation-minimap {
     display: none;
   }
 }
 
-/* The latest turns are TaskChat's stable, fully rendered hot zone. The global
-   code-block optimization reserves a 600px intrinsic placeholder while a
-   block is off-screen; replacing that estimate with the real height as the
-   block approaches the viewport causes repeated scroll corrections in chats
-   containing many short code snippets. Old virtualized turns keep the global
-   optimization, while hot rows always participate in normal layout. */
-.task-chat-hot-row .markdown-code-block {
+/* Virtuoso already windows TaskChat rows. A second content-visibility layer
+   inside mounted Markdown would replace real code-block heights with an
+   intrinsic placeholder and make the virtual scroller correct its position
+   again when the block becomes visible. */
+.task-chat-message-pane .markdown-code-block {
   content-visibility: visible;
   contain-intrinsic-size: none;
 }

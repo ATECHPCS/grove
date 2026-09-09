@@ -114,7 +114,64 @@ function eventLocations(value: unknown): Location[] | undefined {
 }
 
 function eventContent(value: unknown): ToolCallContentData[] | undefined {
-  return Array.isArray(value) ? (value as ToolCallContentData[]) : undefined;
+  if (!Array.isArray(value)) return undefined;
+  return (value as ToolCallContentData[]).flatMap(expandEmbeddedMcpResult);
+}
+
+function expandEmbeddedMcpResult(item: ToolCallContentData): ToolCallContentData[] {
+  if (item.type !== "content" || item.content.type !== "text") return [item];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(item.content.text);
+  } catch {
+    return [item];
+  }
+  if (!parsed || typeof parsed !== "object") return [item];
+  const root = parsed as Record<string, unknown>;
+  const result = root.result && typeof root.result === "object"
+    ? root.result as Record<string, unknown>
+    : root;
+  if (!Array.isArray(result.content)) return [item];
+
+  const blocks = result.content.filter(
+    (block): block is Record<string, unknown> => Boolean(block && typeof block === "object"),
+  );
+  if (!blocks.some((block) => block.type === "image" || block.type === "audio")) {
+    return [item];
+  }
+
+  const expanded = blocks.flatMap((block): ToolCallContentData[] => {
+    if (block.type === "text" && typeof block.text === "string") {
+      return [{ type: "content", content: { type: "text", text: block.text } }];
+    }
+    const mimeType = typeof block.mimeType === "string"
+      ? block.mimeType
+      : typeof block.mime_type === "string"
+        ? block.mime_type
+        : undefined;
+    if (block.type === "image" && typeof block.data === "string") {
+      return [{
+        type: "content",
+        content: {
+          type: "image",
+          data: block.data,
+          mime_type: mimeType || "image/png",
+        },
+      }];
+    }
+    if (block.type === "audio" && typeof block.data === "string") {
+      return [{
+        type: "content",
+        content: {
+          type: "audio",
+          data: block.data,
+          mime_type: mimeType || "audio/mpeg",
+        },
+      }];
+    }
+    return [];
+  });
+  return expanded.length > 0 ? expanded : [item];
 }
 
 function preserveTerminalSnapshots(

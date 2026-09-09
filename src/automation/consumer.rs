@@ -32,6 +32,11 @@ pub struct PreActionContext<'a> {
     pub trigger: &'a TriggerContext,
 }
 
+pub struct TriggerCheckContext<'a> {
+    pub automation: &'a Automation,
+    pub trigger: &'a TriggerContext,
+}
+
 #[derive(Debug)]
 pub struct RuntimeContext<'a> {
     pub automation: &'a Automation,
@@ -68,6 +73,13 @@ pub trait AutomationHandler: Send + Sync {
 
     fn concurrency_policy(&self, _automation: &Automation) -> ConcurrencyPolicy {
         ConcurrencyPolicy::AllowParallel
+    }
+
+    /// Decide whether a trigger has business work before claiming a Run.
+    /// Returning false advances scheduler state without creating a persisted
+    /// Run or starting an Agent Session.
+    fn should_run(&self, _context: TriggerCheckContext<'_>) -> Result<bool> {
+        Ok(true)
     }
 
     /// Prepare business input after Automation has atomically claimed a Run,

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  nextPlanVisibility,
   normalizePlanEntries,
   shouldOpenPlan,
   sortPlanEntries,
@@ -46,6 +47,19 @@ describe("ACP plan entries", () => {
         { content: "Working", priority: "high", status: "in_progress" },
       ]),
     ).toBe(true);
+  });
+
+  it("keeps plan updates collapsed unless the user opened the panel", () => {
+    const active = [
+      { content: "Working", priority: "high" as const, status: "in_progress" },
+    ];
+    const complete = [
+      { content: "Done", priority: "high" as const, status: "completed" },
+    ];
+
+    expect(nextPlanVisibility(false, active)).toBe(false);
+    expect(nextPlanVisibility(true, active)).toBe(true);
+    expect(nextPlanVisibility(true, complete)).toBe(false);
   });
 
 });

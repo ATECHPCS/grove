@@ -6,7 +6,6 @@ import {
   useState,
   type RefObject,
 } from "react";
-import type { VirtuosoHandle } from "react-virtuoso";
 
 interface Match {
   itemIndex: number;
@@ -41,11 +40,11 @@ export interface ChatSearchResult {
  * Data-layer search for the (virtualized) chat list.
  *
  * Why not reuse useDomSearch?
- *   useDomSearch only sees what's currently in the DOM. With Virtuoso
+ *   useDomSearch only sees what's currently in the DOM. With a virtual list
  *   rendering only the visible window, off-screen messages would be
  *   invisible to the search. Here we scan the full message data to
  *   compute total/navigation, then re-apply visible-DOM highlights
- *   whenever Virtuoso renders new items (driven by `renderToken`).
+ *   whenever the list renders new items (driven by `renderToken`).
  *
  * Highlighting uses the CSS Custom Highlight API exclusively — falls back
  * to no highlight on browsers without it (Tauri's WebKit ships it on the
@@ -56,11 +55,21 @@ export function useChatSearch<T>(opts: {
   query: string;
   enabled: boolean;
   extractText: (item: T) => string;
-  virtuosoRef: RefObject<VirtuosoHandle | null>;
+  virtuosoRef?: RefObject<{
+    scrollToIndex: (options: {
+      index: number;
+      align: "center";
+      behavior: "auto";
+    }) => void;
+  } | null>;
   scrollerRef: RefObject<HTMLElement | null>;
-  /** Bumped by the caller whenever Virtuoso renders a different range of
+  /** Bumped by the caller whenever the list renders a different range of
    *  items, so we can re-apply highlights to the freshly mounted DOM. */
   renderToken: number;
+  ensureItemAvailable?: (itemIndex: number) => boolean;
+  virtuosoIndexForItem?: (itemIndex: number) => number;
+  navigationVersion?: number;
+  scrollToItem?: (itemIndex: number) => void;
 }): ChatSearchResult {
   const {
     items,
@@ -70,6 +79,10 @@ export function useChatSearch<T>(opts: {
     virtuosoRef,
     scrollerRef,
     renderToken,
+    ensureItemAvailable,
+    virtuosoIndexForItem,
+    navigationVersion,
+    scrollToItem,
   } = opts;
   // Belt-and-suspenders: gate on `Highlight` global existing too. WebKit
   // and Chromium ship CSS.highlights and Highlight together in practice,
@@ -167,7 +180,7 @@ export function useChatSearch<T>(opts: {
     try { CSS.highlights.delete(HL_CUR); } catch { /* noop */ }
   }, [supportsHighlight]);
 
-  // When the user navigates to a different match, ask Virtuoso to bring
+  // When the user navigates to a different match, ask the list to bring
   // its row into view. Highlight application waits for the next renderToken
   // bump (since Virtuoso may need a frame to mount the row).
   //
@@ -180,6 +193,7 @@ export function useChatSearch<T>(opts: {
     if (!m) return;
     const key = matchKey(m);
     if (key === lastScrolledKeyRef.current) return;
+    if (ensureItemAvailable && !ensureItemAvailable(m.itemIndex)) return;
     lastScrolledKeyRef.current = key;
     const mountedRow = scrollerRef.current?.querySelector<HTMLElement>(
       `[data-item-index="${m.itemIndex}"]`,
@@ -188,14 +202,27 @@ export function useChatSearch<T>(opts: {
       mountedRow.scrollIntoView({ block: "center", behavior: "auto" });
       return;
     }
-    virtuosoRef.current?.scrollToIndex({
-      index: m.itemIndex,
+    if (scrollToItem) {
+      scrollToItem(m.itemIndex);
+      return;
+    }
+    virtuosoRef?.current?.scrollToIndex({
+      index: virtuosoIndexForItem?.(m.itemIndex) ?? m.itemIndex,
       align: "center",
       behavior: "auto",
     });
-  }, [cur, matches, scrollerRef, virtuosoRef]);
+  }, [
+    cur,
+    ensureItemAvailable,
+    matches,
+    navigationVersion,
+    scrollerRef,
+    scrollToItem,
+    virtuosoIndexForItem,
+    virtuosoRef,
+  ]);
 
-  // Apply highlights to whatever Virtuoso currently has rendered.
+  // Apply highlights to whatever the virtual list currently has rendered.
   // Re-runs when the rendered range changes (renderToken), the query
   // changes, or the user navigates.
   useEffect(() => {
@@ -212,7 +239,7 @@ export function useChatSearch<T>(opts: {
     const qLen = query.length;
     const target = matches[cur];
 
-    // Virtuoso adds data-item-index on each rendered row.
+    // Every rendered row exposes its stable transcript index.
     const containers = scroller.querySelectorAll<HTMLElement>(
       "[data-item-index]",
     );

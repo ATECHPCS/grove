@@ -827,15 +827,19 @@ export function TasksPage({ initialTaskId, initialChatId, initialViewMode, onNav
     setPageContext,
   } = useCommandPalette();
 
-  // Sync inWorkspace to context so App can disable Cmd+1-4 sidebar switching
+  // Sync inWorkspace to context so App can disable Cmd+1-4 sidebar switching.
+  // pageVisible-gated: TasksPage stays mounted (display:none) on other routes —
+  // including the keep-alive WorkPage's Local Task workspace — and the visible
+  // page owns the shared context; writing while hidden would clobber it.
   useEffect(() => {
+    if (!pageVisible) return;
     setContextInWorkspace(pageState.inWorkspace);
     setPageContext(pageState.inWorkspace ? "workspace" : "tasks");
     return () => {
       setContextInWorkspace(false);
       setPageContext("default");
     };
-  }, [pageState.inWorkspace, setContextInWorkspace, setPageContext]);
+  }, [pageVisible, pageState.inWorkspace, setContextInWorkspace, setPageContext]);
   const pageOptionsRef = useRef<Parameters<typeof buildCommands>[0]>(null!);
   // Build the latest options object during render (no setState/ref-write
   // side effect), then commit it into the ref in an effect.
@@ -857,9 +861,13 @@ export function TasksPage({ initialTaskId, initialChatId, initialViewMode, onNav
   });
 
   useEffect(() => {
+    // registerPageCommands is a single shared slot. With WorkPage now also
+    // keep-alive (always mounted once visited), whichever page becomes
+    // visible must take the slot back — hence the pageVisible gate + dep.
+    if (!pageVisible) return;
     registerPageCommands(() => buildCommands(pageOptionsRef.current));
     return () => unregisterPageCommands();
-  }, [registerPageCommands, unregisterPageCommands]);
+  }, [pageVisible, registerPageCommands, unregisterPageCommands]);
 
   // If no project selected
   if (!selectedProject) {

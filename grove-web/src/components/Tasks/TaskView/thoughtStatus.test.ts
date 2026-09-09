@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { extractThoughtStatus } from "./thoughtStatus";
+import {
+  extractThoughtStatus,
+  shouldShowGenericThinking,
+} from "./thoughtStatus";
 
 describe("extractThoughtStatus", () => {
   it("extracts a standalone bold heading", () => {
@@ -34,5 +37,24 @@ describe("extractThoughtStatus", () => {
       .toBe("Thinking");
     expect(extractThoughtStatus("No heading yet"))
       .toBe("Thinking");
+  });
+});
+
+describe("shouldShowGenericThinking", () => {
+  it("hides the fallback as soon as the run finishes", () => {
+    expect(shouldShowGenericThinking(false, [{ type: "user" }])).toBe(false);
+  });
+
+  it("never duplicates a real unfinished thought", () => {
+    expect(
+      shouldShowGenericThinking(true, [
+        { type: "thinking", complete: false },
+        { type: "tool" },
+      ]),
+    ).toBe(false);
+  });
+
+  it("shows the fallback while waiting for the first Agent content", () => {
+    expect(shouldShowGenericThinking(true, [{ type: "user" }])).toBe(true);
   });
 });

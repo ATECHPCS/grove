@@ -1,4 +1,5 @@
 import { apiClient } from "./client";
+import { notifyPluginsChanged } from "./plugins";
 
 export type ExtensionKind = "skill" | "plugin" | "mcp";
 
@@ -14,6 +15,7 @@ export interface ExtensionArtifact {
   manifest: Record<string, unknown> | null;
   install_status: "not_installed" | "installed" | "partial";
   installed_agents: string[];
+  installed_plugin_id?: string;
 }
 
 export async function exploreExtensions(params?: { kind?: string; search?: string }): Promise<ExtensionArtifact[]> {
@@ -40,5 +42,7 @@ export async function installMcp(input: {
 }
 
 export async function installCatalogPlugin(repo_key: string, repo_path: string): Promise<{ ok: boolean }> {
-  return apiClient.post("/api/v1/extensions/plugin/install", { repo_key, repo_path });
+  const result = await apiClient.post<{ repo_key: string; repo_path: string }, { ok: boolean }>("/api/v1/extensions/plugin/install", { repo_key, repo_path });
+  notifyPluginsChanged();
+  return result;
 }
