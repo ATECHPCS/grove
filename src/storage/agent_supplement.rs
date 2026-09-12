@@ -99,7 +99,7 @@ pub const BUILTIN_SUPPLEMENTS: &[SupplementEntry] = &[
         terminal_check: Some("codex"),
         acp_check: Some("codex-acp"),
         acp_fallback: None,
-        npx_package: Some("@zed-industries/codex-acp"),
+        npx_package: Some("@agentclientprotocol/codex-acp"),
         supported_launch_modes: &["acp"],
         terminal_profile: None,
     },
