@@ -530,6 +530,7 @@ async fn install_npx(reg: &RegistryAgent) -> Result<Json<InstallResponse>, Marke
         status: InstallStatus::Installed,
         failure_reason: None,
         installed_at: chrono::Utc::now(),
+        pinned: false,
     };
     let agent = installed_agents::add_installation(&reg.id, install)
         .map_err(|e| MarketplaceError::internal(format!("add installation: {}", e)))?;
@@ -558,6 +559,7 @@ async fn install_uvx(reg: &RegistryAgent) -> Result<Json<InstallResponse>, Marke
         status: InstallStatus::Installed,
         failure_reason: None,
         installed_at: chrono::Utc::now(),
+        pinned: false,
     };
     let agent = installed_agents::add_installation(&reg.id, install)
         .map_err(|e| MarketplaceError::internal(format!("add installation: {}", e)))?;
@@ -598,6 +600,7 @@ async fn install_binary(reg: &RegistryAgent) -> Result<Json<InstallResponse>, Ma
         status: InstallStatus::Installing,
         failure_reason: None,
         installed_at: chrono::Utc::now(),
+        pinned: false,
     };
     installed_agents::add_installation(&reg.id, installing)
         .map_err(|e| MarketplaceError::internal(format!("upsert installing-state: {}", e)))?;
@@ -635,6 +638,7 @@ async fn install_binary(reg: &RegistryAgent) -> Result<Json<InstallResponse>, Ma
                 status: InstallStatus::Installed,
                 failure_reason: None,
                 installed_at: chrono::Utc::now(),
+                pinned: false,
             };
             let agent = installed_agents::add_installation(&reg.id, installed)
                 .map_err(|e| MarketplaceError::internal(format!("upsert installed: {}", e)))?;
@@ -845,6 +849,7 @@ mod tests {
             status: InstallStatus::Installed,
             failure_reason: None,
             installed_at: Utc::now(),
+            pinned: false,
         }
     }
 
@@ -856,6 +861,7 @@ mod tests {
             status: InstallStatus::Installed,
             failure_reason: None,
             installed_at: Utc::now(),
+            pinned: false,
         }
     }
 
