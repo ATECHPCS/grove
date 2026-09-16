@@ -1606,13 +1606,31 @@ pub(crate) fn validate_dispatch_agent(agent: &str) -> Result<(), AcpError> {
             rec.selected_install_method,
             crate::storage::installed_agents::InstallMethod::External
         ) {
-            let terminal_only = crate::storage::agent_registry::get()
-                .agents
-                .iter()
-                .find(|a| a.id == agent)
-                .and_then(|a| a.terminal_launch.as_ref())
-                .is_some();
-            if terminal_only {
+            // Ask the real resolver whether an ACP launch is possible rather
+            // than inferring it from the presence of a `terminal_launch` entry.
+            //
+            // The old proxy — "registry declares terminal_launch" — is not the
+            // same question. `inject_grove_supplements` attaches a
+            // `terminal_launch` to claude-acp unconditionally, so every
+            // External selection of Claude was rejected here, including one
+            // pointing straight at the `claude-agent-acp` ACP adapter binary.
+            // That made "install the adapter globally and select it" (the
+            // documented workaround for npx cache failures) silently
+            // undispatchable from the board, which is how it kept getting
+            // reverted to npx.
+            //
+            // `spawn_for_launch_mode(.., "acp")` already encodes the real
+            // rule: use the External channel when it is ACP-drivable, else
+            // fall back to another installed ACP channel, else None.
+            let registry = crate::storage::agent_registry::get();
+            let registry_agent = registry.agents.iter().find(|a| a.id == agent);
+            if crate::storage::installed_agents::spawn_for_launch_mode(
+                &rec,
+                registry_agent,
+                "acp",
+            )
+            .is_none()
+            {
                 return Err(AcpError::BadRequest(format!(
                     "agent {agent} is terminal-only and cannot be dispatched headlessly"
                 )));
