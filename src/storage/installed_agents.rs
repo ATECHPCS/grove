@@ -90,6 +90,22 @@ pub struct Installation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
     pub installed_at: DateTime<Utc>,
+    /// Operator-pinned External path: `auto_scan_path_binaries` must never
+    /// rewrite or deregister this installation.
+    ///
+    /// External rows are normally auto-managed -- grove resolves the binary
+    /// from PATH on every scan and rewrites `install_path` when the
+    /// resolution moves. That is wrong for a deliberately-installed ACP
+    /// adapter (`npm i -g @agentclientprotocol/claude-agent-acp`), which
+    /// commonly lives outside the PATH this process inherits: a systemd user
+    /// unit does not source a login shell, so `~/.npm-global/bin` is absent
+    /// and the probe silently rewrites the path to whatever PATH *does*
+    /// offer (e.g. `/usr/bin/claude`), reverting the operator on every boot.
+    ///
+    /// Defaults to false, so every existing row keeps today's auto-managed
+    /// behaviour and no migration is needed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,6 +394,7 @@ pub fn patch_or_create(
             status: InstallStatus::Installed,
             failure_reason: None,
             installed_at: now,
+            pinned: false,
         }],
         selected_install_method: InstallMethod::External,
         args_override: Vec::new(),
@@ -825,6 +842,19 @@ pub fn auto_scan_path_binaries(
                 .find(|i| i.method == InstallMethod::External)
         });
         if let Some(cached) = cached_external {
+            // A pinned External row is operator-owned: skip the probe and
+            // leave install_path exactly as configured. Existence on disk is
+            // the only meaningful check -- the binary is deliberately off the
+            // PATH this process inherited (see Installation::pinned).
+            if cached.pinned
+                && cached
+                    .install_path
+                    .as_deref()
+                    .is_some_and(|path| std::path::Path::new(path).exists())
+            {
+                detected_agent_ids.insert(reg.id.clone());
+                continue;
+            }
             if let Some(path) = cached.install_path.as_deref() {
                 // The file existing is insufficient: PATH may have changed
                 // since the previous scan (shell profile, GUI environment,
@@ -877,6 +907,8 @@ pub fn auto_scan_path_binaries(
                         .map(|i| i.installed_at)
                 })
                 .unwrap_or(now),
+            // Scan-written rows are auto-managed by definition.
+            pinned: false,
         };
         add_installation(&reg.id, install)?;
     }
@@ -895,6 +927,16 @@ pub fn auto_scan_path_binaries(
             .iter()
             .any(|i| i.method == InstallMethod::External);
         if !has_external {
+            continue;
+        }
+        // A pinned External row is never deregistered by the scan. It is not
+        // expected to be on PATH at all, so "disappeared from PATH" carries
+        // no information about it; only the operator removes it.
+        if agent
+            .installations
+            .iter()
+            .any(|i| i.method == InstallMethod::External && i.pinned)
+        {
             continue;
         }
         // If External wasn't the user's selected channel, just drop it
@@ -1324,6 +1366,7 @@ pub fn reconcile_onboarding_agents(
             status: InstallStatus::Installed,
             failure_reason: None,
             installed_at: now,
+            pinned: false,
         };
         add_installation(id, install)?;
         // Seeding the Npx channel must not hijack an existing, working
@@ -1375,6 +1418,200 @@ mod tests {
         }
     }
 
+    /// A pinned External row points at a binary that is deliberately NOT on
+    /// PATH (the systemd-user-unit case). The scan must leave it alone rather
+    /// than rewriting install_path to whatever PATH does offer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_scan_never_rewrites_a_pinned_external_path() {
+        let _l = crate::storage::database::test_lock().lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        // The operator-installed adapter lives off-PATH.
+        let offpath = tempfile::tempdir().unwrap();
+        let adapter = offpath.path().join("claude-agent-acp");
+        make_executable(&adapter);
+
+        // PATH offers a DIFFERENT binary under the name the probe looks for.
+        let on_path = tempfile::tempdir().unwrap();
+        make_executable(&on_path.path().join("local-fixture-agent"));
+
+        let mut registry = crate::storage::agent_registry::RegistryDocument {
+            version: "1".into(),
+            agents: Vec::new(),
+        };
+        registry.agents.push(registry_with_npx("local-fixture-agent").agents.remove(0));
+
+        let now = Utc::now();
+        upsert(&InstalledAgent {
+            id: "local-fixture-agent".into(),
+            installations: vec![Installation {
+                method: InstallMethod::External,
+                version: String::new(),
+                install_path: Some(adapter.to_string_lossy().into_owned()),
+                status: InstallStatus::Installed,
+                failure_reason: None,
+                installed_at: now,
+                pinned: true,
+            }],
+            selected_install_method: InstallMethod::External,
+            args_override: Vec::new(),
+            env_override: Default::default(),
+            hidden: false,
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+
+        {
+            let _path = PathGuard::set(on_path.path());
+            reset_auto_scan_cache();
+            auto_scan_path_binaries(&registry).unwrap();
+        }
+
+        let rec = get("local-fixture-agent").unwrap().unwrap();
+        let ext = rec
+            .installations
+            .iter()
+            .find(|i| i.method == InstallMethod::External)
+            .unwrap();
+        assert!(ext.pinned, "pin must survive the scan");
+        assert_eq!(
+            ext.install_path.as_deref(),
+            adapter.to_str(),
+            "scan rewrote an operator-pinned install_path"
+        );
+        crate::storage::set_grove_dir_override(None);
+    }
+
+    /// The deregister pass drops External rows whose binary left PATH. A
+    /// pinned row was never expected on PATH, so it must be exempt.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_scan_never_deregisters_a_pinned_external_row() {
+        let _l = crate::storage::database::test_lock().lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        let offpath = tempfile::tempdir().unwrap();
+        let adapter = offpath.path().join("claude-agent-acp");
+        make_executable(&adapter);
+        let empty_path = tempfile::tempdir().unwrap();
+
+        let registry = crate::storage::agent_registry::RegistryDocument {
+            version: "1".into(),
+            agents: Vec::new(),
+        };
+
+        let now = Utc::now();
+        upsert(&InstalledAgent {
+            id: "local-fixture-agent".into(),
+            installations: vec![Installation {
+                method: InstallMethod::External,
+                version: String::new(),
+                install_path: Some(adapter.to_string_lossy().into_owned()),
+                status: InstallStatus::Installed,
+                failure_reason: None,
+                installed_at: now,
+                pinned: true,
+            }],
+            selected_install_method: InstallMethod::External,
+            args_override: Vec::new(),
+            env_override: Default::default(),
+            hidden: false,
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+
+        {
+            let _path = PathGuard::set(empty_path.path());
+            reset_auto_scan_cache();
+            auto_scan_path_binaries(&registry).unwrap();
+        }
+
+        let rec = get("local-fixture-agent").unwrap().unwrap();
+        assert!(
+            rec.installations
+                .iter()
+                .any(|i| i.method == InstallMethod::External && i.pinned),
+            "scan deregistered an operator-pinned External row"
+        );
+        crate::storage::set_grove_dir_override(None);
+    }
+
+    /// Guard the default: an UNpinned External row keeps today's
+    /// auto-managed behaviour and is still rewritten when PATH moves.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_scan_still_rewrites_an_unpinned_external_path() {
+        let _l = crate::storage::database::test_lock().lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        let stale = tempfile::tempdir().unwrap();
+        let stale_bin = stale.path().join("local-fixture-agent");
+        make_executable(&stale_bin);
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh_bin = fresh.path().join("local-fixture-agent");
+        make_executable(&fresh_bin);
+
+        let mut registry = crate::storage::agent_registry::RegistryDocument {
+            version: "1".into(),
+            agents: Vec::new(),
+        };
+        registry.agents.push(registry_with_npx("local-fixture-agent").agents.remove(0));
+
+        let now = Utc::now();
+        upsert(&InstalledAgent {
+            id: "local-fixture-agent".into(),
+            installations: vec![Installation {
+                method: InstallMethod::External,
+                version: String::new(),
+                install_path: Some(stale_bin.to_string_lossy().into_owned()),
+                status: InstallStatus::Installed,
+                failure_reason: None,
+                installed_at: now,
+                pinned: false,
+            }],
+            selected_install_method: InstallMethod::External,
+            args_override: Vec::new(),
+            env_override: Default::default(),
+            hidden: false,
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+
+        {
+            let _path = PathGuard::set(fresh.path());
+            reset_auto_scan_cache();
+            auto_scan_path_binaries(&registry).unwrap();
+        }
+
+        let rec = get("local-fixture-agent").unwrap().unwrap();
+        let ext = rec
+            .installations
+            .iter()
+            .find(|i| i.method == InstallMethod::External)
+            .unwrap();
+        assert_eq!(ext.install_path.as_deref(), fresh_bin.to_str());
+        crate::storage::set_grove_dir_override(None);
+    }
+
+    /// `pinned` is absent from every existing row's JSON; it must deserialize
+    /// as false rather than failing the row.
+    #[test]
+    fn pinned_defaults_to_false_for_legacy_rows() {
+        let json = r#"{"method":"external","version":"","install_path":"/usr/bin/claude","status":"installed","installed_at":"2026-05-30T02:34:25.814252488Z"}"#;
+        let install: Installation = serde_json::from_str(json).unwrap();
+        assert!(!install.pinned);
+        // And a false pin is not written back out, so rows stay byte-stable.
+        let round = serde_json::to_string(&install).unwrap();
+        assert!(!round.contains("pinned"), "{round}");
+    }
+
     struct PathGuard(Option<std::ffi::OsString>);
 
     impl PathGuard {
@@ -1419,6 +1656,7 @@ mod tests {
                 status: InstallStatus::Installed,
                 failure_reason: None,
                 installed_at: now,
+                pinned: false,
             }],
             selected_install_method: InstallMethod::Npx,
             args_override: vec![],
@@ -1453,6 +1691,7 @@ mod tests {
             status: InstallStatus::Installed,
             failure_reason: None,
             installed_at: Utc::now(),
+            pinned: false,
         });
         agent.selected_install_method = InstallMethod::Binary;
         let picked = agent.selected_installation().unwrap();
@@ -1492,6 +1731,7 @@ mod tests {
                 status: InstallStatus::Installed,
                 failure_reason: None,
                 installed_at: Utc::now(),
+                pinned: false,
             },
         );
         agent.selected_install_method = InstallMethod::External;
@@ -1535,6 +1775,7 @@ mod tests {
                 status: InstallStatus::Installed,
                 failure_reason: None,
                 installed_at: Utc::now(),
+                pinned: false,
             },
         );
         agent.selected_install_method = InstallMethod::External;
@@ -1571,6 +1812,7 @@ mod tests {
                 status: InstallStatus::Installed,
                 failure_reason: None,
                 installed_at: Utc::now(),
+                pinned: false,
             },
         )
         .unwrap();
@@ -1614,6 +1856,7 @@ mod tests {
                 status: InstallStatus::Installed,
                 failure_reason: None,
                 installed_at: Utc::now(),
+                pinned: false,
             },
         )
         .unwrap();
@@ -1711,6 +1954,7 @@ mod tests {
             status: InstallStatus::Installed,
             failure_reason: None,
             installed_at: Utc::now(),
+            pinned: false,
         });
         agent.selected_install_method = InstallMethod::External;
 
@@ -1756,6 +2000,7 @@ mod tests {
             status: InstallStatus::Installed,
             failure_reason: None,
             installed_at: now,
+            pinned: false,
         };
         add_installation("claude-acp", binary_install).unwrap();
         let got = get("claude-acp").unwrap().unwrap();
@@ -1843,6 +2088,7 @@ mod tests {
                 status: InstallStatus::Installed,
                 failure_reason: None,
                 installed_at: now,
+                pinned: false,
             },
         )
         .unwrap();

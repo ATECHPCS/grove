@@ -1935,6 +1935,7 @@ mod tests {
                     status: crate::storage::installed_agents::InstallStatus::Installed,
                     failure_reason: None,
                     installed_at: now,
+                    pinned: false,
                 }],
                 selected_install_method: crate::storage::installed_agents::InstallMethod::External,
                 args_override: Vec::new(),
