@@ -460,6 +460,89 @@ pub fn pin_package_version(package: &str, version: &str) -> String {
     }
 }
 
+/// Per-process latch recording npx pins that failed to resolve from the local
+/// cache, so the next launch of that pin skips `--prefer-offline`.
+///
+/// Why a latch and not a pre-flight probe: an unconditional "resolve first,
+/// then spawn" pass runs npx twice on every session start (~3s warm, ~19s
+/// cold) and was deliberately removed from the ACP spawn path. Recording the
+/// failure instead costs nothing on the happy path — the first session after a
+/// pin bump still dies, but the client's automatic reconnect (~1.3s later)
+/// re-enters `spawn_for`, now without the flag, and connects. Net effect is a
+/// couple of seconds of self-healing rather than an indefinite wedge.
+///
+/// Intentionally process-local and not persisted: the cache it compensates for
+/// is itself process-external and self-heals on the next genuine miss, so a
+/// stale "needs online" entry would only cost one skipped cache hit. The latch
+/// is cleared once a pin resolves successfully.
+mod npx_online_retry {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    fn pins() -> &'static Mutex<HashSet<String>> {
+        static PINS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        PINS.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    /// Record that `pinned` (e.g. `@scope/pkg@1.2.3`) failed to resolve with
+    /// `--prefer-offline`. Returns true if this is a new entry.
+    pub fn mark_needs_online(pinned: &str) -> bool {
+        pins()
+            .lock()
+            .map(|mut set| set.insert(pinned.to_string()))
+            .unwrap_or(false)
+    }
+
+    /// True when `pinned` should be launched without `--prefer-offline`.
+    pub fn needs_online(pinned: &str) -> bool {
+        pins()
+            .lock()
+            .map(|set| set.contains(pinned))
+            .unwrap_or(false)
+    }
+
+    /// Clear the latch for `pinned` after a successful launch, so steady-state
+    /// launches go back to the fast cached path.
+    pub fn clear(pinned: &str) {
+        if let Ok(mut set) = pins().lock() {
+            set.remove(pinned);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn reset() {
+        if let Ok(mut set) = pins().lock() {
+            set.clear();
+        }
+    }
+}
+
+/// Classify a line of npx/npm stderr as "this pin is not resolvable from the
+/// local cache". `ETARGET` is npm's code for "no matching version found",
+/// which under `--prefer-offline` means the cached packument predates the pin.
+pub fn npx_line_indicates_stale_cache(line: &str) -> bool {
+    line.contains("code ETARGET") || line.contains("No matching version found")
+}
+
+/// Record a stale-cache failure for `pinned` so the next `spawn_for` of it
+/// drops `--prefer-offline`. Returns true the first time it fires for a pin.
+pub fn note_npx_stale_cache(pinned: &str) -> bool {
+    npx_online_retry::mark_needs_online(pinned)
+}
+
+/// Clear a recorded stale-cache failure for `pinned` after it launches cleanly.
+pub fn clear_npx_stale_cache(pinned: &str) {
+    npx_online_retry::clear(pinned);
+}
+
+/// Extract the pinned `pkg@version` spec from an npx argv built by `spawn_for`
+/// — the first argument that is neither a flag nor the leading `-y`.
+pub fn npx_pin_from_args(args: &[String]) -> Option<&str> {
+    args.iter()
+        .map(String::as_str)
+        .find(|arg| !arg.starts_with('-'))
+}
+
 /// Resolve the spawn command + args for a launched agent using the selected
 /// installation channel. Returns `None` to mean "no launchable channel" —
 /// caller treats the agent as unavailable.
@@ -492,7 +575,21 @@ pub fn spawn_for(
             // back to the network on a genuine cache miss, so first-ever launch
             // of a new agent is unaffected. Shaves the ~3s warm-cache tax that
             // otherwise gates `session_ready` on every fresh session start.
-            let mut args = vec!["-y".to_string(), "--prefer-offline".to_string(), pinned];
+            //
+            // ...unless this exact pin has already failed to resolve offline
+            // once (see `npx_online_retry`). `--prefer-offline` resolves a pin
+            // against the cached packument WITHOUT revalidating it, so a pin
+            // newer than the cache — a freshly bumped registry version, or a
+            // just-published transitive dep — yields `npm ERR! code ETARGET`
+            // and npx exits 1 before the ACP handshake. Dropping the flag for
+            // that pin makes the very next launch fetch fresh metadata and
+            // succeed, so a cold/stale cache self-heals instead of wedging
+            // every session on the agent.
+            let mut args = if npx_online_retry::needs_online(&pinned) {
+                vec!["-y".to_string(), pinned]
+            } else {
+                vec!["-y".to_string(), "--prefer-offline".to_string(), pinned]
+            };
             args.extend(npx.args.iter().cloned());
             Some(("npx".to_string(), args))
         }
@@ -567,11 +664,18 @@ pub fn spawn_for_launch_mode(
     registry_agent: Option<&crate::storage::agent_registry::RegistryAgent>,
     launch_mode: &str,
 ) -> Option<(String, Vec<String>)> {
+    // An External channel counts as "the terminal CLI" only when it is NOT the
+    // agent's own ACP adapter binary. `inject_grove_supplements` attaches a
+    // `terminal_launch` to claude-acp unconditionally, so testing
+    // `terminal_launch.is_some()` alone diverted a deliberately-selected
+    // `claude-agent-acp` binary back onto npx — exactly the channel the
+    // operator installed it to avoid.
     let external_is_terminal = launch_mode == "acp"
         && rec.selected_install_method == InstallMethod::External
         && registry_agent
             .and_then(|agent| agent.terminal_launch.as_ref())
-            .is_some();
+            .is_some()
+        && !registry_agent.is_some_and(|reg| external_selection_is_acp_adapter(rec, reg));
 
     if !external_is_terminal {
         return spawn_for(rec, registry_agent);
@@ -986,6 +1090,39 @@ fn package_to_binary_name(package: &str) -> String {
         .to_string()
 }
 
+/// True when the row's *selected* External installation points at a binary
+/// that is the agent's own ACP adapter (same basename as the registry's npx
+/// package) and that binary still exists on disk.
+///
+/// Used by `reconcile_onboarding_agents` to tell a deliberate "global adapter
+/// install" External selection — which is a fully working ACP channel — apart
+/// from the legacy terminal-CLI External selection the migration retires.
+fn external_selection_is_acp_adapter(
+    rec: &InstalledAgent,
+    reg: &crate::storage::agent_registry::RegistryAgent,
+) -> bool {
+    let Some(install) = rec.selected_installation() else {
+        return false;
+    };
+    if install.method != InstallMethod::External || install.status != InstallStatus::Installed {
+        return false;
+    }
+    let Some(path) = install.install_path.as_deref() else {
+        return false;
+    };
+    if !std::path::Path::new(path).exists() {
+        return false;
+    }
+    let bin_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path);
+    reg.distribution
+        .npx
+        .as_ref()
+        .is_some_and(|npx| package_to_binary_name(&npx.package) == bin_name)
+}
+
 /// Look up the right argv for an External-installed binary by matching the
 /// resolved binary basename against each declared distribution channel and
 /// returning that channel's args.
@@ -1160,10 +1297,21 @@ pub fn reconcile_onboarding_agents(
             // Claude Terminal remains implemented for historical chats, but
             // it is no longer a selectable product mode. Converge upgraded
             // users onto the existing Npx channel without deleting External.
+            //
+            // EXCEPT when the External selection is the ACP adapter binary
+            // itself (a deliberate `npm i -g @agentclientprotocol/
+            // claude-agent-acp` + explicit selection, used to take npx off the
+            // launch path entirely). That is a working ACP channel, not the
+            // legacy terminal CLI this migration exists to retire, and
+            // stomping it on every boot silently reverted the operator's fix
+            // and re-exposed them to npx cache failures.
             if id == "claude-acp"
                 && existing
                     .as_ref()
                     .is_some_and(|a| a.selected_install_method == InstallMethod::External)
+                && !existing
+                    .as_ref()
+                    .is_some_and(|a| external_selection_is_acp_adapter(a, reg))
             {
                 patch_or_create(id, Some(InstallMethod::Npx), None, None, None)?;
             }
@@ -1178,7 +1326,15 @@ pub fn reconcile_onboarding_agents(
             installed_at: now,
         };
         add_installation(id, install)?;
-        if id == "claude-acp" {
+        // Seeding the Npx channel must not hijack an existing, working
+        // External ACP-adapter selection either — same rule as the has_npx
+        // branch above. We still ADD the channel (a useful fallback); we just
+        // don't make it active.
+        if id == "claude-acp"
+            && !existing
+                .as_ref()
+                .is_some_and(|a| external_selection_is_acp_adapter(a, reg))
+        {
             patch_or_create(id, Some(InstallMethod::Npx), None, None, None)?;
         }
         seeded += 1;
@@ -1348,6 +1504,191 @@ mod tests {
             args,
             vec!["-y", "--prefer-offline", "@example/claude-acp@1.0.0"]
         );
+    }
+
+    /// The External-selection-is-the-adapter case: an ACP launch must spawn the
+    /// selected binary, NOT divert to npx, even though `claude-acp` always
+    /// carries an injected `terminal_launch`.
+    #[test]
+    fn acp_launch_keeps_external_acp_adapter_binary() {
+        use crate::storage::agent_registry::TerminalLaunch;
+
+        let temp = tempfile::tempdir().unwrap();
+        let adapter = temp.path().join("claude-acp");
+        std::fs::write(&adapter, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let mut registry = registry_with_npx("claude-acp");
+        registry.agents[0].terminal_launch = Some(TerminalLaunch {
+            cmd: "claude".into(),
+            session_id_arg: "--session-id".into(),
+            resume_arg: "--resume".into(),
+            mcp_config_arg: "--mcp-config".into(),
+        });
+
+        let mut agent = fresh_npx("claude-acp");
+        agent.installations.insert(
+            0,
+            Installation {
+                method: InstallMethod::External,
+                version: "0.77.0".into(),
+                install_path: Some(adapter.to_string_lossy().into_owned()),
+                status: InstallStatus::Installed,
+                failure_reason: None,
+                installed_at: Utc::now(),
+            },
+        );
+        agent.selected_install_method = InstallMethod::External;
+
+        let (command, _args) =
+            spawn_for_launch_mode(&agent, Some(&registry.agents[0]), "acp").unwrap();
+
+        assert_eq!(command, adapter.to_string_lossy());
+    }
+
+    /// An operator who ran `npm i -g @agentclientprotocol/claude-agent-acp` and
+    /// selected that External binary is opting OUT of npx on the launch path.
+    /// Boot reconciliation used to stomp that selection back to Npx on every
+    /// restart, silently reverting the fix and re-exposing them to npx cache
+    /// failures.
+    #[tokio::test]
+    async fn reconcile_keeps_external_selection_pointing_at_the_acp_adapter() {
+        let _l = crate::storage::database::test_lock().lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        // The globally-installed adapter binary. Its basename matches the
+        // registry's npx package name, which is what marks it as the ACP
+        // adapter rather than the legacy terminal CLI.
+        let adapter = temp.path().join("claude-acp");
+        std::fs::write(&adapter, "#!/bin/sh\nexit 0\n").unwrap();
+
+        add_installation(
+            "claude-acp",
+            Installation {
+                method: InstallMethod::External,
+                version: String::new(),
+                install_path: Some(adapter.to_string_lossy().into_owned()),
+                status: InstallStatus::Installed,
+                failure_reason: None,
+                installed_at: Utc::now(),
+            },
+        )
+        .unwrap();
+        patch_or_create("claude-acp", Some(InstallMethod::External), None, None, None).unwrap();
+
+        reconcile_onboarding_agents(&onboarding_registry()).unwrap();
+
+        let agent = get("claude-acp").unwrap().unwrap();
+        assert_eq!(
+            agent.selected_install_method,
+            InstallMethod::External,
+            "a working external ACP adapter selection must survive boot reconciliation"
+        );
+        // The Npx channel is still seeded as a fallback — we keep the data,
+        // we just stop forcing the selection onto it.
+        assert!(agent
+            .installations
+            .iter()
+            .any(|i| i.method == InstallMethod::Npx));
+
+        crate::storage::set_grove_dir_override(None);
+    }
+
+    /// The legacy case the migration exists for: External pointing at the
+    /// terminal `claude` CLI (different basename) still converges onto Npx.
+    #[tokio::test]
+    async fn reconcile_still_migrates_legacy_terminal_external_selection() {
+        let _l = crate::storage::database::test_lock().lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::set_grove_dir_override(Some(temp.path().to_path_buf()));
+
+        let terminal = temp.path().join("claude");
+        std::fs::write(&terminal, "#!/bin/sh\nexit 0\n").unwrap();
+
+        add_installation(
+            "claude-acp",
+            Installation {
+                method: InstallMethod::External,
+                version: String::new(),
+                install_path: Some(terminal.to_string_lossy().into_owned()),
+                status: InstallStatus::Installed,
+                failure_reason: None,
+                installed_at: Utc::now(),
+            },
+        )
+        .unwrap();
+        patch_or_create("claude-acp", Some(InstallMethod::External), None, None, None).unwrap();
+
+        reconcile_onboarding_agents(&onboarding_registry()).unwrap();
+
+        let agent = get("claude-acp").unwrap().unwrap();
+        assert_eq!(agent.selected_install_method, InstallMethod::Npx);
+
+        crate::storage::set_grove_dir_override(None);
+    }
+
+    #[test]
+    fn npx_pin_is_extracted_from_spawn_args() {
+        let args: Vec<String> = ["-y", "--prefer-offline", "@example/claude-acp@1.0.0", "--acp"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            npx_pin_from_args(&args),
+            Some("@example/claude-acp@1.0.0")
+        );
+    }
+
+    #[test]
+    fn npm_etarget_stderr_is_recognised_as_stale_cache() {
+        assert!(npx_line_indicates_stale_cache("npm error code ETARGET"));
+        assert!(npx_line_indicates_stale_cache(
+            "npm error notarget No matching version found for @a/b@0.77.0."
+        ));
+        assert!(!npx_line_indicates_stale_cache(
+            "npm warn deprecated whatwg-encoding@3.1.1"
+        ));
+    }
+
+    #[test]
+    fn stale_cache_latch_drops_prefer_offline_until_cleared() {
+        let registry = registry_with_npx("claude-acp");
+        let agent = fresh_npx("claude-acp");
+        let pin = "@example/claude-acp@1.0.0";
+        npx_online_retry::reset();
+
+        // Steady state: cached fast path.
+        let (_, args) = spawn_for(&agent, Some(&registry.agents[0])).unwrap();
+        assert!(args.iter().any(|a| a == "--prefer-offline"));
+
+        // A stale-cache failure latches the pin; the next spawn goes online.
+        assert!(note_npx_stale_cache(pin));
+        assert!(!note_npx_stale_cache(pin), "latch is idempotent per pin");
+        let (_, args) = spawn_for(&agent, Some(&registry.agents[0])).unwrap();
+        assert!(
+            !args.iter().any(|a| a == "--prefer-offline"),
+            "latched pin must resolve against the live registry: {args:?}"
+        );
+        assert!(args.contains(&pin.to_string()));
+
+        // A successful handshake clears it and restores the fast path.
+        clear_npx_stale_cache(pin);
+        let (_, args) = spawn_for(&agent, Some(&registry.agents[0])).unwrap();
+        assert!(args.iter().any(|a| a == "--prefer-offline"));
+        npx_online_retry::reset();
+    }
+
+    #[test]
+    fn latch_is_scoped_to_the_exact_pin() {
+        let registry = registry_with_npx("claude-acp");
+        let agent = fresh_npx("claude-acp");
+        npx_online_retry::reset();
+
+        // A different version of the same package must not be affected.
+        note_npx_stale_cache("@example/claude-acp@9.9.9");
+        let (_, args) = spawn_for(&agent, Some(&registry.agents[0])).unwrap();
+        assert!(args.iter().any(|a| a == "--prefer-offline"));
+        npx_online_retry::reset();
     }
 
     #[test]

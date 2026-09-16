@@ -4711,7 +4711,20 @@ async fn run_acp_session(
                         config.chat_id.as_deref(),
                     )
                 });
-            tokio::task::spawn_local(drain_stderr_to_file(stderr, log_path));
+            // For npx launches, watch the drained stderr for npm's ETARGET
+            // ("no matching version found"). That means `--prefer-offline`
+            // resolved the pin against a stale cached packument and npx is
+            // about to exit 1 before the ACP handshake — latch the pin so the
+            // next spawn (the client reconnects within ~1.3s) omits the flag
+            // and fetches fresh metadata. See storage::installed_agents
+            // ::npx_online_retry.
+            let npx_pin = if config.agent_command == "npx" {
+                crate::storage::installed_agents::npx_pin_from_args(&config.agent_args)
+                    .map(str::to_string)
+            } else {
+                None
+            };
+            tokio::task::spawn_local(drain_stderr_to_file(stderr, log_path, npx_pin));
         }
 
         writer = Box::new(proc.stdin.take().unwrap().compat_write());
@@ -5061,6 +5074,15 @@ async fn drive_session(
         })??;
 
     validate_v1_protocol_version(init_resp.protocol_version)?;
+
+    // The agent handshook, so npx resolved this pin. Drop any stale-cache latch
+    // set by a previous failed launch so steady-state spawns go back to the
+    // fast `--prefer-offline` path.
+    if config.agent_command == "npx" {
+        if let Some(pin) = crate::storage::installed_agents::npx_pin_from_args(&config.agent_args) {
+            crate::storage::installed_agents::clear_npx_stale_cache(pin);
+        }
+    }
 
     // 缓存 agent 声明的登录方法 — 后续收到 -32000 AuthRequired 时取第一个走
     // authenticate。`unstable_auth_methods` feature 未启用,所以这里只会拿到
@@ -9621,7 +9643,16 @@ impl futures::AsyncRead for LoggingAsyncRead {
 }
 
 /// Drain agent stderr line-by-line into a log file (append mode).
-async fn drain_stderr_to_file(stderr: tokio::process::ChildStderr, path: PathBuf) {
+/// Drain a spawned agent's stderr into its per-chat `agent.log`.
+///
+/// `npx_pin`, when set, is the `pkg@version` this child was launched with via
+/// npx; any npm stale-cache error seen on stderr latches that pin for an
+/// online retry on the next spawn.
+async fn drain_stderr_to_file(
+    stderr: tokio::process::ChildStderr,
+    path: PathBuf,
+    npx_pin: Option<String>,
+) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -9644,6 +9675,17 @@ async fn drain_stderr_to_file(stderr: tokio::process::ChildStderr, path: PathBuf
                 use std::io::Write;
                 let _ = writer.write_all(line.as_bytes());
                 let _ = writer.flush();
+                if let Some(pin) = npx_pin.as_deref() {
+                    if crate::storage::installed_agents::npx_line_indicates_stale_cache(&line)
+                        && crate::storage::installed_agents::note_npx_stale_cache(pin)
+                    {
+                        eprintln!(
+                            "[ACP] npx could not resolve {pin} from the local cache \
+                             (npm ETARGET); retrying without --prefer-offline on the \
+                             next launch"
+                        );
+                    }
+                }
             }
         }
     }
